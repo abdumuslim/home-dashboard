@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat:*)",
+      "Bash(ssh:*)",
+      "Bash(scp -i ~/.ssh/vps1_key -o StrictHostKeyChecking=no -r D:/dev/home/app/* root@31.97.76.221:/opt/home-dashboard/app/ > D:/dev/home/ssh_out.txt 2>&1 && echo \"APP FILES OK\" >> D:/dev/home/ssh_out.txt)",
+      "Bash(scp -i ~/.ssh/vps1_key -o StrictHostKeyChecking=no D:/dev/home/docker-compose.yml root@31.97.76.221:/opt/home-dashboard/docker-compose.yml > D:/dev/home/ssh_out.txt 2>&1 && echo \"COMPOSE OK\" >> D:/dev/home/ssh_out.txt)",
+      "Bash(scp:*)",
+      "WebFetch(domain:home.altijwal.com)"
+    ]
+  }
+}

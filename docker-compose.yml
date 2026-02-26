@@ -1,0 +1,17 @@
+services:
+  dashboard:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - rag_default
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.home.rule=Host(`home.altijwal.com`)
+      - traefik.http.routers.home.tls=true
+      - traefik.http.routers.home.entrypoints=web,websecure
+      - traefik.http.services.home.loadbalancer.server.port=8000
+
+networks:
+  rag_default:
+    external: true

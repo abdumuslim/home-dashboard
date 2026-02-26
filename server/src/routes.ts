@@ -1,0 +1,124 @@
+import { Router, type Request, type Response } from "express";
+import pg from "pg";
+
+const RANGE_MAP: Record<string, string> = {
+  "6h": "6 hours",
+  "24h": "24 hours",
+  "48h": "48 hours",
+  "1w": "7 days",
+  "30d": "30 days",
+};
+
+const WEATHER_AVG_COLS: string[] = [
+  "temp_c", "humidity", "wind_speed_kmh", "wind_gust_kmh",
+  "pressure_rel_hpa", "pressure_abs_hpa", "solar_radiation",
+  "uv_index", "temp_indoor_c", "humidity_indoor",
+  "feels_like_c", "dew_point_c", "temp_ch8_c", "humidity_ch8",
+  "feels_like_indoor_c", "dew_point_indoor_c",
+  "feels_like_ch8_c", "dew_point_ch8_c",
+  "rain_hourly_mm",
+];
+
+const AIR_AVG_COLS: string[] = [
+  "temperature", "humidity", "co2", "pm25", "pm10",
+  "tvoc", "noise", "battery",
+];
+
+function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
+  const d: Record<string, unknown> = { ...row };
+  for (const key of Object.keys(d)) {
+    const val = d[key];
+    if (val instanceof Date) {
+      d[key] = val.toISOString();
+    }
+  }
+  return d;
+}
+
+export function createRouter(pool: pg.Pool): Router {
+  const router = Router();
+
+  router.get("/api/current", async (_req: Request, res: Response) => {
+    const weatherResult = await pool.query(
+      "SELECT * FROM weather_readings ORDER BY ts DESC LIMIT 1"
+    );
+    const airResult = await pool.query(
+      "SELECT * FROM air_readings ORDER BY ts DESC LIMIT 1"
+    );
+    const weather = weatherResult.rows[0] ?? null;
+    const air = airResult.rows[0] ?? null;
+    res.json({
+      weather: weather ? rowToDict(weather) : null,
+      air: air ? rowToDict(air) : null,
+    });
+  });
+
+  router.get("/api/history", async (req: Request, res: Response) => {
+    const source = (req.query.source as string) || "weather";
+    const range = (req.query.range as string) || "24h";
+
+    const table = source === "weather" ? "weather_readings" : "air_readings";
+    const interval = RANGE_MAP[range];
+    if (!interval) {
+      res.status(400).json({ error: `Invalid range: ${range}` });
+      return;
+    }
+
+    let rows: Record<string, unknown>[];
+
+    if (range === "30d") {
+      const cols = source === "weather" ? WEATHER_AVG_COLS : AIR_AVG_COLS;
+      const avgExprs = cols.map((c) => `AVG(${c})::REAL AS ${c}`).join(", ");
+      const result = await pool.query(
+        `SELECT date_trunc('hour', ts) AS ts, ${avgExprs}
+         FROM ${table}
+         WHERE ts >= NOW() - INTERVAL '${interval}'
+         GROUP BY date_trunc('hour', ts)
+         ORDER BY ts ASC`
+      );
+      rows = result.rows;
+    } else {
+      const result = await pool.query(
+        `SELECT * FROM ${table}
+         WHERE ts >= NOW() - INTERVAL '${interval}'
+         ORDER BY ts ASC`
+      );
+      rows = result.rows;
+    }
+
+    res.json({
+      source,
+      range,
+      count: rows.length,
+      data: rows.map(rowToDict),
+    });
+  });
+
+  router.get("/api/status", async (_req: Request, res: Response) => {
+    const weatherLastResult = await pool.query(
+      "SELECT ts FROM weather_readings ORDER BY ts DESC LIMIT 1"
+    );
+    const airLastResult = await pool.query(
+      "SELECT ts FROM air_readings ORDER BY ts DESC LIMIT 1"
+    );
+    const weatherCountResult = await pool.query(
+      "SELECT COUNT(*) FROM weather_readings"
+    );
+    const airCountResult = await pool.query(
+      "SELECT COUNT(*) FROM air_readings"
+    );
+
+    const weatherLast: Date | null = weatherLastResult.rows[0]?.ts ?? null;
+    const airLast: Date | null = airLastResult.rows[0]?.ts ?? null;
+
+    res.json({
+      weather_last_update: weatherLast ? weatherLast.toISOString() : null,
+      air_last_update: airLast ? airLast.toISOString() : null,
+      weather_total_readings: parseInt(weatherCountResult.rows[0].count as string, 10),
+      air_total_readings: parseInt(airCountResult.rows[0].count as string, 10),
+      collector_interval_seconds: 300,
+    });
+  });
+
+  return router;
+}
