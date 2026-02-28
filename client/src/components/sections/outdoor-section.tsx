@@ -32,8 +32,12 @@ export function OutdoorSection({ weather, weatherHistory }: OutdoorSectionProps)
         />
         <RainfallCard
           hourly={weather?.rain_hourly_mm}
+          event={weather?.rain_event_mm}
           daily={weather?.rain_daily_mm}
+          weekly={weather?.rain_weekly_mm}
           monthly={weather?.rain_monthly_mm}
+          yearly={weather?.rain_yearly_mm}
+          lastRain={weather?.last_rain}
           pressure={weather?.pressure_rel_hpa}
           weatherHistory={weatherHistory}
         />
