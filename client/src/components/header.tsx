@@ -17,8 +17,8 @@ export function Header({ weatherTs, airTs }: HeaderProps) {
         <span className="font-mono text-[0.85rem] text-text">{formatTime()}</span>
       </div>
       <div className="flex gap-4 items-center">
-        <StatusPill status={weatherAgo.status} text={weatherAgo.text} />
-        <StatusPill status={airAgo.status} text={airAgo.text} />
+        <StatusPill label="Weather" status={weatherAgo.status} text={weatherAgo.text} />
+        <StatusPill label="Air" status={airAgo.status} text={airAgo.text} />
       </div>
     </header>
   );

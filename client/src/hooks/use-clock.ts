@@ -12,11 +12,12 @@ export function useClock() {
   }, []);
 
   const formatTime = useCallback(() => {
-    return new Date(now).toLocaleTimeString("en-GB", {
+    return new Date(now).toLocaleTimeString("en-US", {
       timeZone: TZ,
-      hour: "2-digit",
+      hour: "numeric",
       minute: "2-digit",
       second: "2-digit",
+      hour12: true,
     });
   }, [now]);
 

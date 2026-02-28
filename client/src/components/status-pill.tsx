@@ -9,11 +9,13 @@ const dotColors = {
 interface StatusPillProps {
   status: "online" | "stale" | "offline";
   text: string;
+  label: string;
 }
 
-export function StatusPill({ status, text }: StatusPillProps) {
+export function StatusPill({ status, text, label }: StatusPillProps) {
   return (
     <div className="flex items-center gap-1.5 text-[0.75rem] text-dim">
+      <span className="text-text">{label}</span>
       <span className={cn("w-[7px] h-[7px] rounded-full", dotColors[status])} />
       <span>{text}</span>
     </div>
