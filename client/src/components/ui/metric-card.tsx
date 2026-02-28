@@ -21,10 +21,9 @@ export function MetricCard({ id, children, flash, level, className }: MetricCard
     <div
       id={id}
       className={cn(
-        "bg-card-bg border border-card-border rounded-[12px] px-4 py-3",
-        "flex flex-col min-h-[150px] h-full",
+        "glass-card px-4 py-3 text-white",
+        "flex flex-col min-h-[220px] h-full relative overflow-hidden",
         "transition-[border-color] duration-300",
-        "hover:border-card-hover",
         flash && "animate-card-flash",
         level && levelBorders[level],
         className
