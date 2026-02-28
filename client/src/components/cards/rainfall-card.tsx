@@ -1,78 +1,89 @@
-import { useMemo } from "react";
-import { CloudRain } from "lucide-react";
+import { Bar } from "react-chartjs-2";
 import { MetricCard } from "@/components/ui/metric-card";
-import { CardTop } from "@/components/ui/card-top";
 import { fmt } from "@/constants/thresholds";
-import { cn } from "@/lib/utils";
 import type { WeatherReading } from "@/types/api";
 
 interface RainfallCardProps {
   hourly: number | null | undefined;
   daily: number | null | undefined;
   monthly: number | null | undefined;
-  pressure: number | null | undefined;
-  weatherHistory: WeatherReading[];
+  pressure?: number | null | undefined;
+  weatherHistory?: WeatherReading[];
 }
 
-export function RainfallCard({ hourly, daily, monthly, pressure, weatherHistory }: RainfallCardProps) {
-  const trend = useMemo(() => {
-    const hist = weatherHistory
-      .filter((r) => r.pressure_rel_hpa != null)
-      .map((r) => ({ ts: new Date(r.ts).getTime(), v: r.pressure_rel_hpa! }));
+export function RainfallCard({ hourly, daily, monthly, weatherHistory = [] }: RainfallCardProps) {
+  const chartData = {
+    datasets: [
+      {
+        data: weatherHistory
+          .filter((r) => r.rain_hourly_mm != null)
+          .map((r) => ({ x: r.ts, y: r.rain_hourly_mm as number })),
+        backgroundColor: "#00d4ff",
+        borderRadius: 2,
+      },
+    ],
+  };
 
-    if (hist.length < 2) return null;
-
-    const now = Date.now();
-    const cutoff = now - 3 * 3600000;
-    const old = hist.find((p) => p.ts >= cutoff) || hist[0];
-    const cur = hist[hist.length - 1];
-    const diff = cur.v - old.v;
-
-    if (diff > 1) return { direction: "rising" as const, diff: Math.abs(diff) };
-    if (diff < -1) return { direction: "falling" as const, diff: Math.abs(diff) };
-    return { direction: "steady" as const, diff: 0 };
-  }, [weatherHistory]);
+  const chartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: { enabled: false },
+    },
+    scales: {
+      x: {
+        type: "time" as const,
+        time: { unit: "hour" as const, stepSize: 1, displayFormats: { hour: "h" } },
+        grid: { display: false },
+        ticks: { color: "#7a8ba8", font: { size: 9 }, maxRotation: 0, autoSkip: false, autoSkipPadding: 0, padding: 0 },
+      },
+      y: {
+        display: true,
+        position: "left" as const,
+        grid: { color: "rgba(255,255,255,0.05)" },
+        ticks: { color: "#7a8ba8", font: { size: 10 }, stepSize: 1 },
+      },
+    },
+  };
 
   return (
-    <MetricCard>
-      <CardTop
-        icon={<CloudRain className="w-full h-full" />}
-        iconColor="blue"
-        title="Rainfall"
-      />
-      <div className="flex-1 flex justify-around items-center py-2">
-        <RainCol value={fmt(hourly, 1)} unit="mm/hr" label="Rate" />
-        <RainCol value={fmt(daily, 1)} unit="mm" label="Day" />
-        <RainCol value={fmt(monthly, 1)} unit="mm" label="Month" />
+    <MetricCard className="p-4 pb-0 flex flex-col justify-between">
+      <div className="flex flex-col mb-2 z-10 w-full">
+        <h3 className="text-[0.95rem] font-medium text-text mb-2">Rainfall</h3>
+
+        <div className="flex items-start gap-4">
+          <div className="flex flex-col">
+            <div className="flex items-baseline gap-1">
+              <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
+                {fmt(hourly, 1)}
+              </span>
+              <span className="text-[0.9rem] font-medium text-text">mm/hr</span>
+            </div>
+            <span className="text-[0.75rem] text-text mt-1">Rate</span>
+          </div>
+
+          <div className="flex gap-4 ml-auto pt-1">
+            <div className="flex flex-col text-center">
+              <span className="text-xl font-medium leading-none text-white">
+                {fmt(daily, 1)}
+              </span>
+              <span className="text-[0.75rem] text-text mt-1">Day</span>
+            </div>
+
+            <div className="flex flex-col text-center">
+              <span className="text-xl font-medium leading-none text-white">
+                {fmt(monthly, 1)}
+              </span>
+              <span className="text-[0.75rem] text-text mt-1">Month</span>
+            </div>
+          </div>
+        </div>
       </div>
-      <div className="text-center pt-1 border-t border-card-border">
-        <span className="text-[0.9rem] font-semibold">{fmt(pressure, 1)}</span>
-        <span className="text-[0.7rem] text-dim ml-0.5">hPa</span>
-        {trend && (
-          <span
-            className={cn(
-              "text-[0.7rem] font-semibold ml-1.5",
-              trend.direction === "rising" && "text-green",
-              trend.direction === "falling" && "text-red",
-              trend.direction === "steady" && "text-dim"
-            )}
-          >
-            {trend.direction === "rising" && `↑ ${fmt(trend.diff, 1)}`}
-            {trend.direction === "falling" && `↓ ${fmt(trend.diff, 1)}`}
-            {trend.direction === "steady" && "→ stable"}
-          </span>
-        )}
+
+      <div className="absolute bottom-0 left-0 right-0 h-[80px] w-full mt-auto px-2 pb-2">
+        {weatherHistory.length > 0 && <Bar data={chartData} options={chartOptions} />}
       </div>
     </MetricCard>
-  );
-}
-
-function RainCol({ value, unit, label }: { value: string; unit: string; label: string }) {
-  return (
-    <div className="text-center">
-      <span className="block text-2xl font-bold leading-none">{value}</span>
-      <span className="block text-[0.55rem] text-dim my-0.5">{unit}</span>
-      <span className="block text-[0.6rem] font-medium text-dim">{label}</span>
-    </div>
   );
 }
