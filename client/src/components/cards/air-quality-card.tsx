@@ -1,6 +1,8 @@
-import type { ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { Bar } from "react-chartjs-2";
-import { getStatus } from "@/constants/thresholds";
+import { MetricCard } from "@/components/ui/metric-card";
+import { useFlash } from "@/hooks/use-flash";
+import { fmt, getStatus } from "@/constants/thresholds";
 import type { AirReading } from "@/types/api";
 
 const levelColors: Record<string, string> = {
@@ -25,7 +27,7 @@ interface AirQualityCardProps {
   airHistory?: AirReading[];
 }
 
-// Helper to bucket data into 1-hour intervals and average them
+// Helper to bucket data into 30-minute intervals and average them
 function bucketData(history: AirReading[], metricKey: keyof AirReading) {
   const buckets = new Map<number, { sum: number; count: number }>();
 
@@ -33,9 +35,9 @@ function bucketData(history: AirReading[], metricKey: keyof AirReading) {
     const val = r[metricKey];
     if (val == null) return;
 
-    // Round down to the nearest hour (60 * 60 * 1000 = 3600000 ms)
+    // Round down to the nearest 30 min (30 * 60 * 1000 = 1800000 ms)
     const ts = new Date(r.ts).getTime();
-    const bucketTs = Math.floor(ts / 3600000) * 3600000;
+    const bucketTs = Math.floor(ts / 1800000) * 1800000;
 
     const existing = buckets.get(bucketTs) || { sum: 0, count: 0 };
     buckets.set(bucketTs, {
@@ -60,13 +62,40 @@ export function AirQualityCard({
   metric,
   airHistory = [],
 }: AirQualityCardProps) {
+  const flash = useFlash(value != null ? value : null);
   const status = getStatus(metric, value);
   const activeColor = status.level ? levelColors[status.level] : "#7a8ba8";
 
-  // Filter valid history and construct chart data
-  const aggregatedHistory = bucketData(airHistory, metric as keyof AirReading);
+  const aggregatedHistory = useMemo(
+    () => bucketData(airHistory, metric as keyof AirReading),
+    [airHistory, metric]
+  );
 
-  const chartData = {
+  // Today's hi/lo since midnight
+  const { hi, lo } = useMemo(() => {
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+    const key = metric as keyof AirReading;
+    const today = airHistory.filter(
+      (r) => r[key] != null && new Date(r.ts) >= midnight
+    );
+    if (today.length === 0) return { hi: null, lo: null };
+    const vals = today.map((r) => r[key] as number);
+    return { hi: Math.max(...vals), lo: Math.min(...vals) };
+  }, [airHistory, metric]);
+
+  // Cap Y-axis at ~90th percentile so outlier spikes don't compress all other bars
+  const yMax = useMemo(() => {
+    if (aggregatedHistory.length === 0) return undefined;
+    const sorted = aggregatedHistory.map((r) => r.y).sort((a, b) => a - b);
+    const p90 = sorted[Math.floor(sorted.length * 0.9)];
+    const dataMax = sorted[sorted.length - 1];
+    // Only cap if the max is significantly above p90 (i.e. there are outlier spikes)
+    if (dataMax > p90 * 1.5) return Math.ceil(p90 * 1.3);
+    return undefined; // let Chart.js auto-scale normally
+  }, [aggregatedHistory]);
+
+  const chartData = useMemo(() => ({
     datasets: [
       {
         data: aggregatedHistory,
@@ -75,10 +104,10 @@ export function AirQualityCard({
           return s.level ? levelColors[s.level] : "#7a8ba8";
         }),
         borderRadius: 1,
-        barThickness: 3,
+        barThickness: 2,
       },
     ],
-  };
+  }), [aggregatedHistory, metric]);
 
   const chartOptions = {
     responsive: true,
@@ -96,15 +125,26 @@ export function AirQualityCard({
         offset: true,
       },
       y: {
-        display: false,
+        display: true,
+        position: "left" as const,
         beginAtZero: true,
+        max: yMax,
+        grid: { color: "rgba(255,255,255,0.05)" },
+        ticks: { color: "#7a8ba8", font: { size: 10 }, maxTicksLimit: 4 },
       },
+    },
+    elements: {
+      point: { radius: 0, hitRadius: 10, hoverRadius: 4 },
+    },
+    interaction: {
+      intersect: false,
+      mode: "index" as const,
     },
   };
 
   return (
-    <div className="glass-card flex flex-col p-4 pb-0 min-h-[200px] relative">
-      <div className="flex items-center gap-5 z-10 w-full mb-2">
+    <MetricCard flash={flash} className="p-4 pb-0 flex flex-col !min-h-[200px]">
+      <div className="flex items-center gap-5 z-10 w-full mb-[70px]">
         <div className="relative shrink-0 w-[80px] h-[80px] flex justify-center items-center">
           <svg width="80" height="80" viewBox="0 0 80 80" className="absolute inset-0">
             <circle
@@ -124,7 +164,7 @@ export function AirQualityCard({
               strokeWidth="4"
             />
           </svg>
-          <div className="flex flex-col items-center justify-center z-10 w-full text-center px-1">
+          <div className="flex flex-col items-center justify-center z-10 w-full text-center px-1 mt-1">
             <span className="text-xl font-semibold leading-none text-white tracking-tight">
               {value ?? "--"}
             </span>
@@ -133,7 +173,7 @@ export function AirQualityCard({
         </div>
 
         <div className="flex flex-col flex-1 justify-center max-w-full overflow-hidden">
-          <h3 className="text-[1.05rem] font-medium text-text mb-1 truncate">{title}</h3>
+          <h3 className="text-[0.95rem] font-medium text-text mb-2 truncate">{title}</h3>
           <div
             className="text-[0.95rem] font-semibold truncate"
             style={{ color: activeColor }}
@@ -141,11 +181,18 @@ export function AirQualityCard({
             {status.label}
           </div>
         </div>
+
+        {hi != null && lo != null && (
+          <div className="flex flex-col items-end shrink-0 text-xs text-dim gap-0.5">
+            <span><span className="text-red-400">&uarr;</span> <span className="text-text font-medium">{fmt(hi, 0)}</span></span>
+            <span><span className="text-blue-400">&darr;</span> <span className="text-text font-medium">{fmt(lo, 0)}</span></span>
+          </div>
+        )}
       </div>
 
-      <div className="absolute bottom-0 left-0 right-0 h-[85px] w-full mt-auto px-4 pb-3 z-0">
+      <div className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden">
         {aggregatedHistory.length > 0 && <Bar data={chartData} options={chartOptions} />}
       </div>
-    </div>
+    </MetricCard>
   );
 }
