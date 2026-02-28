@@ -27,9 +27,34 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
       : (speeds[mid - 1] + speeds[mid]) / 2;
   };
 
-  // Pre-compute current median for display (use latest reading)
+  // Snap degrees to nearest 22.5° (16 compass points, matching DIRS)
+  const snapDir = (deg: number) => Math.round(deg / 22.5) * 22.5 % 360;
+
+  // Circular mean of wind direction within a time window (handles 0°/360° wrap)
+  const getMeanDir = (history: WeatherReading[], timestamp: number, windowMs: number = 600000) => {
+    const points = history.filter(
+      (r) => r.wind_dir != null && Math.abs(new Date(r.ts).getTime() - timestamp) <= windowMs / 2
+    );
+    if (points.length === 0) return null;
+    let sinSum = 0, cosSum = 0;
+    for (const r of points) {
+      const rad = (r.wind_dir as number) * Math.PI / 180;
+      sinSum += Math.sin(rad);
+      cosSum += Math.cos(rad);
+    }
+    const mean = Math.atan2(sinSum, cosSum) * 180 / Math.PI;
+    return snapDir(((mean % 360) + 360) % 360);
+  };
+
+  // Pre-compute current medians for display (use latest reading)
+  const latestTs = weatherHistory.length > 0
+    ? new Date(weatherHistory[weatherHistory.length - 1].ts).getTime()
+    : 0;
   const currentMedian = weatherHistory.length > 0
-    ? getMedianSpeed(weatherHistory, new Date(weatherHistory[weatherHistory.length - 1].ts).getTime())
+    ? getMedianSpeed(weatherHistory, latestTs)
+    : null;
+  const medianDir = weatherHistory.length > 0
+    ? getMeanDir(weatherHistory, latestTs)
     : null;
 
   // Generate chart data: median speed per 30-min bucket for smooth curve
@@ -123,26 +148,43 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
             <span className="text-[0.75rem] text-text font-medium mt-1">10Min Med</span>
           </div>
 
-          <div className="relative w-[60px] h-[60px] rounded-full border-2 border-[#1e2f50] flex flex-col items-center justify-center bg-transparent shrink-0 ml-auto">
+          <div className="relative w-[72px] h-[72px] rounded-full border-2 border-[#1e2f50] flex flex-col items-center justify-center bg-transparent shrink-0 ml-auto">
             <span className="text-sm font-medium text-cyan z-10">{degDir(dir)}</span>
 
+            {/* Current direction arrow (back layer) — filled cyan */}
             <div
               className="absolute inset-0 transition-transform duration-700 pointer-events-none"
-              style={{ transform: dir != null ? `rotate(${dir}deg)` : undefined }}
+              style={{ transform: dir != null ? `rotate(${snapDir(dir)}deg)` : undefined }}
             >
               <svg
-                className="absolute -top-[9px] left-1/2 -translate-x-1/2 w-[14px] h-[18px] text-cyan drop-shadow-md rotate-180"
-                viewBox="0 0 24 24"
+                className="absolute -top-[10px] left-1/2 -translate-x-1/2 w-[12px] h-[20px] text-cyan drop-shadow-md rotate-180"
+                viewBox="0 0 16 24"
                 fill="currentColor"
-                preserveAspectRatio="none"
               >
-                <path d="M12 0L24 24L12 17L0 24Z" />
+                <path d="M8 0L16 24L8 18L0 24Z" />
+              </svg>
+            </div>
+
+            {/* Median direction arrow (front layer) — outline white */}
+            <div
+              className="absolute inset-0 transition-transform duration-700 pointer-events-none z-[1]"
+              style={{ transform: medianDir != null ? `rotate(${medianDir}deg)` : undefined }}
+            >
+              <svg
+                className="absolute -top-[13px] left-1/2 -translate-x-1/2 w-[14px] h-[24px] drop-shadow-md rotate-180"
+                viewBox="0 0 16 24"
+                fill="none"
+                stroke="white"
+                strokeWidth="2.5"
+                strokeLinejoin="round"
+              >
+                <path d="M8 0L16 24L8 18L0 24Z" />
               </svg>
             </div>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim -mt-[5px]">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim -mt-[17px]">
           <span>Gust <span className="text-text font-medium">{gust != null ? gust.toFixed(1) : "--"} km/h</span></span>
           <span>Max <span className="text-text font-medium">{maxDailyGust != null ? maxDailyGust.toFixed(1) : "--"} km/h</span></span>
         </div>
