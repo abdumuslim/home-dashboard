@@ -88,8 +88,8 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
     datasets: [
       {
         data: chartDataPoints,
-        borderColor: "#00d4ff",
-        backgroundColor: "rgba(0, 212, 255, 0.2)",
+        borderColor: "#f59e0b",
+        backgroundColor: "rgba(245, 158, 11, 0.15)",
         fill: true,
         borderWidth: 2,
         pointRadius: 0,
@@ -140,7 +140,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
 
           <div className="flex flex-col">
             <div className="flex items-baseline gap-1">
-              <span className="text-3xl font-semibold leading-none text-white tracking-tight">
+              <span className="text-3xl font-semibold leading-none tracking-tight" style={{ color: "#f59e0b" }}>
                 {currentMedian != null ? currentMedian.toFixed(1) : "--"}
               </span>
               <span className="text-sm text-dim">km/h</span>
@@ -174,7 +174,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
                 className="absolute -top-[13px] left-1/2 -translate-x-1/2 w-[14px] h-[24px] drop-shadow-md rotate-180"
                 viewBox="0 0 16 24"
                 fill="none"
-                stroke="white"
+                stroke="#f59e0b"
                 strokeWidth="2.5"
                 strokeLinejoin="round"
               >
