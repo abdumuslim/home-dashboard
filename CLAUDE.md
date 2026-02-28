@@ -107,9 +107,45 @@ Deduplication: `ON CONFLICT (ts) DO NOTHING`. The 30-day history endpoint downsa
 ## Dashboard Layout
 
 3 sections with tabs (Dashboard / Charts):
-- **Outdoor** (4-col grid): Temperature, Wind (golden circle), Humidity, Rainfall, Solar, UV, Pressure
+- **Outdoor** (4-col grid): Temperature, Wind (golden circle), Rainfall (+ Barometer), Solar
 - **Indoor** (3-col grid): Mom, Abdu, Kitchen — each with temp + humidity
 - **Air Quality** (5-col grid): CO2, PM2.5, PM10, tVOC, Noise — battery in section header
+
+## Card Design Language
+
+All metric cards follow a consistent design language established in the Temperature and Wind cards:
+
+### Layout Structure
+- **Title:** `h3` with `text-[0.95rem] font-medium text-text mb-2`
+- **Hero row:** 1-2 primary values side by side, `flex items-baseline gap-8 mb-2`
+  - Value: `text-3xl font-semibold leading-none tracking-tight` with a distinct color per metric
+  - Unit: `text-xl` inline with value (e.g. `°C`, `%`) or `text-sm text-dim` separated (e.g. `km/h`)
+  - Label below: `text-[0.75rem] text-text font-medium mt-1`
+- **Secondary row:** compact supporting info, `flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim`
+  - Values highlighted with `text-text font-medium`
+- **Content spacing:** `mb-[100px]` on content div to reserve space for the chart below
+- **Chart:** absolute-positioned at bottom, `h-[100px]`, `z-0 rounded-b-xl overflow-hidden`, `px-2 pb-1`
+
+### Chart Defaults
+- Line charts: `borderWidth: 2, pointRadius: 0, tension: 0.4, cubicInterpolationMode: "monotone", fill: true`
+- Bar charts: `borderRadius: 2` (or 1 for AQ), colored per severity
+- Smoothing: hourly bucketed averages (or 30-min median for wind)
+- X-axis: `type: "time", unit: "hour", stepSize: 1, displayFormats: { hour: "h" }`, no rotation
+- Y-axis: `position: "left"`, subtle grid `rgba(255,255,255,0.05)`
+
+### Colors
+- **Primary metric:** cyan `#00d4ff` (temp uses dynamic `getTempColor()`)
+- **Secondary metric:** white `text-white` or a complementary color (e.g. amber `#f59e0b` for wind median)
+- **Pressure/Baro:** emerald `#10b981` (value + chart line)
+- **Rain drop SVG:** blue `#2196ff` (stroke + fill)
+- **Labels:** `text-text` (light gray)
+- **Dim text/units:** `text-dim`
+- **Chart fill:** primary color at 15% opacity
+
+### Card Container
+- Uses `MetricCard` component (glass-card, `min-h-[220px]`, `relative overflow-hidden`)
+- Or raw `div.glass-card` for cards not using MetricCard (indoor, AQ)
+- `p-4 pb-0 flex flex-col` on MetricCard className
 
 ## API Rate Limits
 
