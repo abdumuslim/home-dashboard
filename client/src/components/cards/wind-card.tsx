@@ -27,20 +27,37 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
       : (speeds[mid - 1] + speeds[mid]) / 2;
   };
 
-  // Pre-compute current median for display
+  // Pre-compute current median for display (use latest reading)
   const currentMedian = weatherHistory.length > 0
-    ? getMedianSpeed(weatherHistory, new Date(weatherHistory[0].ts).getTime())
+    ? getMedianSpeed(weatherHistory, new Date(weatherHistory[weatherHistory.length - 1].ts).getTime())
     : null;
 
-  // Generate chart data using 10-min median
-  const chartDataPoints = weatherHistory
-    .filter((r) => r.wind_speed_kmh != null)
-    .map((r) => {
+  // Generate chart data: median speed per 30-min bucket for smooth curve
+  const chartDataPoints = (() => {
+    const readings = weatherHistory.filter((r) => r.wind_speed_kmh != null);
+    if (readings.length === 0) return [];
+
+    const bucketMs = 30 * 60 * 1000;
+    const buckets = new Map<number, number[]>();
+    for (const r of readings) {
       const ts = new Date(r.ts).getTime();
-      const median = getMedianSpeed(weatherHistory, ts);
-      return { x: r.ts, y: median };
-    })
-    .filter((p) => p.y !== null) as { x: string; y: number }[];
+      const bucketTs = Math.floor(ts / bucketMs) * bucketMs;
+      const arr = buckets.get(bucketTs) || [];
+      arr.push(r.wind_speed_kmh as number);
+      buckets.set(bucketTs, arr);
+    }
+
+    return Array.from(buckets.entries())
+      .map(([ts, speeds]) => {
+        speeds.sort((a, b) => a - b);
+        const mid = Math.floor(speeds.length / 2);
+        const median = speeds.length % 2 !== 0
+          ? speeds[mid]
+          : (speeds[mid - 1] + speeds[mid]) / 2;
+        return { x: new Date(ts).toISOString(), y: median };
+      })
+      .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
+  })();
 
   const chartData = {
     datasets: [
@@ -52,6 +69,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
         borderWidth: 2,
         pointRadius: 0,
         tension: 0.4,
+        cubicInterpolationMode: "monotone" as const,
       },
     ],
   };
@@ -80,16 +98,33 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
   };
 
   return (
-    <MetricCard className="p-4 pb-0 flex flex-col justify-between">
-      <div className="flex flex-col mb-2 z-10 w-full">
+    <MetricCard className="p-4 pb-0 flex flex-col">
+      <div className="flex flex-col z-10 w-full mb-[100px]">
         <h3 className="text-[0.95rem] font-medium text-text mb-2">Wind</h3>
 
-        <div className="flex items-center gap-4">
-          <div className="relative w-[60px] h-[60px] rounded-full border-2 border-[#1e2f50] flex flex-col items-center justify-center bg-transparent shrink-0">
-            <span className="absolute top-0.5 text-[0.55rem] text-dim">N</span>
-            <span className="absolute bottom-0.5 text-[0.55rem] text-dim">S</span>
-            <span className="absolute left-1 text-[0.55rem] text-dim">W</span>
-            <span className="absolute right-1 text-[0.55rem] text-dim">E</span>
+        <div className="flex items-start gap-6 mb-2">
+          <div className="flex flex-col">
+            <div className="flex items-baseline gap-1">
+              <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
+                {speed != null ? speed.toFixed(1) : "--"}
+              </span>
+              <span className="text-sm text-dim">km/h</span>
+            </div>
+            <span className="text-[0.75rem] text-text font-medium mt-1">Speed</span>
+          </div>
+
+          <div className="flex flex-col">
+            <div className="flex items-baseline gap-1">
+              <span className="text-3xl font-semibold leading-none text-white tracking-tight">
+                {currentMedian != null ? currentMedian.toFixed(1) : "--"}
+              </span>
+              <span className="text-sm text-dim">km/h</span>
+            </div>
+            <span className="text-[0.75rem] text-text font-medium mt-1">10Min Med</span>
+          </div>
+
+          <div className="relative w-[60px] h-[60px] rounded-full border-2 border-[#1e2f50] flex flex-col items-center justify-center bg-transparent shrink-0 ml-auto">
+            <span className="text-sm font-medium text-cyan z-10">{degDir(dir)}</span>
 
             <div
               className="absolute inset-0 transition-transform duration-700 pointer-events-none"
@@ -105,38 +140,15 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
               </svg>
             </div>
           </div>
+        </div>
 
-          <div className="flex flex-col flex-1">
-            <div className="flex items-end justify-between gap-1 w-full">
-              <div className="flex items-baseline gap-1">
-                <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
-                  {speed != null ? speed.toFixed(1) : "--"}
-                </span>
-                <span className="text-[0.9rem] font-medium text-dim">km/h</span>
-              </div>
-              <div className="flex flex-col items-end">
-                <span className="text-[0.65rem] text-dim uppercase tracking-wider mb-0.5 leading-none">10m Median</span>
-                <div className="flex items-baseline gap-0.5">
-                  <span className="text-xl font-medium leading-none text-white tracking-tight">
-                    {currentMedian != null ? currentMedian.toFixed(1) : "--"}
-                  </span>
-                  <span className="text-[0.7rem] font-medium text-dim">km/h</span>
-                </div>
-              </div>
-            </div>
-            <div className="text-[0.8rem] text-text font-medium mt-1">
-              From {degDir(dir)}
-            </div>
-            <div className="text-[0.75rem] text-text mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
-              <span>Gusts {gust != null ? gust.toFixed(1) : "--"} <span className="text-dim">km/h</span></span>
-              <span className="text-dim text-[0.5rem]">•</span>
-              <span>Max {maxDailyGust != null ? maxDailyGust.toFixed(1) : "--"} <span className="text-dim">km/h</span></span>
-            </div>
-          </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim -mt-[5px]">
+          <span>Gust <span className="text-text font-medium">{gust != null ? gust.toFixed(1) : "--"} km/h</span></span>
+          <span>Max <span className="text-text font-medium">{maxDailyGust != null ? maxDailyGust.toFixed(1) : "--"} km/h</span></span>
         </div>
       </div>
 
-      <div className="absolute bottom-0 left-0 right-0 h-[100px] w-full mt-auto px-2 pb-2">
+      <div className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden">
         {weatherHistory.length > 0 && <Line data={chartData} options={chartOptions} />}
       </div>
     </MetricCard>
