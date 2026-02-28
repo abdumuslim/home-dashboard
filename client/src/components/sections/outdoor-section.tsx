@@ -1,4 +1,4 @@
-import type { WeatherReading } from "@/types/api";
+import type { WeatherReading, OpenOverlayFn } from "@/types/api";
 import { TemperatureCard } from "@/components/cards/temperature-card";
 import { WindCard } from "@/components/cards/wind-card";
 import { RainfallCard } from "@/components/cards/rainfall-card";
@@ -7,9 +7,10 @@ import { SolarCard } from "@/components/cards/solar-card";
 interface OutdoorSectionProps {
   weather: WeatherReading | null;
   weatherHistory: WeatherReading[];
+  openOverlay: OpenOverlayFn;
 }
 
-export function OutdoorSection({ weather, weatherHistory }: OutdoorSectionProps) {
+export function OutdoorSection({ weather, weatherHistory, openOverlay }: OutdoorSectionProps) {
   return (
     <section className="mb-6">
       <div className="px-0.5 pt-5 pb-3">
@@ -22,6 +23,7 @@ export function OutdoorSection({ weather, weatherHistory }: OutdoorSectionProps)
           dewPoint={weather?.dew_point_c}
           feelsLike={weather?.feels_like_c}
           weatherHistory={weatherHistory}
+          openOverlay={openOverlay}
         />
         <WindCard
           speed={weather?.wind_speed_kmh}
@@ -29,6 +31,7 @@ export function OutdoorSection({ weather, weatherHistory }: OutdoorSectionProps)
           maxDailyGust={weather?.max_daily_gust_kmh}
           dir={weather?.wind_dir}
           weatherHistory={weatherHistory}
+          openOverlay={openOverlay}
         />
         <RainfallCard
           hourly={weather?.rain_hourly_mm}
@@ -40,11 +43,13 @@ export function OutdoorSection({ weather, weatherHistory }: OutdoorSectionProps)
           lastRain={weather?.last_rain}
           pressure={weather?.pressure_rel_hpa}
           weatherHistory={weatherHistory}
+          openOverlay={openOverlay}
         />
         <SolarCard
           radiation={weather?.solar_radiation}
           uvIndex={weather?.uv_index}
           weatherHistory={weatherHistory}
+          openOverlay={openOverlay}
         />
       </div>
     </section>

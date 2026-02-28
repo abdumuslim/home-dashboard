@@ -1,12 +1,13 @@
 import { AirQualityCard } from "@/components/cards/air-quality-card";
-import type { AirReading } from "@/types/api";
+import type { AirReading, OpenOverlayFn } from "@/types/api";
 
 interface AirQualitySectionProps {
   air: AirReading | null;
   airHistory: AirReading[];
+  openOverlay: OpenOverlayFn;
 }
 
-export function AirQualitySection({ air, airHistory }: AirQualitySectionProps) {
+export function AirQualitySection({ air, airHistory, openOverlay }: AirQualitySectionProps) {
   return (
     <section className="mb-6">
       <div className="px-0.5 pt-5 pb-3">
@@ -21,6 +22,7 @@ export function AirQualitySection({ air, airHistory }: AirQualitySectionProps) {
           unit="µg/m³"
           metric="pm25"
           airHistory={airHistory}
+          openOverlay={openOverlay}
         />
         <AirQualityCard
           title="PM10"
@@ -28,6 +30,7 @@ export function AirQualitySection({ air, airHistory }: AirQualitySectionProps) {
           unit="µg/m³"
           metric="pm10"
           airHistory={airHistory}
+          openOverlay={openOverlay}
         />
         <AirQualityCard
           title="tVOC"
@@ -35,6 +38,7 @@ export function AirQualitySection({ air, airHistory }: AirQualitySectionProps) {
           unit="index"
           metric="tvoc"
           airHistory={airHistory}
+          openOverlay={openOverlay}
         />
         <AirQualityCard
           title={<>CO<sub>2</sub></>}
@@ -42,6 +46,7 @@ export function AirQualitySection({ air, airHistory }: AirQualitySectionProps) {
           unit="ppm"
           metric="co2"
           airHistory={airHistory}
+          openOverlay={openOverlay}
         />
       </div>
     </section>

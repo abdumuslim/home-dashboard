@@ -1,5 +1,5 @@
 import { Home, User, CookingPot } from "lucide-react";
-import type { WeatherReading, AirReading } from "@/types/api";
+import type { WeatherReading, AirReading, OpenOverlayFn } from "@/types/api";
 import { IndoorCard } from "@/components/cards/indoor-card";
 
 interface IndoorSectionProps {
@@ -7,6 +7,7 @@ interface IndoorSectionProps {
   air: AirReading | null;
   weatherHistory: WeatherReading[];
   airHistory: AirReading[];
+  openOverlay: OpenOverlayFn;
 }
 
 // Magnus formula for dew point; Steadman approximation for feels-like (indoor, no wind/sun)
@@ -26,7 +27,7 @@ function calcFeelsLike(t: number, rh: number): number {
   return hi;
 }
 
-export function IndoorSection({ weather, air, weatherHistory, airHistory }: IndoorSectionProps) {
+export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay }: IndoorSectionProps) {
   const kitchenDewPoint = air?.temperature != null && air?.humidity != null
     ? calcDewPoint(air.temperature, air.humidity) : undefined;
   const kitchenFeelsLike = air?.temperature != null && air?.humidity != null
@@ -48,6 +49,7 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory }: Indo
           feelsLike={weather?.feels_like_indoor_c}
           history={weatherHistory}
           metricKey="temp_indoor_c"
+          openOverlay={openOverlay}
         />
         <IndoorCard
           title="Abdu"
@@ -59,6 +61,7 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory }: Indo
           feelsLike={weather?.feels_like_ch8_c}
           history={weatherHistory}
           metricKey="temp_ch8_c"
+          openOverlay={openOverlay}
         />
         <IndoorCard
           title="Kitchen"
@@ -71,6 +74,7 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory }: Indo
           noise={air?.noise}
           history={airHistory}
           metricKey="temperature"
+          openOverlay={openOverlay}
         />
       </div>
     </section>

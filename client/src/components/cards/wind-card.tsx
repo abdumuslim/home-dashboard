@@ -1,7 +1,10 @@
+import { useMemo } from "react";
 import { Line } from "react-chartjs-2";
+import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { degDir } from "@/constants/thresholds";
-import type { WeatherReading } from "@/types/api";
+import { getBucketMs, bucketMedian, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
+import type { WeatherReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
 interface WindCardProps {
   speed: number | null | undefined;
@@ -9,28 +12,66 @@ interface WindCardProps {
   maxDailyGust?: number | null | undefined;
   dir: number | null | undefined;
   weatherHistory?: WeatherReading[];
+  openOverlay: OpenOverlayFn;
 }
 
-export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }: WindCardProps) {
-  // Calculate median of wind speed over the last 10 minutes
+function ExpandedWindChart({ range, weatherHistory }: { range: TimeRange; weatherHistory: WeatherReading[] }) {
+  const bMs = getBucketMs(range);
+  const speedData = useMemo(() => bucketMedian(weatherHistory, "wind_speed_kmh", bMs), [weatherHistory, bMs]);
+  const gustData = useMemo(() => bucketAverage(weatherHistory, "wind_gust_kmh", bMs), [weatherHistory, bMs]);
+
+  const data = {
+    datasets: [
+      {
+        label: "Speed (median, km/h)",
+        data: speedData,
+        borderColor: "#f59e0b",
+        backgroundColor: "rgba(245, 158, 11, 0.1)",
+        fill: true,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.4,
+        cubicInterpolationMode: "monotone" as const,
+      },
+      {
+        label: "Gust (km/h)",
+        data: gustData,
+        borderColor: "rgba(245, 158, 11, 0.4)",
+        backgroundColor: "transparent",
+        fill: false,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.4,
+        cubicInterpolationMode: "monotone" as const,
+        borderDash: [4, 4],
+      },
+    ],
+  };
+
+  const options = {
+    ...expandedChartOptions(range, "km/h"),
+    plugins: {
+      ...expandedChartOptions(range, "km/h").plugins,
+      legend: { display: true, labels: { color: "#7a8ba8", boxWidth: 12, padding: 16 } },
+    },
+  };
+
+  return <div className="h-full"><Line data={data} options={options} /></div>;
+}
+
+export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], openOverlay }: WindCardProps) {
   const getMedianSpeed = (history: WeatherReading[], timestamp: number, windowMs: number = 600000) => {
     const windowPoints = history.filter(
       (r) => r.wind_speed_kmh != null && new Date(r.ts).getTime() >= timestamp - windowMs && new Date(r.ts).getTime() <= timestamp
     );
     if (windowPoints.length === 0) return null;
-
     const speeds = windowPoints.map((r) => r.wind_speed_kmh as number).sort((a, b) => a - b);
     const mid = Math.floor(speeds.length / 2);
-
-    return speeds.length % 2 !== 0
-      ? speeds[mid]
-      : (speeds[mid - 1] + speeds[mid]) / 2;
+    return speeds.length % 2 !== 0 ? speeds[mid] : (speeds[mid - 1] + speeds[mid]) / 2;
   };
 
-  // Snap degrees to nearest 22.5° (16 compass points, matching DIRS)
   const snapDir = (deg: number) => Math.round(deg / 22.5) * 22.5 % 360;
 
-  // Circular mean of wind direction over the last 10 minutes (handles 0°/360° wrap)
   const getMeanDir = (history: WeatherReading[], timestamp: number, windowMs: number = 600000) => {
     const points = history.filter(
       (r) => r.wind_dir != null && new Date(r.ts).getTime() >= timestamp - windowMs && new Date(r.ts).getTime() <= timestamp
@@ -46,22 +87,15 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
     return snapDir(((mean % 360) + 360) % 360);
   };
 
-  // Pre-compute current medians for display (use latest reading)
   const latestTs = weatherHistory.length > 0
     ? new Date(weatherHistory[weatherHistory.length - 1].ts).getTime()
     : 0;
-  const currentMedian = weatherHistory.length > 0
-    ? getMedianSpeed(weatherHistory, latestTs)
-    : null;
-  const medianDir = weatherHistory.length > 0
-    ? getMeanDir(weatherHistory, latestTs)
-    : null;
+  const currentMedian = weatherHistory.length > 0 ? getMedianSpeed(weatherHistory, latestTs) : null;
+  const medianDir = weatherHistory.length > 0 ? getMeanDir(weatherHistory, latestTs) : null;
 
-  // Generate chart data: median speed per 30-min bucket for smooth curve
   const chartDataPoints = (() => {
     const readings = weatherHistory.filter((r) => r.wind_speed_kmh != null);
     if (readings.length === 0) return [];
-
     const bucketMs = 30 * 60 * 1000;
     const buckets = new Map<number, number[]>();
     for (const r of readings) {
@@ -71,14 +105,11 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
       arr.push(r.wind_speed_kmh as number);
       buckets.set(bucketTs, arr);
     }
-
     return Array.from(buckets.entries())
       .map(([ts, speeds]) => {
         speeds.sort((a, b) => a - b);
         const mid = Math.floor(speeds.length / 2);
-        const median = speeds.length % 2 !== 0
-          ? speeds[mid]
-          : (speeds[mid - 1] + speeds[mid]) / 2;
+        const median = speeds.length % 2 !== 0 ? speeds[mid] : (speeds[mid - 1] + speeds[mid]) / 2;
         return { x: new Date(ts).toISOString(), y: median };
       })
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
@@ -102,10 +133,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
-    plugins: {
-      legend: { display: false },
-      tooltip: { enabled: false },
-    },
+    plugins: { legend: { display: false }, tooltip: { enabled: false } },
     scales: {
       x: {
         type: "time" as const,
@@ -120,6 +148,12 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
         ticks: { color: "#7a8ba8", font: { size: 10 }, stepSize: 5 },
       },
     },
+  };
+
+  const handleExpand = () => {
+    openOverlay("Wind", (range, wh) => (
+      <ExpandedWindChart range={range} weatherHistory={wh} />
+    ));
   };
 
   return (
@@ -151,7 +185,6 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
           <div className="relative w-[72px] h-[72px] rounded-full border-2 border-[#1e2f50] flex flex-col items-center justify-center bg-transparent shrink-0 ml-auto">
             <span className="text-sm font-medium text-cyan z-10">{degDir(dir)}</span>
 
-            {/* Current direction arrow (back layer) — filled cyan */}
             <div
               className="absolute inset-0 transition-transform duration-700 pointer-events-none"
               style={{ transform: dir != null ? `rotate(${snapDir(dir)}deg)` : undefined }}
@@ -165,7 +198,6 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
               </svg>
             </div>
 
-            {/* Median direction arrow (front layer) — outline white */}
             <div
               className="absolute inset-0 transition-transform duration-700 pointer-events-none z-[1]"
               style={{ transform: medianDir != null ? `rotate(${medianDir}deg)` : undefined }}
@@ -190,7 +222,13 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
         </div>
       </div>
 
-      <div className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden">
+      <div
+        className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer"
+        onClick={handleExpand}
+      >
+        <div className="absolute top-1 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">
+          <Maximize2 className="w-3.5 h-3.5 text-dim" />
+        </div>
         {weatherHistory.length > 0 && <Line data={chartData} options={chartOptions} />}
       </div>
     </MetricCard>
