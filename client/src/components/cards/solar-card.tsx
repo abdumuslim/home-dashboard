@@ -24,37 +24,45 @@ interface SkyResult { label: string; Icon: typeof Sun; color: string }
 
 function getSkyCondition(
   radiation: number | null | undefined,
-  refMax: number | null,
+  ref: number | null,
   history: WeatherReading[],
 ): SkyResult | null {
-  if (refMax == null || refMax < 10 || radiation == null) return null;
+  if (ref == null || ref < 1 || radiation == null) return null;
 
-  const level = radiation / refMax;
+  // Direct comparison: current radiation vs 5-min reference from 3 clearest days
+  const level = radiation / ref;
 
-  // Analyze last 10 min for unexpected drops (instability = clouds)
+  // Analyze last 10 min for cloud-induced instability (detrended).
+  // A smooth sunrise/sunset decline has ~0 deviation from the trend line,
+  // while cloud shadows cause sudden dips that deviate from the trend.
   const now = Date.now();
-  const recent = history
+  const pts = history
     .filter((r) => r.solar_radiation != null && now - new Date(r.ts).getTime() <= 600000)
-    .map((r) => r.solar_radiation as number);
+    .map((r) => ({ t: new Date(r.ts).getTime(), v: r.solar_radiation as number }))
+    .sort((a, b) => a.t - b.t);
 
-  let dropRatio = 0;
-  if (recent.length >= 2) {
-    const max10 = Math.max(...recent);
-    const min10 = Math.min(...recent);
-    dropRatio = (max10 - min10) / refMax; // normalized variability
+  let variability = 0;
+  if (pts.length >= 3) {
+    const first = pts[0], last = pts[pts.length - 1];
+    const dt = last.t - first.t;
+    const slope = dt > 0 ? (last.v - first.v) / dt : 0;
+    let maxDev = 0;
+    for (const pt of pts) {
+      const expected = first.v + slope * (pt.t - first.t);
+      maxDev = Math.max(maxDev, Math.abs(pt.v - expected));
+    }
+    variability = ref > 0 ? maxDev / ref : 0;
   }
 
-  // High radiation
+  // Classify
   if (level > 0.7) {
-    if (dropRatio < 0.1) return { label: "Sunny", Icon: Sun, color: "#ffc107" };
+    if (variability < 0.15) return { label: "Sunny", Icon: Sun, color: "#ffc107" };
     return { label: "Partly Cloudy", Icon: CloudSun, color: "#fbbf24" };
   }
-  // Moderate radiation
   if (level > 0.4) {
-    if (dropRatio < 0.1) return { label: "Partly Cloudy", Icon: CloudSun, color: "#fbbf24" };
+    if (variability < 0.15) return { label: "Partly Cloudy", Icon: CloudSun, color: "#fbbf24" };
     return { label: "Mostly Cloudy", Icon: Cloud, color: "#94a3b8" };
   }
-  // Low radiation
   if (level > 0.15) return { label: "Mostly Cloudy", Icon: Cloud, color: "#94a3b8" };
   return { label: "Overcast", Icon: Cloud, color: "#64748b" };
 }
@@ -66,8 +74,8 @@ export function SolarCard({ radiation, uvIndex, weatherHistory = [] }: SolarCard
   const uvStatus = getStatus("uv", uvIndex);
   const uvColor = uvStatus.level ? UV_COLORS[uvStatus.level] : "#7a8ba8";
 
-  // Fetch weekly max solar radiation per hour-of-day
-  const [hourlyMax, setHourlyMax] = useState<Record<number, number> | null>(null);
+  // Fetch weekly max solar radiation per 15-min slot
+  const [quarterMax, setQuarterMax] = useState<Record<string, number> | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -75,7 +83,7 @@ export function SolarCard({ radiation, uvIndex, weatherHistory = [] }: SolarCard
       try {
         const res = await fetch("/api/solar-reference");
         const data = await res.json();
-        if (mounted) setHourlyMax(data.hourly_max);
+        if (mounted) setQuarterMax(data.quarter_hourly_max);
       } catch { /* ignore */ }
     };
     fetchRef();
@@ -83,9 +91,25 @@ export function SolarCard({ radiation, uvIndex, weatherHistory = [] }: SolarCard
     return () => { mounted = false; clearInterval(id); };
   }, []);
 
+  const now = new Date();
+  const h = now.getHours();
+  const slot5 = Math.floor(now.getMinutes() / 5);
+  // Look up 5-min slot reference, with fallback to adjacent slots
+  const getRef = (qm: Record<string, number>): number | null => {
+    const key = `${h}:${slot5}`;
+    if (key in qm) return qm[key];
+    // Try adjacent slots (±1) as fallback
+    for (const adj of [slot5 - 1, slot5 + 1]) {
+      const adjH = adj < 0 ? h - 1 : adj > 11 ? h + 1 : h;
+      const adjS = ((adj % 12) + 12) % 12;
+      const adjKey = `${adjH}:${adjS}`;
+      if (adjKey in qm) return qm[adjKey];
+    }
+    return null;
+  };
   const sky = getSkyCondition(
     radiation,
-    hourlyMax ? (hourlyMax[new Date().getHours()] ?? null) : null,
+    quarterMax ? getRef(quarterMax) : null,
     weatherHistory,
   );
 
