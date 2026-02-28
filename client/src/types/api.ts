@@ -49,7 +49,7 @@ export interface CurrentData {
 
 export type TimeRange = "6h" | "24h" | "48h" | "1w" | "30d";
 
-export type StatusLevel = "good" | "moderate" | "poor" | "severe" | "extreme";
+export type StatusLevel = "good" | "moderate" | "poor" | "severe" | "extreme" | "normal" | "slightly_high" | "high" | "very_high" | "excellent" | "low";
 
 export interface ThresholdEntry {
   max: number;

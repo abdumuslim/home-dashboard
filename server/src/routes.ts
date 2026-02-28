@@ -94,6 +94,25 @@ export function createRouter(pool: pg.Pool): Router {
     });
   });
 
+  // Max solar radiation per hour-of-day over last 7 days (for sky condition)
+  router.get("/api/solar-reference", async (_req: Request, res: Response) => {
+    const result = await pool.query(
+      `SELECT
+         EXTRACT(HOUR FROM ts AT TIME ZONE 'Asia/Baghdad')::int AS hour,
+         MAX(solar_radiation)::real AS max_radiation
+       FROM weather_readings
+       WHERE ts >= NOW() - INTERVAL '7 days'
+         AND solar_radiation IS NOT NULL
+       GROUP BY hour
+       ORDER BY hour`
+    );
+    const hourlyMax: Record<number, number> = {};
+    for (const row of result.rows) {
+      hourlyMax[row.hour as number] = row.max_radiation as number;
+    }
+    res.json({ hourly_max: hourlyMax });
+  });
+
   router.get("/api/status", async (_req: Request, res: Response) => {
     const weatherLastResult = await pool.query(
       "SELECT ts FROM weather_readings ORDER BY ts DESC LIMIT 1"

@@ -21,7 +21,7 @@ export default function App() {
       <Header weatherTs={weather?.ts} airTs={air?.ts} />
 
       <div className="max-w-[1440px] mx-auto px-5 pt-8 pb-2">
-        <h1 className="text-3xl font-medium tracking-wide text-white">Modern Smart Home Dashboard V2</h1>
+        <h1 className="text-3xl font-medium tracking-wide text-white">Home Dashboard</h1>
       </div>
 
       <nav className="flex px-5 bg-transparent max-md:px-3">
