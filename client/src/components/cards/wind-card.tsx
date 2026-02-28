@@ -12,10 +12,10 @@ interface WindCardProps {
 }
 
 export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }: WindCardProps) {
-  // Calculate 10-minute median for raw speed values
+  // Calculate median of wind speed over the last 10 minutes
   const getMedianSpeed = (history: WeatherReading[], timestamp: number, windowMs: number = 600000) => {
     const windowPoints = history.filter(
-      (r) => r.wind_speed_kmh != null && Math.abs(new Date(r.ts).getTime() - timestamp) <= windowMs / 2
+      (r) => r.wind_speed_kmh != null && new Date(r.ts).getTime() >= timestamp - windowMs && new Date(r.ts).getTime() <= timestamp
     );
     if (windowPoints.length === 0) return null;
 
@@ -30,10 +30,10 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [] }
   // Snap degrees to nearest 22.5° (16 compass points, matching DIRS)
   const snapDir = (deg: number) => Math.round(deg / 22.5) * 22.5 % 360;
 
-  // Circular mean of wind direction within a time window (handles 0°/360° wrap)
+  // Circular mean of wind direction over the last 10 minutes (handles 0°/360° wrap)
   const getMeanDir = (history: WeatherReading[], timestamp: number, windowMs: number = 600000) => {
     const points = history.filter(
-      (r) => r.wind_dir != null && Math.abs(new Date(r.ts).getTime() - timestamp) <= windowMs / 2
+      (r) => r.wind_dir != null && new Date(r.ts).getTime() >= timestamp - windowMs && new Date(r.ts).getTime() <= timestamp
     );
     if (points.length === 0) return null;
     let sinSum = 0, cosSum = 0;
