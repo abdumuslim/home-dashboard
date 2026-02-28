@@ -51,6 +51,11 @@ export type TimeRange = "6h" | "24h" | "48h" | "1w" | "30d";
 
 export type StatusLevel = "good" | "moderate" | "poor" | "severe" | "extreme" | "normal" | "slightly_high" | "high" | "very_high" | "excellent" | "low";
 
+export type OpenOverlayFn = (
+  title: string,
+  renderExpanded: (range: TimeRange, weatherHistory: WeatherReading[], airHistory: AirReading[]) => import("react").ReactNode,
+) => void;
+
 export interface ThresholdEntry {
   max: number;
   level: StatusLevel;

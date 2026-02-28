@@ -1,8 +1,10 @@
 import { useMemo } from "react";
 import { Chart } from "react-chartjs-2";
+import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { fmt } from "@/constants/thresholds";
-import type { WeatherReading } from "@/types/api";
+import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
+import type { WeatherReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
 interface RainfallCardProps {
   hourly: number | null | undefined;
@@ -14,14 +16,13 @@ interface RainfallCardProps {
   lastRain: string | null | undefined;
   pressure: number | null | undefined;
   weatherHistory?: WeatherReading[];
+  openOverlay: OpenOverlayFn;
 }
 
 function RainDrop({ rate }: { rate: number | null | undefined }) {
-  // Fill 0-100% based on 0-10 mm/hr (heavy rain = full)
   const fillPct = rate != null && rate > 0 ? Math.min(rate / 10, 1) : 0;
   const h = 28;
   const fillY = h * (1 - fillPct);
-
   return (
     <svg width="22" height="32" viewBox="0 0 20 28" className="flex-shrink-0 self-center">
       <defs>
@@ -29,15 +30,8 @@ function RainDrop({ rate }: { rate: number | null | undefined }) {
           <path d="M10 1C10 1 1 11 1 17c0 5.5 4 9 9 9s9-3.5 9-9C19 11 10 1 10 1z" />
         </clipPath>
       </defs>
-      <path
-        d="M10 1C10 1 1 11 1 17c0 5.5 4 9 9 9s9-3.5 9-9C19 11 10 1 10 1z"
-        fill="none" stroke="#2196ff" strokeWidth="2.5"
-      />
-      <rect
-        x="0" y={fillY} width="20" height={h - fillY}
-        fill="#2196ff" opacity="0.6"
-        clipPath="url(#rain-drop-clip)"
-      />
+      <path d="M10 1C10 1 1 11 1 17c0 5.5 4 9 9 9s9-3.5 9-9C19 11 10 1 10 1z" fill="none" stroke="#2196ff" strokeWidth="2.5" />
+      <rect x="0" y={fillY} width="20" height={h - fillY} fill="#2196ff" opacity="0.6" clipPath="url(#rain-drop-clip)" />
     </svg>
   );
 }
@@ -55,14 +49,74 @@ function formatLastRain(iso: string | null | undefined): string {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+function ExpandedRainfallChart({ range, weatherHistory }: { range: TimeRange; weatherHistory: WeatherReading[] }) {
+  const bMs = getBucketMs(range);
+  const pressureData = useMemo(() => bucketAverage(weatherHistory, "pressure_rel_hpa", bMs), [weatherHistory, bMs]);
+  const rainRateData = useMemo(() => bucketAverage(weatherHistory, "rain_hourly_mm", bMs), [weatherHistory, bMs]);
+  const hasRain = rainRateData.some((d) => d.y > 0);
+
+  const data = {
+    datasets: [
+      {
+        type: "line" as const,
+        label: "Pressure (hPa)",
+        data: pressureData,
+        borderColor: "#10b981",
+        backgroundColor: "rgba(16, 185, 129, 0.1)",
+        fill: true,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.4,
+        cubicInterpolationMode: "monotone" as const,
+        yAxisID: "y",
+      },
+      ...(hasRain ? [{
+        type: "line" as const,
+        label: "Rain (mm/hr)",
+        data: rainRateData,
+        borderColor: "#2196ff",
+        backgroundColor: "rgba(33, 150, 246, 0.15)",
+        fill: true,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.4,
+        cubicInterpolationMode: "monotone" as const,
+        yAxisID: "y2",
+      }] : []),
+    ],
+  };
+
+  const base = expandedChartOptions(range, "hPa");
+  const options = {
+    ...base,
+    plugins: {
+      ...base.plugins,
+      legend: { display: true, labels: { color: "#7a8ba8", boxWidth: 12, padding: 16 } },
+    },
+    scales: {
+      ...base.scales,
+      y: { ...base.scales.y, grace: "5%" },
+      y2: {
+        display: hasRain,
+        position: "right" as const,
+        title: { display: true, text: "mm/hr", color: "#2196ff", font: { size: 11 } },
+        min: 0,
+        suggestedMax: 1,
+        grid: { drawOnChartArea: false },
+        ticks: { color: "#2196ff", font: { size: 11 }, stepSize: 1 },
+      },
+    },
+  };
+
+  return <div className="h-full"><Chart type="line" data={data} options={options} /></div>;
+}
+
 export function RainfallCard({
   hourly, event, daily, weekly, monthly, yearly,
-  lastRain, pressure, weatherHistory = [],
+  lastRain, pressure, weatherHistory = [], openOverlay,
 }: RainfallCardProps) {
-  // 3-hour pressure trend
   const baroTrend = useMemo(() => {
-    const now = Date.now();
-    const threeHoursAgo = now - 3 * 3600000;
+    const threeHoursAgo = Date.now() - 3 * 3600000;
     const recent = weatherHistory.filter((r) => r.pressure_rel_hpa != null);
     if (recent.length < 2) return null;
     const latest = recent[recent.length - 1].pressure_rel_hpa as number;
@@ -77,7 +131,6 @@ export function RainfallCard({
     return { arrow, diff, color };
   }, [weatherHistory]);
 
-  // Downsample pressure to hourly averages for smooth chart
   const hourlyPressure = useMemo(() => {
     const buckets = new Map<number, { sum: number; count: number }>();
     for (const r of weatherHistory) {
@@ -92,7 +145,6 @@ export function RainfallCard({
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
   }, [weatherHistory]);
 
-  // Rain rate data — hourly bucketed to align with pressure
   const rainData = useMemo(() => {
     const buckets = new Map<number, { sum: number; count: number }>();
     for (const r of weatherHistory) {
@@ -141,10 +193,7 @@ export function RainfallCard({
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
-    plugins: {
-      legend: { display: false },
-      tooltip: { enabled: false },
-    },
+    plugins: { legend: { display: false }, tooltip: { enabled: false } },
     scales: {
       x: {
         type: "time" as const,
@@ -168,13 +217,14 @@ export function RainfallCard({
         ticks: { color: "#2196ff", font: { size: 10 }, stepSize: 1 },
       },
     },
-    elements: {
-      point: { radius: 0, hitRadius: 10, hoverRadius: 4 },
-    },
-    interaction: {
-      intersect: false,
-      mode: "index" as const,
-    },
+    elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 } },
+    interaction: { intersect: false, mode: "index" as const },
+  };
+
+  const handleExpand = () => {
+    openOverlay("Rainfall & Pressure", (range, wh) => (
+      <ExpandedRainfallChart range={range} weatherHistory={wh} />
+    ));
   };
 
   return (
@@ -220,7 +270,13 @@ export function RainfallCard({
         </div>
       </div>
 
-      <div className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden">
+      <div
+        className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer"
+        onClick={handleExpand}
+      >
+        <div className="absolute top-1 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">
+          <Maximize2 className="w-3.5 h-3.5 text-dim" />
+        </div>
         {hourlyPressure.length > 0 && <Chart type="line" data={chartData} options={chartOptions} />}
       </div>
     </MetricCard>

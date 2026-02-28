@@ -1,9 +1,11 @@
 import { useMemo } from "react";
 import { Line } from "react-chartjs-2";
+import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
 import { fmt, getTempColor } from "@/constants/thresholds";
-import type { WeatherReading } from "@/types/api";
+import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
+import type { WeatherReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
 interface TemperatureCardProps {
   temp: number | null | undefined;
@@ -11,12 +13,70 @@ interface TemperatureCardProps {
   dewPoint: number | null | undefined;
   feelsLike: number | null | undefined;
   weatherHistory?: WeatherReading[];
+  openOverlay: OpenOverlayFn;
 }
 
-export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHistory = [] }: TemperatureCardProps) {
+function ExpandedTemperatureChart({ range, weatherHistory }: { range: TimeRange; weatherHistory: WeatherReading[] }) {
+  const bMs = getBucketMs(range);
+  const tempData = useMemo(() => bucketAverage(weatherHistory, "temp_c", bMs), [weatherHistory, bMs]);
+  const humData = useMemo(() => bucketAverage(weatherHistory, "humidity", bMs), [weatherHistory, bMs]);
+
+  const data = {
+    datasets: [
+      {
+        label: "Temperature (°C)",
+        data: tempData,
+        borderColor: "#00d4ff",
+        backgroundColor: "rgba(0, 212, 255, 0.1)",
+        fill: true,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.4,
+        cubicInterpolationMode: "monotone" as const,
+        yAxisID: "y",
+      },
+      {
+        label: "Humidity (%)",
+        data: humData,
+        borderColor: "#8b5cf6",
+        backgroundColor: "transparent",
+        fill: false,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.4,
+        cubicInterpolationMode: "monotone" as const,
+        borderDash: [4, 2],
+        yAxisID: "y2",
+      },
+    ],
+  };
+
+  const options = {
+    ...expandedChartOptions(range, "°C"),
+    plugins: {
+      ...expandedChartOptions(range, "°C").plugins,
+      legend: { display: true, labels: { color: "#7a8ba8", boxWidth: 12, padding: 16 } },
+    },
+    scales: {
+      ...expandedChartOptions(range, "°C").scales,
+      y: { ...expandedChartOptions(range, "°C").scales.y, ticks: { ...expandedChartOptions(range, "°C").scales.y.ticks, stepSize: 2 } },
+      y2: {
+        position: "right" as const,
+        title: { display: true, text: "%", color: "#7a8ba8", font: { size: 11 } },
+        grid: { drawOnChartArea: false },
+        ticks: { color: "#8b5cf6", font: { size: 11 } },
+        min: 0,
+        max: 100,
+      },
+    },
+  };
+
+  return <div className="h-full"><Line data={data} options={options} /></div>;
+}
+
+export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHistory = [], openOverlay }: TemperatureCardProps) {
   const flash = useFlash(temp != null ? fmt(temp, 1) : null);
 
-  // Today's hi/lo since midnight
   const { hiTemp, loTemp } = useMemo(() => {
     const midnight = new Date();
     midnight.setHours(0, 0, 0, 0);
@@ -28,7 +88,6 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
     return { hiTemp: Math.max(...temps), loTemp: Math.min(...temps) };
   }, [weatherHistory]);
 
-  // Downsample to hourly averages for smooth chart (same approach as indoor cards)
   const hourlyData = useMemo(() => {
     const buckets = new Map<number, { sum: number; count: number }>();
     for (const r of weatherHistory) {
@@ -61,10 +120,7 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
-    plugins: {
-      legend: { display: false },
-      tooltip: { enabled: false },
-    },
+    plugins: { legend: { display: false }, tooltip: { enabled: false } },
     scales: {
       x: {
         type: "time" as const,
@@ -79,13 +135,14 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
         ticks: { color: "#7a8ba8", font: { size: 10 }, stepSize: 2 },
       },
     },
-    elements: {
-      point: { radius: 0, hitRadius: 10, hoverRadius: 4 },
-    },
-    interaction: {
-      intersect: false,
-      mode: "index" as const,
-    },
+    elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 } },
+    interaction: { intersect: false, mode: "index" as const },
+  };
+
+  const handleExpand = () => {
+    openOverlay("Temp & Humidity", (range, wh) => (
+      <ExpandedTemperatureChart range={range} weatherHistory={wh} />
+    ));
   };
 
   return (
@@ -124,7 +181,13 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
         </div>
       </div>
 
-      <div className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden">
+      <div
+        className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer"
+        onClick={handleExpand}
+      >
+        <div className="absolute top-1 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">
+          <Maximize2 className="w-3.5 h-3.5 text-dim" />
+        </div>
         {hourlyData.length > 0 && <Line data={chartData} options={chartOptions} />}
       </div>
     </MetricCard>
