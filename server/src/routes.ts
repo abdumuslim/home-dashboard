@@ -94,23 +94,36 @@ export function createRouter(pool: pg.Pool): Router {
     });
   });
 
-  // Max solar radiation per hour-of-day over last 7 days (for sky condition)
+  // Reference solar radiation per 5-min slot: average of the 3 clearest days.
+  // 5-min resolution eliminates intra-slot variation that caused false cloud
+  // detection in late afternoon when radiation drops rapidly.
   router.get("/api/solar-reference", async (_req: Request, res: Response) => {
     const result = await pool.query(
-      `SELECT
+      `WITH daily_totals AS (
+         SELECT DATE(ts AT TIME ZONE 'Asia/Baghdad') AS day,
+                SUM(solar_radiation) AS total
+         FROM weather_readings
+         WHERE ts >= NOW() - INTERVAL '7 days' AND solar_radiation IS NOT NULL
+         GROUP BY day
+       ),
+       best_days AS (
+         SELECT day FROM daily_totals ORDER BY total DESC LIMIT 3
+       )
+       SELECT
          EXTRACT(HOUR FROM ts AT TIME ZONE 'Asia/Baghdad')::int AS hour,
-         MAX(solar_radiation)::real AS max_radiation
+         (EXTRACT(MINUTE FROM ts AT TIME ZONE 'Asia/Baghdad')::int / 5) AS slot,
+         AVG(solar_radiation)::real AS ref_radiation
        FROM weather_readings
-       WHERE ts >= NOW() - INTERVAL '7 days'
+       WHERE DATE(ts AT TIME ZONE 'Asia/Baghdad') IN (SELECT day FROM best_days)
          AND solar_radiation IS NOT NULL
-       GROUP BY hour
-       ORDER BY hour`
+       GROUP BY hour, slot
+       ORDER BY hour, slot`
     );
-    const hourlyMax: Record<number, number> = {};
+    const slotRef: Record<string, number> = {};
     for (const row of result.rows) {
-      hourlyMax[row.hour as number] = row.max_radiation as number;
+      slotRef[`${row.hour}:${row.slot}`] = row.ref_radiation as number;
     }
-    res.json({ hourly_max: hourlyMax });
+    res.json({ quarter_hourly_max: slotRef });
   });
 
   router.get("/api/status", async (_req: Request, res: Response) => {
