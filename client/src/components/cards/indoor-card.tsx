@@ -1,8 +1,9 @@
 import type { ReactNode } from "react";
 import { Line } from "react-chartjs-2";
+import { MetricCard } from "@/components/ui/metric-card";
+import { useFlash } from "@/hooks/use-flash";
 import { fmt, getStatus } from "@/constants/thresholds";
 import type { WeatherReading, AirReading } from "@/types/api";
-import { cn } from "@/lib/utils";
 
 const statusLevelColors: Record<string, string> = {
   excellent: "#0df41e",
@@ -41,6 +42,7 @@ export function IndoorCard({
   history = [],
   metricKey,
 }: IndoorCardProps) {
+  const flash = useFlash(temp != null ? fmt(temp, 1) : null);
   const noiseStatus = noise !== undefined ? getStatus("noise", noise) : null;
 
   // Downsample history into hourly averages for a smooth chart
@@ -65,7 +67,7 @@ export function IndoorCard({
       {
         data: hourlyData,
         borderColor: "#00d4ff",
-        backgroundColor: "rgba(0, 212, 255, 0.1)",
+        backgroundColor: "rgba(0, 212, 255, 0.15)",
         borderWidth: 2,
         fill: true,
         pointRadius: 0,
@@ -80,7 +82,7 @@ export function IndoorCard({
     maintainAspectRatio: false,
     plugins: {
       legend: { display: false },
-      tooltip: { enabled: false }, // Consider turning on if detail needed
+      tooltip: { enabled: false },
     },
     scales: {
       x: {
@@ -97,11 +99,7 @@ export function IndoorCard({
       },
     },
     elements: {
-      point: {
-        radius: 0,
-        hitRadius: 10,
-        hoverRadius: 4,
-      }
+      point: { radius: 0, hitRadius: 10, hoverRadius: 4 },
     },
     interaction: {
       intersect: false,
@@ -109,54 +107,51 @@ export function IndoorCard({
     },
   };
 
-  // Adjust card min-height to accommodate chart if rendering
-  const hasChart = hourlyData.length > 0;
-
   return (
-    <div className={cn("glass-card p-3.5 flex flex-col relative", hasChart ? "min-h-[220px] pb-0" : "justify-between")}>
-      <div className="z-10 w-full mb-2">
-        <h3 className="text-[0.95rem] font-medium text-text mb-3">{title}</h3>
-        <div className="flex justify-between items-end gap-2 text-left">
+    <MetricCard flash={flash} className="p-4 pb-0 flex flex-col">
+      <div className="flex flex-col z-10 w-full mb-[100px]">
+        <h3 className="text-[0.95rem] font-medium text-text mb-2">{title}</h3>
 
+        <div className="flex items-baseline gap-5">
           <div className="flex flex-col">
-            <span className="text-[0.75rem] text-text mb-1">Temp</span>
-            <span className="text-xl font-medium tracking-tight text-cyan">
-              {fmt(temp, 1)}&deg;C
+            <span className="text-3xl font-semibold leading-none tracking-tight text-cyan">
+              {fmt(temp, 1)}<span className="text-xl">&deg;C</span>
             </span>
+            <span className="text-[0.75rem] text-text font-medium mt-1">Temp.</span>
           </div>
 
           <div className="flex flex-col">
-            <span className="text-[0.75rem] text-text mb-1">Humidity</span>
-            <span className="text-xl font-medium tracking-tight text-cyan">
-              {fmt(humidity, 0)}%
+            <span className="text-3xl font-semibold leading-none tracking-tight text-cyan">
+              {fmt(humidity, 0)}<span className="text-xl">%</span>
             </span>
+            <span className="text-[0.75rem] text-text font-medium mt-1">Humidity</span>
           </div>
 
           {dewPoint != null && (
-            <div className="flex flex-col">
-              <span className="text-[0.75rem] text-text mb-1">Dew Point</span>
-              <span className="text-xl font-medium tracking-tight text-yellow">
-                {fmt(dewPoint, 1)}&deg;C
+            <div className="flex flex-col ml-auto">
+              <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
+                {fmt(dewPoint, 1)}<span className="text-sm">&deg;C</span>
               </span>
+              <span className="text-[0.75rem] text-text font-medium mt-1">Dew Point</span>
             </div>
           )}
 
           {feelsLike != null && (
             <div className="flex flex-col">
-              <span className="text-[0.75rem] text-text mb-1">Feels Like</span>
-              <span className="text-xl font-medium tracking-tight text-yellow">
-                {fmt(feelsLike, 1)}&deg;C
+              <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
+                {fmt(feelsLike, 1)}<span className="text-sm">&deg;C</span>
               </span>
+              <span className="text-[0.75rem] text-text font-medium mt-1">Feels Like</span>
             </div>
           )}
 
           {noise !== undefined && noiseStatus && (
-            <div className="flex flex-col mb-0.5">
-              <span className="text-xl font-medium tracking-tight text-white flex items-baseline gap-1">
-                {noise ?? "--"} <span className="text-sm font-normal">dB</span>
+            <div className="flex flex-col ml-auto">
+              <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
+                {noise ?? "--"}<span className="text-sm"> dB</span>
               </span>
               <span
-                className="text-[0.75rem] font-medium"
+                className="text-[0.75rem] font-medium mt-1"
                 style={{ color: noiseStatus.level ? statusLevelColors[noiseStatus.level] : "#7a8ba8" }}
               >
                 {noiseStatus.label}
@@ -166,11 +161,9 @@ export function IndoorCard({
         </div>
       </div>
 
-      {hasChart && (
-        <div className="absolute bottom-0 left-0 right-0 h-[120px] w-full mt-auto px-2 pb-1 z-0 rounded-b-xl overflow-hidden">
-          <Line data={chartData} options={chartOptions} />
-        </div>
-      )}
-    </div>
+      <div className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden">
+        {hourlyData.length > 0 && <Line data={chartData} options={chartOptions} />}
+      </div>
+    </MetricCard>
   );
 }
