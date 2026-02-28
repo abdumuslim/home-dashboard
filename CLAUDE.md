@@ -8,7 +8,7 @@ Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.j
 
 **4 physical sensors, 2 APIs:**
 - **Ambient Weather WS-2000** (1 API device, 3 sensor groups in `lastData`):
-  - Outdoor: temp, humidity, wind, rain, pressure, UV, solar (~5 min updates)
+  - Outdoor: temp, humidity, wind, rain, pressure, UV, solar (~1 min updates)
   - Indoor console: temp, humidity, feels like, dew point (`tempinf`, `humidityin`, `feelsLikein`, `dewPointin`)
   - Channel 8 "Abdu": temp, humidity, feels like, dew point (`temp8f`, `humidity8`, `feelsLike8`, `dewPoint8`)
 - **Qingping Air Monitor CGS1**: CO2, PM2.5, PM10, tVOC, noise, temp, humidity (~15 min updates)
