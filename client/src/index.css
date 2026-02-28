@@ -32,7 +32,10 @@
 @layer base {
   body {
     font-family: var(--font-sans);
-    background: var(--color-bg);
+    background: radial-gradient(circle at top right, rgba(48, 31, 85, 0.4), transparent 50%),
+                radial-gradient(circle at bottom left, rgba(14, 42, 71, 0.6), transparent 50%),
+                #0b0f1a;
+    background-attachment: fixed;
     color: var(--color-text);
     min-height: 100vh;
     -webkit-font-smoothing: antialiased;
@@ -42,6 +45,17 @@
 
   *, *::before, *::after {
     box-sizing: border-box;
+  }
+}
+
+@layer components {
+  .glass-card {
+    background: rgba(255, 255, 255, 0.05);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
   }
 }
 

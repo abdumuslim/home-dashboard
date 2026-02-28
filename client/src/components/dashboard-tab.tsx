@@ -7,14 +7,15 @@ interface DashboardTabProps {
   weather: WeatherReading | null;
   air: AirReading | null;
   weatherHistory: WeatherReading[];
+  airHistory: AirReading[];
 }
 
-export function DashboardTab({ weather, air, weatherHistory }: DashboardTabProps) {
+export function DashboardTab({ weather, air, weatherHistory, airHistory }: DashboardTabProps) {
   return (
     <div className="max-w-[1440px] mx-auto px-5 pt-2 pb-8">
       <OutdoorSection weather={weather} weatherHistory={weatherHistory} />
-      <IndoorSection weather={weather} air={air} />
-      <AirQualitySection air={air} />
+      <IndoorSection weather={weather} air={air} weatherHistory={weatherHistory} airHistory={airHistory} />
+      <AirQualitySection air={air} airHistory={airHistory} />
     </div>
   );
 }

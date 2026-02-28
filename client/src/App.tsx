@@ -14,13 +14,17 @@ type Tab = "dashboard" | "charts";
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("dashboard");
   const { weather, air } = useCurrentData();
-  const { weatherHistory } = useHistoryData("24h", true);
+  const { weatherHistory, airHistory } = useHistoryData("24h", true);
 
   return (
     <>
       <Header weatherTs={weather?.ts} airTs={air?.ts} />
 
-      <nav className="flex px-5 border-b border-card-border bg-bg max-md:px-3">
+      <div className="max-w-[1440px] mx-auto px-5 pt-8 pb-2">
+        <h1 className="text-3xl font-medium tracking-wide text-white">Modern Smart Home Dashboard V2</h1>
+      </div>
+
+      <nav className="flex px-5 bg-transparent max-md:px-3">
         {(["dashboard", "charts"] as Tab[]).map((tab) => (
           <button
             key={tab}
@@ -37,9 +41,7 @@ export default function App() {
         ))}
       </nav>
 
-      {activeTab === "dashboard" && (
-        <DashboardTab weather={weather} air={air} weatherHistory={weatherHistory} />
-      )}
+      <DashboardTab weather={weather} air={air} weatherHistory={weatherHistory} airHistory={airHistory} />
 
       {activeTab === "charts" && (
         <Suspense fallback={<div className="text-center text-dim py-8">Loading charts...</div>}>
