@@ -27,6 +27,7 @@ export interface WeatherReading {
   dew_point_indoor_c: number | null;
   feels_like_ch8_c: number | null;
   dew_point_ch8_c: number | null;
+  last_rain: string | null;
 }
 
 export interface AirReading {
