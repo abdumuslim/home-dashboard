@@ -9,8 +9,19 @@ export function createChartOptions(title: string, yUnit?: string): ChartOptions<
     scales: {
       x: {
         type: "time",
-        time: { tooltipFormat: "MMM d, HH:mm" },
-        ticks: { color: "#7a8ba8", maxTicksLimit: 8, font: { size: 11 } },
+        time: {
+          unit: "hour",
+          displayFormats: { hour: "h" },
+          tooltipFormat: "MMM d, h:mm a"
+        },
+        ticks: {
+          color: "#7a8ba8",
+          maxTicksLimit: 24,
+          stepSize: 1,
+          font: { size: 11 },
+          maxRotation: 0,
+          autoSkip: false
+        },
         grid: { color: "#1e2f50" },
       },
       y: {
