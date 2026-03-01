@@ -200,6 +200,7 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
               {tempDelta != null && (
                 <span className={`text-sm ml-1.5 font-medium ${tempDelta > 0 ? "text-red-400" : tempDelta < 0 ? "text-blue-400" : "text-white"}`}>
                   {tempDelta > 0 ? "\u2191" : tempDelta < 0 ? "\u2193" : "="}{fmt(Math.abs(convertTempDelta(tempDelta, tempUnit)), 1)}&deg;
+                  <span className="text-[0.6rem] text-dim font-normal ml-0.5">vs yd</span>
                 </span>
               )}
             </span>
@@ -212,11 +213,13 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
               {humDelta != null && (
                 <span className={`text-sm ml-1.5 font-medium ${humDelta > 0 ? "text-red-400" : humDelta < 0 ? "text-blue-400" : "text-white"}`}>
                   {humDelta > 0 ? "\u2191" : humDelta < 0 ? "\u2193" : "="}{fmt(Math.abs(humDelta), 0)}%
+                  <span className="text-[0.6rem] text-dim font-normal ml-0.5">vs yd</span>
                 </span>
               )}
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Humidity</span>
           </div>
+
         </div>
 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim">
