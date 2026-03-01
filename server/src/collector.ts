@@ -74,6 +74,7 @@ export class Collector {
   async runForever(): Promise<void> {
     await this.backfillAmbientHistory();
     await sleep(2000);
+    await this.backfillQingpingHistory();
     while (!this.stopped) {
       try {
         await this.collectAll();
@@ -215,28 +216,164 @@ export class Collector {
 
   private async backfillAmbientHistory(): Promise<void> {
     const mac = "C8:C9:A3:0E:CB:CB";
+    const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+
+    // Check how far back we already have data
+    const oldest = await this.pool.query(
+      "SELECT ts FROM weather_readings ORDER BY ts ASC LIMIT 1"
+    );
+    const oldestTs = oldest.rows[0]?.ts as Date | undefined;
+    if (oldestTs && oldestTs.getTime() <= thirtyDaysAgo) {
+      // Already have 30+ days — just fetch the latest batch to fill gap since last shutdown
+      console.log("[collector] Weather data already spans 30+ days, fetching latest batch only");
+      await this.fetchAWBatch(mac);
+      return;
+    }
+
+    // Paginate backwards to fill 30 days
+    let endDate: number | undefined;
+    let totalCount = 0;
+    const maxIterations = 35;
+
+    try {
+      for (let i = 0; i < maxIterations; i++) {
+        const count = await this.fetchAWBatch(mac, endDate);
+        totalCount += count;
+
+        if (count < 288) {
+          console.log(`[collector] AW backfill: got ${count} < 288 records, no more data`);
+          break;
+        }
+
+        // Find the oldest record we just fetched to use as endDate for next page
+        const oldestFetched = await this.pool.query(
+          `SELECT ts FROM weather_readings ORDER BY ts ASC LIMIT 1`
+        );
+        const ts = oldestFetched.rows[0]?.ts as Date | undefined;
+        if (!ts || ts.getTime() <= thirtyDaysAgo) {
+          break;
+        }
+        endDate = ts.getTime();
+
+        // Respect rate limit: 1 req/sec
+        await sleep(1100);
+      }
+      console.log(`[collector] Backfilled ${totalCount} weather records total`);
+    } catch (err) {
+      console.error(`[collector] AW backfill stopped after ${totalCount} records:`, err);
+    }
+  }
+
+  private async fetchAWBatch(mac: string, endDate?: number): Promise<number> {
     const url = new URL(`https://rt.ambientweather.net/v1/devices/${mac}`);
     url.searchParams.set("apiKey", this.config.awApiKey);
     url.searchParams.set("applicationKey", this.config.awAppKey);
     url.searchParams.set("limit", "288");
+    if (endDate !== undefined) {
+      url.searchParams.set("endDate", String(endDate));
+    }
+
+    const resp = await fetch(url.toString(), {
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!resp.ok) {
+      throw new Error(`AW backfill API ${resp.status}: ${await resp.text()}`);
+    }
+    const records: AWData[] = await resp.json() as AWData[];
+    for (const record of records) {
+      const row = this.convertAW(record);
+      await this.storeWeather(row);
+    }
+    if (records.length > 0) {
+      console.log(`[collector] AW backfill page: ${records.length} records`);
+    }
+    return records.length;
+  }
+
+  private async backfillQingpingHistory(): Promise<void> {
+    const mac = "582D3470F981";
+    const thirtyDaysAgo = Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000);
+
+    // Check how far back we already have data
+    const oldest = await this.pool.query(
+      "SELECT ts FROM air_readings ORDER BY ts ASC LIMIT 1"
+    );
+    const oldestTs = oldest.rows[0]?.ts as Date | undefined;
+    if (oldestTs && oldestTs.getTime() / 1000 <= thirtyDaysAgo) {
+      console.log("[collector] Air data already spans 30+ days, skipping backfill");
+      return;
+    }
 
     try {
-      const resp = await fetch(url.toString(), {
-        signal: AbortSignal.timeout(60_000),
-      });
-      if (!resp.ok) {
-        throw new Error(`AW backfill API ${resp.status}: ${await resp.text()}`);
+      await this.ensureQpToken();
+      const endTime = oldestTs
+        ? Math.floor(oldestTs.getTime() / 1000)
+        : Math.floor(Date.now() / 1000);
+
+      let totalCount = 0;
+      let offset = 0;
+      const limit = 200;
+
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const tsNow = Math.floor(Date.now() * 1000); // milliseconds for timestamp param
+        const url = `https://apis.cleargrass.com/v1/apis/devices/data?mac=${mac}&start_time=${thirtyDaysAgo}&end_time=${endTime}&timestamp=${tsNow}&limit=${limit}&offset=${offset}`;
+
+        const resp = await fetch(url, {
+          headers: { Authorization: `Bearer ${this.qpToken}` },
+          signal: AbortSignal.timeout(60_000),
+        });
+        if (!resp.ok) {
+          throw new Error(`QP history API ${resp.status}: ${await resp.text()}`);
+        }
+
+        interface QpHistoryItem {
+          timestamp: { value: number };
+          temperature?: { value: number };
+          humidity?: { value: number };
+          co2?: { value: number };
+          pm25?: { value: number };
+          pm10?: { value: number };
+          tvoc_index?: { value: number };
+          noise?: { value: number };
+          battery?: { value: number };
+        }
+        interface QpHistoryResponse {
+          total?: number;
+          data?: QpHistoryItem[];
+        }
+
+        const body = (await resp.json()) as QpHistoryResponse;
+        const items = body.data ?? [];
+        if (items.length === 0) break;
+
+        for (const d of items) {
+          const row: AirRow = {
+            ts: new Date(d.timestamp.value * 1000),
+            temperature: d.temperature?.value ?? null,
+            humidity: d.humidity?.value ?? null,
+            co2: d.co2?.value ?? null,
+            pm25: d.pm25?.value ?? null,
+            pm10: d.pm10?.value ?? null,
+            tvoc: d.tvoc_index?.value ?? null,
+            noise: d.noise?.value ?? null,
+            battery: d.battery?.value ?? null,
+          };
+          await this.storeAir(row);
+        }
+
+        totalCount += items.length;
+        offset += items.length;
+        console.log(`[collector] QP backfill page: ${items.length} records (total: ${totalCount})`);
+
+        const total = body.total ?? 0;
+        if (offset >= total) break;
+
+        await sleep(500);
       }
-      const records: AWData[] = await resp.json() as AWData[];
-      let count = 0;
-      for (const record of records) {
-        const row = this.convertAW(record);
-        await this.storeWeather(row);
-        count++;
-      }
-      console.log(`[collector] Backfilled ${count} weather records`);
+      console.log(`[collector] Backfilled ${totalCount} air records total`);
     } catch (err) {
-      console.error("[collector] Backfill failed, will retry on next restart:", err);
+      console.error("[collector] QP backfill failed:", err);
     }
   }
 
