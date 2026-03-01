@@ -4,6 +4,7 @@ import pg from "pg";
 const RANGE_MAP: Record<string, string> = {
   "6h": "6 hours",
   "24h": "24 hours",
+  "25h": "25 hours",
   "48h": "48 hours",
   "1w": "7 days",
   "30d": "30 days",

@@ -97,22 +97,39 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
   }, [weatherHistory]);
 
   const { tempDelta, humDelta } = useMemo(() => {
-    if (temp == null || humidity == null || weatherHistory.length === 0)
+    if (weatherHistory.length === 0)
       return { tempDelta: null, humDelta: null };
-    const target = Date.now() - 86400000;
-    let closest = weatherHistory[0];
-    let minDiff = Math.abs(new Date(closest.ts).getTime() - target);
+
+    const now = Date.now();
+    const WINDOW = 300_000; // 5 minutes
+    const target = now - 86_400_000;
+
+    // Today: [now - 5min, now], Yesterday: [target, target + 5min]
+    // Yesterday window shifted forward to stay within 24h history range
+    const winStart = now - WINDOW;
+
+    let nowTempSum = 0, nowHumSum = 0, nowCount = 0;
+    let ydTempSum = 0, ydHumSum = 0, ydCount = 0;
+
     for (const r of weatherHistory) {
-      const diff = Math.abs(new Date(r.ts).getTime() - target);
-      if (diff < minDiff) { closest = r; minDiff = diff; }
+      if (r.temp_c == null || r.humidity == null) continue;
+      const ts = new Date(r.ts).getTime();
+      if (ts >= winStart && ts <= now) {
+        nowTempSum += r.temp_c; nowHumSum += r.humidity; nowCount++;
+      }
+      if (ts >= target && ts <= target + WINDOW) {
+        ydTempSum += r.temp_c; ydHumSum += r.humidity; ydCount++;
+      }
     }
-    if (minDiff > 3600000 || closest.temp_c == null || closest.humidity == null)
+
+    if (nowCount === 0 || ydCount === 0)
       return { tempDelta: null, humDelta: null };
+
     return {
-      tempDelta: temp - closest.temp_c,
-      humDelta: humidity - closest.humidity,
+      tempDelta: nowTempSum / nowCount - ydTempSum / ydCount,
+      humDelta: nowHumSum / nowCount - ydHumSum / ydCount,
     };
-  }, [weatherHistory, temp, humidity]);
+  }, [weatherHistory]);
 
   const hourlyData = useMemo(() => {
     const buckets = new Map<number, { sum: number; count: number }>();
@@ -180,9 +197,9 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
           <div className="flex flex-col">
             <span className="text-3xl font-semibold leading-none tracking-tight" style={{ color: getTempColor(temp) }}>
               {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
-              {tempDelta != null && tempDelta !== 0 && (
-                <span className={`text-xs ml-1.5 font-medium ${tempDelta > 0 ? "text-red-400" : "text-blue-400"}`}>
-                  {tempDelta > 0 ? "\u2191" : "\u2193"}{fmt(Math.abs(convertTempDelta(tempDelta, tempUnit)), 1)}&deg;
+              {tempDelta != null && (
+                <span className={`text-sm ml-1.5 font-medium ${tempDelta > 0 ? "text-red-400" : tempDelta < 0 ? "text-blue-400" : "text-white"}`}>
+                  {tempDelta > 0 ? "\u2191" : tempDelta < 0 ? "\u2193" : "="}{fmt(Math.abs(convertTempDelta(tempDelta, tempUnit)), 1)}&deg;
                 </span>
               )}
             </span>
@@ -192,9 +209,9 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
           <div className="flex flex-col">
             <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
               {fmt(humidity, 0)}<span className="text-xl">%</span>
-              {humDelta != null && humDelta !== 0 && (
-                <span className={`text-xs ml-1.5 font-medium ${humDelta > 0 ? "text-red-400" : "text-blue-400"}`}>
-                  {humDelta > 0 ? "\u2191" : "\u2193"}{fmt(Math.abs(humDelta), 0)}%
+              {humDelta != null && (
+                <span className={`text-sm ml-1.5 font-medium ${humDelta > 0 ? "text-red-400" : humDelta < 0 ? "text-blue-400" : "text-white"}`}>
+                  {humDelta > 0 ? "\u2191" : humDelta < 0 ? "\u2193" : "="}{fmt(Math.abs(humDelta), 0)}%
                 </span>
               )}
             </span>
