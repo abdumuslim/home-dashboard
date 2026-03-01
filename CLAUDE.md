@@ -11,7 +11,7 @@ Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.j
   - Outdoor: temp, humidity, wind, rain, pressure, UV, solar (~1 min updates)
   - Indoor console: temp, humidity, feels like, dew point (`tempinf`, `humidityin`, `feelsLikein`, `dewPointin`)
   - Channel 8 "Abdu": temp, humidity, feels like, dew point (`temp8f`, `humidity8`, `feelsLike8`, `dewPoint8`)
-- **Qingping Air Monitor CGS1**: CO2, PM2.5, PM10, tVOC, noise, temp, humidity (~15 min updates)
+- **Qingping Air Monitor CGS2**: CO2, PM2.5, PM10, tVOC, noise, temp, humidity (~30s via MQTT, cloud API fallback ~15 min)
 
 ## Architecture
 
@@ -35,7 +35,7 @@ D:\dev\home\
 │   ├── src/
 │   │   ├── index.ts        # Express app, static serving, collector startup
 │   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status)
-│   │   ├── collector.ts    # Collector class (AW + Qingping polling)
+│   │   ├── collector.ts    # Collector class (AW polling + Qingping MQTT/cloud)
 │   │   ├── database.ts     # pg pool, schema init, migrations
 │   │   └── config.ts       # Env vars (dotenv)
 │   ├── package.json
@@ -52,8 +52,11 @@ D:\dev\home\
 │   │   └── constants/      # Thresholds, directions, helpers
 │   ├── vite.config.ts
 │   └── package.json
+├── mosquitto/              # MQTT broker config
+│   └── config/
+│       └── mosquitto.conf  # Broker config (passwd file generated on VPS)
 ├── Dockerfile              # Multi-stage (node:22-slim)
-├── docker-compose.yml
+├── docker-compose.yml      # dashboard + mosquitto services
 └── .env                    # On VPS only
 ```
 
@@ -79,11 +82,14 @@ The Vite dev server proxies `/api/*` to `https://home.altijwal.com` so no local 
 
 ```bash
 # Create tarball excluding node_modules
-cd D:/dev/home && tar czf /tmp/home-deploy.tar.gz --exclude='node_modules' --exclude='dist' --exclude='.git' server client Dockerfile docker-compose.yml
+cd D:/dev/home && tar czf /tmp/home-deploy.tar.gz --exclude='node_modules' --exclude='dist' --exclude='.git' server client mosquitto Dockerfile docker-compose.yml
 
 # Upload and rebuild
 scp -i ~/.ssh/vps1_key -o StrictHostKeyChecking=no /tmp/home-deploy.tar.gz root@31.97.76.221:/tmp/
 ssh -i ~/.ssh/vps1_key -o StrictHostKeyChecking=no root@31.97.76.221 "cd /opt/home-dashboard && tar xzf /tmp/home-deploy.tar.gz && docker compose up -d --build"
+
+# IMPORTANT: After tar extract, regenerate mosquitto passwd (tar overwrites the config dir):
+ssh -i ~/.ssh/vps1_key -o StrictHostKeyChecking=no root@31.97.76.221 "rm -f /opt/home-dashboard/mosquitto/config/passwd && docker run --rm -v /opt/home-dashboard/mosquitto/config:/mosquitto/config eclipse-mosquitto:2 mosquitto_passwd -c -b /mosquitto/config/passwd qingping dratafat && chmod 644 /opt/home-dashboard/mosquitto/config/passwd && docker restart home-dashboard-mosquitto-1"
 ```
 
 Vite adds content hashes to built assets (e.g., `index-abc123.js`) — no manual cache busting needed.
@@ -150,7 +156,8 @@ All metric cards follow a consistent design language established in the Temperat
 ## API Rate Limits
 
 - **Ambient Weather**: 1 request/sec. Collector polls every 5s (sensors only update every ~5 min, dedup discards repeats). 2-second sleep after backfill prevents 429 on the first collection cycle
-- **Qingping**: OAuth token expires in ~2 hours, refreshed 5 min before expiry. Device updates every ~15 min
+- **Qingping MQTT (primary)**: Device pushes to self-hosted Mosquitto broker every ~30s. Collector subscribes to `qingping/{MAC}/up`. Interval configured via downlink to `qingping/{MAC}/down`.
+- **Qingping Cloud API (fallback)**: OAuth token expires in ~2 hours, refreshed 5 min before expiry. Automatically resumes when MQTT is silent >2 minutes.
 
 ## Frontend Update Intervals
 
