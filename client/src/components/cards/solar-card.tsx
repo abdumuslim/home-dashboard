@@ -115,9 +115,9 @@ function ExpandedSolarChart({ range, weatherHistory }: { range: TimeRange; weath
         position: "right" as const,
         title: { display: true, text: "UV Index", color: "#ff9800", font: { size: 11 } },
         min: 0,
-        suggestedMax: 11,
+        suggestedMax: Math.max(...uvData.map((d) => d.y), 3) + 1,
         grid: { drawOnChartArea: false },
-        ticks: { color: "#ff9800", font: { size: 11 }, stepSize: 2 },
+        ticks: { color: "#ff9800", font: { size: 11 }, stepSize: 1 },
       },
     },
   };
@@ -262,14 +262,14 @@ export function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay
         display: hasUV,
         position: "right" as const,
         min: 0,
-        suggestedMax: 11,
+        suggestedMax: Math.max(...hourlyUV.map((d) => d.y), 3) + 1,
         grid: { drawOnChartArea: false },
-        ticks: { color: "#ff9800", font: { size: 10 }, stepSize: 2 },
+        ticks: { color: "#ff9800", font: { size: 10 }, stepSize: 1 },
       },
     },
     elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 } },
     interaction: { intersect: false, mode: "index" as const },
-  }), [hasUV]);
+  }), [hasUV, hourlyUV]);
 
   const handleExpand = () => {
     openOverlay("Solar & UV", (range, wh) => (
