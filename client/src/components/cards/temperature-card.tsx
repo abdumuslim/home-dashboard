@@ -88,6 +88,24 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
     return { hiTemp: Math.max(...temps), loTemp: Math.min(...temps) };
   }, [weatherHistory]);
 
+  const { tempDelta, humDelta } = useMemo(() => {
+    if (temp == null || humidity == null || weatherHistory.length === 0)
+      return { tempDelta: null, humDelta: null };
+    const target = Date.now() - 86400000;
+    let closest = weatherHistory[0];
+    let minDiff = Math.abs(new Date(closest.ts).getTime() - target);
+    for (const r of weatherHistory) {
+      const diff = Math.abs(new Date(r.ts).getTime() - target);
+      if (diff < minDiff) { closest = r; minDiff = diff; }
+    }
+    if (minDiff > 3600000 || closest.temp_c == null || closest.humidity == null)
+      return { tempDelta: null, humDelta: null };
+    return {
+      tempDelta: temp - closest.temp_c,
+      humDelta: humidity - closest.humidity,
+    };
+  }, [weatherHistory, temp, humidity]);
+
   const hourlyData = useMemo(() => {
     const buckets = new Map<number, { sum: number; count: number }>();
     for (const r of weatherHistory) {
@@ -154,6 +172,11 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
           <div className="flex flex-col">
             <span className="text-3xl font-semibold leading-none tracking-tight" style={{ color: getTempColor(temp) }}>
               {fmt(temp, 1)}<span className="text-xl">&deg;C</span>
+              {tempDelta != null && tempDelta !== 0 && (
+                <span className={`text-xs ml-1.5 font-medium ${tempDelta > 0 ? "text-red-400" : "text-blue-400"}`}>
+                  {tempDelta > 0 ? "\u2191" : "\u2193"}{fmt(Math.abs(tempDelta), 1)}&deg;
+                </span>
+              )}
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Temp.</span>
           </div>
@@ -161,6 +184,11 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
           <div className="flex flex-col">
             <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
               {fmt(humidity, 0)}<span className="text-xl">%</span>
+              {humDelta != null && humDelta !== 0 && (
+                <span className={`text-xs ml-1.5 font-medium ${humDelta > 0 ? "text-red-400" : "text-blue-400"}`}>
+                  {humDelta > 0 ? "\u2191" : "\u2193"}{fmt(Math.abs(humDelta), 0)}%
+                </span>
+              )}
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Humidity</span>
           </div>
