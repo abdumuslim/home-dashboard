@@ -9,6 +9,10 @@ export interface Config {
   vapidPublicKey: string;
   vapidPrivateKey: string;
   vapidSubject: string;
+  mqttBrokerUrl: string;
+  mqttUsername: string;
+  mqttPassword: string;
+  mqttQingpingMac: string;
 }
 
 export const config: Config = {
@@ -20,4 +24,8 @@ export const config: Config = {
   vapidPublicKey: process.env.VAPID_PUBLIC_KEY ?? "",
   vapidPrivateKey: process.env.VAPID_PRIVATE_KEY ?? "",
   vapidSubject: process.env.VAPID_SUBJECT ?? "mailto:admin@altijwal.com",
+  mqttBrokerUrl: process.env.MQTT_BROKER_URL ?? "mqtt://mosquitto:1883",
+  mqttUsername: process.env.MQTT_USERNAME ?? "",
+  mqttPassword: process.env.MQTT_PASSWORD ?? "",
+  mqttQingpingMac: process.env.MQTT_QINGPING_MAC ?? "582D3470F981",
 };

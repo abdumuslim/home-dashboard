@@ -1,8 +1,23 @@
 services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/config/passwd:/mosquitto/config/passwd:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    networks:
+      - rag_default
+
   dashboard:
     build: .
     restart: unless-stopped
     env_file: .env
+    depends_on:
+      - mosquitto
     networks:
       - rag_default
     labels:
@@ -11,6 +26,10 @@ services:
       - traefik.http.routers.home.tls=true
       - traefik.http.routers.home.entrypoints=web,websecure
       - traefik.http.services.home.loadbalancer.server.port=8000
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:
 
 networks:
   rag_default:
