@@ -2,7 +2,9 @@ import { useMemo } from "react";
 import { Line } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
+import { useUnits } from "@/hooks/use-units";
 import { degDir } from "@/constants/thresholds";
+import { convertWindSpeed } from "@/constants/units";
 import { getBucketMs, bucketMedian, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
 import type { WeatherReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
@@ -16,14 +18,21 @@ interface WindCardProps {
 }
 
 function ExpandedWindChart({ range, weatherHistory }: { range: TimeRange; weatherHistory: WeatherReading[] }) {
+  const { windLabel, units: { windSpeed: windUnit } } = useUnits();
   const bMs = getBucketMs(range);
-  const speedData = useMemo(() => bucketMedian(weatherHistory, "wind_speed_kmh", bMs), [weatherHistory, bMs]);
-  const gustData = useMemo(() => bucketAverage(weatherHistory, "wind_gust_kmh", bMs), [weatherHistory, bMs]);
+  const speedData = useMemo(
+    () => bucketMedian(weatherHistory, "wind_speed_kmh", bMs).map(p => ({ ...p, y: convertWindSpeed(p.y, windUnit) })),
+    [weatherHistory, bMs, windUnit],
+  );
+  const gustData = useMemo(
+    () => bucketAverage(weatherHistory, "wind_gust_kmh", bMs).map(p => ({ ...p, y: convertWindSpeed(p.y, windUnit) })),
+    [weatherHistory, bMs, windUnit],
+  );
 
   const data = {
     datasets: [
       {
-        label: "Speed (median, km/h)",
+        label: `Speed (median, ${windLabel})`,
         data: speedData,
         borderColor: "#f59e0b",
         backgroundColor: "rgba(245, 158, 11, 0.1)",
@@ -34,7 +43,7 @@ function ExpandedWindChart({ range, weatherHistory }: { range: TimeRange; weathe
         cubicInterpolationMode: "monotone" as const,
       },
       {
-        label: "Gust (km/h)",
+        label: `Gust (${windLabel})`,
         data: gustData,
         borderColor: "rgba(245, 158, 11, 0.4)",
         backgroundColor: "transparent",
@@ -48,10 +57,11 @@ function ExpandedWindChart({ range, weatherHistory }: { range: TimeRange; weathe
     ],
   };
 
+  const base = expandedChartOptions(range, windLabel);
   const options = {
-    ...expandedChartOptions(range, "km/h"),
+    ...base,
     plugins: {
-      ...expandedChartOptions(range, "km/h").plugins,
+      ...base.plugins,
       legend: { display: true, labels: { color: "#7a8ba8", boxWidth: 12, padding: 16 } },
     },
   };
@@ -60,6 +70,8 @@ function ExpandedWindChart({ range, weatherHistory }: { range: TimeRange; weathe
 }
 
 export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], openOverlay }: WindCardProps) {
+  const { fmtWind, windLabel, units: { windSpeed: windUnit } } = useUnits();
+
   const getMedianSpeed = (history: WeatherReading[], timestamp: number, windowMs: number = 600000) => {
     const windowPoints = history.filter(
       (r) => r.wind_speed_kmh != null && new Date(r.ts).getTime() >= timestamp - windowMs && new Date(r.ts).getTime() <= timestamp
@@ -93,7 +105,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
   const currentMedian = weatherHistory.length > 0 ? getMedianSpeed(weatherHistory, latestTs) : null;
   const medianDir = weatherHistory.length > 0 ? getMeanDir(weatherHistory, latestTs) : null;
 
-  const chartDataPoints = (() => {
+  const chartDataPoints = useMemo(() => {
     const readings = weatherHistory.filter((r) => r.wind_speed_kmh != null);
     if (readings.length === 0) return [];
     const bucketMs = 30 * 60 * 1000;
@@ -110,10 +122,10 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
         speeds.sort((a, b) => a - b);
         const mid = Math.floor(speeds.length / 2);
         const median = speeds.length % 2 !== 0 ? speeds[mid] : (speeds[mid - 1] + speeds[mid]) / 2;
-        return { x: new Date(ts).toISOString(), y: median };
+        return { x: new Date(ts).toISOString(), y: convertWindSpeed(median, windUnit) };
       })
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
-  })();
+  }, [weatherHistory, windUnit]);
 
   const chartData = {
     datasets: [
@@ -165,9 +177,9 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
           <div className="flex flex-col">
             <div className="flex items-baseline gap-1">
               <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
-                {speed != null ? speed.toFixed(1) : "--"}
+                {fmtWind(speed)}
               </span>
-              <span className="text-sm text-dim">km/h</span>
+              <span className="text-sm text-dim">{windLabel}</span>
             </div>
             <span className="text-[0.75rem] text-text font-medium mt-1">Speed</span>
           </div>
@@ -175,9 +187,9 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
           <div className="flex flex-col">
             <div className="flex items-baseline gap-1">
               <span className="text-3xl font-semibold leading-none tracking-tight" style={{ color: "#f59e0b" }}>
-                {currentMedian != null ? currentMedian.toFixed(1) : "--"}
+                {fmtWind(currentMedian)}
               </span>
-              <span className="text-sm text-dim">km/h</span>
+              <span className="text-sm text-dim">{windLabel}</span>
             </div>
             <span className="text-[0.75rem] text-text font-medium mt-1">10Min Med</span>
           </div>
@@ -217,8 +229,8 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
         </div>
 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim -mt-[17px]">
-          <span>Gust <span className="text-text font-medium">{gust != null ? gust.toFixed(1) : "--"} km/h</span></span>
-          <span>Max <span className="text-text font-medium">{maxDailyGust != null ? maxDailyGust.toFixed(1) : "--"} km/h</span></span>
+          <span>Gust <span className="text-text font-medium">{fmtWind(gust)} {windLabel}</span></span>
+          <span>Max <span className="text-text font-medium">{fmtWind(maxDailyGust)} {windLabel}</span></span>
         </div>
       </div>
 

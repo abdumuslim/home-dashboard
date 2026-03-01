@@ -3,7 +3,9 @@ import { Line } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
+import { useUnits } from "@/hooks/use-units";
 import { fmt, getStatus } from "@/constants/thresholds";
+import { convertTemp } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
 import type { WeatherReading, AirReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
@@ -57,12 +59,14 @@ function ExpandedIndoorChart({
   humidityKey: string;
   isAirSource: boolean;
 }) {
+  const { tempLabel, units: { temperature: tempUnit } } = useUnits();
   const bMs = getBucketMs(range);
   const history = isAirSource ? airHistory : weatherHistory;
 
   const tempData = useMemo(
-    () => bucketAverage(history as (WeatherReading & AirReading)[], metricKey as keyof (WeatherReading & AirReading), bMs),
-    [history, metricKey, bMs],
+    () => bucketAverage(history as (WeatherReading & AirReading)[], metricKey as keyof (WeatherReading & AirReading), bMs)
+      .map(p => ({ ...p, y: convertTemp(p.y, tempUnit) })),
+    [history, metricKey, bMs, tempUnit],
   );
   const humData = useMemo(
     () => bucketAverage(history as (WeatherReading & AirReading)[], humidityKey as keyof (WeatherReading & AirReading), bMs),
@@ -72,7 +76,7 @@ function ExpandedIndoorChart({
   const data = {
     datasets: [
       {
-        label: "Temperature (\u00B0C)",
+        label: `Temperature (${tempLabel})`,
         data: tempData,
         borderColor: "#00d4ff",
         backgroundColor: "rgba(0, 212, 255, 0.1)",
@@ -99,7 +103,7 @@ function ExpandedIndoorChart({
     ],
   };
 
-  const base = expandedChartOptions(range, "\u00B0C");
+  const base = expandedChartOptions(range, tempLabel);
   const options = {
     ...base,
     plugins: {
@@ -133,10 +137,11 @@ export function IndoorCard({
   metricKey,
   openOverlay,
 }: IndoorCardProps) {
-  const flash = useFlash(temp != null ? fmt(temp, 1) : null);
+  const { fmtTemp, tempLabel, units: { temperature: tempUnit } } = useUnits();
+  const flash = useFlash(temp != null ? fmtTemp(temp) : null);
   const noiseStatus = noise !== undefined ? getStatus("noise", noise) : null;
 
-  const hourlyData = (() => {
+  const hourlyData = useMemo(() => {
     if (!metricKey) return [];
     const buckets = new Map<number, { sum: number; count: number }>();
     for (const r of history) {
@@ -148,9 +153,9 @@ export function IndoorCard({
       buckets.set(bucketTs, { sum: existing.sum + (val as number), count: existing.count + 1 });
     }
     return Array.from(buckets.entries())
-      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: d.sum / d.count }))
+      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: convertTemp(d.sum / d.count, tempUnit) }))
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
-  })();
+  }, [history, metricKey, tempUnit]);
 
   const chartData = {
     datasets: [
@@ -214,7 +219,7 @@ export function IndoorCard({
         <div className="flex items-baseline gap-5">
           <div className="flex flex-col">
             <span className="text-3xl font-semibold leading-none tracking-tight text-cyan">
-              {fmt(temp, 1)}<span className="text-xl">&deg;C</span>
+              {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Temp.</span>
           </div>
@@ -229,7 +234,7 @@ export function IndoorCard({
           {dewPoint != null && (
             <div className="flex flex-col ml-auto">
               <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
-                {fmt(dewPoint, 1)}<span className="text-sm">&deg;C</span>
+                {fmtTemp(dewPoint)}<span className="text-sm">{tempLabel}</span>
               </span>
               <span className="text-[0.75rem] text-text font-medium mt-1">Dew Point</span>
             </div>
@@ -238,7 +243,7 @@ export function IndoorCard({
           {feelsLike != null && (
             <div className="flex flex-col">
               <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
-                {fmt(feelsLike, 1)}<span className="text-sm">&deg;C</span>
+                {fmtTemp(feelsLike)}<span className="text-sm">{tempLabel}</span>
               </span>
               <span className="text-[0.75rem] text-text font-medium mt-1">Feels Like</span>
             </div>

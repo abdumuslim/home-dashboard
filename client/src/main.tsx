@@ -16,6 +16,7 @@ import {
 import "chartjs-adapter-date-fns";
 import "./index.css";
 import App from "./App";
+import { UnitsProvider } from "@/hooks/use-units";
 
 Chart.register(
   CategoryScale,
@@ -32,6 +33,8 @@ Chart.register(
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    <UnitsProvider>
+      <App />
+    </UnitsProvider>
   </StrictMode>
 );
