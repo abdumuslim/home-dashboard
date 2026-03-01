@@ -2,6 +2,7 @@ import type { WeatherReading, AirReading, OpenOverlayFn } from "@/types/api";
 import { OutdoorSection } from "./sections/outdoor-section";
 import { IndoorSection } from "./sections/indoor-section";
 import { AirQualitySection } from "./sections/air-quality-section";
+import { PrayerSection } from "./sections/prayer-section";
 
 interface DashboardTabProps {
   weather: WeatherReading | null;
@@ -17,6 +18,7 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
       <OutdoorSection weather={weather} weatherHistory={weatherHistory} openOverlay={openOverlay} />
       <IndoorSection weather={weather} air={air} weatherHistory={weatherHistory} airHistory={airHistory} openOverlay={openOverlay} />
       <AirQualitySection air={air} airHistory={airHistory} openOverlay={openOverlay} />
+      <PrayerSection />
     </div>
   );
 }

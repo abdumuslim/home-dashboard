@@ -25,6 +25,7 @@
   --animate-overlay-in: overlay-in 150ms ease-out;
   --animate-panel-in: panel-in 200ms ease-out;
   --animate-panel-out: panel-out 150ms ease-in forwards;
+  --animate-prayer-blink: prayer-blink 1s ease-in-out infinite;
 }
 
 @keyframes card-flash {
@@ -45,6 +46,17 @@
 @keyframes panel-out {
   from { opacity: 1; transform: scale(1) translateY(0); }
   to { opacity: 0; transform: scale(0.95) translateY(8px); }
+}
+
+@keyframes prayer-blink {
+  0%, 100% {
+    box-shadow: 0 0 8px rgba(198, 40, 40, 0.3);
+    border-color: rgba(198, 40, 40, 0.6);
+  }
+  50% {
+    box-shadow: 0 0 20px rgba(198, 40, 40, 0.6), 0 0 40px rgba(198, 40, 40, 0.2);
+    border-color: rgba(198, 40, 40, 1);
+  }
 }
 
 @layer base {
