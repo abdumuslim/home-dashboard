@@ -3,7 +3,16 @@ import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useUnits } from "@/hooks/use-units";
+import { usePushNotifications } from "@/hooks/use-push-notifications";
 import { UNIT_OPTIONS, type UnitPreferences } from "@/constants/units";
+
+const NOTIFICATION_BREAKPOINTS = [
+  { value: 15, label: "15 min" },
+  { value: 7, label: "7 min" },
+  { value: 4, label: "4 min" },
+  { value: 2, label: "2 min" },
+  { value: 0, label: "At time" },
+];
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -19,6 +28,7 @@ const SECTIONS: { key: keyof typeof UNIT_OPTIONS; label: string }[] = [
 
 export function SettingsModal({ onClose }: SettingsModalProps) {
   const { units, setUnits } = useUnits();
+  const { isSupported, isSubscribed, breakpoints, setBreakpoints } = usePushNotifications();
   const [draft, setDraft] = useState<UnitPreferences>({ ...units });
   const [phase, setPhase] = useState<"in" | "out">("in");
 
@@ -58,7 +68,7 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
       >
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-3 border-b border-white/10">
-          <h2 className="text-base font-medium text-text">Units</h2>
+          <h2 className="text-base font-medium text-text">Settings</h2>
           <button
             onClick={handleClose}
             className="p-1 rounded-lg text-dim hover:text-white hover:bg-white/10 transition-colors"
@@ -67,8 +77,9 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
           </button>
         </div>
 
-        {/* Body */}
+        {/* Units */}
         <div className="px-5 py-4 flex flex-col gap-4">
+          <h3 className="text-xs font-medium tracking-wider text-dim uppercase">Units</h3>
           {SECTIONS.map(({ key, label }) => (
             <div key={key} className="flex items-center justify-between border-b border-white/5 pb-3 last:border-0 last:pb-0">
               <span className="text-sm text-text">{label}</span>
@@ -100,6 +111,42 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
             </div>
           ))}
         </div>
+
+        {/* Prayer Notifications */}
+        {isSupported && isSubscribed && (
+          <div className="px-5 py-4 flex flex-col gap-3 border-t border-white/10">
+            <h3 className="text-xs font-medium tracking-wider text-dim uppercase">Prayer Notifications</h3>
+            <div className="flex flex-wrap gap-3">
+              {NOTIFICATION_BREAKPOINTS.map(({ value, label }) => {
+                const checked = breakpoints.includes(value);
+                return (
+                  <label key={value} className="flex items-center gap-1.5 cursor-pointer text-sm text-dim">
+                    <span
+                      className={cn(
+                        "w-3.5 h-3.5 rounded border flex items-center justify-center transition-colors",
+                        checked ? "border-green-400 bg-green-400/20" : "border-dim",
+                      )}
+                    >
+                      {checked && <span className="text-green-400 text-[10px] leading-none">&#10003;</span>}
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => {
+                        const next = checked
+                          ? breakpoints.filter((b) => b !== value)
+                          : [...breakpoints, value].sort((a, b) => b - a);
+                        setBreakpoints(next);
+                      }}
+                      className="sr-only"
+                    />
+                    <span className={checked ? "text-text" : ""}>{label}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
     </div>,
     document.body,

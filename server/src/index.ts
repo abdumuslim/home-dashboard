@@ -34,8 +34,11 @@ async function main(): Promise<void> {
     next();
   });
 
+  // Parse JSON bodies for push subscription endpoints
+  app.use(express.json());
+
   // Mount API routes
-  app.use(createRouter(pool));
+  app.use(createRouter(pool, config));
 
   // Serve static files from ../static (relative to dist/ or src/)
   const staticDir = path.resolve(__dirname, "..", "static");

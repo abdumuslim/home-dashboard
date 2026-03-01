@@ -31,6 +31,10 @@ Chart.register(
   Filler
 );
 
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js");
+}
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <UnitsProvider>
