@@ -143,7 +143,7 @@ export class Collector {
 
       for (const bp of BREAKPOINTS) {
         const key = `${name}-${bp}`;
-        if (minutesLeft <= bp && minutesLeft > bp - 0.5 && !this.sentNotifications.has(key)) {
+        if (minutesLeft <= bp && minutesLeft > bp - 2 && !this.sentNotifications.has(key)) {
           this.sentNotifications.add(key);
           await this.sendPrayerPush(name, bp, prayerTime);
         }
@@ -169,6 +169,7 @@ export class Collector {
       "SELECT endpoint, subscription, breakpoints FROM push_subscriptions"
     );
 
+    let sent = 0;
     for (const row of result.rows) {
       const bps = (row.breakpoints as number[]) ?? BREAKPOINTS;
       if (!bps.includes(minutesBefore)) continue;
@@ -178,16 +179,21 @@ export class Collector {
           JSON.parse(row.subscription as string),
           JSON.stringify({ title, body, prayer, minutesLeft: minutesBefore })
         );
+        sent++;
       } catch (err: unknown) {
         const status = (err as { statusCode?: number }).statusCode;
         if (status === 404 || status === 410) {
           await this.pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [row.endpoint]);
-          console.log(`[collector] Removed stale push subscription: ${row.endpoint}`);
+          console.log(`[collector] Removed stale push subscription`);
+        } else {
+          console.error(`[collector] Push failed (${status}):`, (err as Error).message);
         }
       }
     }
 
-    console.log(`[collector] Sent push: ${title}`);
+    if (sent > 0) {
+      console.log(`[collector] Sent push: ${title} (${sent} subscribers)`);
+    }
   }
 
   // ---------- Ambient Weather ----------

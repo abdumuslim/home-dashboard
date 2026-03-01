@@ -32,12 +32,21 @@ export function usePushNotifications() {
   );
   const [breakpoints, setBreakpointsState] = useState<number[]>(loadBreakpoints);
 
-  // Check existing subscription on mount
+  // Check existing subscription on mount and sync to server
   useEffect(() => {
     if (!isSupported) return;
     navigator.serviceWorker.ready.then((reg) => {
       reg.pushManager.getSubscription().then((sub) => {
         setIsSubscribed(!!sub);
+        // Re-sync subscription to server on every page load
+        // in case the browser regenerated the push endpoint
+        if (sub) {
+          fetch("/api/push/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ subscription: sub.toJSON(), breakpoints: loadBreakpoints() }),
+          }).catch(() => { /* ignore sync errors */ });
+        }
       });
     });
   }, [isSupported]);
