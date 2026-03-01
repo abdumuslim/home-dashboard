@@ -182,7 +182,7 @@ export function IndoorCard({
         display: true,
         position: "left" as const,
         grid: { color: "rgba(255,255,255,0.05)" },
-        ticks: { color: "#7a8ba8", font: { size: 10 } },
+        ticks: { color: "#7a8ba8", font: { size: 10 }, maxTicksLimit: 5 },
       },
     },
     elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 } },
