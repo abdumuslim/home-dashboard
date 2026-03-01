@@ -1,5 +1,6 @@
 import pg from "pg";
 import webpush from "web-push";
+import mqtt from "mqtt";
 import { Coordinates, CalculationMethod, PrayerTimes } from "adhan";
 import type { Config } from "./config.js";
 
@@ -75,6 +76,8 @@ export class Collector {
   private stopped = false;
   private sentNotifications = new Set<string>();
   private sentDateKey = "";
+  private mqttClient: mqtt.MqttClient | null = null;
+  private lastMqttMessage = 0;
 
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
@@ -88,12 +91,17 @@ export class Collector {
 
   stop(): void {
     this.stopped = true;
+    if (this.mqttClient) {
+      this.mqttClient.end(true);
+      console.log("[collector] MQTT client closed");
+    }
   }
 
   async runForever(): Promise<void> {
     await this.backfillAmbientHistory();
     await sleep(2000);
     await this.backfillQingpingHistory();
+    this.startMqtt();
     while (!this.stopped) {
       try {
         await this.collectAll();
@@ -105,10 +113,15 @@ export class Collector {
   }
 
   private async collectAll(): Promise<void> {
-    const results = await Promise.allSettled([
-      this.collectAmbientWeather(),
-      this.collectQingping(),
-    ]);
+    const mqttActive = this.mqttClient?.connected &&
+      (Date.now() - this.lastMqttMessage < 120_000);
+
+    const tasks: Promise<void>[] = [this.collectAmbientWeather()];
+    if (!mqttActive) {
+      tasks.push(this.collectQingping());
+    }
+
+    const results = await Promise.allSettled(tasks);
     for (const r of results) {
       if (r.status === "rejected") {
         console.error("[collector] Collection error:", r.reason);
@@ -476,7 +489,135 @@ export class Collector {
     }
   }
 
-  // ---------- Qingping ----------
+  // ---------- MQTT (Qingping direct) ----------
+
+  private startMqtt(): void {
+    if (!this.config.mqttUsername) {
+      console.log("[collector] MQTT not configured, skipping");
+      return;
+    }
+
+    const mac = this.config.mqttQingpingMac;
+    const topic = `qingping/${mac}/up`;
+
+    this.mqttClient = mqtt.connect(this.config.mqttBrokerUrl, {
+      username: this.config.mqttUsername,
+      password: this.config.mqttPassword,
+      clientId: `home-dashboard-${Date.now()}`,
+      clean: true,
+      reconnectPeriod: 5000,
+      connectTimeout: 30000,
+    });
+
+    this.mqttClient.on("connect", () => {
+      console.log("[collector] MQTT connected to broker");
+      this.mqttClient!.subscribe(topic, { qos: 1 }, (err) => {
+        if (err) {
+          console.error("[collector] MQTT subscribe error:", err);
+        } else {
+          console.log(`[collector] MQTT subscribed to ${topic}`);
+          this.sendIntervalConfig();
+        }
+      });
+    });
+
+    this.mqttClient.on("message", (_topic: string, payload: Buffer) => {
+      this.handleMqttMessage(payload).catch((err) => {
+        console.error("[collector] MQTT message handling error:", err);
+      });
+    });
+
+    this.mqttClient.on("error", (err) => {
+      console.error("[collector] MQTT error:", err);
+    });
+
+    this.mqttClient.on("reconnect", () => {
+      console.log("[collector] MQTT reconnecting...");
+    });
+  }
+
+  private async handleMqttMessage(payload: Buffer): Promise<void> {
+    const raw = payload.toString("utf-8");
+
+    interface QpMqttSensorData {
+      temperature?: { value: number };
+      humidity?: { value: number };
+      co2?: { value: number };
+      pm25?: { value: number };
+      pm10?: { value: number };
+      tvoc_index?: { value: number };
+      noise?: { value: number };
+      battery?: { value: number };
+    }
+    interface QpMqttPayload {
+      type?: string;
+      sensorData?: QpMqttSensorData[];
+    }
+
+    let msg: QpMqttPayload;
+    try {
+      msg = JSON.parse(raw) as QpMqttPayload;
+    } catch {
+      console.warn("[collector] MQTT: non-JSON message, ignoring");
+      return;
+    }
+
+    if (msg.type === "28") {
+      console.log("[collector] MQTT: received settings ack");
+      return;
+    }
+
+    const sensors = msg.sensorData?.[0];
+    if (!sensors) {
+      console.warn("[collector] MQTT: no sensorData in message");
+      return;
+    }
+
+    const row: AirRow = {
+      ts: new Date(),
+      temperature: sensors.temperature?.value ?? null,
+      humidity: sensors.humidity?.value ?? null,
+      co2: sensors.co2?.value ?? null,
+      pm25: sensors.pm25?.value ?? null,
+      pm10: sensors.pm10?.value ?? null,
+      tvoc: sensors.tvoc_index?.value ?? null,
+      noise: sensors.noise?.value ?? null,
+      battery: sensors.battery?.value ?? null,
+    };
+
+    await this.storeAir(row);
+    this.lastMqttMessage = Date.now();
+    console.log(`[collector] MQTT air reading stored at ${row.ts.toISOString()}`);
+  }
+
+  private sendIntervalConfig(): void {
+    if (!this.mqttClient) return;
+
+    const mac = this.config.mqttQingpingMac;
+    const topic = `qingping/${mac}/down`;
+
+    const cfg = {
+      id: Date.now(),
+      need_ack: 1,
+      type: "17",
+      setting: {
+        report_interval: 30,
+        collect_interval: 30,
+        co2_sampling_interval: 30,
+        pm_sampling_interval: 30,
+      },
+    };
+
+    this.mqttClient.publish(topic, JSON.stringify(cfg), { qos: 1 }, (err) => {
+      if (err) {
+        console.error("[collector] MQTT interval config publish failed:", err);
+      } else {
+        console.log("[collector] MQTT interval config sent (30s intervals)");
+      }
+    });
+  }
+
+  // ---------- Qingping (cloud fallback) ----------
 
   private async ensureQpToken(): Promise<void> {
     if (this.qpToken && Date.now() / 1000 < this.qpTokenExpires - 300) {
