@@ -55,6 +55,13 @@ const MIGRATIONS: string[] = [
   "ALTER TABLE weather_readings ADD COLUMN IF NOT EXISTS dew_point_indoor_c REAL",
   "ALTER TABLE weather_readings ADD COLUMN IF NOT EXISTS feels_like_ch8_c REAL",
   "ALTER TABLE weather_readings ADD COLUMN IF NOT EXISTS dew_point_ch8_c REAL",
+  `CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id SERIAL PRIMARY KEY,
+    endpoint TEXT UNIQUE NOT NULL,
+    subscription JSONB NOT NULL,
+    breakpoints INTEGER[] DEFAULT '{15,7,4,2,0}',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`,
 ];
 
 export async function createPool(dsn: string): Promise<pg.Pool> {

@@ -1,4 +1,6 @@
 import pg from "pg";
+import webpush from "web-push";
+import { Coordinates, CalculationMethod, PrayerTimes } from "adhan";
 import type { Config } from "./config.js";
 
 interface WeatherRow {
@@ -55,16 +57,33 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const BAGHDAD_COORDS = new Coordinates(33.321502, 44.358335);
+const PRAYER_PARAMS = CalculationMethod.Dubai();
+PRAYER_PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
+
+const PRAYER_NAMES = ["fajr", "dhuhr", "asr", "maghrib", "isha"] as const;
+const PRAYER_LABELS: Record<string, string> = {
+  fajr: "Fajr", dhuhr: "Dhuhr", asr: "Asr", maghrib: "Maghrib", isha: "Isha",
+};
+const BREAKPOINTS = [15, 7, 4, 2, 0];
+
 export class Collector {
   private pool: pg.Pool;
   private config: Config;
   private qpToken: string | null = null;
   private qpTokenExpires = 0;
   private stopped = false;
+  private sentNotifications = new Set<string>();
+  private sentDateKey = "";
 
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
     this.config = config;
+
+    if (config.vapidPublicKey && config.vapidPrivateKey) {
+      webpush.setVapidDetails(config.vapidSubject, config.vapidPublicKey, config.vapidPrivateKey);
+      console.log("[collector] Web Push configured");
+    }
   }
 
   stop(): void {
@@ -95,6 +114,80 @@ export class Collector {
         console.error("[collector] Collection error:", r.reason);
       }
     }
+
+    try {
+      await this.checkPrayerNotifications();
+    } catch (err) {
+      console.error("[collector] Prayer notification check failed:", err);
+    }
+  }
+
+  private async checkPrayerNotifications(): Promise<void> {
+    if (!this.config.vapidPublicKey) return;
+
+    const now = new Date();
+    const dateKey = now.toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
+
+    // Reset sent set on new day
+    if (dateKey !== this.sentDateKey) {
+      this.sentNotifications.clear();
+      this.sentDateKey = dateKey;
+    }
+
+    const pt = new PrayerTimes(BAGHDAD_COORDS, now, PRAYER_PARAMS);
+    const nowMs = now.getTime();
+
+    for (const name of PRAYER_NAMES) {
+      const prayerTime = pt[name] as Date;
+      const minutesLeft = (prayerTime.getTime() - nowMs) / 60000;
+
+      for (const bp of BREAKPOINTS) {
+        const key = `${name}-${bp}`;
+        if (minutesLeft <= bp && minutesLeft > bp - 0.5 && !this.sentNotifications.has(key)) {
+          this.sentNotifications.add(key);
+          await this.sendPrayerPush(name, bp, prayerTime);
+        }
+      }
+    }
+  }
+
+  private async sendPrayerPush(prayer: string, minutesBefore: number, prayerTime: Date): Promise<void> {
+    const label = PRAYER_LABELS[prayer] ?? prayer;
+    const timeStr = prayerTime.toLocaleTimeString("en-US", {
+      timeZone: "Asia/Baghdad",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    });
+
+    const title = minutesBefore === 0
+      ? `It's time for ${label}`
+      : `${label} in ${minutesBefore} minutes`;
+    const body = timeStr;
+
+    const result = await this.pool.query(
+      "SELECT endpoint, subscription, breakpoints FROM push_subscriptions"
+    );
+
+    for (const row of result.rows) {
+      const bps = (row.breakpoints as number[]) ?? BREAKPOINTS;
+      if (!bps.includes(minutesBefore)) continue;
+
+      try {
+        await webpush.sendNotification(
+          JSON.parse(row.subscription as string),
+          JSON.stringify({ title, body, prayer, minutesLeft: minutesBefore })
+        );
+      } catch (err: unknown) {
+        const status = (err as { statusCode?: number }).statusCode;
+        if (status === 404 || status === 410) {
+          await this.pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [row.endpoint]);
+          console.log(`[collector] Removed stale push subscription: ${row.endpoint}`);
+        }
+      }
+    }
+
+    console.log(`[collector] Sent push: ${title}`);
   }
 
   // ---------- Ambient Weather ----------

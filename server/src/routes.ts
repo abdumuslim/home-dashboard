@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import pg from "pg";
+import type { Config } from "./config.js";
 
 const RANGE_MAP: Record<string, string> = {
   "6h": "6 hours",
@@ -36,7 +37,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool): Router {
+export function createRouter(pool: pg.Pool, config?: Config): Router {
   const router = Router();
 
   router.get("/api/current", async (_req: Request, res: Response) => {
@@ -151,6 +152,41 @@ export function createRouter(pool: pg.Pool): Router {
       air_total_readings: parseInt(airCountResult.rows[0].count as string, 10),
       collector_interval_seconds: 300,
     });
+  });
+
+  // ---------- Push Notifications ----------
+
+  router.get("/api/push/vapid-key", (_req: Request, res: Response) => {
+    res.json({ publicKey: config?.vapidPublicKey ?? "" });
+  });
+
+  router.post("/api/push/subscribe", async (req: Request, res: Response) => {
+    const { subscription, breakpoints } = req.body as {
+      subscription: { endpoint: string };
+      breakpoints?: number[];
+    };
+    if (!subscription?.endpoint) {
+      res.status(400).json({ error: "Missing subscription" });
+      return;
+    }
+    const bp = breakpoints ?? [15, 7, 4, 2, 0];
+    await pool.query(
+      `INSERT INTO push_subscriptions (endpoint, subscription, breakpoints)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (endpoint) DO UPDATE SET subscription = $2, breakpoints = $3`,
+      [subscription.endpoint, JSON.stringify(subscription), bp]
+    );
+    res.json({ ok: true });
+  });
+
+  router.post("/api/push/unsubscribe", async (req: Request, res: Response) => {
+    const { endpoint } = req.body as { endpoint: string };
+    if (!endpoint) {
+      res.status(400).json({ error: "Missing endpoint" });
+      return;
+    }
+    await pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [endpoint]);
+    res.json({ ok: true });
   });
 
   return router;
