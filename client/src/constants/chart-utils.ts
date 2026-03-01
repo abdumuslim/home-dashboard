@@ -5,6 +5,7 @@ export function getBucketMs(range: TimeRange): number {
   switch (range) {
     case "6h": return 5 * 60_000;      // 5 min
     case "24h": return 5 * 60_000;      // 5 min
+    case "25h": return 5 * 60_000;      // 5 min
     case "48h": return 5 * 60_000;      // 5 min
     case "1w": return 60 * 60_000;      // 1 hr
     case "30d": return 3 * 60 * 60_000; // 3 hr (server returns hourly, aggregate further)

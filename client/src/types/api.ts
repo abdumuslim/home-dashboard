@@ -47,7 +47,7 @@ export interface CurrentData {
   air: AirReading | null;
 }
 
-export type TimeRange = "6h" | "24h" | "48h" | "1w" | "30d";
+export type TimeRange = "6h" | "24h" | "25h" | "48h" | "1w" | "30d";
 
 export type StatusLevel = "good" | "moderate" | "poor" | "severe" | "extreme" | "normal" | "slightly_high" | "high" | "very_high" | "excellent" | "low";
 
