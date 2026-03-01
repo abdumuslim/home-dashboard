@@ -2,7 +2,9 @@ import { useMemo } from "react";
 import { Chart } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
+import { useUnits } from "@/hooks/use-units";
 import { fmt } from "@/constants/thresholds";
+import { convertPressure, convertRainfall, PRESSURE_DECIMALS } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
 import type { WeatherReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
@@ -50,16 +52,23 @@ function formatLastRain(iso: string | null | undefined): string {
 }
 
 function ExpandedRainfallChart({ range, weatherHistory }: { range: TimeRange; weatherHistory: WeatherReading[] }) {
+  const { pressureLabel, rainLabel, units: { pressure: pressureUnit, rainfall: rainUnit } } = useUnits();
   const bMs = getBucketMs(range);
-  const pressureData = useMemo(() => bucketAverage(weatherHistory, "pressure_rel_hpa", bMs), [weatherHistory, bMs]);
-  const rainRateData = useMemo(() => bucketAverage(weatherHistory, "rain_hourly_mm", bMs), [weatherHistory, bMs]);
+  const pressureData = useMemo(
+    () => bucketAverage(weatherHistory, "pressure_rel_hpa", bMs).map(p => ({ ...p, y: convertPressure(p.y, pressureUnit) })),
+    [weatherHistory, bMs, pressureUnit],
+  );
+  const rainRateData = useMemo(
+    () => bucketAverage(weatherHistory, "rain_hourly_mm", bMs).map(p => ({ ...p, y: convertRainfall(p.y, rainUnit) })),
+    [weatherHistory, bMs, rainUnit],
+  );
   const hasRain = rainRateData.some((d) => d.y > 0);
 
   const data = {
     datasets: [
       {
         type: "line" as const,
-        label: "Pressure (hPa)",
+        label: `Pressure (${pressureLabel})`,
         data: pressureData,
         borderColor: "#10b981",
         backgroundColor: "rgba(16, 185, 129, 0.1)",
@@ -72,7 +81,7 @@ function ExpandedRainfallChart({ range, weatherHistory }: { range: TimeRange; we
       },
       ...(hasRain ? [{
         type: "line" as const,
-        label: "Rain (mm/hr)",
+        label: `Rain (${rainLabel})`,
         data: rainRateData,
         borderColor: "#2196ff",
         backgroundColor: "rgba(33, 150, 246, 0.15)",
@@ -86,7 +95,7 @@ function ExpandedRainfallChart({ range, weatherHistory }: { range: TimeRange; we
     ],
   };
 
-  const base = expandedChartOptions(range, "hPa");
+  const base = expandedChartOptions(range, pressureLabel);
   const options = {
     ...base,
     plugins: {
@@ -99,7 +108,7 @@ function ExpandedRainfallChart({ range, weatherHistory }: { range: TimeRange; we
       y2: {
         display: hasRain,
         position: "right" as const,
-        title: { display: true, text: "mm/hr", color: "#2196ff", font: { size: 11 } },
+        title: { display: true, text: rainLabel, color: "#2196ff", font: { size: 11 } },
         min: 0,
         suggestedMax: 1,
         grid: { drawOnChartArea: false },
@@ -115,6 +124,8 @@ export function RainfallCard({
   hourly, event, daily, weekly, monthly, yearly,
   lastRain, pressure, weatherHistory = [], openOverlay,
 }: RainfallCardProps) {
+  const { fmtRain, fmtPressure, rainLabel, pressureLabel, units: { pressure: pressureUnit, rainfall: rainUnit } } = useUnits();
+
   const baroTrend = useMemo(() => {
     const threeHoursAgo = Date.now() - 3 * 3600000;
     const recent = weatherHistory.filter((r) => r.pressure_rel_hpa != null);
@@ -141,9 +152,9 @@ export function RainfallCard({
       buckets.set(bucketTs, { sum: existing.sum + (r.pressure_rel_hpa as number), count: existing.count + 1 });
     }
     return Array.from(buckets.entries())
-      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: d.sum / d.count }))
+      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: convertPressure(d.sum / d.count, pressureUnit) }))
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
-  }, [weatherHistory]);
+  }, [weatherHistory, pressureUnit]);
 
   const rainData = useMemo(() => {
     const buckets = new Map<number, { sum: number; count: number }>();
@@ -155,9 +166,9 @@ export function RainfallCard({
       buckets.set(bucketTs, { sum: existing.sum + (r.rain_hourly_mm as number), count: existing.count + 1 });
     }
     return Array.from(buckets.entries())
-      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: d.sum / d.count }))
+      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: convertRainfall(d.sum / d.count, rainUnit) }))
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
-  }, [weatherHistory]);
+  }, [weatherHistory, rainUnit]);
 
   const hasRain = rainData.some((d) => d.y > 0);
 
@@ -238,9 +249,9 @@ export function RainfallCard({
               <RainDrop rate={hourly} />
               <div className="flex items-baseline gap-1">
                 <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
-                  {fmt(hourly, 1)}
+                  {fmtRain(hourly)}
                 </span>
-                <span className="text-sm text-dim">mm/hr</span>
+                <span className="text-sm text-dim">{rainLabel}</span>
               </div>
             </div>
             <span className="text-[0.75rem] text-text font-medium mt-1">Rate</span>
@@ -249,11 +260,13 @@ export function RainfallCard({
           <div className="flex flex-col">
             <div className="flex items-baseline gap-1">
               <span className="text-3xl font-semibold leading-none tracking-tight" style={{ color: "#10b981" }}>
-                {fmt(pressure, 1)}
+                {fmtPressure(pressure)}
               </span>
-              <span className="text-sm text-dim">hPa</span>
+              <span className="text-sm text-dim">{pressureLabel}</span>
               {baroTrend && (
-                <span className="text-sm font-medium" style={{ color: baroTrend.color }}>{baroTrend.arrow}{Math.abs(baroTrend.diff).toFixed(1)}</span>
+                <span className="text-sm font-medium" style={{ color: baroTrend.color }}>
+                  {baroTrend.arrow}{fmt(convertPressure(Math.abs(baroTrend.diff), pressureUnit), PRESSURE_DECIMALS[pressureUnit])}
+                </span>
               )}
             </div>
             <span className="text-[0.75rem] text-text font-medium mt-1">Barometer</span>
@@ -261,11 +274,11 @@ export function RainfallCard({
         </div>
 
         <div className="flex items-center gap-x-2 text-xs text-dim">
-          <span>Ev <span className="text-text font-medium">{fmt(event, 1)}</span></span>
-          <span>Day <span className="text-text font-medium">{fmt(daily, 1)}</span></span>
-          <span>Wk <span className="text-text font-medium">{fmt(weekly, 1)}</span></span>
-          <span>Mo <span className="text-text font-medium">{fmt(monthly, 1)}</span></span>
-          <span>Yr <span className="text-text font-medium">{fmt(yearly, 1)}</span></span>
+          <span>Ev <span className="text-text font-medium">{fmtRain(event)}</span></span>
+          <span>Day <span className="text-text font-medium">{fmtRain(daily)}</span></span>
+          <span>Wk <span className="text-text font-medium">{fmtRain(weekly)}</span></span>
+          <span>Mo <span className="text-text font-medium">{fmtRain(monthly)}</span></span>
+          <span>Yr <span className="text-text font-medium">{fmtRain(yearly)}</span></span>
           <span>Last <span className="text-text font-medium">{formatLastRain(lastRain)}</span></span>
         </div>
       </div>

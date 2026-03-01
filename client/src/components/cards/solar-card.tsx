@@ -3,7 +3,9 @@ import { Chart } from "react-chartjs-2";
 import { Sun, CloudSun, Cloud, Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
+import { useUnits } from "@/hooks/use-units";
 import { fmt, getStatus } from "@/constants/thresholds";
+import { convertSolar } from "@/constants/units";
 import { getBucketMs, bucketAverage, bucketMax, expandedChartOptions } from "@/constants/chart-utils";
 import type { WeatherReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
@@ -63,8 +65,12 @@ function getSkyCondition(
 }
 
 function ExpandedSolarChart({ range, weatherHistory }: { range: TimeRange; weatherHistory: WeatherReading[] }) {
+  const { solarLabel, units: { solar: solarUnit } } = useUnits();
   const bMs = getBucketMs(range);
-  const solarData = useMemo(() => bucketAverage(weatherHistory, "solar_radiation", bMs), [weatherHistory, bMs]);
+  const solarData = useMemo(
+    () => bucketAverage(weatherHistory, "solar_radiation", bMs).map(p => ({ ...p, y: convertSolar(p.y, solarUnit) })),
+    [weatherHistory, bMs, solarUnit],
+  );
   const uvData = useMemo(() => bucketMax(weatherHistory, "uv_index", bMs), [weatherHistory, bMs]);
   const hasUV = uvData.some((d) => d.y > 0);
 
@@ -72,7 +78,7 @@ function ExpandedSolarChart({ range, weatherHistory }: { range: TimeRange; weath
     datasets: [
       {
         type: "line" as const,
-        label: "Solar Radiation (W/m\u00B2)",
+        label: `Solar Radiation (${solarLabel})`,
         data: solarData,
         borderColor: "#ffc107",
         backgroundColor: "rgba(255, 193, 7, 0.1)",
@@ -100,7 +106,7 @@ function ExpandedSolarChart({ range, weatherHistory }: { range: TimeRange; weath
     ],
   };
 
-  const base = expandedChartOptions(range, "W/m\u00B2");
+  const base = expandedChartOptions(range, solarLabel);
   const options = {
     ...base,
     plugins: {
@@ -126,7 +132,8 @@ function ExpandedSolarChart({ range, weatherHistory }: { range: TimeRange; weath
 }
 
 export function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay }: SolarCardProps) {
-  const flashRad = useFlash(radiation != null ? fmt(radiation, 0) : null);
+  const { fmtSolar, solarLabel, units: { solar: solarUnit } } = useUnits();
+  const flashRad = useFlash(radiation != null ? fmtSolar(radiation) : null);
   const flashUV = useFlash(uvIndex != null ? fmt(uvIndex, 0) : null);
   const flash = flashRad || flashUV;
   const uvStatus = getStatus("uv", uvIndex);
@@ -164,17 +171,17 @@ export function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay
   };
   const sky = getSkyCondition(radiation, quarterMax ? getRef(quarterMax) : null, weatherHistory);
 
-  const { peakRadiation, peakUv, peakUvColor } = useMemo(() => {
+  const { peakRad, peakUv, peakUvColor } = useMemo(() => {
     const midnight = new Date();
     midnight.setHours(0, 0, 0, 0);
     const today = weatherHistory.filter((r) => new Date(r.ts) >= midnight);
     const rads = today.filter((r) => r.solar_radiation != null).map((r) => r.solar_radiation as number);
     const uvs = today.filter((r) => r.uv_index != null).map((r) => r.uv_index as number);
-    const peakRad = rads.length > 0 ? Math.max(...rads) : null;
+    const peakRadVal = rads.length > 0 ? Math.max(...rads) : null;
     const peakUvVal = uvs.length > 0 ? Math.max(...uvs) : null;
     const peakUvStatus = getStatus("uv", peakUvVal);
     return {
-      peakRadiation: peakRad != null ? fmt(peakRad, 0) : "--",
+      peakRad: peakRadVal,
       peakUv: peakUvVal != null ? fmt(peakUvVal, 0) : "--",
       peakUvColor: peakUvStatus.level ? UV_COLORS[peakUvStatus.level] : "#7a8ba8",
     };
@@ -190,9 +197,9 @@ export function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay
       buckets.set(bucketTs, { sum: existing.sum + (r.solar_radiation as number), count: existing.count + 1 });
     }
     return Array.from(buckets.entries())
-      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: d.sum / d.count }))
+      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: convertSolar(d.sum / d.count, solarUnit) }))
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
-  }, [weatherHistory]);
+  }, [weatherHistory, solarUnit]);
 
   const hourlyUV = useMemo(() => {
     const buckets = new Map<number, number>();
@@ -286,9 +293,9 @@ export function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay
           <div className="flex flex-col">
             <div className="flex items-baseline gap-1">
               <span className="text-3xl font-semibold leading-none text-yellow tracking-tight">
-                {fmt(radiation, 0)}
+                {fmtSolar(radiation)}
               </span>
-              <span className="text-sm text-dim">W/m²</span>
+              <span className="text-sm text-dim">{solarLabel}</span>
             </div>
             <span className="text-[0.75rem] text-text font-medium mt-1">Radiation</span>
           </div>
@@ -314,7 +321,7 @@ export function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay
         </div>
 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim">
-          <span>Peak <span className="text-text font-medium">{peakRadiation} W/m²</span></span>
+          <span>Peak <span className="text-text font-medium">{fmtSolar(peakRad)} {solarLabel}</span></span>
           <span>Peak UV <span className="font-medium" style={{ color: peakUvColor }}>{peakUv}</span></span>
         </div>
       </div>

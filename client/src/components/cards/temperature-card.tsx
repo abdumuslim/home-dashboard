@@ -3,7 +3,9 @@ import { Line } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
+import { useUnits } from "@/hooks/use-units";
 import { fmt, getTempColor } from "@/constants/thresholds";
+import { convertTemp, convertTempDelta } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
 import type { WeatherReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
@@ -17,14 +19,18 @@ interface TemperatureCardProps {
 }
 
 function ExpandedTemperatureChart({ range, weatherHistory }: { range: TimeRange; weatherHistory: WeatherReading[] }) {
+  const { tempLabel, units: { temperature: tempUnit } } = useUnits();
   const bMs = getBucketMs(range);
-  const tempData = useMemo(() => bucketAverage(weatherHistory, "temp_c", bMs), [weatherHistory, bMs]);
+  const tempData = useMemo(
+    () => bucketAverage(weatherHistory, "temp_c", bMs).map(p => ({ ...p, y: convertTemp(p.y, tempUnit) })),
+    [weatherHistory, bMs, tempUnit],
+  );
   const humData = useMemo(() => bucketAverage(weatherHistory, "humidity", bMs), [weatherHistory, bMs]);
 
   const data = {
     datasets: [
       {
-        label: "Temperature (°C)",
+        label: `Temperature (${tempLabel})`,
         data: tempData,
         borderColor: "#00d4ff",
         backgroundColor: "rgba(0, 212, 255, 0.1)",
@@ -51,15 +57,16 @@ function ExpandedTemperatureChart({ range, weatherHistory }: { range: TimeRange;
     ],
   };
 
+  const base = expandedChartOptions(range, tempLabel);
   const options = {
-    ...expandedChartOptions(range, "°C"),
+    ...base,
     plugins: {
-      ...expandedChartOptions(range, "°C").plugins,
+      ...base.plugins,
       legend: { display: true, labels: { color: "#7a8ba8", boxWidth: 12, padding: 16 } },
     },
     scales: {
-      ...expandedChartOptions(range, "°C").scales,
-      y: { ...expandedChartOptions(range, "°C").scales.y, ticks: { ...expandedChartOptions(range, "°C").scales.y.ticks, stepSize: 2 } },
+      ...base.scales,
+      y: { ...base.scales.y, ticks: { ...base.scales.y.ticks, stepSize: 2 } },
       y2: {
         position: "right" as const,
         title: { display: true, text: "%", color: "#7a8ba8", font: { size: 11 } },
@@ -75,7 +82,8 @@ function ExpandedTemperatureChart({ range, weatherHistory }: { range: TimeRange;
 }
 
 export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHistory = [], openOverlay }: TemperatureCardProps) {
-  const flash = useFlash(temp != null ? fmt(temp, 1) : null);
+  const { fmtTemp, tempLabel, units: { temperature: tempUnit } } = useUnits();
+  const flash = useFlash(temp != null ? fmtTemp(temp) : null);
 
   const { hiTemp, loTemp } = useMemo(() => {
     const midnight = new Date();
@@ -116,9 +124,9 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
       buckets.set(bucketTs, { sum: existing.sum + (r.temp_c as number), count: existing.count + 1 });
     }
     return Array.from(buckets.entries())
-      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: d.sum / d.count }))
+      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: convertTemp(d.sum / d.count, tempUnit) }))
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
-  }, [weatherHistory]);
+  }, [weatherHistory, tempUnit]);
 
   const chartData = {
     datasets: [
@@ -171,10 +179,10 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
         <div className="flex items-baseline gap-8 mb-2">
           <div className="flex flex-col">
             <span className="text-3xl font-semibold leading-none tracking-tight" style={{ color: getTempColor(temp) }}>
-              {fmt(temp, 1)}<span className="text-xl">&deg;C</span>
+              {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
               {tempDelta != null && tempDelta !== 0 && (
                 <span className={`text-xs ml-1.5 font-medium ${tempDelta > 0 ? "text-red-400" : "text-blue-400"}`}>
-                  {tempDelta > 0 ? "\u2191" : "\u2193"}{fmt(Math.abs(tempDelta), 1)}&deg;
+                  {tempDelta > 0 ? "\u2191" : "\u2193"}{fmt(Math.abs(convertTempDelta(tempDelta, tempUnit)), 1)}&deg;
                 </span>
               )}
             </span>
@@ -198,14 +206,14 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
           {hiTemp != null && loTemp != null && (
             <span>
               <span className="text-red-400">&uarr;</span>
-              <span className="text-text font-medium">{fmt(hiTemp, 1)}&deg;</span>
+              <span className="text-text font-medium">{fmtTemp(hiTemp)}&deg;</span>
               {" "}
               <span className="text-blue-400">&darr;</span>
-              <span className="text-text font-medium">{fmt(loTemp, 1)}&deg;</span>
+              <span className="text-text font-medium">{fmtTemp(loTemp)}&deg;</span>
             </span>
           )}
-          <span>Dew Point <span className="text-text font-medium">{fmt(dewPoint, 1)}&deg;C</span></span>
-          <span>Feels Like <span className="text-text font-medium">{fmt(feelsLike, 1)}&deg;C</span></span>
+          <span>Dew Point <span className="text-text font-medium">{fmtTemp(dewPoint)}{tempLabel}</span></span>
+          <span>Feels Like <span className="text-text font-medium">{fmtTemp(feelsLike)}{tempLabel}</span></span>
         </div>
       </div>
 
