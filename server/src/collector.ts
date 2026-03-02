@@ -51,6 +51,20 @@ interface AirRow {
   battery: number | null;
 }
 
+interface QpSensorFields {
+  temperature?: { value: number };
+  humidity?: { value: number };
+  co2?: { value: number };
+  pm25?: { value: number };
+  pm10?: { value: number };
+  tvoc_index?: { value: number };
+  noise?: { value: number };
+  battery?: { value: number };
+}
+
+const QP_MSG_SETTINGS_ACK = "28";
+const QP_MSG_INTERVAL_CONFIG = "17";
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AWData = Record<string, any>;
 
@@ -133,6 +147,7 @@ export class Collector {
     } catch (err) {
       console.error("[collector] Prayer notification check failed:", err);
     }
+
   }
 
   private async checkPrayerNotifications(): Promise<void> {
@@ -189,7 +204,7 @@ export class Collector {
 
       try {
         await webpush.sendNotification(
-          JSON.parse(row.subscription as string),
+          row.subscription,
           JSON.stringify({ title, body, prayer, minutesLeft: minutesBefore })
         );
         sent++;
@@ -402,8 +417,22 @@ export class Collector {
     return records.length;
   }
 
+  private toAirRow(ts: Date, d: QpSensorFields): AirRow {
+    return {
+      ts,
+      temperature: d.temperature?.value ?? null,
+      humidity: d.humidity?.value ?? null,
+      co2: d.co2?.value ?? null,
+      pm25: d.pm25?.value ?? null,
+      pm10: d.pm10?.value ?? null,
+      tvoc: d.tvoc_index?.value ?? null,
+      noise: d.noise?.value ?? null,
+      battery: d.battery?.value ?? null,
+    };
+  }
+
   private async backfillQingpingHistory(): Promise<void> {
-    const mac = "582D3470F981";
+    const mac = this.config.mqttQingpingMac;
     const thirtyDaysAgo = Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000);
 
     // Check how far back we already have data
@@ -439,16 +468,8 @@ export class Collector {
           throw new Error(`QP history API ${resp.status}: ${await resp.text()}`);
         }
 
-        interface QpHistoryItem {
+        interface QpHistoryItem extends QpSensorFields {
           timestamp: { value: number };
-          temperature?: { value: number };
-          humidity?: { value: number };
-          co2?: { value: number };
-          pm25?: { value: number };
-          pm10?: { value: number };
-          tvoc_index?: { value: number };
-          noise?: { value: number };
-          battery?: { value: number };
         }
         interface QpHistoryResponse {
           total?: number;
@@ -460,18 +481,7 @@ export class Collector {
         if (items.length === 0) break;
 
         for (const d of items) {
-          const row: AirRow = {
-            ts: new Date(d.timestamp.value * 1000),
-            temperature: d.temperature?.value ?? null,
-            humidity: d.humidity?.value ?? null,
-            co2: d.co2?.value ?? null,
-            pm25: d.pm25?.value ?? null,
-            pm10: d.pm10?.value ?? null,
-            tvoc: d.tvoc_index?.value ?? null,
-            noise: d.noise?.value ?? null,
-            battery: d.battery?.value ?? null,
-          };
-          await this.storeAir(row);
+          await this.storeAir(this.toAirRow(new Date(d.timestamp.value * 1000), d));
         }
 
         totalCount += items.length;
@@ -539,19 +549,9 @@ export class Collector {
   private async handleMqttMessage(payload: Buffer): Promise<void> {
     const raw = payload.toString("utf-8");
 
-    interface QpMqttSensorData {
-      temperature?: { value: number };
-      humidity?: { value: number };
-      co2?: { value: number };
-      pm25?: { value: number };
-      pm10?: { value: number };
-      tvoc_index?: { value: number };
-      noise?: { value: number };
-      battery?: { value: number };
-    }
     interface QpMqttPayload {
       type?: string;
-      sensorData?: QpMqttSensorData[];
+      sensorData?: QpSensorFields[];
     }
 
     let msg: QpMqttPayload;
@@ -562,7 +562,7 @@ export class Collector {
       return;
     }
 
-    if (msg.type === "28") {
+    if (msg.type === QP_MSG_SETTINGS_ACK) {
       console.log("[collector] MQTT: received settings ack");
       return;
     }
@@ -573,18 +573,7 @@ export class Collector {
       return;
     }
 
-    const row: AirRow = {
-      ts: new Date(),
-      temperature: sensors.temperature?.value ?? null,
-      humidity: sensors.humidity?.value ?? null,
-      co2: sensors.co2?.value ?? null,
-      pm25: sensors.pm25?.value ?? null,
-      pm10: sensors.pm10?.value ?? null,
-      tvoc: sensors.tvoc_index?.value ?? null,
-      noise: sensors.noise?.value ?? null,
-      battery: sensors.battery?.value ?? null,
-    };
-
+    const row = this.toAirRow(new Date(), sensors);
     await this.storeAir(row);
     this.lastMqttMessage = Date.now();
     console.log(`[collector] MQTT air reading stored at ${row.ts.toISOString()}`);
@@ -599,7 +588,7 @@ export class Collector {
     const cfg = {
       id: Date.now(),
       need_ack: 1,
-      type: "17",
+      type: QP_MSG_INTERVAL_CONFIG,
       setting: {
         report_interval: 30,
         collect_interval: 30,
@@ -664,7 +653,7 @@ export class Collector {
     }
 
     interface QpDevice {
-      data: Record<string, { value: number }>;
+      data: QpSensorFields & { timestamp: { value: number } };
     }
     interface QpResponse {
       devices?: QpDevice[];
@@ -676,19 +665,7 @@ export class Collector {
       return;
     }
     const data = body.devices[0].data;
-    const ts = new Date(data.timestamp.value * 1000);
-
-    const row: AirRow = {
-      ts,
-      temperature: data.temperature?.value ?? null,
-      humidity: data.humidity?.value ?? null,
-      co2: data.co2?.value ?? null,
-      pm25: data.pm25?.value ?? null,
-      pm10: data.pm10?.value ?? null,
-      tvoc: data.tvoc_index?.value ?? null,
-      noise: data.noise?.value ?? null,
-      battery: data.battery?.value ?? null,
-    };
+    const row = this.toAirRow(new Date(data.timestamp.value * 1000), data);
     await this.storeAir(row);
     console.log(`[collector] Stored air reading at ${row.ts.toISOString()}`);
   }
