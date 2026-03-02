@@ -12,10 +12,6 @@ interface OutdoorSectionProps {
 
 export function OutdoorSection({ weather, weatherHistory, openOverlay }: OutdoorSectionProps) {
   return (
-    <section className="mb-6">
-      <div className="px-0.5 pt-5 pb-3">
-        <h2 className="text-base font-medium tracking-wider text-white">OUTDOOR <span className="text-dim text-sm tracking-normal ml-1">(WS-2000)</span></h2>
-      </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <TemperatureCard
           temp={weather?.temp_c}
@@ -52,6 +48,5 @@ export function OutdoorSection({ weather, weatherHistory, openOverlay }: Outdoor
           openOverlay={openOverlay}
         />
       </div>
-    </section>
   );
 }
