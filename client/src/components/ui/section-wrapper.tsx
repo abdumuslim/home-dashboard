@@ -44,7 +44,7 @@ export function SectionWrapper({
 
         <div className="flex items-center gap-1">
           {headerRight}
-          <div className="flex items-center gap-0.5 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
+          <div className="flex items-center gap-0.5 md:hidden md:group-hover:flex">
             {!isFirst && (
               <button
                 onClick={onMoveUp}
