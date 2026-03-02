@@ -243,12 +243,12 @@ export function RainfallCard({
       <div className="flex flex-col z-10 w-full mb-[100px]">
         <h3 className="text-[0.95rem] font-medium text-text mb-2">Rainfall</h3>
 
-        <div className="flex items-end gap-8 mb-2">
+        <div className="flex items-end gap-3 md:gap-8 mb-2">
           <div className="flex flex-col">
             <div className="flex items-end gap-1.5">
               <RainDrop rate={hourly} />
               <div className="flex items-baseline gap-1">
-                <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
+                <span className="text-2xl md:text-3xl font-semibold leading-none text-cyan tracking-tight">
                   {fmtRain(hourly)}
                 </span>
                 <span className="text-sm text-dim">{rainLabel}</span>
@@ -259,7 +259,7 @@ export function RainfallCard({
 
           <div className="flex flex-col">
             <div className="flex items-baseline gap-1">
-              <span className="text-3xl font-semibold leading-none tracking-tight" style={{ color: "#10b981" }}>
+              <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight" style={{ color: "#10b981" }}>
                 {fmtPressure(pressure)}
               </span>
               <span className="text-sm text-dim">{pressureLabel}</span>

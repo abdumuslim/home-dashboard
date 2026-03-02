@@ -14,7 +14,7 @@ export function Header({ weatherTs, airTs, onOpenSettings }: HeaderProps) {
   const airAgo = getAgo(airTs);
 
   return (
-    <header className="flex justify-between items-center px-5 py-2.5 border-b border-card-border">
+    <header className="flex flex-wrap justify-between items-center px-5 py-2.5 border-b border-card-border gap-y-2">
       <div>
         <span className="font-mono text-[0.85rem] text-text">{formatTime()}</span>
       </div>

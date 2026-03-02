@@ -34,44 +34,44 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
     ? calcFeelsLike(air.temperature, air.humidity) : undefined;
 
   return (
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-        <IndoorCard
-          title="Mom"
-          icon={<Home className="w-full h-full" />}
-          iconColor="blue"
-          temp={weather?.temp_indoor_c}
-          humidity={weather?.humidity_indoor}
-          dewPoint={weather?.dew_point_indoor_c}
-          feelsLike={weather?.feels_like_indoor_c}
-          history={weatherHistory}
-          metricKey="temp_indoor_c"
-          openOverlay={openOverlay}
-        />
-        <IndoorCard
-          title="Abdu"
-          icon={<User className="w-full h-full" />}
-          iconColor="purple"
-          temp={weather?.temp_ch8_c}
-          humidity={weather?.humidity_ch8}
-          dewPoint={weather?.dew_point_ch8_c}
-          feelsLike={weather?.feels_like_ch8_c}
-          history={weatherHistory}
-          metricKey="temp_ch8_c"
-          openOverlay={openOverlay}
-        />
-        <IndoorCard
-          title="Kitchen"
-          icon={<CookingPot className="w-full h-full" />}
-          iconColor="green"
-          temp={air?.temperature}
-          humidity={air?.humidity}
-          dewPoint={kitchenDewPoint}
-          feelsLike={kitchenFeelsLike}
-          noise={air?.noise}
-          history={airHistory}
-          metricKey="temperature"
-          openOverlay={openOverlay}
-        />
-      </div>
+    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+      <IndoorCard
+        title="Mom"
+        icon={<Home className="w-full h-full" />}
+        iconColor="blue"
+        temp={weather?.temp_indoor_c}
+        humidity={weather?.humidity_indoor}
+        dewPoint={weather?.dew_point_indoor_c}
+        feelsLike={weather?.feels_like_indoor_c}
+        history={weatherHistory}
+        metricKey="temp_indoor_c"
+        openOverlay={openOverlay}
+      />
+      <IndoorCard
+        title="Abdu"
+        icon={<User className="w-full h-full" />}
+        iconColor="purple"
+        temp={weather?.temp_ch8_c}
+        humidity={weather?.humidity_ch8}
+        dewPoint={weather?.dew_point_ch8_c}
+        feelsLike={weather?.feels_like_ch8_c}
+        history={weatherHistory}
+        metricKey="temp_ch8_c"
+        openOverlay={openOverlay}
+      />
+      <IndoorCard
+        title="Kitchen"
+        icon={<CookingPot className="w-full h-full" />}
+        iconColor="green"
+        temp={air?.temperature}
+        humidity={air?.humidity}
+        dewPoint={kitchenDewPoint}
+        feelsLike={kitchenFeelsLike}
+        noise={air?.noise}
+        history={airHistory}
+        metricKey="temperature"
+        openOverlay={openOverlay}
+      />
+    </div>
   );
 }
