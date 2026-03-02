@@ -49,7 +49,7 @@ export function PrayerCard({ prayer }: { prayer: PrayerInfo }) {
         {formattedTime}
       </span>
 
-      <span className="text-sm font-medium" style={{ color: accentColor }}>
+      <span className="text-2xl font-bold font-[tabular-nums]" style={{ color: accentColor }}>
         {isPassed ? "Passed" : countdown}
       </span>
     </div>
