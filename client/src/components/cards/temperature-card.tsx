@@ -193,9 +193,9 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
       <div className="flex flex-col z-10 w-full mb-[100px]">
         <h3 className="text-[0.95rem] font-medium text-text mb-2">Temp &amp; Humidity</h3>
 
-        <div className="flex items-baseline gap-8 mb-2">
+        <div className="flex items-baseline gap-4 md:gap-8 mb-2">
           <div className="flex flex-col">
-            <span className="text-3xl font-semibold leading-none tracking-tight" style={{ color: getTempColor(temp) }}>
+            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight" style={{ color: getTempColor(temp) }}>
               {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
               {tempDelta != null && (
                 <span className={`text-sm ml-1.5 font-medium ${tempDelta > 0 ? "text-red-400" : tempDelta < 0 ? "text-blue-400" : "text-white"}`}>
@@ -208,7 +208,7 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
           </div>
 
           <div className="flex flex-col">
-            <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
+            <span className="text-2xl md:text-3xl font-semibold leading-none text-cyan tracking-tight">
               {fmt(humidity, 0)}<span className="text-xl">%</span>
               {humDelta != null && (
                 <span className={`text-sm ml-1.5 font-medium ${humDelta > 0 ? "text-red-400" : humDelta < 0 ? "text-blue-400" : "text-white"}`}>

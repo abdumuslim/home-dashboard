@@ -216,16 +216,16 @@ export function IndoorCard({
       <div className="flex flex-col z-10 w-full mb-[100px]">
         <h3 className="text-[0.95rem] font-medium text-text mb-2">{title}</h3>
 
-        <div className="flex items-baseline gap-5">
+        <div className="flex items-baseline gap-3 md:gap-5">
           <div className="flex flex-col">
-            <span className="text-3xl font-semibold leading-none tracking-tight text-cyan">
+            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight text-cyan">
               {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Temp.</span>
           </div>
 
           <div className="flex flex-col">
-            <span className="text-3xl font-semibold leading-none tracking-tight text-cyan">
+            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight text-cyan">
               {fmt(humidity, 0)}<span className="text-xl">%</span>
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Humidity</span>

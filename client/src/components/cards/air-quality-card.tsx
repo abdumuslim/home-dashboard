@@ -192,35 +192,35 @@ export function AirQualityCard({
   };
 
   return (
-    <MetricCard flash={flash} className="p-4 pb-0 flex flex-col !min-h-[200px]">
-      <div className="flex items-center gap-5 z-10 w-full mb-[70px]">
-        <div className="relative shrink-0 w-[80px] h-[80px] flex justify-center items-center">
-          <svg width="80" height="80" viewBox="0 0 80 80" className="absolute inset-0">
+    <MetricCard flash={flash} className="p-3 sm:p-4 pb-0 flex flex-col !min-h-[200px]">
+      <div className="flex items-center gap-2 md:gap-5 z-10 w-full mb-[70px]">
+        <div className="relative shrink-0 size-[60px] md:size-[80px] flex justify-center items-center">
+          <svg viewBox="0 0 80 80" className="absolute inset-0 w-full h-full">
             <circle cx="40" cy="40" r="36" fill="rgba(255,255,255,0.02)" stroke="rgba(255,255,255,0.06)" strokeWidth="4" />
             <circle cx="40" cy="40" r="36" fill="transparent" stroke={activeColor} strokeWidth="4" />
           </svg>
           <div className="flex flex-col items-center justify-center z-10 w-full text-center px-1 mt-1">
-            <span className="text-xl font-semibold leading-none text-white tracking-tight">
+            <span className="text-lg md:text-xl font-semibold leading-none text-white tracking-tight">
               {value ?? "--"}
             </span>
-            <span className="text-[0.6rem] font-medium text-dim mt-0.5">{unit}</span>
+            <span className="text-[0.55rem] md:text-[0.6rem] font-medium text-dim mt-0.5">{unit}</span>
           </div>
         </div>
 
-        <div className="flex flex-col flex-1 justify-center max-w-full overflow-hidden">
-          <h3 className="text-[0.95rem] font-medium text-text mb-2 truncate">{title}</h3>
-          <div className="text-[0.95rem] font-semibold truncate" style={{ color: activeColor }}>
+        <div className="flex flex-col flex-1 justify-center min-w-0">
+          <h3 className="text-[0.95rem] font-medium text-text mb-1 truncate">{title}</h3>
+          <div className="text-[0.85rem] sm:text-[0.95rem] font-semibold truncate" style={{ color: activeColor }}>
             {status.label}
           </div>
         </div>
-
-        {hi != null && lo != null && (
-          <div className="flex flex-col items-end shrink-0 text-xs text-dim gap-0.5">
-            <span><span className="text-red-400">&uarr;</span> <span className="text-text font-medium">{fmt(hi, 0)}</span></span>
-            <span><span className="text-blue-400">&darr;</span> <span className="text-text font-medium">{fmt(lo, 0)}</span></span>
-          </div>
-        )}
       </div>
+
+      {hi != null && lo != null && (
+        <div className="absolute right-3 top-[80px] z-10 flex items-center gap-3 text-xs text-dim">
+          <span><span className="text-red-400">&uarr;</span> <span className="text-text font-medium">{fmt(hi, 0)}</span></span>
+          <span><span className="text-blue-400">&darr;</span> <span className="text-text font-medium">{fmt(lo, 0)}</span></span>
+        </div>
+      )}
 
       <div
         className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer"

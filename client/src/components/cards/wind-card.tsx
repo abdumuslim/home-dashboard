@@ -173,10 +173,10 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
       <div className="flex flex-col z-10 w-full mb-[100px]">
         <h3 className="text-[0.95rem] font-medium text-text mb-2">Wind</h3>
 
-        <div className="flex items-start gap-6 mb-2">
+        <div className="flex items-start gap-3 md:gap-6 mb-2">
           <div className="flex flex-col">
             <div className="flex items-baseline gap-1">
-              <span className="text-3xl font-semibold leading-none text-cyan tracking-tight">
+              <span className="text-2xl md:text-3xl font-semibold leading-none text-cyan tracking-tight">
                 {fmtWind(speed)}
               </span>
               <span className="text-sm text-dim">{windLabel}</span>
@@ -186,7 +186,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
 
           <div className="flex flex-col">
             <div className="flex items-baseline gap-1">
-              <span className="text-3xl font-semibold leading-none tracking-tight" style={{ color: "#f59e0b" }}>
+              <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight" style={{ color: "#f59e0b" }}>
                 {fmtWind(currentMedian)}
               </span>
               <span className="text-sm text-dim">{windLabel}</span>
@@ -194,7 +194,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
             <span className="text-[0.75rem] text-text font-medium mt-1">10Min Med</span>
           </div>
 
-          <div className="relative w-[72px] h-[72px] rounded-full border-2 border-[#1e2f50] flex flex-col items-center justify-center bg-transparent shrink-0 ml-auto">
+          <div className="relative size-[60px] md:size-[72px] rounded-full border-2 border-[#1e2f50] flex flex-col items-center justify-center bg-transparent shrink-0 ml-auto">
             <span className="text-sm font-medium text-cyan z-10">{degDir(dir)}</span>
 
             <div
