@@ -9,12 +9,6 @@ interface AirQualitySectionProps {
 
 export function AirQualitySection({ air, airHistory, openOverlay }: AirQualitySectionProps) {
   return (
-    <section className="mb-6">
-      <div className="px-0.5 pt-5 pb-3">
-        <h2 className="text-base font-medium tracking-wider text-white">
-          AIR QUALITY <span className="text-dim text-[0.85rem] tracking-normal ml-2">Qingping CGS1 {air?.battery ?? "--"}%</span>
-        </h2>
-      </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <AirQualityCard
           title="PM2.5"
@@ -49,6 +43,5 @@ export function AirQualitySection({ air, airHistory, openOverlay }: AirQualitySe
           openOverlay={openOverlay}
         />
       </div>
-    </section>
   );
 }

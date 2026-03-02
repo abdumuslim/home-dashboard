@@ -34,10 +34,6 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
     ? calcFeelsLike(air.temperature, air.humidity) : undefined;
 
   return (
-    <section className="mb-6">
-      <div className="px-0.5 pt-5 pb-3">
-        <h2 className="text-base font-medium tracking-wider text-white">INDOOR</h2>
-      </div>
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
         <IndoorCard
           title="Mom"
@@ -77,6 +73,5 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
           openOverlay={openOverlay}
         />
       </div>
-    </section>
   );
 }
