@@ -34,9 +34,9 @@ D:\dev\home\
 ├── server/                 # Node.js backend (Express + TypeScript)
 │   ├── src/
 │   │   ├── index.ts        # Express app, static serving, collector startup
-│   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status)
+│   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status, /api/alerts CRUD)
 │   │   ├── collector.ts    # Collector class (AW polling + Qingping MQTT/cloud + alert checking)
-│   │   ├── alert-metrics.ts # Shared metrics catalog + getMetricValue helper
+│   │   ├── alert-metrics.ts # Shared metrics catalog, getMetricValue, PRAYER_LABELS
 │   │   ├── database.ts     # pg pool, schema init, migrations
 │   │   └── config.ts       # Env vars (dotenv)
 │   ├── package.json

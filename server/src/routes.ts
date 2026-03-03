@@ -192,14 +192,6 @@ export function createRouter(pool: pg.Pool, config?: Config): Router {
 
   // ---------- Alerts ----------
 
-  router.get("/api/alert-metrics", (_req: Request, res: Response) => {
-    const metrics: Record<string, { label: string; unit: string; group: string; min: number; max: number }> = {};
-    for (const [key, def] of Object.entries(ALERT_METRICS)) {
-      metrics[key] = { label: def.label, unit: def.unit, group: def.group, min: def.min, max: def.max };
-    }
-    res.json({ metrics, prayerNames: [...VALID_PRAYER_NAMES] });
-  });
-
   router.get("/api/alerts", async (req: Request, res: Response) => {
     const endpoint = req.query.endpoint as string;
     if (!endpoint) {

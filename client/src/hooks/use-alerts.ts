@@ -1,12 +1,18 @@
 import { useState, useEffect, useCallback } from "react";
 import type { AlertRule } from "@/types/alerts";
-import { ALERT_METRICS, PRAYER_NAMES } from "@/constants/alert-metrics";
+
+async function throwIfNotOk(resp: Response): Promise<void> {
+  if (resp.ok) return;
+  const text = await resp.text();
+  let msg = `Server error (${resp.status})`;
+  try { msg = (JSON.parse(text) as { error: string }).error; } catch { /* not JSON */ }
+  throw new Error(msg);
+}
 
 export function useAlerts(endpoint: string | null) {
   const [alerts, setAlerts] = useState<AlertRule[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Fetch alerts when endpoint changes
   const fetchAlerts = useCallback(async () => {
     if (!endpoint) {
       setAlerts([]);
@@ -39,12 +45,7 @@ export function useAlerts(endpoint: string | null) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ endpoint, ...body }),
       });
-      if (!resp.ok) {
-        const text = await resp.text();
-        let msg = `Server error (${resp.status})`;
-        try { msg = (JSON.parse(text) as { error: string }).error; } catch { /* not JSON */ }
-        throw new Error(msg);
-      }
+      await throwIfNotOk(resp);
       await fetchAlerts();
     },
     [endpoint, fetchAlerts],
@@ -58,12 +59,7 @@ export function useAlerts(endpoint: string | null) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ endpoint, ...body }),
       });
-      if (!resp.ok) {
-        const text = await resp.text();
-        let msg = `Server error (${resp.status})`;
-        try { msg = (JSON.parse(text) as { error: string }).error; } catch { /* not JSON */ }
-        throw new Error(msg);
-      }
+      await throwIfNotOk(resp);
       await fetchAlerts();
     },
     [endpoint, fetchAlerts],
@@ -72,13 +68,14 @@ export function useAlerts(endpoint: string | null) {
   const deleteAlert = useCallback(
     async (alertId: number) => {
       if (!endpoint) return;
-      await fetch(`/api/alerts/${alertId}?endpoint=${encodeURIComponent(endpoint)}`, {
+      const resp = await fetch(`/api/alerts/${alertId}?endpoint=${encodeURIComponent(endpoint)}`, {
         method: "DELETE",
       });
+      await throwIfNotOk(resp);
       await fetchAlerts();
     },
     [endpoint, fetchAlerts],
   );
 
-  return { alerts, metrics: ALERT_METRICS, prayerNames: [...PRAYER_NAMES], loading, createAlert, updateAlert, deleteAlert };
+  return { alerts, loading, createAlert, updateAlert, deleteAlert };
 }

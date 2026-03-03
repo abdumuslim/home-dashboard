@@ -38,6 +38,10 @@ export const ALERT_METRICS: Record<string, MetricDef> = {
 
 export const VALID_PRAYER_NAMES = ["fajr", "dhuhr", "asr", "maghrib", "isha"] as const;
 
+export const PRAYER_LABELS: Record<string, string> = {
+  fajr: "Fajr", dhuhr: "Dhuhr", asr: "Asr", maghrib: "Maghrib", isha: "Isha",
+};
+
 export function getMetricValue(
   metric: string,
   weather: Record<string, unknown> | null,

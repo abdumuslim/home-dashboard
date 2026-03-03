@@ -3,7 +3,7 @@ import webpush from "web-push";
 import mqtt from "mqtt";
 import { Coordinates, CalculationMethod, PrayerTimes } from "adhan";
 import type { Config } from "./config.js";
-import { getMetricValue, ALERT_METRICS } from "./alert-metrics.js";
+import { getMetricValue, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 
 interface WeatherRow {
   ts: Date;
@@ -77,10 +77,7 @@ const BAGHDAD_COORDS = new Coordinates(33.321502, 44.358335);
 const PRAYER_PARAMS = CalculationMethod.Dubai();
 PRAYER_PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
 
-const PRAYER_NAMES = ["fajr", "dhuhr", "asr", "maghrib", "isha"] as const;
-const PRAYER_LABELS: Record<string, string> = {
-  fajr: "Fajr", dhuhr: "Dhuhr", asr: "Asr", maghrib: "Maghrib", isha: "Isha",
-};
+const PRAYER_NAMES = VALID_PRAYER_NAMES;
 
 interface AlertRule {
   id: number;
@@ -113,6 +110,8 @@ export class Collector {
   private latestWeatherTs: Date | null = null;
   private latestAirRow: Record<string, unknown> | null = null;
   private latestAirTs: Date | null = null;
+  private cachedPrayerTimes: PrayerTimes | null = null;
+  private cachedPrayerDateKey = "";
 
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
@@ -180,6 +179,12 @@ export class Collector {
     );
     this.alertRules = result.rows as AlertRule[];
     this.alertRulesLastFetch = Date.now();
+
+    // Prune stale sensor alert state for deleted rules
+    const activeIds = new Set(this.alertRules.map((r) => r.id));
+    for (const id of this.sensorAlertState.keys()) {
+      if (!activeIds.has(id)) this.sensorAlertState.delete(id);
+    }
   }
 
   private async checkAlerts(): Promise<void> {
@@ -233,8 +238,12 @@ export class Collector {
       }
     }
 
-    // Check prayer alerts
-    const pt = new PrayerTimes(BAGHDAD_COORDS, now, PRAYER_PARAMS);
+    // Check prayer alerts (cache PrayerTimes per day — changes only at midnight)
+    if (dateKey !== this.cachedPrayerDateKey) {
+      this.cachedPrayerTimes = new PrayerTimes(BAGHDAD_COORDS, now, PRAYER_PARAMS);
+      this.cachedPrayerDateKey = dateKey;
+    }
+    const pt = this.cachedPrayerTimes!;
     const nowMs = now.getTime();
 
     for (const rule of this.alertRules) {
