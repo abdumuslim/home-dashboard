@@ -21,6 +21,15 @@ export function useClock() {
     });
   }, [now]);
 
+  const formatDate = useCallback(() => {
+    return new Date(now).toLocaleDateString("en-US", {
+      timeZone: TZ,
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+    });
+  }, [now]);
+
   const getAgo = useCallback(
     (ts: string | null | undefined): { text: string; status: ConnectionStatus } => {
       if (!ts) return { text: "offline", status: "offline" };
@@ -33,5 +42,5 @@ export function useClock() {
     [now]
   );
 
-  return { formatTime, getAgo };
+  return { formatTime, formatDate, getAgo };
 }

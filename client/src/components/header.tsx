@@ -9,14 +9,15 @@ interface HeaderProps {
 }
 
 export function Header({ weatherTs, airTs, onOpenSettings }: HeaderProps) {
-  const { formatTime, getAgo } = useClock();
+  const { formatTime, formatDate, getAgo } = useClock();
   const weatherAgo = getAgo(weatherTs);
   const airAgo = getAgo(airTs);
 
   return (
     <header className="flex flex-wrap justify-between items-center px-5 py-2.5 border-b border-card-border gap-y-2">
-      <div>
+      <div className="flex items-center gap-2">
         <span className="font-mono text-[0.85rem] text-text">{formatTime()}</span>
+        <span className="text-[0.8rem] text-dim">{formatDate()}</span>
       </div>
       <div className="flex gap-4 items-center">
         <StatusPill label="Weather" status={weatherAgo.status} text={weatherAgo.text} />
