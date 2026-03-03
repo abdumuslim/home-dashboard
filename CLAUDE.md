@@ -35,7 +35,8 @@ D:\dev\home\
 │   ├── src/
 │   │   ├── index.ts        # Express app, static serving, collector startup
 │   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status)
-│   │   ├── collector.ts    # Collector class (AW polling + Qingping MQTT/cloud)
+│   │   ├── collector.ts    # Collector class (AW polling + Qingping MQTT/cloud + alert checking)
+│   │   ├── alert-metrics.ts # Shared metrics catalog + getMetricValue helper
 │   │   ├── database.ts     # pg pool, schema init, migrations
 │   │   └── config.ts       # Env vars (dotenv)
 │   ├── package.json
@@ -45,11 +46,11 @@ D:\dev\home\
 │   │   ├── main.tsx        # Entry point, Chart.js registration
 │   │   ├── App.tsx         # Root component with tabs
 │   │   ├── index.css       # Tailwind theme + custom wind/flash CSS
-│   │   ├── hooks/          # useCurrentData, useHistoryData, useClock, useFlash
-│   │   ├── components/     # Header, sections, cards, charts
+│   │   ├── hooks/          # useCurrentData, useHistoryData, useClock, useFlash, useAlerts, usePushNotifications
+│   │   ├── components/     # Header, sections, cards, charts, AlertsModal
 │   │   ├── charts/         # Chart.js wrappers
-│   │   ├── types/          # API type definitions
-│   │   └── constants/      # Thresholds, directions, helpers
+│   │   ├── types/          # API type definitions (api.ts, alerts.ts)
+│   │   └── constants/      # Thresholds, directions, helpers, alert-metrics
 │   ├── vite.config.ts
 │   └── package.json
 ├── mosquitto/              # MQTT broker config
@@ -104,11 +105,12 @@ ssh -i ~/.ssh/vps1_key -o StrictHostKeyChecking=no root@31.97.76.221 "command" >
 
 ## Database Schema
 
-Two tables in the `home` database, both keyed by `ts TIMESTAMPTZ` with BRIN indexes:
-- `weather_readings` — 32 columns (metric units, all conversions done at collection time). Includes outdoor, indoor console, and ch8 "Abdu" sensor data. New columns added via `MIGRATIONS` list in `database.ts`.
-- `air_readings` — 9 columns
+Three tables in the `home` database:
+- `weather_readings` — 32 columns, keyed by `ts TIMESTAMPTZ` with BRIN index (metric units, all conversions done at collection time). Includes outdoor, indoor console, and ch8 "Abdu" sensor data.
+- `air_readings` — 9 columns, keyed by `ts TIMESTAMPTZ` with BRIN index
+- `alert_rules` — per-subscription alert configurations (FK to `push_subscriptions.endpoint` with CASCADE). Fields: `alert_type` (sensor/prayer), `metric`, `condition` (above/below), `threshold`, `prayer_timing` (at_time/before), `prayer_minutes`, `prayer_names TEXT[]`.
 
-Deduplication: `ON CONFLICT (ts) DO NOTHING`. The 30-day history endpoint downsamples to hourly averages.
+New columns/tables added via `MIGRATIONS` list in `database.ts`. Deduplication: `ON CONFLICT (ts) DO NOTHING`. The 30-day history endpoint downsamples to hourly averages.
 
 ## Dashboard Layout
 
