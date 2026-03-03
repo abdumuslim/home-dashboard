@@ -1,6 +1,4 @@
-import { Bell, BellOff } from "lucide-react";
 import { usePrayerTimes } from "@/hooks/use-prayer-times";
-import { usePushNotifications } from "@/hooks/use-push-notifications";
 import { PrayerCard } from "@/components/cards/prayer-card";
 
 export function PrayerSectionHeader() {
@@ -25,34 +23,6 @@ export function PrayerSectionHeader() {
         )}
       </span>
     </h2>
-  );
-}
-
-export function PrayerSectionBell() {
-  const { isSupported, isSubscribed, permission, subscribe, unsubscribe } = usePushNotifications();
-
-  if (!isSupported || permission === "denied") return null;
-
-  const handleBellClick = () => {
-    if (isSubscribed) {
-      unsubscribe();
-    } else {
-      subscribe();
-    }
-  };
-
-  return (
-    <button
-      onClick={handleBellClick}
-      className="p-1.5 rounded-lg transition-colors hover:bg-white/10"
-      title={isSubscribed ? "Disable prayer notifications" : "Enable prayer notifications"}
-    >
-      {isSubscribed ? (
-        <Bell className="w-4 h-4 text-yellow" />
-      ) : (
-        <BellOff className="w-4 h-4 text-dim" />
-      )}
-    </button>
   );
 }
 

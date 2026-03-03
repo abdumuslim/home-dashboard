@@ -1,20 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
 
-const STORAGE_KEY = "home-dashboard-notification-prefs";
-const DEFAULT_BREAKPOINTS = [15, 7, 4, 2, 0];
-
-function loadBreakpoints(): number[] {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) return JSON.parse(stored) as number[];
-  } catch { /* ignore */ }
-  return DEFAULT_BREAKPOINTS;
-}
-
-function saveBreakpoints(bp: number[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(bp));
-}
-
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
   const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
   const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
@@ -30,7 +15,7 @@ export function usePushNotifications() {
   const [permission, setPermission] = useState<NotificationPermission>(
     isSupported ? Notification.permission : "denied"
   );
-  const [breakpoints, setBreakpointsState] = useState<number[]>(loadBreakpoints);
+  const [endpoint, setEndpoint] = useState<string | null>(null);
 
   // Check existing subscription on mount and sync to server
   useEffect(() => {
@@ -38,13 +23,13 @@ export function usePushNotifications() {
     navigator.serviceWorker.ready.then((reg) => {
       reg.pushManager.getSubscription().then((sub) => {
         setIsSubscribed(!!sub);
-        // Re-sync subscription to server on every page load
-        // in case the browser regenerated the push endpoint
         if (sub) {
+          setEndpoint(sub.endpoint);
+          // Re-sync subscription to server on every page load
           fetch("/api/push/subscribe", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ subscription: sub.toJSON(), breakpoints: loadBreakpoints() }),
+            body: JSON.stringify({ subscription: sub.toJSON() }),
           }).catch(() => { /* ignore sync errors */ });
         }
       });
@@ -69,44 +54,29 @@ export function usePushNotifications() {
     await fetch("/api/push/subscribe", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ subscription: sub.toJSON(), breakpoints }),
+      body: JSON.stringify({ subscription: sub.toJSON() }),
     });
 
     setIsSubscribed(true);
-  }, [isSupported, breakpoints]);
+    setEndpoint(sub.endpoint);
+  }, [isSupported]);
 
   const unsubscribe = useCallback(async () => {
     if (!isSupported) return;
     const reg = await navigator.serviceWorker.ready;
     const sub = await reg.pushManager.getSubscription();
     if (sub) {
-      const endpoint = sub.endpoint;
+      const ep = sub.endpoint;
       await sub.unsubscribe();
       await fetch("/api/push/unsubscribe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ endpoint }),
+        body: JSON.stringify({ endpoint: ep }),
       });
     }
     setIsSubscribed(false);
+    setEndpoint(null);
   }, [isSupported]);
 
-  const setBreakpoints = useCallback(async (bp: number[]) => {
-    setBreakpointsState(bp);
-    saveBreakpoints(bp);
-
-    // If already subscribed, update the server
-    if (!isSupported) return;
-    const reg = await navigator.serviceWorker.ready;
-    const sub = await reg.pushManager.getSubscription();
-    if (sub) {
-      await fetch("/api/push/subscribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ subscription: sub.toJSON(), breakpoints: bp }),
-      });
-    }
-  }, [isSupported]);
-
-  return { isSupported, isSubscribed, permission, subscribe, unsubscribe, breakpoints, setBreakpoints };
+  return { isSupported, isSubscribed, permission, endpoint, subscribe, unsubscribe };
 }

@@ -62,7 +62,46 @@ const MIGRATIONS: string[] = [
     breakpoints INTEGER[] DEFAULT '{15,7,4,2,0}',
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`,
+  `CREATE TABLE IF NOT EXISTS alert_rules (
+    id SERIAL PRIMARY KEY,
+    endpoint TEXT NOT NULL REFERENCES push_subscriptions(endpoint) ON DELETE CASCADE,
+    alert_type TEXT NOT NULL CHECK (alert_type IN ('sensor','prayer')),
+    metric TEXT,
+    condition TEXT CHECK (condition IN ('above','below')),
+    threshold REAL,
+    prayer_timing TEXT CHECK (prayer_timing IN ('at_time','before')),
+    prayer_minutes INTEGER,
+    prayer_names TEXT[],
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`,
 ];
+
+async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {
+  const existing = await client.query("SELECT COUNT(*) FROM alert_rules");
+  if (Number(existing.rows[0].count) > 0) return;
+
+  const subs = await client.query(
+    "SELECT endpoint, breakpoints FROM push_subscriptions WHERE breakpoints IS NOT NULL"
+  );
+  if (subs.rowCount === 0) return;
+
+  for (const row of subs.rows) {
+    const bps = (row.breakpoints as number[]) ?? [];
+    for (const bp of bps) {
+      await client.query(
+        `INSERT INTO alert_rules (endpoint, alert_type, prayer_timing, prayer_minutes, prayer_names)
+         VALUES ($1, 'prayer', $2, $3, $4)`,
+        [
+          row.endpoint,
+          bp === 0 ? "at_time" : "before",
+          bp === 0 ? null : bp,
+          ["fajr", "dhuhr", "asr", "maghrib", "isha"],
+        ]
+      );
+    }
+  }
+  console.log(`[database] Migrated legacy breakpoints for ${subs.rowCount} subscriptions`);
+}
 
 export async function createPool(dsn: string): Promise<pg.Pool> {
   // Parse the DSN to connect to the default 'postgres' database first
@@ -93,6 +132,8 @@ export async function initDb(pool: pg.Pool): Promise<void> {
     for (const sql of MIGRATIONS) {
       await client.query(sql);
     }
+    // One-time migration: convert legacy breakpoints to alert_rules
+    await migrateLegacyBreakpoints(client);
   } finally {
     client.release();
   }
