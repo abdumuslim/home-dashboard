@@ -4,12 +4,29 @@ import {
   CalculationMethod,
   PrayerTimes,
   Prayer,
+  Rounding,
 } from "adhan";
 import { TZ } from "@/constants/thresholds";
 
 const BAGHDAD = new Coordinates(33.321502, 44.358335);
 const PARAMS = CalculationMethod.Dubai();
 PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
+PARAMS.rounding = Rounding.None;
+
+// Fajr uses ceiling rounding (matches Iraqi Awqaf — conservative for fasting start)
+// All other prayers use nearest rounding
+function roundPrayerTime(date: Date, prayer: string): Date {
+  const d = new Date(date);
+  const s = d.getSeconds();
+  const ms = d.getMilliseconds();
+  if (prayer === "fajr") {
+    if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
+  } else {
+    if (s >= 30) d.setMinutes(d.getMinutes() + 1);
+  }
+  d.setSeconds(0, 0);
+  return d;
+}
 
 // Sorted by month/day — must stay in chronological order for lookup
 const ISLAMIC_EVENTS = [
@@ -181,7 +198,7 @@ export function usePrayerTimes() {
   const allPassed = nextPrayerEnum === Prayer.None;
 
   const prayers: PrayerInfo[] = PRAYER_ORDER.map(({ key, label }) => {
-    const time = todayPrayers[key] as Date;
+    const time = roundPrayerTime(todayPrayers[key] as Date, key);
     const diffMs = time.getTime() - nowMs;
     const isPassed = diffMs < 0;
     const isNext = !allPassed && nextPrayerEnum === key;
@@ -201,7 +218,7 @@ export function usePrayerTimes() {
   // When all today's prayers have passed, provide tomorrow's Fajr as next
   let nextPrayer: PrayerInfo | null = null;
   if (allPassed) {
-    const fajrTime = tomorrowPrayers.fajr;
+    const fajrTime = roundPrayerTime(tomorrowPrayers.fajr, "fajr");
     const diffMs = fajrTime.getTime() - nowMs;
     nextPrayer = {
       name: "fajr",

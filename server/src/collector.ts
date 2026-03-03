@@ -1,7 +1,7 @@
 import pg from "pg";
 import webpush from "web-push";
 import mqtt from "mqtt";
-import { Coordinates, CalculationMethod, PrayerTimes } from "adhan";
+import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import type { Config } from "./config.js";
 import { getMetricValue, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 
@@ -76,6 +76,20 @@ function sleep(ms: number): Promise<void> {
 const BAGHDAD_COORDS = new Coordinates(33.321502, 44.358335);
 const PRAYER_PARAMS = CalculationMethod.Dubai();
 PRAYER_PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
+PRAYER_PARAMS.rounding = Rounding.None;
+
+function roundPrayerTime(date: Date, prayer: string): Date {
+  const d = new Date(date);
+  const s = d.getSeconds();
+  const ms = d.getMilliseconds();
+  if (prayer === "fajr") {
+    if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
+  } else {
+    if (s >= 30) d.setMinutes(d.getMinutes() + 1);
+  }
+  d.setSeconds(0, 0);
+  return d;
+}
 
 const PRAYER_NAMES = VALID_PRAYER_NAMES;
 
@@ -253,8 +267,9 @@ export class Collector {
       const bp = rule.prayer_timing === "at_time" ? 0 : (rule.prayer_minutes ?? 0);
 
       for (const name of rule.prayer_names) {
-        const prayerTime = pt[name as keyof PrayerTimes] as Date | undefined;
-        if (!(prayerTime instanceof Date)) continue;
+        const rawPrayerTime = pt[name as keyof PrayerTimes] as Date | undefined;
+        if (!(rawPrayerTime instanceof Date)) continue;
+        const prayerTime = roundPrayerTime(rawPrayerTime, name);
 
         const minutesLeft = (prayerTime.getTime() - nowMs) / 60000;
         const key = `alert-${rule.id}-${name}`;
