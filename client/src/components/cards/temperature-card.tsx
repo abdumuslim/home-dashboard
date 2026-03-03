@@ -233,7 +233,7 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
             </span>
           )}
           <span>Dew Point <span className="text-text font-medium">{fmtTemp(dewPoint)}{tempLabel}</span></span>
-          <span>Feels Like <span className="text-text font-medium">{fmtTemp(feelsLike)}{tempLabel}</span></span>
+          <span>Feels Like <span className={`font-medium ${temp != null && feelsLike != null ? (feelsLike > temp ? "text-red-400" : feelsLike < temp ? "text-blue-400" : "text-text") : "text-text"}`}>{fmtTemp(feelsLike)}{tempLabel}</span></span>
         </div>
       </div>
 
