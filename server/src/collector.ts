@@ -3,6 +3,7 @@ import webpush from "web-push";
 import mqtt from "mqtt";
 import { Coordinates, CalculationMethod, PrayerTimes } from "adhan";
 import type { Config } from "./config.js";
+import { getMetricValue, ALERT_METRICS } from "./alert-metrics.js";
 
 interface WeatherRow {
   ts: Date;
@@ -80,7 +81,19 @@ const PRAYER_NAMES = ["fajr", "dhuhr", "asr", "maghrib", "isha"] as const;
 const PRAYER_LABELS: Record<string, string> = {
   fajr: "Fajr", dhuhr: "Dhuhr", asr: "Asr", maghrib: "Maghrib", isha: "Isha",
 };
-const BREAKPOINTS = [15, 7, 4, 2, 0];
+
+interface AlertRule {
+  id: number;
+  endpoint: string;
+  alert_type: "sensor" | "prayer";
+  metric: string | null;
+  condition: "above" | "below" | null;
+  threshold: number | null;
+  prayer_timing: "at_time" | "before" | null;
+  prayer_minutes: number | null;
+  prayer_names: string[] | null;
+  subscription: unknown; // JSONB, already parsed by pg driver
+}
 
 export class Collector {
   private pool: pg.Pool;
@@ -92,6 +105,14 @@ export class Collector {
   private sentDateKey = "";
   private mqttClient: mqtt.MqttClient | null = null;
   private lastMqttMessage = 0;
+  // Alert system
+  private alertRules: AlertRule[] = [];
+  private alertRulesLastFetch = 0;
+  private sensorAlertState = new Map<number, "idle" | "triggered">();
+  private latestWeatherRow: Record<string, unknown> | null = null;
+  private latestWeatherTs: Date | null = null;
+  private latestAirRow: Record<string, unknown> | null = null;
+  private latestAirTs: Date | null = null;
 
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
@@ -143,84 +164,150 @@ export class Collector {
     }
 
     try {
-      await this.checkPrayerNotifications();
+      await this.checkAlerts();
     } catch (err) {
-      console.error("[collector] Prayer notification check failed:", err);
+      console.error("[collector] Alert check failed:", err);
     }
 
   }
 
-  private async checkPrayerNotifications(): Promise<void> {
+  private async refreshAlertRules(): Promise<void> {
+    if (Date.now() - this.alertRulesLastFetch < 30_000) return;
+    const result = await this.pool.query(
+      `SELECT ar.*, ps.subscription
+       FROM alert_rules ar
+       JOIN push_subscriptions ps ON ar.endpoint = ps.endpoint`
+    );
+    this.alertRules = result.rows as AlertRule[];
+    this.alertRulesLastFetch = Date.now();
+  }
+
+  private async checkAlerts(): Promise<void> {
     if (!this.config.vapidPublicKey) return;
+
+    await this.refreshAlertRules();
+    if (this.alertRules.length === 0) return;
 
     const now = new Date();
     const dateKey = now.toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
 
-    // Reset sent set on new day
+    // Reset prayer sent set on new day
     if (dateKey !== this.sentDateKey) {
       this.sentNotifications.clear();
       this.sentDateKey = dateKey;
     }
 
+    // Check sensor alerts
+    const weatherStale = !this.latestWeatherTs || (now.getTime() - this.latestWeatherTs.getTime() > 300_000);
+    const airStale = !this.latestAirTs || (now.getTime() - this.latestAirTs.getTime() > 300_000);
+
+    for (const rule of this.alertRules) {
+      if (rule.alert_type === "sensor") {
+        const def = rule.metric ? ALERT_METRICS[rule.metric] : null;
+        if (!def || !rule.condition || rule.threshold == null) continue;
+
+        // Skip if source data is stale
+        if (def.source === "weather" && weatherStale) continue;
+        if (def.source === "air" && airStale) continue;
+
+        const value = getMetricValue(
+          rule.metric!,
+          this.latestWeatherRow,
+          this.latestAirRow,
+        );
+        if (value == null) continue;
+
+        const conditionMet = rule.condition === "above"
+          ? value > rule.threshold
+          : value < rule.threshold;
+
+        const state = this.sensorAlertState.get(rule.id) ?? "idle";
+
+        if (conditionMet && state === "idle") {
+          this.sensorAlertState.set(rule.id, "triggered");
+          await this.sendAlertPush(rule, value);
+        } else if (!conditionMet && state === "triggered") {
+          // Value returned to normal — reset to idle (hysteresis)
+          this.sensorAlertState.set(rule.id, "idle");
+        }
+      }
+    }
+
+    // Check prayer alerts
     const pt = new PrayerTimes(BAGHDAD_COORDS, now, PRAYER_PARAMS);
     const nowMs = now.getTime();
 
-    for (const name of PRAYER_NAMES) {
-      const prayerTime = pt[name] as Date;
-      const minutesLeft = (prayerTime.getTime() - nowMs) / 60000;
+    for (const rule of this.alertRules) {
+      if (rule.alert_type !== "prayer") continue;
+      if (!rule.prayer_names?.length) continue;
 
-      for (const bp of BREAKPOINTS) {
-        const key = `${name}-${bp}`;
+      const bp = rule.prayer_timing === "at_time" ? 0 : (rule.prayer_minutes ?? 0);
+
+      for (const name of rule.prayer_names) {
+        const prayerTime = pt[name as keyof PrayerTimes] as Date | undefined;
+        if (!(prayerTime instanceof Date)) continue;
+
+        const minutesLeft = (prayerTime.getTime() - nowMs) / 60000;
+        const key = `alert-${rule.id}-${name}`;
+
         if (minutesLeft <= bp && minutesLeft > bp - 2 && !this.sentNotifications.has(key)) {
           this.sentNotifications.add(key);
-          await this.sendPrayerPush(name, bp, prayerTime);
+
+          const label = PRAYER_LABELS[name] ?? name;
+          const timeStr = prayerTime.toLocaleTimeString("en-US", {
+            timeZone: "Asia/Baghdad",
+            hour: "numeric",
+            minute: "2-digit",
+            hour12: true,
+          });
+
+          const title = bp === 0
+            ? `It's time for ${label}`
+            : `${label} in ${bp} minutes`;
+
+          await this.sendPush(rule.subscription, {
+            title,
+            body: timeStr,
+            type: "prayer",
+            prayer: name,
+            minutesLeft: bp,
+          });
         }
       }
     }
   }
 
-  private async sendPrayerPush(prayer: string, minutesBefore: number, prayerTime: Date): Promise<void> {
-    const label = PRAYER_LABELS[prayer] ?? prayer;
-    const timeStr = prayerTime.toLocaleTimeString("en-US", {
-      timeZone: "Asia/Baghdad",
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true,
+  private async sendAlertPush(rule: AlertRule, currentValue: number): Promise<void> {
+    const def = ALERT_METRICS[rule.metric!];
+    const unit = def.unit ? ` ${def.unit}` : "";
+    const title = `${def.label} ${rule.condition} ${rule.threshold}${unit}`;
+    const body = `Current: ${Math.round(currentValue * 10) / 10}${unit}`;
+
+    await this.sendPush(rule.subscription, {
+      title,
+      body,
+      type: "sensor",
+      metric: rule.metric,
     });
+  }
 
-    const title = minutesBefore === 0
-      ? `It's time for ${label}`
-      : `${label} in ${minutesBefore} minutes`;
-    const body = timeStr;
-
-    const result = await this.pool.query(
-      "SELECT endpoint, subscription, breakpoints FROM push_subscriptions"
-    );
-
-    let sent = 0;
-    for (const row of result.rows) {
-      const bps = (row.breakpoints as number[]) ?? BREAKPOINTS;
-      if (!bps.includes(minutesBefore)) continue;
-
-      try {
-        await webpush.sendNotification(
-          row.subscription,
-          JSON.stringify({ title, body, prayer, minutesLeft: minutesBefore })
-        );
-        sent++;
-      } catch (err: unknown) {
-        const status = (err as { statusCode?: number }).statusCode;
-        if (status === 404 || status === 410) {
-          await this.pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [row.endpoint]);
-          console.log(`[collector] Removed stale push subscription`);
-        } else {
-          console.error(`[collector] Push failed (${status}):`, (err as Error).message);
+  private async sendPush(subscription: unknown, payload: Record<string, unknown>): Promise<void> {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await webpush.sendNotification(subscription as any, JSON.stringify(payload));
+      console.log(`[collector] Sent push: ${payload.title}`);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode;
+      if (status === 404 || status === 410) {
+        const endpoint = (subscription as { endpoint?: string }).endpoint;
+        if (endpoint) {
+          await this.pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [endpoint]);
+          console.log("[collector] Removed stale push subscription");
+          this.alertRulesLastFetch = 0; // Force refresh on next cycle
         }
+      } else {
+        console.error(`[collector] Push failed (${status}):`, (err as Error).message);
       }
-    }
-
-    if (sent > 0) {
-      console.log(`[collector] Sent push: ${title} (${sent} subscribers)`);
     }
   }
 
@@ -245,6 +332,8 @@ export class Collector {
     const data = devices[0].lastData as AWData;
     const row = this.convertAW(data);
     await this.storeWeather(row);
+    this.latestWeatherRow = row as unknown as Record<string, unknown>;
+    this.latestWeatherTs = row.ts;
     console.log(`[collector] Stored weather reading at ${row.ts.toISOString()}`);
   }
 
@@ -575,6 +664,8 @@ export class Collector {
 
     const row = this.toAirRow(new Date(), sensors);
     await this.storeAir(row);
+    this.latestAirRow = row as unknown as Record<string, unknown>;
+    this.latestAirTs = row.ts;
     this.lastMqttMessage = Date.now();
     console.log(`[collector] MQTT air reading stored at ${row.ts.toISOString()}`);
   }
@@ -667,6 +758,8 @@ export class Collector {
     const data = body.devices[0].data;
     const row = this.toAirRow(new Date(data.timestamp.value * 1000), data);
     await this.storeAir(row);
+    this.latestAirRow = row as unknown as Record<string, unknown>;
+    this.latestAirTs = row.ts;
     console.log(`[collector] Stored air reading at ${row.ts.toISOString()}`);
   }
 

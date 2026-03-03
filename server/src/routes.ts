@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import pg from "pg";
 import type { Config } from "./config.js";
+import { ALERT_METRICS, VALID_PRAYER_NAMES } from "./alert-metrics.js";
 
 const RANGE_MAP: Record<string, string> = {
   "6h": "6 hours",
@@ -186,6 +187,140 @@ export function createRouter(pool: pg.Pool, config?: Config): Router {
       return;
     }
     await pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [endpoint]);
+    res.json({ ok: true });
+  });
+
+  // ---------- Alerts ----------
+
+  router.get("/api/alert-metrics", (_req: Request, res: Response) => {
+    const metrics: Record<string, { label: string; unit: string; group: string; min: number; max: number }> = {};
+    for (const [key, def] of Object.entries(ALERT_METRICS)) {
+      metrics[key] = { label: def.label, unit: def.unit, group: def.group, min: def.min, max: def.max };
+    }
+    res.json({ metrics, prayerNames: [...VALID_PRAYER_NAMES] });
+  });
+
+  router.get("/api/alerts", async (req: Request, res: Response) => {
+    const endpoint = req.query.endpoint as string;
+    if (!endpoint) {
+      res.status(400).json({ error: "Missing endpoint" });
+      return;
+    }
+    const result = await pool.query(
+      "SELECT * FROM alert_rules WHERE endpoint = $1 ORDER BY created_at ASC",
+      [endpoint]
+    );
+    res.json({ alerts: result.rows });
+  });
+
+  interface AlertBody {
+    endpoint: string;
+    alert_type: string;
+    metric?: string;
+    condition?: string;
+    threshold?: number;
+    prayer_timing?: string;
+    prayer_minutes?: number;
+    prayer_names?: string[];
+  }
+
+  function validateAlertFields(body: AlertBody): string | null {
+    const { alert_type, metric, condition, threshold, prayer_timing, prayer_minutes, prayer_names } = body;
+    if (alert_type === "sensor") {
+      if (!metric || !(metric in ALERT_METRICS)) return "Invalid metric";
+      if (condition !== "above" && condition !== "below") return "Condition must be 'above' or 'below'";
+      if (typeof threshold !== "number" || !isFinite(threshold)) return "Threshold must be a finite number";
+      const def = ALERT_METRICS[metric];
+      if (threshold < def.min || threshold > def.max) return `Threshold must be between ${def.min} and ${def.max}`;
+    } else if (alert_type === "prayer") {
+      if (prayer_timing !== "at_time" && prayer_timing !== "before") return "prayer_timing must be 'at_time' or 'before'";
+      if (prayer_timing === "before") {
+        if (typeof prayer_minutes !== "number" || !Number.isInteger(prayer_minutes) || prayer_minutes < 1 || prayer_minutes > 120)
+          return "prayer_minutes must be an integer between 1 and 120";
+      }
+      if (!Array.isArray(prayer_names) || prayer_names.length === 0) return "At least one prayer must be selected";
+      const validNames = VALID_PRAYER_NAMES as readonly string[];
+      if (!prayer_names.every((n) => validNames.includes(n))) return "Invalid prayer name";
+    } else {
+      return "alert_type must be 'sensor' or 'prayer'";
+    }
+    return null;
+  }
+
+  router.post("/api/alerts", async (req: Request, res: Response) => {
+    const body = req.body as AlertBody;
+    if (!body.endpoint) { res.status(400).json({ error: "Missing endpoint" }); return; }
+
+    const sub = await pool.query("SELECT 1 FROM push_subscriptions WHERE endpoint = $1", [body.endpoint]);
+    if (sub.rowCount === 0) { res.status(400).json({ error: "Subscription not found" }); return; }
+
+    const err = validateAlertFields(body);
+    if (err) { res.status(400).json({ error: err }); return; }
+
+    if (body.alert_type === "sensor") {
+      const result = await pool.query(
+        `INSERT INTO alert_rules (endpoint, alert_type, metric, condition, threshold)
+         VALUES ($1, 'sensor', $2, $3, $4) RETURNING *`,
+        [body.endpoint, body.metric, body.condition, body.threshold]
+      );
+      res.json({ alert: result.rows[0] });
+    } else {
+      const mins = body.prayer_timing === "at_time" ? null : body.prayer_minutes;
+      const result = await pool.query(
+        `INSERT INTO alert_rules (endpoint, alert_type, prayer_timing, prayer_minutes, prayer_names)
+         VALUES ($1, 'prayer', $2, $3, $4) RETURNING *`,
+        [body.endpoint, body.prayer_timing, mins, body.prayer_names]
+      );
+      res.json({ alert: result.rows[0] });
+    }
+  });
+
+  router.put("/api/alerts/:id", async (req: Request, res: Response) => {
+    const id = parseInt(String(req.params.id), 10);
+    const body = req.body as AlertBody;
+    if (!body.endpoint || isNaN(id)) { res.status(400).json({ error: "Missing endpoint or invalid id" }); return; }
+
+    // Verify ownership
+    const existing = await pool.query(
+      "SELECT id, alert_type FROM alert_rules WHERE id = $1 AND endpoint = $2",
+      [id, body.endpoint]
+    );
+    if (existing.rowCount === 0) { res.status(404).json({ error: "Alert not found" }); return; }
+
+    const err = validateAlertFields(body);
+    if (err) { res.status(400).json({ error: err }); return; }
+
+    if (body.alert_type === "sensor") {
+      const result = await pool.query(
+        `UPDATE alert_rules SET alert_type = 'sensor', metric = $1, condition = $2, threshold = $3,
+         prayer_timing = NULL, prayer_minutes = NULL, prayer_names = NULL
+         WHERE id = $4 RETURNING *`,
+        [body.metric, body.condition, body.threshold, id]
+      );
+      res.json({ alert: result.rows[0] });
+    } else {
+      const mins = body.prayer_timing === "at_time" ? null : body.prayer_minutes;
+      const result = await pool.query(
+        `UPDATE alert_rules SET alert_type = 'prayer', prayer_timing = $1, prayer_minutes = $2, prayer_names = $3,
+         metric = NULL, condition = NULL, threshold = NULL
+         WHERE id = $4 RETURNING *`,
+        [body.prayer_timing, mins, body.prayer_names, id]
+      );
+      res.json({ alert: result.rows[0] });
+    }
+  });
+
+  router.delete("/api/alerts/:id", async (req: Request, res: Response) => {
+    const id = parseInt(String(req.params.id), 10);
+    const endpoint = req.query.endpoint as string;
+    if (!endpoint || isNaN(id)) {
+      res.status(400).json({ error: "Missing endpoint or invalid id" });
+      return;
+    }
+    await pool.query(
+      "DELETE FROM alert_rules WHERE id = $1 AND endpoint = $2",
+      [id, endpoint]
+    );
     res.json({ ok: true });
   });
 

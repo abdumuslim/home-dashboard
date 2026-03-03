@@ -5,7 +5,7 @@ import { SectionWrapper } from "./ui/section-wrapper";
 import { OutdoorSection } from "./sections/outdoor-section";
 import { IndoorSection } from "./sections/indoor-section";
 import { AirQualitySection } from "./sections/air-quality-section";
-import { PrayerSectionHeader, PrayerSectionBell, PrayerSectionContent } from "./sections/prayer-section";
+import { PrayerSectionHeader, PrayerSectionContent } from "./sections/prayer-section";
 
 interface DashboardTabProps {
   weather: WeatherReading | null;
@@ -52,7 +52,6 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
     },
     prayer: {
       header: <PrayerSectionHeader />,
-      headerRight: <PrayerSectionBell />,
       content: <PrayerSectionContent />,
     },
   };

@@ -1,11 +1,16 @@
 self.addEventListener("push", (event) => {
   const data = event.data?.json() ?? {};
+
+  const tag = data.type === "sensor"
+    ? "sensor-" + (data.metric ?? "unknown")
+    : data.prayer ?? "prayer";
+
   event.waitUntil(
-    self.registration.showNotification(data.title ?? "Prayer Time", {
+    self.registration.showNotification(data.title ?? "Alert", {
       body: data.body ?? "",
       icon: "/favicon.ico",
       badge: "/favicon.ico",
-      tag: data.prayer ?? "prayer",
+      tag,
       renotify: true,
     })
   );
