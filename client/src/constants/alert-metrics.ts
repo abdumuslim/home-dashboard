@@ -29,3 +29,7 @@ export const ALERT_METRICS: Record<string, MetricInfo> = {
 };
 
 export const PRAYER_NAMES = ["fajr", "dhuhr", "asr", "maghrib", "isha"] as const;
+
+export const PRAYER_LABELS: Record<string, string> = {
+  fajr: "Fajr", dhuhr: "Dhuhr", asr: "Asr", maghrib: "Maghrib", isha: "Isha",
+};

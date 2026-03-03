@@ -4,11 +4,8 @@ import { X, Trash2, Pencil, Bell, BellOff, Plus, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePushNotifications } from "@/hooks/use-push-notifications";
 import { useAlerts } from "@/hooks/use-alerts";
+import { ALERT_METRICS, PRAYER_NAMES, PRAYER_LABELS } from "@/constants/alert-metrics";
 import type { AlertCondition, PrayerTiming, AlertRule, MetricInfo } from "@/types/alerts";
-
-const PRAYER_LABELS: Record<string, string> = {
-  fajr: "Fajr", dhuhr: "Dhuhr", asr: "Asr", maghrib: "Maghrib", isha: "Isha",
-};
 
 function Spinner({ className }: { className?: string }) {
   return <Loader2 className={cn("animate-spin", className)} />;
@@ -35,7 +32,9 @@ interface AlertsModalProps {
 
 export function AlertsModal({ onClose }: AlertsModalProps) {
   const { isSupported, isSubscribed, permission, endpoint, subscribe, unsubscribe } = usePushNotifications();
-  const { alerts, metrics, prayerNames, loading, createAlert, updateAlert, deleteAlert } = useAlerts(endpoint);
+  const { alerts, loading, createAlert, updateAlert, deleteAlert } = useAlerts(endpoint);
+  const metrics = ALERT_METRICS;
+  const prayerNames = [...PRAYER_NAMES];
   const [phase, setPhase] = useState<"in" | "out">("in");
   const [showForm, setShowForm] = useState(false);
   const [editingAlert, setEditingAlert] = useState<AlertRule | null>(null);
