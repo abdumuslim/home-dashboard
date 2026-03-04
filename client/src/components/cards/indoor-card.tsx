@@ -4,7 +4,7 @@ import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
 import { useUnits } from "@/hooks/use-units";
-import { fmt, getStatus } from "@/constants/thresholds";
+import { fmt, getStatus, getTempGradientStyle } from "@/constants/thresholds";
 import { convertTemp } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
 import type { WeatherReading, AirReading, OpenOverlayFn, TimeRange } from "@/types/api";
@@ -218,7 +218,7 @@ export function IndoorCard({
 
         <div className="flex items-baseline gap-3 md:gap-5">
           <div className="flex flex-col">
-            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight text-cyan">
+            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight" style={getTempGradientStyle(temp)}>
               {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Temp.</span>

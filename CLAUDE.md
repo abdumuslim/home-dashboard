@@ -142,7 +142,7 @@ All metric cards follow a consistent design language established in the Temperat
 - Y-axis: `position: "left"`, subtle grid `rgba(255,255,255,0.05)`
 
 ### Colors
-- **Primary metric:** cyan `#00d4ff` (temp uses dynamic `getTempColor()`)
+- **Primary metric:** cyan `#00d4ff` (temp uses CSS gradient text via `getTempGradientStyle()` — 14-range scale)
 - **Secondary metric:** white `text-white` or a complementary color (e.g. amber `#f59e0b` for wind median)
 - **Pressure/Baro:** emerald `#10b981` (value + chart line)
 - **Rain drop SVG:** blue `#2196ff` (stroke + fill)

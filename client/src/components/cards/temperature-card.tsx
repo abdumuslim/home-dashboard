@@ -4,7 +4,7 @@ import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
 import { useUnits } from "@/hooks/use-units";
-import { fmt, getTempColor } from "@/constants/thresholds";
+import { fmt, getTempGradientStyle } from "@/constants/thresholds";
 import { convertTemp, convertTempDelta } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
 import type { WeatherReading, OpenOverlayFn, TimeRange } from "@/types/api";
@@ -195,8 +195,8 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
 
         <div className="flex items-baseline gap-4 md:gap-8 mb-2">
           <div className="flex flex-col">
-            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight" style={{ color: getTempColor(temp) }}>
-              {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
+            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight">
+              <span style={getTempGradientStyle(temp)}>{fmtTemp(temp)}<span className="text-xl">{tempLabel}</span></span>
               {tempDelta != null && (
                 <span className={`text-sm ml-1.5 font-medium ${tempDelta > 0 ? "text-red-400" : tempDelta < 0 ? "text-blue-400" : "text-white"}`}>
                   {tempDelta > 0 ? "\u2191" : tempDelta < 0 ? "\u2193" : "="}{fmt(Math.abs(convertTempDelta(tempDelta, tempUnit)), 1)}&deg;
