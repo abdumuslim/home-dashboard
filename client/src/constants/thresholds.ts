@@ -77,13 +77,13 @@ const TEMP_RANGES: { max: number; from: string; to: string }[] = [
   { max: 4.4,   from: "#1AEEF4", to: "#00CCD3" }, // Cyan
   { max: 10.0,  from: "#B7FE1E", to: "#95D900" }, // Lime Green
   { max: 15.6,  from: "#FFE316", to: "#DBC100" }, // Yellow
-  { max: 21.1,  from: "#FFBA13", to: "#E09E00" }, // Gold
-  { max: 26.7,  from: "#FF941A", to: "#DA7600" }, // Orange
-  { max: 32.2,  from: "#FF6E1D", to: "#D55400" }, // Dark Orange
-  { max: 37.8,  from: "#F64B17", to: "#CC3500" }, // Orange Red
-  { max: 43.3,  from: "#D93A17", to: "#B02800" }, // Red
+  { max: 21.1,  from: "#FFD014", to: "#E0B500" }, // Gold (shifted yellow)
+  { max: 26.7,  from: "#FFB218", to: "#DA9500" }, // Orange (shifted golden)
+  { max: 32.2,  from: "#FF8C1A", to: "#D57000" }, // Dark Orange (shifted amber)
+  { max: 37.8,  from: "#F66818", to: "#CC4D00" }, // Orange Red
+  { max: 43.3,  from: "#D94E17", to: "#B03500" }, // Red
 ];
-const TEMP_EXTREME = { from: "#C42B16", to: "#981900" }; // Dark Red (> 43.3)
+const TEMP_EXTREME = { from: "#C43A16", to: "#982400" }; // Dark Red (> 43.3)
 
 export function getTempColor(temp: number | null | undefined): string {
   if (temp == null) return "#00d4ff";
