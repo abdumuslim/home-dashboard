@@ -95,12 +95,17 @@ export function getTempColor(temp: number | null | undefined): string {
 
 export function getTempGradientStyle(temp: number | null | undefined): CSSProperties {
   if (temp == null) return { color: "#00d4ff" };
-  let from: string, to: string;
-  const range = TEMP_RANGES.find(r => temp <= r.max);
-  if (range) { from = range.from; to = range.to; }
-  else { from = TEMP_EXTREME.from; to = TEMP_EXTREME.to; }
+  const idx = TEMP_RANGES.findIndex(r => temp <= r.max);
+  let top: string, bottom: string;
+  if (idx >= 0) {
+    top = idx > 0 ? TEMP_RANGES[idx - 1].from : TEMP_RANGES[idx].from;
+    bottom = TEMP_RANGES[idx].to;
+  } else {
+    top = TEMP_RANGES[TEMP_RANGES.length - 1].from;
+    bottom = TEMP_EXTREME.to;
+  }
   return {
-    background: `linear-gradient(to bottom, ${from}, ${to})`,
+    background: `linear-gradient(to bottom, ${top}, ${bottom})`,
     backgroundClip: "text",
     WebkitBackgroundClip: "text",
     WebkitTextFillColor: "transparent",
