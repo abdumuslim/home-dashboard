@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import type { ThresholdEntry } from "@/types/api";
 
 export const TZ = "Asia/Baghdad";
@@ -67,21 +68,41 @@ export function fmt(v: number | null | undefined, decimals: number): string {
   return Number(v).toFixed(decimals);
 }
 
-const TEMP_COLORS: [number, string][] = [
-  [0, "#60a5fa"],   // Blue — freezing
-  [5, "#38bdf8"],   // Sky — very cold
-  [10, "#22d3ee"],  // Cyan — cold
-  [18, "#4ade80"],  // Green — cool
-  [26, "#a3e635"],  // Lime — comfortable
-  [32, "#facc15"],  // Yellow — warm
-  [40, "#fb923c"],  // Orange — hot
-  [49, "#fb7185"],  // Rose — very hot
+const TEMP_RANGES: { max: number; from: string; to: string }[] = [
+  { max: -23.3, from: "#F141DA", to: "#D61CC0" }, // Magenta
+  { max: -17.8, from: "#9F33F2", to: "#7F11D0" }, // Purple
+  { max: -12.2, from: "#3C14F5", to: "#1D00CD" }, // Dark Blue
+  { max: -6.7,  from: "#3B69FF", to: "#1144EB" }, // Blue
+  { max: -1.1,  from: "#1ABCFE", to: "#0098DF" }, // Light Blue
+  { max: 4.4,   from: "#1AEEF4", to: "#00CCD3" }, // Cyan
+  { max: 10.0,  from: "#B7FE1E", to: "#95D900" }, // Lime Green
+  { max: 15.6,  from: "#FFE316", to: "#DBC100" }, // Yellow
+  { max: 21.1,  from: "#FFBA13", to: "#E09E00" }, // Gold
+  { max: 26.7,  from: "#FF941A", to: "#DA7600" }, // Orange
+  { max: 32.2,  from: "#FF6E1D", to: "#D55400" }, // Dark Orange
+  { max: 37.8,  from: "#F64B17", to: "#CC3500" }, // Orange Red
+  { max: 43.3,  from: "#D93A17", to: "#B02800" }, // Red
 ];
+const TEMP_EXTREME = { from: "#C42B16", to: "#981900" }; // Dark Red (> 43.3)
 
 export function getTempColor(temp: number | null | undefined): string {
   if (temp == null) return "#00d4ff";
-  for (const [max, color] of TEMP_COLORS) {
-    if (temp <= max) return color;
+  for (const r of TEMP_RANGES) {
+    if (temp <= r.max) return r.from;
   }
-  return "#c084fc"; // Purple — extreme heat (≥50)
+  return TEMP_EXTREME.from;
+}
+
+export function getTempGradientStyle(temp: number | null | undefined): CSSProperties {
+  if (temp == null) return { color: "#00d4ff" };
+  let from: string, to: string;
+  const range = TEMP_RANGES.find(r => temp <= r.max);
+  if (range) { from = range.from; to = range.to; }
+  else { from = TEMP_EXTREME.from; to = TEMP_EXTREME.to; }
+  return {
+    background: `linear-gradient(to bottom, ${from}, ${to})`,
+    backgroundClip: "text",
+    WebkitBackgroundClip: "text",
+    WebkitTextFillColor: "transparent",
+  };
 }
