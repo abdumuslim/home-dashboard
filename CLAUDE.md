@@ -30,7 +30,9 @@ Browser → Cloudflare → Traefik (VPS, existing) → dashboard container (port
   - Supports 2FA (credentials/token cached in persistent volume).
   - Handles both **MiIO** (`get_prop`, `set_power`) and **MIoT** (`get_properties`, `set_properties`) protocols.
   - **MIoT Mappings**: Power (2:2), Fan Level (2:4), Mode (2:5), AQI (3:6), Humidity (3:7), Temperature (3:8), Filter Life (4:3), Buzzer (5:1), LED (6:6), Child Lock (7:1).
-- **Automations**: AQI-triggered rules processed in the collector loop. Configurable via dashboard.
+- **Automations**: Two types processed in the collector loop, configurable via dashboard:
+  - **Metric-based**: AQI threshold triggers (e.g., PM2.5 above 50 → turn on purifier, off when below).
+  - **Schedule-based**: Daily time window enforcement (e.g., 22:00–07:00 → keep purifier ON, re-sends turn-on every ~5s if device found off). Uses `getDevicePower()` with 5s cache.
 - **Separate docker-compose**: Lives at `/opt/home-dashboard/` on the VPS, joins the existing `rag_default` network.
   - Mounts `dashboard_data` volume to `/app/data` for `xiaomi-credentials.json`.
 - **Multi-stage Docker build**: Stage 1 builds client (Vite), Stage 2 builds server (tsc), Stage 3 runs production Node.js
@@ -118,7 +120,7 @@ Three main tables in the `home` database:
 - `weather_readings` — 32 columns, keyed by `ts TIMESTAMPTZ` with BRIN index (metric units, all conversions done at collection time). Includes outdoor, indoor console, and ch8 "Abdu" sensor data.
 - `air_readings` — 9 columns, keyed by `ts TIMESTAMPTZ` with BRIN index
 - `alert_rules` — per-subscription alert configurations (FK to `push_subscriptions.endpoint` with CASCADE). Fields: `alert_type` (sensor/prayer), `metric`, `condition` (above/below), `threshold`, `prayer_timing` (at_time/before), `prayer_minutes`, `prayer_names TEXT[]`.
-- `automations` — AQI-triggered rules for Xiaomi devices. Fields: `id`, `device_ids`, `device_names`, `metric`, `condition`, `threshold`, `action`, `enabled`.
+- `automations` — Purifier automation rules. Fields: `id`, `automation_type` (metric/schedule), `device_ids`, `device_names`, `metric`, `condition`, `threshold` (metric type), `time_start`, `time_end` (schedule type), `action_on`, `action_off`, `cooldown_secs`, `enabled`.
 
 New columns/tables added via `MIGRATIONS` list in `database.ts`. Deduplication: `ON CONFLICT (ts) DO NOTHING`. The 30-day history endpoint downsamples to hourly averages.
 

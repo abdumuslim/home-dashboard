@@ -327,6 +327,20 @@ export class XiaomiCloud {
     return this.cachedDevices;
   }
 
+  /** Lightweight power-only query for automation checks */
+  async getDevicePower(deviceId: string): Promise<"on" | "off" | undefined> {
+    if (this.isMiot(this.getModel(deviceId))) {
+      const result = await this.sendCommand(deviceId, "get_properties", [
+        { did: "power", siid: MIOT_PROPS.power.siid, piid: MIOT_PROPS.power.piid },
+      ]) as Array<{ did: string; value: unknown; code: number }>;
+      const val = result?.[0];
+      if (val?.code === 0) return val.value === true ? "on" : "off";
+      return undefined;
+    }
+    const result = await this.sendCommand(deviceId, "get_prop", ["power"]) as unknown[];
+    return result?.[0] === "on" ? "on" : result?.[0] === "off" ? "off" : undefined;
+  }
+
   getRegion(): string {
     return this.region;
   }
