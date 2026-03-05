@@ -40,21 +40,30 @@ const TRIGGER_METRICS: Record<string, MetricInfo> = Object.fromEntries(
   ),
 );
 
+function formatTimeAmPm(time: string): string {
+  const [h, m] = time.split(":").map(Number);
+  const ampm = h >= 12 ? "PM" : "AM";
+  const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+  return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
+}
+
 function describeTrigger(r: AutomationRule): string {
   const names = (r.device_names ?? [r.device_name]).join(", ");
   if (r.automation_type === "schedule") {
-    return `${r.time_start} – ${r.time_end} → ${names}`;
+    const off = r.turn_off_at_end ? " (off)" : "";
+    return `${r.time_start} – ${r.time_end}${off} → ${names}`;
   }
   const m = r.metric ? ALERT_METRICS[r.metric] : null;
   const label = m?.label ?? r.metric ?? "";
   const unit = m?.unit ? ` ${m.unit}` : "";
-  return `${label} ${r.condition} ${r.threshold}${unit} → ${names}`;
+  const dur = r.sustained_minutes > 0 ? ` for ${r.sustained_minutes}min` : "";
+  return `${label} ${r.condition} ${r.threshold}${unit}${dur} → ${names}`;
 }
 
 export function AlertsModal({ onClose }: AlertsModalProps) {
   const { isSupported, isSubscribed, permission, endpoint, subscribe, unsubscribe } = usePushNotifications();
   const { alerts, loading, createAlert, updateAlert, deleteAlert } = useAlerts(endpoint);
-  const { automations, createAutomation, deleteAutomation, toggleAutomation } = useAutomations();
+  const { automations, createAutomation, updateAutomation, deleteAutomation, toggleAutomation } = useAutomations();
   const { devices } = useDevices();
   const metrics = ALERT_METRICS;
   const prayerNames = [...PRAYER_NAMES];
@@ -260,6 +269,7 @@ export function AlertsModal({ onClose }: AlertsModalProps) {
             automations={automations}
             devices={devices}
             onCreate={createAutomation}
+            onUpdate={updateAutomation}
             onDelete={deleteAutomation}
             onToggle={toggleAutomation}
           />
@@ -592,28 +602,30 @@ function AlertForm({ metrics, prayerNames, editing, onSave, onCancel }: AlertFor
 
 // ---------- Automations Panel ----------
 
-function AutomationsPanel({ automations, devices, onCreate, onDelete, onToggle }: {
+function AutomationsPanel({ automations, devices, onCreate, onUpdate, onDelete, onToggle }: {
   automations: AutomationRule[];
   devices: PurifierDevice[];
   onCreate: (body: Record<string, unknown>) => Promise<void>;
+  onUpdate: (id: number, body: Record<string, unknown>) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
   onToggle: (id: number, enabled: boolean) => Promise<void>;
 }) {
   const [showForm, setShowForm] = useState(false);
+  const [editingRule, setEditingRule] = useState<AutomationRule | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
   return (
     <div className="px-5 py-4 flex flex-col gap-2 border-t border-white/10">
       <div className="flex items-center justify-between">
         <h3 className="text-xs font-medium tracking-wider text-dim uppercase">Purifier Auto Triggers</h3>
-        {!showForm && (
+        {!showForm && !editingRule && (
           <button onClick={() => setShowForm(true)} className="flex items-center gap-1 text-xs text-cyan hover:text-cyan/80 transition-colors">
             <Plus className="w-3.5 h-3.5" /> Add
           </button>
         )}
       </div>
 
-      {automations.length === 0 && !showForm && (
+      {automations.length === 0 && !showForm && !editingRule && (
         <p className="text-sm text-dim py-1">No triggers configured.</p>
       )}
 
@@ -633,6 +645,12 @@ function AutomationsPanel({ automations, devices, onCreate, onDelete, onToggle }
               <span className={cn("absolute top-0.5 w-3 h-3 rounded-full transition-all", a.enabled ? "left-4 bg-cyan" : "left-0.5 bg-dim")} />
             </button>
             <button
+              onClick={() => { setEditingRule(a); setShowForm(false); }}
+              className="p-1 rounded text-dim hover:text-cyan hover:bg-white/10 transition-colors"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+            </button>
+            <button
               onClick={async () => { setDeletingId(a.id); await onDelete(a.id); setDeletingId(null); }}
               disabled={deletingId !== null}
               className="p-1 rounded text-dim hover:text-red-400 hover:bg-white/10 transition-colors"
@@ -643,11 +661,20 @@ function AutomationsPanel({ automations, devices, onCreate, onDelete, onToggle }
         </div>
       ))}
 
-      {showForm && (
+      {(showForm || editingRule) && (
         <AutomationTriggerForm
           devices={devices}
-          onSave={async (data) => { await onCreate(data); setShowForm(false); }}
-          onCancel={() => setShowForm(false)}
+          editing={editingRule}
+          onSave={async (data) => {
+            if (editingRule) {
+              await onUpdate(editingRule.id, data);
+              setEditingRule(null);
+            } else {
+              await onCreate(data);
+              setShowForm(false);
+            }
+          }}
+          onCancel={() => { setShowForm(false); setEditingRule(null); }}
         />
       )}
     </div>
@@ -686,21 +713,27 @@ function DeviceCheckboxes({ devices, selectedDevices, setSelectedDevices }: {
   );
 }
 
-function AutomationTriggerForm({ devices, onSave, onCancel }: {
+function AutomationTriggerForm({ devices, editing, onSave, onCancel }: {
   devices: PurifierDevice[];
+  editing: AutomationRule | null;
   onSave: (data: Record<string, unknown>) => Promise<void>;
   onCancel: () => void;
 }) {
-  const [automationType, setAutomationType] = useState<"metric" | "schedule" | "">("");
+  const [automationType, setAutomationType] = useState<"metric" | "schedule" | "">(editing?.automation_type ?? "");
   // Metric state
-  const [metric, setMetric] = useState("");
-  const [condition, setCondition] = useState<"above" | "below" | "">("");
-  const [threshold, setThreshold] = useState("");
+  const [metric, setMetric] = useState(editing?.metric ?? "");
+  const [condition, setCondition] = useState<"above" | "below" | "">(editing?.condition ?? "");
+  const [threshold, setThreshold] = useState(editing?.threshold != null ? String(editing.threshold) : "");
+  const [sustainedMinutes, setSustainedMinutes] = useState(String(editing?.sustained_minutes ?? 0));
   // Schedule state
-  const [timeStart, setTimeStart] = useState("22:00");
-  const [timeEnd, setTimeEnd] = useState("07:00");
+  const [timeStart, setTimeStart] = useState(editing?.time_start ?? "22:00");
+  const [timeEnd, setTimeEnd] = useState(editing?.time_end ?? "07:00");
+  const [turnOffAtEnd, setTurnOffAtEnd] = useState(editing?.turn_off_at_end ?? false);
   // Shared state
-  const [selectedDevices, setSelectedDevices] = useState<Set<string>>(() => new Set(devices.map((d) => d.id)));
+  const [selectedDevices, setSelectedDevices] = useState<Set<string>>(() => {
+    const ids = editing?.device_ids ?? (editing ? [editing.device_id] : null);
+    return new Set(ids ?? devices.map((d) => d.id));
+  });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -721,7 +754,7 @@ function AutomationTriggerForm({ devices, onSave, onCancel }: {
   return (
     <div className="flex flex-col gap-2.5 p-3 rounded-lg bg-white/5 border border-white/10">
       <div className="flex items-center justify-between">
-        <span className="text-xs text-dim uppercase tracking-wider">New Trigger</span>
+        <span className="text-xs text-dim uppercase tracking-wider">{editing ? "Edit Trigger" : "New Trigger"}</span>
         <button onClick={onCancel} className="text-xs text-dim hover:text-white">Cancel</button>
       </div>
 
@@ -782,32 +815,60 @@ function AutomationTriggerForm({ devices, onSave, onCancel }: {
               )}
             </div>
           )}
+
+          {condition && threshold && (
+            <div className="flex items-center gap-2 text-xs text-dim">
+              <span>For</span>
+              <input
+                type="number"
+                value={sustainedMinutes}
+                onChange={(e) => setSustainedMinutes(e.target.value)}
+                min={0}
+                max={60}
+                className="w-14 bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-sm text-text outline-none focus:border-cyan/50 text-center"
+              />
+              <span>min <span className="text-dim/60">(0 = immediate)</span></span>
+            </div>
+          )}
         </>
       )}
 
       {/* Schedule path */}
       {automationType === "schedule" && (
-        <div className="flex gap-2 items-center">
-          <div className="flex-1">
-            <label className="text-xs text-dim block mb-1">From</label>
-            <input
-              type="time"
-              value={timeStart}
-              onChange={(e) => setTimeStart(e.target.value)}
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
-            />
+        <>
+          <div className="flex gap-2 items-center">
+            <div className="flex-1">
+              <label className="text-xs text-dim block mb-1">From</label>
+              <input
+                type="time"
+                step={60}
+                value={timeStart}
+                onChange={(e) => setTimeStart(e.target.value)}
+                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
+              />
+              <span className="text-[10px] text-dim mt-0.5 block">{formatTimeAmPm(timeStart)}</span>
+            </div>
+            <span className="text-dim text-sm mt-2">–</span>
+            <div className="flex-1">
+              <label className="text-xs text-dim block mb-1">To</label>
+              <input
+                type="time"
+                step={60}
+                value={timeEnd}
+                onChange={(e) => setTimeEnd(e.target.value)}
+                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
+              />
+              <span className="text-[10px] text-dim mt-0.5 block">{formatTimeAmPm(timeEnd)}</span>
+            </div>
           </div>
-          <span className="text-dim text-sm mt-4">–</span>
-          <div className="flex-1">
-            <label className="text-xs text-dim block mb-1">To</label>
-            <input
-              type="time"
-              value={timeEnd}
-              onChange={(e) => setTimeEnd(e.target.value)}
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
-            />
-          </div>
-        </div>
+          <label className="flex items-center gap-1.5 cursor-pointer text-xs text-dim">
+            <span className={cn("w-3.5 h-3.5 rounded border flex items-center justify-center", turnOffAtEnd ? "border-cyan bg-cyan/20" : "border-dim")}>
+              {turnOffAtEnd && <span className="text-cyan text-[10px]">&#10003;</span>}
+            </span>
+            <input type="checkbox" checked={turnOffAtEnd} onChange={(e) => setTurnOffAtEnd(e.target.checked)} className="sr-only" />
+            <span className={turnOffAtEnd ? "text-text" : ""}>Turn off at end time</span>
+          </label>
+        </>
       )}
 
       {/* Device selection (shared) */}
@@ -826,9 +887,10 @@ function AutomationTriggerForm({ devices, onSave, onCancel }: {
             const ids = Array.from(selectedDevices);
             const names = ids.map((id) => devices.find((d) => d.id === id)?.name ?? id);
             if (automationType === "schedule") {
-              await onSave({ automation_type: "schedule", time_start: timeStart, time_end: timeEnd, device_ids: ids, device_names: names });
+              await onSave({ automation_type: "schedule", time_start: timeStart, time_end: timeEnd, turn_off_at_end: turnOffAtEnd, device_ids: ids, device_names: names });
             } else {
-              await onSave({ metric, condition, threshold: thresholdNum, device_ids: ids, device_names: names });
+              const mins = parseInt(sustainedMinutes, 10);
+              await onSave({ metric, condition, threshold: thresholdNum, sustained_minutes: isFinite(mins) && mins > 0 ? mins : 0, device_ids: ids, device_names: names });
             }
           } catch (err: unknown) {
             setError((err as Error).message);
@@ -840,7 +902,7 @@ function AutomationTriggerForm({ devices, onSave, onCancel }: {
         className="flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-sm bg-cyan/20 text-cyan hover:bg-cyan/30 disabled:opacity-30 disabled:cursor-not-allowed"
       >
         {saving && <Spinner className="w-4 h-4" />}
-        {saving ? "Saving..." : "Save Trigger"}
+        {saving ? "Saving..." : editing ? "Update Trigger" : "Save Trigger"}
       </button>
     </div>
   );

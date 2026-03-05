@@ -45,6 +45,19 @@ export function useAutomations() {
     [fetchAutomations],
   );
 
+  const updateAutomation = useCallback(
+    async (id: number, body: Record<string, unknown>) => {
+      const resp = await fetch(`/api/automations/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) throw new Error((await resp.json() as { error: string }).error);
+      await fetchAutomations();
+    },
+    [fetchAutomations],
+  );
+
   const toggleAutomation = useCallback(
     async (id: number, enabled: boolean) => {
       await fetch(`/api/automations/${id}`, {
@@ -57,5 +70,5 @@ export function useAutomations() {
     [fetchAutomations],
   );
 
-  return { automations, loading, createAutomation, deleteAutomation, toggleAutomation };
+  return { automations, loading, createAutomation, updateAutomation, deleteAutomation, toggleAutomation };
 }

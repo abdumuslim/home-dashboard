@@ -121,6 +121,8 @@ interface AutomationRule {
   device_name: string;
   device_ids: string[] | null;
   device_names: string[] | null;
+  turn_off_at_end: boolean;
+  sustained_minutes: number;
   action_on: PurifierAction;
   action_off: PurifierAction | null;
   cooldown_secs: number;
@@ -134,6 +136,7 @@ function parseTimeToMinutes(time: string): number {
 interface AutomationState {
   status: "idle" | "triggered";
   lastToggle: number;
+  conditionSince: number | null;
 }
 
 export class Collector {
@@ -449,21 +452,41 @@ export class Collector {
       ? value > rule.threshold
       : value < rule.threshold;
 
-    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0 };
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null };
     const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
 
     const deviceIds = rule.device_ids ?? [rule.device_id];
     const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
 
-    if (conditionMet && state.status === "idle" && (now - state.lastToggle >= cooldownMs)) {
+    // Sustained duration: track how long condition has been continuously met
+    if (conditionMet) {
+      if (state.conditionSince == null) {
+        state.conditionSince = now;
+        this.automationState.set(rule.id, state);
+      }
+    } else {
+      // Condition not met — reset sustained timer (strict: any dip resets)
+      if (state.conditionSince != null) {
+        state.conditionSince = null;
+        this.automationState.set(rule.id, state);
+      }
+    }
+
+    // Check if sustained long enough
+    const sustainedMs = (rule.sustained_minutes ?? 0) * 60_000;
+    const sustainedEnough = sustainedMs === 0 || (state.conditionSince != null && (now - state.conditionSince >= sustainedMs));
+
+    if (conditionMet && sustainedEnough && state.status === "idle" && (now - state.lastToggle >= cooldownMs)) {
       console.log(
-        `[collector] Automation "${rule.name}": ${rule.metric}=${value} ${rule.condition} ${rule.threshold}, turning ON [${deviceNames}]`,
+        `[collector] Automation "${rule.name}": ${rule.metric}=${value} ${rule.condition} ${rule.threshold}` +
+        (sustainedMs > 0 ? ` for ${rule.sustained_minutes}min` : "") +
+        `, turning ON [${deviceNames}]`,
       );
       try {
         for (const did of deviceIds) {
           await this.xiaomiCloud!.executeAction(did, rule.action_on);
         }
-        this.automationState.set(rule.id, { status: "triggered", lastToggle: now });
+        this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince });
       } catch (err) {
         console.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
       }
@@ -475,7 +498,7 @@ export class Collector {
         for (const did of deviceIds) {
           await this.xiaomiCloud!.executeAction(did, rule.action_off);
         }
-        this.automationState.set(rule.id, { status: "idle", lastToggle: now });
+        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null });
       } catch (err) {
         console.error(`[collector] Automation "${rule.name}" action_off failed:`, (err as Error).message);
       }
@@ -503,7 +526,7 @@ export class Collector {
       ? (nowMinutes >= startMinutes && nowMinutes < endMinutes)
       : (nowMinutes >= startMinutes || nowMinutes < endMinutes);
 
-    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0 };
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null };
     const now = Date.now();
     const cooldownMs = (rule.cooldown_secs ?? 60) * 1000;
 
@@ -523,16 +546,28 @@ export class Collector {
             await this.xiaomiCloud!.executeAction(did, rule.action_on);
             // Update cache immediately after turning on
             this.devicePowerCache.set(did, { power: "on", ts: Date.now() });
-            this.automationState.set(rule.id, { status: "triggered", lastToggle: now });
+            this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null });
           }
         } catch (err) {
           console.error(`[collector] Schedule "${rule.name}" check failed for ${did}:`, (err as Error).message);
         }
       }
     } else {
-      // Outside window: reset state to idle
+      // Outside window: optionally turn off, then reset state to idle
       if (state.status === "triggered") {
-        this.automationState.set(rule.id, { status: "idle", lastToggle: now });
+        if (rule.turn_off_at_end) {
+          const deviceIds = rule.device_ids ?? [rule.device_id];
+          const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
+          console.log(`[collector] Schedule "${rule.name}": window ended, turning OFF [${deviceNames}]`);
+          for (const did of deviceIds) {
+            try {
+              await this.xiaomiCloud!.executeAction(did, { power: "off" });
+            } catch (err) {
+              console.error(`[collector] Schedule "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
+            }
+          }
+        }
+        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null });
       }
     }
   }
