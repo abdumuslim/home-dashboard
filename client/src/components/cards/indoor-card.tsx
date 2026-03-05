@@ -1,6 +1,6 @@
 import { useState, useMemo, type ReactNode } from "react";
 import { Line } from "react-chartjs-2";
-import { Maximize2, Power, Fan, Settings, Loader2 } from "lucide-react";
+import { Maximize2, Power, Fan, Settings, Loader2, Hourglass } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { MetricCard } from "@/components/ui/metric-card";
 import { PurifierDetailOverlay } from "@/components/ui/purifier-detail-overlay";
@@ -233,57 +233,63 @@ export function IndoorCard({
 
   return (
     <MetricCard flash={flash} className="p-4 pb-0 flex flex-col">
-      <div className="flex flex-col z-10 w-full mb-[100px]">
-        {/* Top Header Row with Unified "Nano Banana" Pill */}
-        <div className="flex justify-between items-start w-full gap-2 mb-2">
-          <h3 className="text-[0.95rem] font-medium text-text mt-1">{title}</h3>
+      <div className="flex z-10 w-full mb-[100px] gap-3">
+        {/* Left: main content */}
+        <div className="flex flex-col flex-1 min-w-0">
+          {/* Title */}
+          <h3 className="text-[0.95rem] font-medium text-text mb-2 mt-1">{title}</h3>
 
-          {hasPurifier && (
-            <div className={cn(
-              "flex items-center gap-1.5 bg-[#171920]/90 border border-white/[0.05] p-1 rounded-full shadow-[0_4px_12px_-4px_rgba(0,0,0,0.5)] backdrop-blur-xl transition-all",
-              offline ? "opacity-40" : "hover:border-white/10 hover:bg-[#1a1c23]/95"
-            )}>
-              {/* Status / AQI Pill */}
-              <div className={cn(
-                "flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-colors h-7",
-                isOn ? "bg-emerald-500/15 text-emerald-400 shadow-inner" : "bg-white/[0.03] text-dim"
-              )}>
-                <Fan className={cn("w-3.5 h-3.5", isOn && "animate-[spin_3s_linear_infinite]")} />
-                {device.isOnline && device.aqi != null ? (
-                  <span className="text-[0.7rem] font-bold text-text ml-0.5 tracking-wide flex items-baseline gap-1">
-                    {device.aqi} <span className="text-[0.55rem] text-dim font-bold uppercase">AQI</span>
-                  </span>
-                ) : (
-                  <span className="text-[0.65rem] font-semibold tracking-wider uppercase flex items-center h-full">Purifier</span>
-                )}
+          {/* Main Weather Data */}
+          <div className="flex items-baseline gap-3 md:gap-5 mt-1">
+            <div className="flex flex-col">
+              <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight" style={getTempGradientStyle(temp)}>
+                {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
+              </span>
+              <span className="text-[0.75rem] text-text font-medium mt-1">Temp.</span>
+            </div>
+
+            <div className="flex flex-col">
+              <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight text-cyan">
+                {fmt(humidity, 0)}<span className="text-xl">%</span>
+              </span>
+              <span className="text-[0.75rem] text-text font-medium mt-1">Humidity</span>
+            </div>
+
+            {/* Noise (Kitchen only) */}
+            {noise !== undefined && noiseStatus && (
+              <div className="flex flex-col ml-auto">
+                <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
+                  {noise ?? "--"}<span className="text-sm"> dB</span>
+                </span>
+                <span
+                  className="text-[0.75rem] font-medium mt-1"
+                  style={{ color: noiseStatus.level ? statusLevelColors[noiseStatus.level] : "#7a8ba8" }}
+                >
+                  {noiseStatus.label}
+                </span>
               </div>
+            )}
+          </div>
 
-              {/* Filter Watch-Style Progress Ring */}
-              {device.isOnline && device.filter_life != null && (
-                <>
-                  <div className="w-[1px] h-3.5 bg-white/[0.08] mx-0.5" />
-                  <div
-                    className="relative flex items-center justify-center w-7 h-7 rounded-full"
-                    title={`Filter: ${device.filter_life}%`}
-                  >
-                    <svg className="w-full h-full transform -rotate-90" viewBox="0 0 16 16">
-                      <circle cx="8" cy="8" r="6" className="stroke-[#000000]/30 drop-shadow-sm" strokeWidth="2.5" fill="none" />
-                      <circle
-                        cx="8" cy="8" r="6"
-                        className={cn("transition-all duration-1000 ease-out", filterLow ? "stroke-red-500" : "stroke-emerald-400")}
-                        strokeWidth="2.2" strokeDasharray={37.7} strokeDashoffset={37.7 * (1 - Math.max(0, device.filter_life) / 100)} strokeLinecap="round" fill="none"
-                      />
-                    </svg>
-                    <div className={cn("absolute flex items-center justify-center text-[0.45rem] font-bold tabular-nums tracking-tighter", filterLow ? "text-red-400" : "text-text/90")}>
-                      {device.filter_life}
-                    </div>
-                  </div>
-                </>
-              )}
+          {/* Secondary Info Row */}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim mt-4">
+            {dewPoint != null && (
+              <span>Dew Point <span className="text-text font-medium">{fmtTemp(dewPoint)}{tempLabel}</span></span>
+            )}
+            {feelsLike != null && (
+              <span>Feels Like <span className="text-text font-medium">{fmtTemp(feelsLike)}{tempLabel}</span></span>
+            )}
+          </div>
+        </div>
 
-              <div className="w-[1px] h-3.5 bg-white/[0.08] mx-0.5" />
-
-              {/* Power button */}
+        {/* Right: purifier controls — vertical capsule */}
+        {hasPurifier && (
+          <div className={cn(
+            "flex flex-col items-center bg-[#171920]/90 border border-white/[0.05] p-1 rounded-2xl shadow-[0_4px_12px_-4px_rgba(0,0,0,0.5)] backdrop-blur-xl transition-all shrink-0 self-start",
+            offline ? "opacity-40" : "hover:border-white/10 hover:bg-[#1a1c23]/95"
+          )}>
+            {/* Row 1: Power + Settings */}
+            <div className="flex items-center gap-1">
               <button
                 onClick={handlePowerToggle}
                 disabled={offline || powerBusy}
@@ -301,8 +307,6 @@ export function IndoorCard({
                   : <Power className="w-3.5 h-3.5" strokeWidth={2.5} />
                 }
               </button>
-
-              {/* Settings button */}
               <button
                 onClick={() => setShowDetail(true)}
                 className="flex items-center justify-center w-7 h-7 rounded-full text-dim hover:text-white hover:bg-white/10 transition-colors shrink-0"
@@ -311,56 +315,65 @@ export function IndoorCard({
                 <Settings className="w-4 h-4" />
               </button>
             </div>
-          )}
-        </div>
 
-        {/* Main Weather Data */}
-        <div className="flex items-baseline gap-3 md:gap-5 mt-1">
-          <div className="flex flex-col">
-            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight" style={getTempGradientStyle(temp)}>
-              {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
-            </span>
-            <span className="text-[0.75rem] text-text font-medium mt-1">Temp.</span>
+            <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
+
+            {/* Row 2: AQI Status */}
+            {(() => {
+              const aqiStatus = device!.isOnline && device!.aqi != null ? getStatus("pm25", device!.aqi) : null;
+              const aqiColor = aqiStatus?.level ? statusLevelColors[aqiStatus.level] : undefined;
+              return (
+                <div
+                  className={cn(
+                    "flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-colors h-7",
+                    isOn ? "shadow-inner" : "bg-white/[0.03] text-dim"
+                  )}
+                  style={isOn ? { backgroundColor: aqiColor ? `${aqiColor}15` : "rgba(16,185,129,0.15)", color: aqiColor || "#34d399" } : undefined}
+                >
+                  <Fan className={cn("w-3.5 h-3.5", isOn && "animate-[spin_3s_linear_infinite]")} />
+                  {aqiStatus ? (
+                    <span className="text-[0.7rem] font-bold text-text ml-0.5 tracking-wide flex items-baseline gap-1">
+                      {device!.aqi} <span className="text-[0.55rem] text-dim font-bold uppercase">AQI</span>
+                    </span>
+                  ) : (
+                    <span className="text-[0.65rem] font-semibold tracking-wider uppercase flex items-center h-full">Purifier</span>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* Row 3: Filter bar capsule (only if available) */}
+            {device!.isOnline && device!.filter_life != null && (
+              <>
+                <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
+                <div
+                  className="relative h-5 w-full rounded-full overflow-hidden bg-black/30 mx-1 my-0.5"
+                  title={`Filter: ${device!.filter_life}%`}
+                >
+                  <div
+                    className={cn(
+                      "absolute inset-y-0 left-0 rounded-full transition-all duration-1000 ease-out",
+                      filterLow ? "bg-red-500/40" : "bg-emerald-500/25"
+                    )}
+                    style={{ width: `${Math.max(0, device!.filter_life!)}%` }}
+                  />
+                  <div className="relative flex items-center justify-center h-full gap-1 px-2">
+                    <Hourglass className={cn(
+                      "w-3 h-3 shrink-0",
+                      filterLow ? "text-red-400" : "text-emerald-400"
+                    )} />
+                    <span className={cn(
+                      "text-[0.6rem] font-bold tabular-nums tracking-tight",
+                      filterLow ? "text-red-400" : "text-emerald-400"
+                    )}>
+                      {device!.filter_life}%
+                    </span>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
-
-          <div className="flex flex-col">
-            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight text-cyan">
-              {fmt(humidity, 0)}<span className="text-xl">%</span>
-            </span>
-            <span className="text-[0.75rem] text-text font-medium mt-1">Humidity</span>
-          </div>
-
-          {/* Noise (Kitchen only) */}
-          {noise !== undefined && noiseStatus && (
-            <div className="flex flex-col ml-auto">
-              <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
-                {noise ?? "--"}<span className="text-sm"> dB</span>
-              </span>
-              <span
-                className="text-[0.75rem] font-medium mt-1"
-                style={{ color: noiseStatus.level ? statusLevelColors[noiseStatus.level] : "#7a8ba8" }}
-              >
-                {noiseStatus.label}
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Secondary Info Row */}
-        <div className="flex flex-wrap items-center justify-between gap-2 mt-4">
-          {(dewPoint != null || feelsLike != null) ? (
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim">
-              {dewPoint != null && (
-                <span>Dew Point <span className="text-text font-medium">{fmtTemp(dewPoint)}{tempLabel}</span></span>
-              )}
-              {feelsLike != null && (
-                <span>Feels Like <span className="text-text font-medium">{fmtTemp(feelsLike)}{tempLabel}</span></span>
-              )}
-            </div>
-          ) : (
-            <div />
-          )}
-        </div>
+        )}
       </div>
 
       <div
