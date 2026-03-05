@@ -392,6 +392,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     metric: string;
     condition: string;
     threshold: number;
+    sustained_minutes?: number;
     device_ids: string[];
     device_names: string[];
     enabled?: boolean;
@@ -401,6 +402,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     automation_type: "schedule";
     time_start: string;
     time_end: string;
+    turn_off_at_end?: boolean;
     device_ids: string[];
     device_names: string[];
     enabled?: boolean;
@@ -415,6 +417,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     if (typeof body.threshold !== "number" || !isFinite(body.threshold)) return "Threshold must be a finite number";
     const def = ALERT_METRICS[body.metric];
     if (body.threshold < def.min || body.threshold > def.max) return `Threshold must be between ${def.min} and ${def.max}`;
+    if (body.sustained_minutes != null && (!Number.isInteger(body.sustained_minutes) || body.sustained_minutes < 0 || body.sustained_minutes > 60))
+      return "Sustained minutes must be 0–60";
     if (!Array.isArray(body.device_ids) || body.device_ids.length === 0) return "Select at least one device";
     return null;
   }
@@ -437,11 +441,13 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const err = validateScheduleAutomation(sb);
       if (err) { res.status(400).json({ error: err }); return; }
 
-      const name = `Schedule ${sb.time_start} – ${sb.time_end}`;
+      const turnOff = sb.turn_off_at_end ?? false;
+      const name = `Schedule ${sb.time_start} – ${sb.time_end}${turnOff ? " (off at end)" : ""}`;
+      const actionOff = turnOff ? '{"power":"off"}' : null;
       const result = await pool.query(
-        `INSERT INTO automations (name, enabled, automation_type, time_start, time_end, device_id, device_name, device_ids, device_names, action_on, cooldown_secs)
-         VALUES ($1, $2, 'schedule', $3, $4, $5, $6, $7, $8, '{"power":"on"}', 60) RETURNING *`,
-        [name, sb.enabled ?? true, sb.time_start, sb.time_end, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names],
+        `INSERT INTO automations (name, enabled, automation_type, time_start, time_end, turn_off_at_end, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
+         VALUES ($1, $2, 'schedule', $3, $4, $5, $6, $7, $8, $9, '{"power":"on"}', $10, 60) RETURNING *`,
+        [name, sb.enabled ?? true, sb.time_start, sb.time_end, turnOff, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, actionOff],
       );
       res.json({ automation: result.rows[0] });
     } else {
@@ -449,11 +455,12 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const err = validateMetricAutomation(mb);
       if (err) { res.status(400).json({ error: err }); return; }
 
-      const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}`;
+      const mins = mb.sustained_minutes ?? 0;
+      const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}${mins > 0 ? ` for ${mins}min` : ""}`;
       const result = await pool.query(
-        `INSERT INTO automations (name, enabled, automation_type, metric, condition, threshold, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
-         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, '{"power":"on"}', '{"power":"off"}', 300) RETURNING *`,
-        [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names],
+        `INSERT INTO automations (name, enabled, automation_type, metric, condition, threshold, sustained_minutes, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
+         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, '{"power":"on"}', '{"power":"off"}', 300) RETURNING *`,
+        [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mins, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names],
       );
       res.json({ automation: result.rows[0] });
     }
@@ -471,13 +478,15 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const err = validateScheduleAutomation(sb);
       if (err) { res.status(400).json({ error: err }); return; }
 
-      const name = `Schedule ${sb.time_start} – ${sb.time_end}`;
+      const turnOff = sb.turn_off_at_end ?? false;
+      const name = `Schedule ${sb.time_start} – ${sb.time_end}${turnOff ? " (off at end)" : ""}`;
+      const actionOff = turnOff ? '{"power":"off"}' : null;
       const result = await pool.query(
-        `UPDATE automations SET name=$1, enabled=$2, automation_type='schedule', time_start=$3, time_end=$4,
-         metric=NULL, condition=NULL, threshold=NULL,
-         device_id=$5, device_name=$6, device_ids=$7, device_names=$8
-         WHERE id=$9 RETURNING *`,
-        [name, sb.enabled ?? true, sb.time_start, sb.time_end, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, id],
+        `UPDATE automations SET name=$1, enabled=$2, automation_type='schedule', time_start=$3, time_end=$4, turn_off_at_end=$5,
+         metric=NULL, condition=NULL, threshold=NULL, sustained_minutes=0,
+         action_off=$6, device_id=$7, device_name=$8, device_ids=$9, device_names=$10
+         WHERE id=$11 RETURNING *`,
+        [name, sb.enabled ?? true, sb.time_start, sb.time_end, turnOff, actionOff, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, id],
       );
       if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
       res.json({ automation: result.rows[0] });
@@ -486,13 +495,14 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const err = validateMetricAutomation(mb);
       if (err) { res.status(400).json({ error: err }); return; }
 
-      const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}`;
+      const mins = mb.sustained_minutes ?? 0;
+      const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}${mins > 0 ? ` for ${mins}min` : ""}`;
       const result = await pool.query(
-        `UPDATE automations SET name=$1, enabled=$2, automation_type='metric', metric=$3, condition=$4, threshold=$5,
-         time_start=NULL, time_end=NULL,
-         device_id=$6, device_name=$7, device_ids=$8, device_names=$9
-         WHERE id=$10 RETURNING *`,
-        [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, id],
+        `UPDATE automations SET name=$1, enabled=$2, automation_type='metric', metric=$3, condition=$4, threshold=$5, sustained_minutes=$6,
+         time_start=NULL, time_end=NULL, turn_off_at_end=false,
+         device_id=$7, device_name=$8, device_ids=$9, device_names=$10
+         WHERE id=$11 RETURNING *`,
+        [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mins, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, id],
       );
       if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
       res.json({ automation: result.rows[0] });

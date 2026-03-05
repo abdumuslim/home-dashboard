@@ -120,7 +120,7 @@ Three main tables in the `home` database:
 - `weather_readings` — 32 columns, keyed by `ts TIMESTAMPTZ` with BRIN index (metric units, all conversions done at collection time). Includes outdoor, indoor console, and ch8 "Abdu" sensor data.
 - `air_readings` — 9 columns, keyed by `ts TIMESTAMPTZ` with BRIN index
 - `alert_rules` — per-subscription alert configurations (FK to `push_subscriptions.endpoint` with CASCADE). Fields: `alert_type` (sensor/prayer), `metric`, `condition` (above/below), `threshold`, `prayer_timing` (at_time/before), `prayer_minutes`, `prayer_names TEXT[]`.
-- `automations` — Purifier automation rules. Fields: `id`, `automation_type` (metric/schedule), `device_ids`, `device_names`, `metric`, `condition`, `threshold` (metric type), `time_start`, `time_end` (schedule type), `action_on`, `action_off`, `cooldown_secs`, `enabled`.
+- `automations` — Purifier automation rules. Fields: `id`, `automation_type` (metric/schedule), `device_ids`, `device_names`, `metric`, `condition`, `threshold`, `sustained_minutes` (metric type), `time_start`, `time_end`, `turn_off_at_end` (schedule type), `action_on`, `action_off`, `cooldown_secs`, `enabled`.
 
 New columns/tables added via `MIGRATIONS` list in `database.ts`. Deduplication: `ON CONFLICT (ts) DO NOTHING`. The 30-day history endpoint downsamples to hourly averages.
 
