@@ -248,6 +248,15 @@ export function IndoorCard({
               <span className="text-[0.75rem] text-text font-medium mt-1">Temp.</span>
             </div>
 
+            {feelsLike != null && (
+              <div className="flex flex-col">
+                <span className="text-xl md:text-2xl font-semibold leading-none tracking-tight text-white">
+                  {fmtTemp(feelsLike)}<span className="text-base">{tempLabel}</span>
+                </span>
+                <span className="text-[0.75rem] text-text font-medium mt-1">Feels like</span>
+              </div>
+            )}
+
             <div className="flex flex-col">
               <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight text-cyan">
                 {fmt(humidity, 0)}<span className="text-xl">%</span>
@@ -272,14 +281,11 @@ export function IndoorCard({
           </div>
 
           {/* Secondary Info Row */}
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim mt-4">
-            {dewPoint != null && (
+          {dewPoint != null && (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim mt-4">
               <span>Dew Point <span className="text-text font-medium">{fmtTemp(dewPoint)}{tempLabel}</span></span>
-            )}
-            {feelsLike != null && (
-              <span>Feels Like <span className="text-text font-medium">{fmtTemp(feelsLike)}{tempLabel}</span></span>
-            )}
-          </div>
+            </div>
+          )}
         </div>
 
         {/* Right: purifier controls — vertical capsule */}
