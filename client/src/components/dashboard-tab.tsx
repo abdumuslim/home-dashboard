@@ -1,12 +1,12 @@
 import type { ReactNode } from "react";
 import type { WeatherReading, AirReading, OpenOverlayFn } from "@/types/api";
 import { useSectionLayout, type SectionId } from "@/hooks/use-section-layout";
+import { useDevices } from "@/hooks/use-devices";
 import { SectionWrapper } from "./ui/section-wrapper";
 import { OutdoorSection } from "./sections/outdoor-section";
 import { IndoorSection } from "./sections/indoor-section";
 import { AirQualitySection } from "./sections/air-quality-section";
 import { PrayerSectionHeader, PrayerSectionContent } from "./sections/prayer-section";
-import { PurifiersSection } from "./sections/purifiers-section";
 
 interface DashboardTabProps {
   weather: WeatherReading | null;
@@ -18,6 +18,7 @@ interface DashboardTabProps {
 
 export function DashboardTab({ weather, air, weatherHistory, airHistory, openOverlay }: DashboardTabProps) {
   const { order, collapsed, toggleCollapsed, moveUp, moveDown } = useSectionLayout();
+  const { devices, sendControl } = useDevices();
 
   const sections: Record<SectionId, { header: ReactNode; headerRight?: ReactNode; content: ReactNode }> = {
     outdoor: {
@@ -37,6 +38,8 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
           weatherHistory={weatherHistory}
           airHistory={airHistory}
           openOverlay={openOverlay}
+          devices={devices}
+          sendControl={sendControl}
         />
       ),
     },
@@ -50,10 +53,6 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
         </h2>
       ),
       content: <AirQualitySection air={air} airHistory={airHistory} openOverlay={openOverlay} />,
-    },
-    purifiers: {
-      header: <h2 className="text-base font-medium tracking-wider text-white">AIR PURIFIERS</h2>,
-      content: <PurifiersSection />,
     },
     prayer: {
       header: <PrayerSectionHeader />,
