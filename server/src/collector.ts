@@ -4,6 +4,7 @@ import mqtt from "mqtt";
 import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import type { Config } from "./config.js";
 import { getMetricValue, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
+import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
 
 interface WeatherRow {
   ts: Date;
@@ -106,6 +107,27 @@ interface AlertRule {
   subscription: unknown; // JSONB, already parsed by pg driver
 }
 
+interface AutomationRule {
+  id: number;
+  name: string;
+  enabled: boolean;
+  metric: string;
+  condition: "above" | "below";
+  threshold: number;
+  device_id: string;
+  device_name: string;
+  device_ids: string[] | null;
+  device_names: string[] | null;
+  action_on: PurifierAction;
+  action_off: PurifierAction | null;
+  cooldown_secs: number;
+}
+
+interface AutomationState {
+  status: "idle" | "triggered";
+  lastToggle: number;
+}
+
 export class Collector {
   private pool: pg.Pool;
   private config: Config;
@@ -126,6 +148,11 @@ export class Collector {
   private latestAirTs: Date | null = null;
   private cachedPrayerTimes: PrayerTimes | null = null;
   private cachedPrayerDateKey = "";
+  // Automation system
+  xiaomiCloud: XiaomiCloud | null = null;
+  private automationRules: AutomationRule[] = [];
+  private automationRulesLastFetch = 0;
+  private automationState = new Map<number, AutomationState>();
 
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
@@ -150,6 +177,7 @@ export class Collector {
     await sleep(2000);
     await this.backfillQingpingHistory();
     this.startMqtt();
+    await this.initXiaomiCloud();
     while (!this.stopped) {
       try {
         await this.collectAll();
@@ -157,6 +185,24 @@ export class Collector {
         console.error("[collector] Collection cycle failed:", err);
       }
       await sleep(5000);
+    }
+  }
+
+  private async initXiaomiCloud(): Promise<void> {
+    if (!this.config.miEmail || !this.config.miPassword) {
+      console.log("[collector] Xiaomi Cloud not configured (MI_EMAIL empty), automations disabled");
+      return;
+    }
+    try {
+      this.xiaomiCloud = new XiaomiCloud(
+        this.config.miEmail,
+        this.config.miPassword,
+        this.config.miRegion,
+      );
+      await this.xiaomiCloud.init();
+    } catch (err) {
+      console.error("[collector] Xiaomi Cloud init failed:", (err as Error).message);
+      this.xiaomiCloud = null;
     }
   }
 
@@ -180,6 +226,12 @@ export class Collector {
       await this.checkAlerts();
     } catch (err) {
       console.error("[collector] Alert check failed:", err);
+    }
+
+    try {
+      await this.checkAutomations();
+    } catch (err) {
+      console.error("[collector] Automation check failed:", err);
     }
 
   }
@@ -331,6 +383,81 @@ export class Collector {
         }
       } else {
         console.error(`[collector] Push failed (${status}):`, (err as Error).message);
+      }
+    }
+  }
+
+  // ---------- Automations ----------
+
+  private async refreshAutomationRules(): Promise<void> {
+    if (Date.now() - this.automationRulesLastFetch < 30_000) return;
+    const result = await this.pool.query(
+      "SELECT * FROM automations WHERE enabled = true",
+    );
+    this.automationRules = result.rows as AutomationRule[];
+    this.automationRulesLastFetch = Date.now();
+
+    // Prune stale state for deleted rules
+    const activeIds = new Set(this.automationRules.map((r) => r.id));
+    for (const id of this.automationState.keys()) {
+      if (!activeIds.has(id)) this.automationState.delete(id);
+    }
+  }
+
+  private async checkAutomations(): Promise<void> {
+    if (!this.xiaomiCloud || !this.xiaomiCloud.isReady()) return;
+
+    await this.refreshAutomationRules();
+    if (this.automationRules.length === 0) return;
+
+    const now = Date.now();
+    const weatherStale = !this.latestWeatherTs || (now - this.latestWeatherTs.getTime() > 300_000);
+    const airStale = !this.latestAirTs || (now - this.latestAirTs.getTime() > 300_000);
+
+    for (const rule of this.automationRules) {
+      const def = ALERT_METRICS[rule.metric];
+      if (!def) continue;
+
+      if (def.source === "weather" && weatherStale) continue;
+      if (def.source === "air" && airStale) continue;
+
+      const value = getMetricValue(rule.metric, this.latestWeatherRow, this.latestAirRow);
+      if (value == null) continue;
+
+      const conditionMet = rule.condition === "above"
+        ? value > rule.threshold
+        : value < rule.threshold;
+
+      const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0 };
+      const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
+
+      const deviceIds = rule.device_ids ?? [rule.device_id];
+      const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
+
+      if (conditionMet && state.status === "idle" && (now - state.lastToggle >= cooldownMs)) {
+        console.log(
+          `[collector] Automation "${rule.name}": ${rule.metric}=${value} ${rule.condition} ${rule.threshold}, turning ON [${deviceNames}]`,
+        );
+        try {
+          for (const did of deviceIds) {
+            await this.xiaomiCloud.executeAction(did, rule.action_on);
+          }
+          this.automationState.set(rule.id, { status: "triggered", lastToggle: now });
+        } catch (err) {
+          console.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
+        }
+      } else if (!conditionMet && state.status === "triggered" && rule.action_off && (now - state.lastToggle >= cooldownMs)) {
+        console.log(
+          `[collector] Automation "${rule.name}": ${rule.metric}=${value} returned below ${rule.threshold}, turning OFF [${deviceNames}]`,
+        );
+        try {
+          for (const did of deviceIds) {
+            await this.xiaomiCloud.executeAction(did, rule.action_off);
+          }
+          this.automationState.set(rule.id, { status: "idle", lastToggle: now });
+        } catch (err) {
+          console.error(`[collector] Automation "${rule.name}" action_off failed:`, (err as Error).message);
+        }
       }
     }
   }

@@ -6,6 +6,7 @@ import { OutdoorSection } from "./sections/outdoor-section";
 import { IndoorSection } from "./sections/indoor-section";
 import { AirQualitySection } from "./sections/air-quality-section";
 import { PrayerSectionHeader, PrayerSectionContent } from "./sections/prayer-section";
+import { PurifiersSection } from "./sections/purifiers-section";
 
 interface DashboardTabProps {
   weather: WeatherReading | null;
@@ -49,6 +50,10 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
         </h2>
       ),
       content: <AirQualitySection air={air} airHistory={airHistory} openOverlay={openOverlay} />,
+    },
+    purifiers: {
+      header: <h2 className="text-base font-medium tracking-wider text-white">AIR PURIFIERS</h2>,
+      content: <PurifiersSection />,
     },
     prayer: {
       header: <PrayerSectionHeader />,

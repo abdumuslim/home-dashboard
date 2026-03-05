@@ -1,8 +1,8 @@
 import { useState, useCallback, useEffect } from "react";
 
-export type SectionId = "outdoor" | "indoor" | "air-quality" | "prayer";
+export type SectionId = "outdoor" | "indoor" | "air-quality" | "purifiers" | "prayer";
 
-const ALL_SECTIONS: SectionId[] = ["outdoor", "indoor", "air-quality", "prayer"];
+const ALL_SECTIONS: SectionId[] = ["outdoor", "indoor", "air-quality", "purifiers", "prayer"];
 const STORAGE_KEY = "home-dashboard-layout";
 
 interface SectionLayout {
@@ -12,7 +12,7 @@ interface SectionLayout {
 
 const DEFAULT_LAYOUT: SectionLayout = {
   order: [...ALL_SECTIONS],
-  collapsed: { outdoor: false, indoor: false, "air-quality": false, prayer: false },
+  collapsed: { outdoor: false, indoor: false, "air-quality": false, purifiers: false, prayer: false },
 };
 
 function isValidLayout(data: unknown): data is SectionLayout {
