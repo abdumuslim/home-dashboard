@@ -74,6 +74,22 @@ const MIGRATIONS: string[] = [
     prayer_names TEXT[],
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`,
+  `CREATE TABLE IF NOT EXISTS automations (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    metric TEXT NOT NULL,
+    condition TEXT NOT NULL CHECK (condition IN ('above','below')),
+    threshold REAL NOT NULL,
+    device_id TEXT NOT NULL,
+    device_name TEXT NOT NULL,
+    action_on JSONB NOT NULL,
+    action_off JSONB,
+    cooldown_secs INTEGER NOT NULL DEFAULT 300,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`,
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS device_ids TEXT[]",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS device_names TEXT[]",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

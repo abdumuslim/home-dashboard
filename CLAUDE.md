@@ -4,14 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.js/Express backend with React/TypeScript frontend, collects data from two sensor APIs, stores in PostgreSQL, and serves a dark-themed dashboard with live-updating cards and Chart.js charts.
+Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.js/Express backend with React/TypeScript frontend, collects data from two sensor APIs, stores in PostgreSQL, and serves a dark-themed dashboard with live-updating cards and Chart.js charts. It also automates Xiaomi Mi Air Purifiers based on air quality metrics.
 
-**4 physical sensors, 2 APIs:**
+**4 physical sensors, 2 APIs, 2 Purifiers:**
 - **Ambient Weather WS-2000** (1 API device, 3 sensor groups in `lastData`):
   - Outdoor: temp, humidity, wind, rain, pressure, UV, solar (~1 min updates)
   - Indoor console: temp, humidity, feels like, dew point (`tempinf`, `humidityin`, `feelsLikein`, `dewPointin`)
   - Channel 8 "Abdu": temp, humidity, feels like, dew point (`temp8f`, `humidity8`, `feelsLike8`, `dewPoint8`)
 - **Qingping Air Monitor CGS2**: CO2, PM2.5, PM10, tVOC, noise, temp, humidity (~30s via MQTT, cloud API fallback ~15 min)
+- **Xiaomi Mi Air Purifiers**:
+  - "mom": `zhimi.airpurifier.v7` (older MiIO protocol)
+  - "Abdu": `zhimi.airpurifier.vb2` (modern MIoT protocol)
 
 ## Architecture
 
@@ -23,7 +26,13 @@ Browser → Cloudflare → Traefik (VPS, existing) → dashboard container (port
 
 - **Backend**: Express 5 (Node.js/TypeScript) serves REST API + static frontend + runs collector in background
 - **Frontend**: React + TypeScript + Vite + Tailwind CSS v4 + lucide-react icons
-- **Separate docker-compose**: Lives at `/opt/home-dashboard/` on the VPS, joins the existing `rag_default` network
+- **Xiaomi Cloud**: Integrated via `xmihome` library (custom wrapper in `xiaomi-cloud.ts`).
+  - Supports 2FA (credentials/token cached in persistent volume).
+  - Handles both **MiIO** (`get_prop`, `set_power`) and **MIoT** (`get_properties`, `set_properties`) protocols.
+  - **MIoT Mappings**: Power (2:2), Fan Level (2:4), Mode (2:5), AQI (3:6), Humidity (3:7), Temperature (3:8), Filter Life (4:3), Buzzer (5:1), LED (6:6), Child Lock (7:1).
+- **Automations**: AQI-triggered rules processed in the collector loop. Configurable via dashboard.
+- **Separate docker-compose**: Lives at `/opt/home-dashboard/` on the VPS, joins the existing `rag_default` network.
+  - Mounts `dashboard_data` volume to `/app/data` for `xiaomi-credentials.json`.
 - **Multi-stage Docker build**: Stage 1 builds client (Vite), Stage 2 builds server (tsc), Stage 3 runs production Node.js
 - **Database**: Uses the existing `rag-postgres-1` container (pgvector:pg16). The `home` database is auto-created on first startup
 
@@ -34,10 +43,11 @@ D:\dev\home\
 ├── server/                 # Node.js backend (Express + TypeScript)
 │   ├── src/
 │   │   ├── index.ts        # Express app, static serving, collector startup
-│   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status, /api/alerts CRUD)
-│   │   ├── collector.ts    # Collector class (AW polling + Qingping MQTT/cloud + alert checking)
+│   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status, /api/alerts CRUD, /api/xiaomi/*)
+│   │   ├── collector.ts    # Collector class (AW polling + Qingping MQTT/cloud + AQI automation loop)
+│   │   ├── xiaomi-cloud.ts # Wrapper for xmihome, protocol routing, device discovery, auth
 │   │   ├── alert-metrics.ts # Shared metrics catalog, getMetricValue, PRAYER_LABELS
-│   │   ├── database.ts     # pg pool, schema init, migrations
+│   │   ├── database.ts     # pg pool, schema init, migrations (added automations table)
 │   │   └── config.ts       # Env vars (dotenv)
 │   ├── package.json
 │   └── tsconfig.json
@@ -46,10 +56,9 @@ D:\dev\home\
 │   │   ├── main.tsx        # Entry point, Chart.js registration
 │   │   ├── App.tsx         # Root component with tabs
 │   │   ├── index.css       # Tailwind theme + custom wind/flash CSS
-│   │   ├── hooks/          # useCurrentData, useHistoryData, useClock, useFlash, useAlerts, usePushNotifications
+│   │   ├── hooks/          # useCurrentData, useHistoryData, useClock, useFlash, useAlerts, usePushNotifications, useDevices, useAutomations
 │   │   ├── components/     # Header, sections, cards, charts, AlertsModal
-│   │   ├── charts/         # Chart.js wrappers
-│   │   ├── types/          # API type definitions (api.ts, alerts.ts)
+│   │   ├── types/          # API type definitions (api.ts, alerts.ts, automations.ts)
 │   │   └── constants/      # Thresholds, directions, helpers, alert-metrics
 │   ├── vite.config.ts
 │   └── package.json
@@ -57,8 +66,8 @@ D:\dev\home\
 │   └── config/
 │       └── mosquitto.conf  # Broker config (passwd file generated on VPS)
 ├── Dockerfile              # Multi-stage (node:22-slim)
-├── docker-compose.yml      # dashboard + mosquitto services
-└── .env                    # On VPS only
+├── docker-compose.yml      # dashboard + mosquitto services + data volume
+└── .env                    # On VPS only (added MI_EMAIL, MI_PASSWORD, MI_REGION=sg)
 ```
 
 ## Development
@@ -105,19 +114,21 @@ ssh -i ~/.ssh/vps1_key -o StrictHostKeyChecking=no root@31.97.76.221 "command" >
 
 ## Database Schema
 
-Three tables in the `home` database:
+Three main tables in the `home` database:
 - `weather_readings` — 32 columns, keyed by `ts TIMESTAMPTZ` with BRIN index (metric units, all conversions done at collection time). Includes outdoor, indoor console, and ch8 "Abdu" sensor data.
 - `air_readings` — 9 columns, keyed by `ts TIMESTAMPTZ` with BRIN index
 - `alert_rules` — per-subscription alert configurations (FK to `push_subscriptions.endpoint` with CASCADE). Fields: `alert_type` (sensor/prayer), `metric`, `condition` (above/below), `threshold`, `prayer_timing` (at_time/before), `prayer_minutes`, `prayer_names TEXT[]`.
+- `automations` — AQI-triggered rules for Xiaomi devices. Fields: `id`, `device_ids`, `device_names`, `metric`, `condition`, `threshold`, `action`, `enabled`.
 
 New columns/tables added via `MIGRATIONS` list in `database.ts`. Deduplication: `ON CONFLICT (ts) DO NOTHING`. The 30-day history endpoint downsamples to hourly averages.
 
 ## Dashboard Layout
 
-3 sections with tabs (Dashboard / Charts):
-- **Outdoor** (4-col grid): Temperature, Wind (golden circle), Rainfall (+ Barometer), Solar
+4 sections with tabs (Dashboard / Charts):
+- **Outdoor** (4-col grid): Temperature, Wind, Rainfall (+ Barometer), Solar
 - **Indoor** (3-col grid): Mom, Abdu, Kitchen — each with temp + humidity
 - **Air Quality** (5-col grid): CO2, PM2.5, PM10, tVOC, Noise — battery in section header
+- **Purifiers** (2-col grid): "mom" and "Abdu" cards + Inline AQI Automation Trigger panel
 
 ## Card Design Language
 
@@ -133,6 +144,11 @@ All metric cards follow a consistent design language established in the Temperat
   - Values highlighted with `text-text font-medium`
 - **Content spacing:** `mb-[100px]` on content div to reserve space for the chart below
 - **Chart:** absolute-positioned at bottom, `h-[100px]`, `z-0 rounded-b-xl overflow-hidden`, `px-2 pb-1`
+
+### Purifier Card
+- Displays device name, status (online/offline), power, mode (Auto/Favorite/Sleep), fan level, and auxiliary controls (LED, Buzzer, Child Lock).
+- Handles different capabilities based on protocol (e.g., specific MIoT properties).
+- Includes status indicators for filter life.
 
 ### Chart Defaults
 - Line charts: `borderWidth: 2, pointRadius: 0, tension: 0.4, cubicInterpolationMode: "monotone", fill: true`
@@ -157,9 +173,11 @@ All metric cards follow a consistent design language established in the Temperat
 
 ## API Rate Limits
 
-- **Ambient Weather**: 1 request/sec. Collector polls every 5s (sensors only update every ~5 min, dedup discards repeats). 2-second sleep after backfill prevents 429 on the first collection cycle
-- **Qingping MQTT (primary)**: Device pushes to self-hosted Mosquitto broker every ~30s. Collector subscribes to `qingping/{MAC}/up`. Interval configured via downlink to `qingping/{MAC}/down`.
-- **Qingping Cloud API (fallback)**: OAuth token expires in ~2 hours, refreshed 5 min before expiry. Automatically resumes when MQTT is silent >2 minutes.
+- Ambient Weather: 1 request/sec. Collector polls every 5s (sensors only update every ~5 min, dedup discards repeats). 2-second sleep after backfill prevents 429 on the first collection cycle
+- Qingping MQTT (primary): Device pushes to self-hosted Mosquitto broker every ~30s. Collector subscribes to `qingping/{MAC}/up`. Interval configured via downlink to `qingping/{MAC}/down`.
+- Qingping Cloud API (fallback): OAuth token expires in ~2 hours, refreshed 5 min before expiry. Automatically resumes when MQTT is silent >2 minutes.
+- Xiaomi Cloud: Managed by `xmihome`. Avoid aggressive polling. Commands are sent as needed for automations or UI interactions.
+
 
 ## Frontend Update Intervals
 

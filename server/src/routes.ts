@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import pg from "pg";
 import type { Config } from "./config.js";
 import { ALERT_METRICS, VALID_PRAYER_NAMES } from "./alert-metrics.js";
+import type { XiaomiCloud } from "./xiaomi-cloud.js";
 
 const RANGE_MAP: Record<string, string> = {
   "6h": "6 hours",
@@ -38,7 +39,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null): Router {
   const router = Router();
 
   router.get("/api/current", async (_req: Request, res: Response) => {
@@ -314,6 +315,193 @@ export function createRouter(pool: pg.Pool, config?: Config): Router {
       [id, endpoint]
     );
     res.json({ ok: true });
+  });
+
+  // ---------- Xiaomi Cloud Auth ----------
+
+  router.get("/api/xiaomi/auth-status", (_req: Request, res: Response) => {
+    const cloud = getXiaomiCloud?.();
+    if (!cloud) {
+      res.json({ status: "not_configured" });
+      return;
+    }
+    res.json(cloud.getAuthStatus());
+  });
+
+  router.post("/api/xiaomi/verify", async (req: Request, res: Response) => {
+    const cloud = getXiaomiCloud?.();
+    if (!cloud) {
+      res.status(503).json({ error: "Xiaomi Cloud not available" });
+      return;
+    }
+    const { code } = req.body as { code: string };
+    if (!code) {
+      res.status(400).json({ error: "Missing code" });
+      return;
+    }
+    const result = await cloud.submitVerification(code);
+    res.json(result);
+  });
+
+  // ---------- Devices (Xiaomi Cloud) ----------
+
+  router.get("/api/devices", async (_req: Request, res: Response) => {
+    const cloud = getXiaomiCloud?.();
+    if (!cloud) {
+      res.json({ devices: [], available: false });
+      return;
+    }
+    try {
+      const devices = await cloud.fetchDevicesLive();
+      res.json({ devices, available: true, region: cloud.getRegion() });
+    } catch (err) {
+      res.json({ devices: cloud.getDevices(), available: true, region: cloud.getRegion(), error: (err as Error).message });
+    }
+  });
+
+  // ---------- Device Control ----------
+
+  const ALLOWED_COMMANDS = ["set_power", "set_mode", "set_level_favorite", "set_led", "set_buzzer", "set_child_lock"];
+
+  router.post("/api/devices/:id/control", async (req: Request, res: Response) => {
+    const cloud = getXiaomiCloud?.();
+    if (!cloud) { res.status(503).json({ error: "Xiaomi Cloud not available" }); return; }
+    const id = String(req.params.id);
+    const { command, params } = req.body as { command: string; params: unknown[] };
+    if (!command || !ALLOWED_COMMANDS.includes(command)) {
+      res.status(400).json({ error: `Invalid command. Allowed: ${ALLOWED_COMMANDS.join(", ")}` });
+      return;
+    }
+    try {
+      await cloud.sendControlCommand(id, command, params ?? []);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // ---------- Automations ----------
+
+  router.get("/api/automations", async (_req: Request, res: Response) => {
+    const result = await pool.query("SELECT * FROM automations ORDER BY created_at ASC");
+    res.json({ automations: result.rows });
+  });
+
+  interface AutomationBody {
+    metric: string;
+    condition: string;
+    threshold: number;
+    device_ids: string[];
+    device_names: string[];
+    enabled?: boolean;
+  }
+
+  function validateAutomation(body: AutomationBody): string | null {
+    if (!body.metric || !(body.metric in ALERT_METRICS)) return "Invalid metric";
+    if (ALERT_METRICS[body.metric].source !== "air") return "Only air quality metrics allowed";
+    if (body.condition !== "above" && body.condition !== "below") return "Condition must be 'above' or 'below'";
+    if (typeof body.threshold !== "number" || !isFinite(body.threshold)) return "Threshold must be a finite number";
+    const def = ALERT_METRICS[body.metric];
+    if (body.threshold < def.min || body.threshold > def.max) return `Threshold must be between ${def.min} and ${def.max}`;
+    if (!Array.isArray(body.device_ids) || body.device_ids.length === 0) return "Select at least one device";
+    return null;
+  }
+
+  router.post("/api/automations", async (req: Request, res: Response) => {
+    const body = req.body as AutomationBody;
+    const err = validateAutomation(body);
+    if (err) { res.status(400).json({ error: err }); return; }
+
+    const name = `${ALERT_METRICS[body.metric].label} ${body.condition} ${body.threshold}`;
+    const result = await pool.query(
+      `INSERT INTO automations (name, enabled, metric, condition, threshold, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{"power":"on"}', '{"power":"off"}', 300) RETURNING *`,
+      [
+        name,
+        body.enabled ?? true,
+        body.metric,
+        body.condition,
+        body.threshold,
+        body.device_ids[0],
+        body.device_names[0] ?? body.device_ids[0],
+        body.device_ids,
+        body.device_names,
+      ],
+    );
+    res.json({ automation: result.rows[0] });
+  });
+
+  router.put("/api/automations/:id", async (req: Request, res: Response) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+
+    const body = req.body as AutomationBody;
+    const err = validateAutomation(body);
+    if (err) { res.status(400).json({ error: err }); return; }
+
+    const name = `${ALERT_METRICS[body.metric].label} ${body.condition} ${body.threshold}`;
+    const result = await pool.query(
+      `UPDATE automations SET name=$1, enabled=$2, metric=$3, condition=$4, threshold=$5,
+       device_id=$6, device_name=$7, device_ids=$8, device_names=$9
+       WHERE id=$10 RETURNING *`,
+      [
+        name,
+        body.enabled ?? true,
+        body.metric,
+        body.condition,
+        body.threshold,
+        body.device_ids[0],
+        body.device_names[0] ?? body.device_ids[0],
+        body.device_ids,
+        body.device_names,
+        id,
+      ],
+    );
+    if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
+    res.json({ automation: result.rows[0] });
+  });
+
+  router.delete("/api/automations/:id", async (req: Request, res: Response) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+    await pool.query("DELETE FROM automations WHERE id = $1", [id]);
+    res.json({ ok: true });
+  });
+
+  router.post("/api/automations/:id/test", async (req: Request, res: Response) => {
+    const cloud = getXiaomiCloud?.();
+    if (!cloud) { res.status(503).json({ error: "Xiaomi Cloud not available" }); return; }
+    const id = parseInt(String(req.params.id), 10);
+    if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+
+    const result = await pool.query("SELECT * FROM automations WHERE id = $1", [id]);
+    if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
+    const rule = result.rows[0] as { device_ids?: string[]; device_id: string; action_on: { power?: string } };
+
+    try {
+      const ids = rule.device_ids ?? [rule.device_id];
+      for (const did of ids) {
+        await cloud.sendCommand(did, "set_power", ["on"]);
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Enable/disable toggle
+  router.patch("/api/automations/:id", async (req: Request, res: Response) => {
+    const id = parseInt(String(req.params.id), 10);
+    if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
+    const { enabled } = req.body as { enabled: boolean };
+    if (typeof enabled !== "boolean") { res.status(400).json({ error: "enabled must be boolean" }); return; }
+
+    const result = await pool.query(
+      "UPDATE automations SET enabled = $1 WHERE id = $2 RETURNING *",
+      [enabled, id],
+    );
+    if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
+    res.json({ automation: result.rows[0] });
   });
 
   return router;

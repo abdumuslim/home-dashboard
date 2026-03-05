@@ -13,6 +13,9 @@ export interface Config {
   mqttUsername: string;
   mqttPassword: string;
   mqttQingpingMac: string;
+  miEmail: string;
+  miPassword: string;
+  miRegion: string;
 }
 
 export const config: Config = {
@@ -28,4 +31,7 @@ export const config: Config = {
   mqttUsername: process.env.MQTT_USERNAME ?? "",
   mqttPassword: process.env.MQTT_PASSWORD ?? "",
   mqttQingpingMac: process.env.MQTT_QINGPING_MAC ?? "582D3470F981",
+  miEmail: process.env.MI_EMAIL ?? "",
+  miPassword: process.env.MI_PASSWORD ?? "",
+  miRegion: process.env.MI_REGION ?? "sg",
 };
