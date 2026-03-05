@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { X, Trash2, Pencil, Bell, BellOff, Plus, Loader2 } from "lucide-react";
+import { X, Trash2, Pencil, Bell, BellOff, Plus, Loader2, Clock, Activity } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePushNotifications } from "@/hooks/use-push-notifications";
 import { useAlerts } from "@/hooks/use-alerts";
@@ -41,10 +41,13 @@ const TRIGGER_METRICS: Record<string, MetricInfo> = Object.fromEntries(
 );
 
 function describeTrigger(r: AutomationRule): string {
-  const m = ALERT_METRICS[r.metric];
-  const label = m?.label ?? r.metric;
-  const unit = m?.unit ? ` ${m.unit}` : "";
   const names = (r.device_names ?? [r.device_name]).join(", ");
+  if (r.automation_type === "schedule") {
+    return `${r.time_start} – ${r.time_end} → ${names}`;
+  }
+  const m = r.metric ? ALERT_METRICS[r.metric] : null;
+  const label = m?.label ?? r.metric ?? "";
+  const unit = m?.unit ? ` ${m.unit}` : "";
   return `${label} ${r.condition} ${r.threshold}${unit} → ${names}`;
 }
 
@@ -616,7 +619,12 @@ function AutomationsPanel({ automations, devices, onCreate, onDelete, onToggle }
 
       {automations.map((a) => (
         <div key={a.id} className={cn("flex items-center justify-between px-3 py-2 rounded-lg bg-white/5 text-sm", !a.enabled && "opacity-40")}>
-          <span className="text-text truncate">{describeTrigger(a)}</span>
+          <span className="text-text truncate flex items-center gap-1.5">
+            {a.automation_type === "schedule"
+              ? <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              : <Activity className="w-3.5 h-3.5 text-cyan shrink-0" />}
+            {describeTrigger(a)}
+          </span>
           <div className="flex items-center gap-1 shrink-0 ml-2">
             <button
               onClick={() => onToggle(a.id, !a.enabled)}
@@ -646,14 +654,52 @@ function AutomationsPanel({ automations, devices, onCreate, onDelete, onToggle }
   );
 }
 
+function DeviceCheckboxes({ devices, selectedDevices, setSelectedDevices }: {
+  devices: PurifierDevice[];
+  selectedDevices: Set<string>;
+  setSelectedDevices: (s: Set<string>) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {devices.map((d) => {
+        const checked = selectedDevices.has(d.id);
+        return (
+          <label key={d.id} className="flex items-center gap-1.5 cursor-pointer text-xs text-dim">
+            <span className={cn("w-3.5 h-3.5 rounded border flex items-center justify-center", checked ? "border-cyan bg-cyan/20" : "border-dim")}>
+              {checked && <span className="text-cyan text-[10px]">&#10003;</span>}
+            </span>
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={() => {
+                const next = new Set(selectedDevices);
+                if (checked) next.delete(d.id); else next.add(d.id);
+                setSelectedDevices(next);
+              }}
+              className="sr-only"
+            />
+            <span className={checked ? "text-text" : ""}>{d.name}</span>
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
 function AutomationTriggerForm({ devices, onSave, onCancel }: {
   devices: PurifierDevice[];
   onSave: (data: Record<string, unknown>) => Promise<void>;
   onCancel: () => void;
 }) {
+  const [automationType, setAutomationType] = useState<"metric" | "schedule" | "">("");
+  // Metric state
   const [metric, setMetric] = useState("");
   const [condition, setCondition] = useState<"above" | "below" | "">("");
   const [threshold, setThreshold] = useState("");
+  // Schedule state
+  const [timeStart, setTimeStart] = useState("22:00");
+  const [timeEnd, setTimeEnd] = useState("07:00");
+  // Shared state
   const [selectedDevices, setSelectedDevices] = useState<Set<string>>(() => new Set(devices.map((d) => d.id)));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -661,7 +707,16 @@ function AutomationTriggerForm({ devices, onSave, onCancel }: {
   const metricDef = metric ? TRIGGER_METRICS[metric] : null;
   const thresholdNum = parseFloat(threshold);
   const thresholdValid = metricDef && threshold !== "" && isFinite(thresholdNum) && thresholdNum >= metricDef.min && thresholdNum <= metricDef.max;
-  const canSave = metric !== "" && condition !== "" && thresholdValid && selectedDevices.size > 0;
+
+  const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+  const timeValid = timeRegex.test(timeStart) && timeRegex.test(timeEnd) && timeStart !== timeEnd;
+
+  const canSaveMetric = automationType === "metric" && metric !== "" && condition !== "" && thresholdValid && selectedDevices.size > 0;
+  const canSaveSchedule = automationType === "schedule" && timeValid && selectedDevices.size > 0;
+  const canSave = canSaveMetric || canSaveSchedule;
+
+  // Show device checkboxes when enough fields are filled
+  const showDevices = automationType === "schedule" || (condition !== "" && threshold !== "");
 
   return (
     <div className="flex flex-col gap-2.5 p-3 rounded-lg bg-white/5 border border-white/10">
@@ -670,68 +725,94 @@ function AutomationTriggerForm({ devices, onSave, onCancel }: {
         <button onClick={onCancel} className="text-xs text-dim hover:text-white">Cancel</button>
       </div>
 
-      <select
-        value={metric}
-        onChange={(e) => { setMetric(e.target.value); setThreshold(""); }}
-        className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50"
-      >
-        <option value="" className="bg-[#1a1a2e]">Select metric...</option>
-        {Object.entries(TRIGGER_METRICS).map(([key, info]) => (
-          <option key={key} value={key} className="bg-[#1a1a2e]">{info.label}</option>
+      {/* Type selector */}
+      <div className="flex gap-2">
+        {(["metric", "schedule"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setAutomationType(t)}
+            className={cn(
+              "flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border transition-colors",
+              automationType === t ? "border-cyan/50 bg-cyan/10 text-cyan" : "border-white/10 bg-white/5 text-dim hover:text-text",
+            )}
+          >
+            {t === "metric" ? <Activity className="w-3 h-3" /> : <Clock className="w-3 h-3" />}
+            {t === "metric" ? "Metric" : "Schedule"}
+          </button>
         ))}
-      </select>
+      </div>
 
-      {metric && (
-        <div className="flex gap-2">
-          {(["above", "below"] as const).map((c) => (
-            <button
-              key={c}
-              onClick={() => setCondition(c)}
-              className={cn(
-                "px-3 py-1.5 rounded-lg text-xs border transition-colors",
-                condition === c ? "border-cyan/50 bg-cyan/10 text-cyan" : "border-white/10 bg-white/5 text-dim hover:text-text",
+      {/* Metric path */}
+      {automationType === "metric" && (
+        <>
+          <select
+            value={metric}
+            onChange={(e) => { setMetric(e.target.value); setThreshold(""); }}
+            className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50"
+          >
+            <option value="" className="bg-[#1a1a2e]">Select metric...</option>
+            {Object.entries(TRIGGER_METRICS).map(([key, info]) => (
+              <option key={key} value={key} className="bg-[#1a1a2e]">{info.label}</option>
+            ))}
+          </select>
+
+          {metric && (
+            <div className="flex gap-2">
+              {(["above", "below"] as const).map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setCondition(c)}
+                  className={cn(
+                    "px-3 py-1.5 rounded-lg text-xs border transition-colors",
+                    condition === c ? "border-cyan/50 bg-cyan/10 text-cyan" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                  )}
+                >
+                  {c === "above" ? "Above" : "Below"}
+                </button>
+              ))}
+              {condition && (
+                <input
+                  type="number"
+                  value={threshold}
+                  onChange={(e) => setThreshold(e.target.value)}
+                  placeholder={metricDef ? `${metricDef.min}–${metricDef.max} ${metricDef.unit}` : ""}
+                  step="any"
+                  className="flex-1 bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 min-w-0"
+                />
               )}
-            >
-              {c === "above" ? "Above" : "Below"}
-            </button>
-          ))}
-          {condition && (
-            <input
-              type="number"
-              value={threshold}
-              onChange={(e) => setThreshold(e.target.value)}
-              placeholder={metricDef ? `${metricDef.min}–${metricDef.max} ${metricDef.unit}` : ""}
-              step="any"
-              className="flex-1 bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 min-w-0"
-            />
+            </div>
           )}
+        </>
+      )}
+
+      {/* Schedule path */}
+      {automationType === "schedule" && (
+        <div className="flex gap-2 items-center">
+          <div className="flex-1">
+            <label className="text-xs text-dim block mb-1">From</label>
+            <input
+              type="time"
+              value={timeStart}
+              onChange={(e) => setTimeStart(e.target.value)}
+              className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
+            />
+          </div>
+          <span className="text-dim text-sm mt-4">–</span>
+          <div className="flex-1">
+            <label className="text-xs text-dim block mb-1">To</label>
+            <input
+              type="time"
+              value={timeEnd}
+              onChange={(e) => setTimeEnd(e.target.value)}
+              className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
+            />
+          </div>
         </div>
       )}
 
-      {condition && threshold && (
-        <div className="flex flex-wrap gap-2">
-          {devices.map((d) => {
-            const checked = selectedDevices.has(d.id);
-            return (
-              <label key={d.id} className="flex items-center gap-1.5 cursor-pointer text-xs text-dim">
-                <span className={cn("w-3.5 h-3.5 rounded border flex items-center justify-center", checked ? "border-cyan bg-cyan/20" : "border-dim")}>
-                  {checked && <span className="text-cyan text-[10px]">&#10003;</span>}
-                </span>
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  onChange={() => {
-                    const next = new Set(selectedDevices);
-                    if (checked) next.delete(d.id); else next.add(d.id);
-                    setSelectedDevices(next);
-                  }}
-                  className="sr-only"
-                />
-                <span className={checked ? "text-text" : ""}>{d.name}</span>
-              </label>
-            );
-          })}
-        </div>
+      {/* Device selection (shared) */}
+      {showDevices && (
+        <DeviceCheckboxes devices={devices} selectedDevices={selectedDevices} setSelectedDevices={setSelectedDevices} />
       )}
 
       {error && <p className="text-xs text-red-400">{error}</p>}
@@ -743,13 +824,12 @@ function AutomationTriggerForm({ devices, onSave, onCancel }: {
           setError("");
           try {
             const ids = Array.from(selectedDevices);
-            await onSave({
-              metric,
-              condition,
-              threshold: thresholdNum,
-              device_ids: ids,
-              device_names: ids.map((id) => devices.find((d) => d.id === id)?.name ?? id),
-            });
+            const names = ids.map((id) => devices.find((d) => d.id === id)?.name ?? id);
+            if (automationType === "schedule") {
+              await onSave({ automation_type: "schedule", time_start: timeStart, time_end: timeEnd, device_ids: ids, device_names: names });
+            } else {
+              await onSave({ metric, condition, threshold: thresholdNum, device_ids: ids, device_names: names });
+            }
           } catch (err: unknown) {
             setError((err as Error).message);
           } finally {

@@ -19,9 +19,12 @@ export interface AutomationRule {
   id: number;
   name: string;
   enabled: boolean;
-  metric: string;
-  condition: "above" | "below";
-  threshold: number;
+  automation_type: "metric" | "schedule";
+  metric: string | null;
+  condition: "above" | "below" | null;
+  threshold: number | null;
+  time_start: string | null;
+  time_end: string | null;
   device_ids: string[] | null;
   device_names: string[] | null;
   device_id: string;

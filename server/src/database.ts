@@ -90,6 +90,13 @@ const MIGRATIONS: string[] = [
   )`,
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS device_ids TEXT[]",
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS device_names TEXT[]",
+  // Time-based automation support
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS automation_type TEXT NOT NULL DEFAULT 'metric'",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS time_start TEXT",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS time_end TEXT",
+  "ALTER TABLE automations ALTER COLUMN metric DROP NOT NULL",
+  "ALTER TABLE automations ALTER COLUMN condition DROP NOT NULL",
+  "ALTER TABLE automations ALTER COLUMN threshold DROP NOT NULL",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

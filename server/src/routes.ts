@@ -387,7 +387,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     res.json({ automations: result.rows });
   });
 
-  interface AutomationBody {
+  interface MetricAutomationBody {
+    automation_type?: "metric";
     metric: string;
     condition: string;
     threshold: number;
@@ -396,7 +397,18 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     enabled?: boolean;
   }
 
-  function validateAutomation(body: AutomationBody): string | null {
+  interface ScheduleAutomationBody {
+    automation_type: "schedule";
+    time_start: string;
+    time_end: string;
+    device_ids: string[];
+    device_names: string[];
+    enabled?: boolean;
+  }
+
+  type AutomationBody = MetricAutomationBody | ScheduleAutomationBody;
+
+  function validateMetricAutomation(body: MetricAutomationBody): string | null {
     if (!body.metric || !(body.metric in ALERT_METRICS)) return "Invalid metric";
     if (ALERT_METRICS[body.metric].source !== "air") return "Only air quality metrics allowed";
     if (body.condition !== "above" && body.condition !== "below") return "Condition must be 'above' or 'below'";
@@ -407,28 +419,44 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     return null;
   }
 
+  function validateScheduleAutomation(body: ScheduleAutomationBody): string | null {
+    const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+    if (!body.time_start || !timeRegex.test(body.time_start)) return "Invalid start time (HH:MM)";
+    if (!body.time_end || !timeRegex.test(body.time_end)) return "Invalid end time (HH:MM)";
+    if (body.time_start === body.time_end) return "Start and end time cannot be the same";
+    if (!Array.isArray(body.device_ids) || body.device_ids.length === 0) return "Select at least one device";
+    return null;
+  }
+
   router.post("/api/automations", async (req: Request, res: Response) => {
     const body = req.body as AutomationBody;
-    const err = validateAutomation(body);
-    if (err) { res.status(400).json({ error: err }); return; }
+    const isSchedule = body.automation_type === "schedule";
 
-    const name = `${ALERT_METRICS[body.metric].label} ${body.condition} ${body.threshold}`;
-    const result = await pool.query(
-      `INSERT INTO automations (name, enabled, metric, condition, threshold, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{"power":"on"}', '{"power":"off"}', 300) RETURNING *`,
-      [
-        name,
-        body.enabled ?? true,
-        body.metric,
-        body.condition,
-        body.threshold,
-        body.device_ids[0],
-        body.device_names[0] ?? body.device_ids[0],
-        body.device_ids,
-        body.device_names,
-      ],
-    );
-    res.json({ automation: result.rows[0] });
+    if (isSchedule) {
+      const sb = body as ScheduleAutomationBody;
+      const err = validateScheduleAutomation(sb);
+      if (err) { res.status(400).json({ error: err }); return; }
+
+      const name = `Schedule ${sb.time_start} – ${sb.time_end}`;
+      const result = await pool.query(
+        `INSERT INTO automations (name, enabled, automation_type, time_start, time_end, device_id, device_name, device_ids, device_names, action_on, cooldown_secs)
+         VALUES ($1, $2, 'schedule', $3, $4, $5, $6, $7, $8, '{"power":"on"}', 60) RETURNING *`,
+        [name, sb.enabled ?? true, sb.time_start, sb.time_end, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names],
+      );
+      res.json({ automation: result.rows[0] });
+    } else {
+      const mb = body as MetricAutomationBody;
+      const err = validateMetricAutomation(mb);
+      if (err) { res.status(400).json({ error: err }); return; }
+
+      const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}`;
+      const result = await pool.query(
+        `INSERT INTO automations (name, enabled, automation_type, metric, condition, threshold, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
+         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, '{"power":"on"}', '{"power":"off"}', 300) RETURNING *`,
+        [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names],
+      );
+      res.json({ automation: result.rows[0] });
+    }
   });
 
   router.put("/api/automations/:id", async (req: Request, res: Response) => {
@@ -436,29 +464,39 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
 
     const body = req.body as AutomationBody;
-    const err = validateAutomation(body);
-    if (err) { res.status(400).json({ error: err }); return; }
+    const isSchedule = body.automation_type === "schedule";
 
-    const name = `${ALERT_METRICS[body.metric].label} ${body.condition} ${body.threshold}`;
-    const result = await pool.query(
-      `UPDATE automations SET name=$1, enabled=$2, metric=$3, condition=$4, threshold=$5,
-       device_id=$6, device_name=$7, device_ids=$8, device_names=$9
-       WHERE id=$10 RETURNING *`,
-      [
-        name,
-        body.enabled ?? true,
-        body.metric,
-        body.condition,
-        body.threshold,
-        body.device_ids[0],
-        body.device_names[0] ?? body.device_ids[0],
-        body.device_ids,
-        body.device_names,
-        id,
-      ],
-    );
-    if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
-    res.json({ automation: result.rows[0] });
+    if (isSchedule) {
+      const sb = body as ScheduleAutomationBody;
+      const err = validateScheduleAutomation(sb);
+      if (err) { res.status(400).json({ error: err }); return; }
+
+      const name = `Schedule ${sb.time_start} – ${sb.time_end}`;
+      const result = await pool.query(
+        `UPDATE automations SET name=$1, enabled=$2, automation_type='schedule', time_start=$3, time_end=$4,
+         metric=NULL, condition=NULL, threshold=NULL,
+         device_id=$5, device_name=$6, device_ids=$7, device_names=$8
+         WHERE id=$9 RETURNING *`,
+        [name, sb.enabled ?? true, sb.time_start, sb.time_end, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, id],
+      );
+      if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
+      res.json({ automation: result.rows[0] });
+    } else {
+      const mb = body as MetricAutomationBody;
+      const err = validateMetricAutomation(mb);
+      if (err) { res.status(400).json({ error: err }); return; }
+
+      const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}`;
+      const result = await pool.query(
+        `UPDATE automations SET name=$1, enabled=$2, automation_type='metric', metric=$3, condition=$4, threshold=$5,
+         time_start=NULL, time_end=NULL,
+         device_id=$6, device_name=$7, device_ids=$8, device_names=$9
+         WHERE id=$10 RETURNING *`,
+        [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, id],
+      );
+      if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
+      res.json({ automation: result.rows[0] });
+    }
   });
 
   router.delete("/api/automations/:id", async (req: Request, res: Response) => {

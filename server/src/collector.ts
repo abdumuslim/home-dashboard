@@ -111,9 +111,12 @@ interface AutomationRule {
   id: number;
   name: string;
   enabled: boolean;
-  metric: string;
-  condition: "above" | "below";
-  threshold: number;
+  automation_type: "metric" | "schedule";
+  metric: string | null;
+  condition: "above" | "below" | null;
+  threshold: number | null;
+  time_start: string | null;
+  time_end: string | null;
   device_id: string;
   device_name: string;
   device_ids: string[] | null;
@@ -121,6 +124,11 @@ interface AutomationRule {
   action_on: PurifierAction;
   action_off: PurifierAction | null;
   cooldown_secs: number;
+}
+
+function parseTimeToMinutes(time: string): number {
+  const [h, m] = time.split(":").map(Number);
+  return h * 60 + m;
 }
 
 interface AutomationState {
@@ -153,6 +161,8 @@ export class Collector {
   private automationRules: AutomationRule[] = [];
   private automationRulesLastFetch = 0;
   private automationState = new Map<number, AutomationState>();
+  private devicePowerCache = new Map<string, { power: "on" | "off" | undefined; ts: number }>();
+  private readonly POWER_CACHE_TTL = 5_000;
 
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
@@ -410,54 +420,119 @@ export class Collector {
     await this.refreshAutomationRules();
     if (this.automationRules.length === 0) return;
 
+    for (const rule of this.automationRules) {
+      if (rule.automation_type === "schedule") {
+        await this.checkScheduleAutomation(rule);
+      } else {
+        await this.checkMetricAutomation(rule);
+      }
+    }
+  }
+
+  private async checkMetricAutomation(rule: AutomationRule): Promise<void> {
+    if (!rule.metric || !rule.condition || rule.threshold == null) return;
+
     const now = Date.now();
     const weatherStale = !this.latestWeatherTs || (now - this.latestWeatherTs.getTime() > 300_000);
     const airStale = !this.latestAirTs || (now - this.latestAirTs.getTime() > 300_000);
 
-    for (const rule of this.automationRules) {
-      const def = ALERT_METRICS[rule.metric];
-      if (!def) continue;
+    const def = ALERT_METRICS[rule.metric];
+    if (!def) return;
 
-      if (def.source === "weather" && weatherStale) continue;
-      if (def.source === "air" && airStale) continue;
+    if (def.source === "weather" && weatherStale) return;
+    if (def.source === "air" && airStale) return;
 
-      const value = getMetricValue(rule.metric, this.latestWeatherRow, this.latestAirRow);
-      if (value == null) continue;
+    const value = getMetricValue(rule.metric, this.latestWeatherRow, this.latestAirRow);
+    if (value == null) return;
 
-      const conditionMet = rule.condition === "above"
-        ? value > rule.threshold
-        : value < rule.threshold;
+    const conditionMet = rule.condition === "above"
+      ? value > rule.threshold
+      : value < rule.threshold;
 
-      const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0 };
-      const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0 };
+    const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
+
+    const deviceIds = rule.device_ids ?? [rule.device_id];
+    const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
+
+    if (conditionMet && state.status === "idle" && (now - state.lastToggle >= cooldownMs)) {
+      console.log(
+        `[collector] Automation "${rule.name}": ${rule.metric}=${value} ${rule.condition} ${rule.threshold}, turning ON [${deviceNames}]`,
+      );
+      try {
+        for (const did of deviceIds) {
+          await this.xiaomiCloud!.executeAction(did, rule.action_on);
+        }
+        this.automationState.set(rule.id, { status: "triggered", lastToggle: now });
+      } catch (err) {
+        console.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
+      }
+    } else if (!conditionMet && state.status === "triggered" && rule.action_off && (now - state.lastToggle >= cooldownMs)) {
+      console.log(
+        `[collector] Automation "${rule.name}": ${rule.metric}=${value} returned below ${rule.threshold}, turning OFF [${deviceNames}]`,
+      );
+      try {
+        for (const did of deviceIds) {
+          await this.xiaomiCloud!.executeAction(did, rule.action_off);
+        }
+        this.automationState.set(rule.id, { status: "idle", lastToggle: now });
+      } catch (err) {
+        console.error(`[collector] Automation "${rule.name}" action_off failed:`, (err as Error).message);
+      }
+    }
+  }
+
+  private async getDevicePowerCached(deviceId: string): Promise<"on" | "off" | undefined> {
+    const cached = this.devicePowerCache.get(deviceId);
+    if (cached && Date.now() - cached.ts < this.POWER_CACHE_TTL) return cached.power;
+    const power = await this.xiaomiCloud!.getDevicePower(deviceId);
+    this.devicePowerCache.set(deviceId, { power, ts: Date.now() });
+    return power;
+  }
+
+  private async checkScheduleAutomation(rule: AutomationRule): Promise<void> {
+    if (!rule.time_start || !rule.time_end) return;
+
+    const baghdadNow = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Baghdad" }));
+    const nowMinutes = baghdadNow.getHours() * 60 + baghdadNow.getMinutes();
+    const startMinutes = parseTimeToMinutes(rule.time_start);
+    const endMinutes = parseTimeToMinutes(rule.time_end);
+
+    // Handle overnight ranges (e.g., 22:00 → 07:00)
+    const inWindow = startMinutes <= endMinutes
+      ? (nowMinutes >= startMinutes && nowMinutes < endMinutes)
+      : (nowMinutes >= startMinutes || nowMinutes < endMinutes);
+
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0 };
+    const now = Date.now();
+    const cooldownMs = (rule.cooldown_secs ?? 60) * 1000;
+
+    if (inWindow) {
+      if (now - state.lastToggle < cooldownMs) return;
 
       const deviceIds = rule.device_ids ?? [rule.device_id];
       const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
 
-      if (conditionMet && state.status === "idle" && (now - state.lastToggle >= cooldownMs)) {
-        console.log(
-          `[collector] Automation "${rule.name}": ${rule.metric}=${value} ${rule.condition} ${rule.threshold}, turning ON [${deviceNames}]`,
-        );
+      for (const did of deviceIds) {
         try {
-          for (const did of deviceIds) {
-            await this.xiaomiCloud.executeAction(did, rule.action_on);
+          const power = await this.getDevicePowerCached(did);
+          if (power === "off" || power === undefined) {
+            console.log(
+              `[collector] Schedule "${rule.name}": device ${did} is OFF during active window, turning ON [${deviceNames}]`,
+            );
+            await this.xiaomiCloud!.executeAction(did, rule.action_on);
+            // Update cache immediately after turning on
+            this.devicePowerCache.set(did, { power: "on", ts: Date.now() });
+            this.automationState.set(rule.id, { status: "triggered", lastToggle: now });
           }
-          this.automationState.set(rule.id, { status: "triggered", lastToggle: now });
         } catch (err) {
-          console.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
+          console.error(`[collector] Schedule "${rule.name}" check failed for ${did}:`, (err as Error).message);
         }
-      } else if (!conditionMet && state.status === "triggered" && rule.action_off && (now - state.lastToggle >= cooldownMs)) {
-        console.log(
-          `[collector] Automation "${rule.name}": ${rule.metric}=${value} returned below ${rule.threshold}, turning OFF [${deviceNames}]`,
-        );
-        try {
-          for (const did of deviceIds) {
-            await this.xiaomiCloud.executeAction(did, rule.action_off);
-          }
-          this.automationState.set(rule.id, { status: "idle", lastToggle: now });
-        } catch (err) {
-          console.error(`[collector] Automation "${rule.name}" action_off failed:`, (err as Error).message);
-        }
+      }
+    } else {
+      // Outside window: reset state to idle
+      if (state.status === "triggered") {
+        this.automationState.set(rule.id, { status: "idle", lastToggle: now });
       }
     }
   }
