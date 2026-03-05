@@ -13,13 +13,7 @@ interface IndoorSectionProps {
   sendControl?: (deviceId: string, command: string, params: unknown[]) => Promise<void>;
 }
 
-// Magnus formula for dew point; Steadman approximation for feels-like (indoor, no wind/sun)
-function calcDewPoint(t: number, rh: number): number {
-  const b = 17.67, c = 243.5;
-  const gamma = Math.log(rh / 100) + (b * t) / (c + t);
-  return (c * gamma) / (b - gamma);
-}
-
+// Steadman approximation for feels-like (indoor, no wind/sun)
 function calcFeelsLike(t: number, rh: number): number {
   // Simple heat-index for indoor (no wind). Below 20°C just return temp.
   if (t < 20) return t;
@@ -31,8 +25,6 @@ function calcFeelsLike(t: number, rh: number): number {
 }
 
 export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay, devices = [], sendControl }: IndoorSectionProps) {
-  const kitchenDewPoint = air?.temperature != null && air?.humidity != null
-    ? calcDewPoint(air.temperature, air.humidity) : undefined;
   const kitchenFeelsLike = air?.temperature != null && air?.humidity != null
     ? calcFeelsLike(air.temperature, air.humidity) : undefined;
 
@@ -74,7 +66,6 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         iconColor="green"
         temp={air?.temperature}
         humidity={air?.humidity}
-        dewPoint={kitchenDewPoint}
         feelsLike={kitchenFeelsLike}
         noise={air?.noise}
         history={airHistory}
