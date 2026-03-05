@@ -14,8 +14,9 @@ export const THRESHOLDS: Record<string, ThresholdEntry[]> = {
   ],
   pm25: [
     { max: 35, level: "good", label: "Good" },
-    { max: 75, level: "moderate", label: "Moderate" },
-    { max: Infinity, level: "poor", label: "Unhealthy" },
+    { max: 75, level: "slightly_high", label: "Moderate" },
+    { max: 100, level: "poor", label: "Poor" },
+    { max: Infinity, level: "severe", label: "Unhealthy" },
   ],
   pm10: [
     { max: 50, level: "good", label: "Good" },
