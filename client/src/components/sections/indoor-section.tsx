@@ -1,5 +1,6 @@
 import { Home, User, CookingPot } from "lucide-react";
 import type { WeatherReading, AirReading, OpenOverlayFn } from "@/types/api";
+import type { PurifierDevice } from "@/types/automations";
 import { IndoorCard } from "@/components/cards/indoor-card";
 
 interface IndoorSectionProps {
@@ -8,6 +9,8 @@ interface IndoorSectionProps {
   weatherHistory: WeatherReading[];
   airHistory: AirReading[];
   openOverlay: OpenOverlayFn;
+  devices?: PurifierDevice[];
+  sendControl?: (deviceId: string, command: string, params: unknown[]) => Promise<void>;
 }
 
 // Magnus formula for dew point; Steadman approximation for feels-like (indoor, no wind/sun)
@@ -27,11 +30,15 @@ function calcFeelsLike(t: number, rh: number): number {
   return hi;
 }
 
-export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay }: IndoorSectionProps) {
+export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay, devices = [], sendControl }: IndoorSectionProps) {
   const kitchenDewPoint = air?.temperature != null && air?.humidity != null
     ? calcDewPoint(air.temperature, air.humidity) : undefined;
   const kitchenFeelsLike = air?.temperature != null && air?.humidity != null
     ? calcFeelsLike(air.temperature, air.humidity) : undefined;
+
+  // Match purifier devices to indoor cards by name (case-insensitive)
+  const momDevice = devices.find((d) => d.name.toLowerCase() === "mom");
+  const abduDevice = devices.find((d) => d.name.toLowerCase() === "abdu");
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
@@ -41,11 +48,12 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         iconColor="blue"
         temp={weather?.temp_indoor_c}
         humidity={weather?.humidity_indoor}
-        dewPoint={weather?.dew_point_indoor_c}
         feelsLike={weather?.feels_like_indoor_c}
         history={weatherHistory}
         metricKey="temp_indoor_c"
         openOverlay={openOverlay}
+        device={momDevice}
+        onControl={momDevice && sendControl ? (cmd, params) => sendControl(momDevice.id, cmd, params) : undefined}
       />
       <IndoorCard
         title="Abdu"
@@ -53,11 +61,12 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         iconColor="purple"
         temp={weather?.temp_ch8_c}
         humidity={weather?.humidity_ch8}
-        dewPoint={weather?.dew_point_ch8_c}
         feelsLike={weather?.feels_like_ch8_c}
         history={weatherHistory}
         metricKey="temp_ch8_c"
         openOverlay={openOverlay}
+        device={abduDevice}
+        onControl={abduDevice && sendControl ? (cmd, params) => sendControl(abduDevice.id, cmd, params) : undefined}
       />
       <IndoorCard
         title="Kitchen"

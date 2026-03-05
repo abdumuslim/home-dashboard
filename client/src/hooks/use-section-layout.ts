@@ -1,8 +1,8 @@
 import { useState, useCallback, useEffect } from "react";
 
-export type SectionId = "outdoor" | "indoor" | "air-quality" | "purifiers" | "prayer";
+export type SectionId = "outdoor" | "indoor" | "air-quality" | "prayer";
 
-const ALL_SECTIONS: SectionId[] = ["outdoor", "indoor", "air-quality", "purifiers", "prayer"];
+const ALL_SECTIONS: SectionId[] = ["outdoor", "indoor", "air-quality", "prayer"];
 const STORAGE_KEY = "home-dashboard-layout";
 
 interface SectionLayout {
@@ -12,16 +12,23 @@ interface SectionLayout {
 
 const DEFAULT_LAYOUT: SectionLayout = {
   order: [...ALL_SECTIONS],
-  collapsed: { outdoor: false, indoor: false, "air-quality": false, purifiers: false, prayer: false },
+  collapsed: { outdoor: false, indoor: false, "air-quality": false, prayer: false },
 };
+
+function migrateOrder(order: string[]): SectionId[] {
+  // Strip removed sections (e.g. "purifiers") and add any missing ones
+  const valid = new Set<string>(ALL_SECTIONS);
+  const filtered = order.filter((id) => valid.has(id)) as SectionId[];
+  for (const id of ALL_SECTIONS) {
+    if (!filtered.includes(id)) filtered.push(id);
+  }
+  return filtered;
+}
 
 function isValidLayout(data: unknown): data is SectionLayout {
   if (!data || typeof data !== "object") return false;
   const d = data as SectionLayout;
-  if (!Array.isArray(d.order) || d.order.length !== ALL_SECTIONS.length) return false;
-  const valid = new Set<string>(ALL_SECTIONS);
-  if (!d.order.every((id) => valid.has(id))) return false;
-  if (new Set(d.order).size !== d.order.length) return false;
+  if (!Array.isArray(d.order)) return false;
   return true;
 }
 
@@ -31,10 +38,14 @@ function loadLayout(): SectionLayout {
     if (stored) {
       const parsed = JSON.parse(stored);
       if (isValidLayout(parsed)) {
-        return {
-          order: parsed.order,
+        const order = migrateOrder(parsed.order);
+        const layout: SectionLayout = {
+          order,
           collapsed: { ...DEFAULT_LAYOUT.collapsed, ...parsed.collapsed },
         };
+        // Persist migrated layout
+        if (order.length !== parsed.order.length) saveLayout(layout);
+        return layout;
       }
     }
   } catch { /* ignore */ }

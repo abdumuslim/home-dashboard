@@ -1,13 +1,16 @@
-import { useMemo, type ReactNode } from "react";
+import { useState, useMemo, type ReactNode } from "react";
 import { Line } from "react-chartjs-2";
-import { Maximize2 } from "lucide-react";
+import { Maximize2, Power, Fan, Settings, Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils";
 import { MetricCard } from "@/components/ui/metric-card";
+import { PurifierDetailOverlay } from "@/components/ui/purifier-detail-overlay";
 import { useFlash } from "@/hooks/use-flash";
 import { useUnits } from "@/hooks/use-units";
 import { fmt, getStatus, getTempGradientStyle } from "@/constants/thresholds";
 import { convertTemp } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
 import type { WeatherReading, AirReading, OpenOverlayFn, TimeRange } from "@/types/api";
+import type { PurifierDevice } from "@/types/automations";
 
 const statusLevelColors: Record<string, string> = {
   excellent: "#0df41e",
@@ -42,6 +45,8 @@ interface IndoorCardProps {
   history?: (WeatherReading | AirReading)[];
   metricKey?: keyof WeatherReading | keyof AirReading;
   openOverlay: OpenOverlayFn;
+  device?: PurifierDevice;
+  onControl?: (command: string, params: unknown[]) => Promise<void>;
 }
 
 function ExpandedIndoorChart({
@@ -136,10 +141,20 @@ export function IndoorCard({
   history = [],
   metricKey,
   openOverlay,
+  device,
+  onControl,
 }: IndoorCardProps) {
   const { fmtTemp, tempLabel, units: { temperature: tempUnit } } = useUnits();
   const flash = useFlash(temp != null ? fmtTemp(temp) : null);
   const noiseStatus = noise !== undefined ? getStatus("noise", noise) : null;
+  const [showDetail, setShowDetail] = useState(false);
+  const [powerBusy, setPowerBusy] = useState(false);
+
+  const handlePowerToggle = async () => {
+    if (!device || !onControl || !device.isOnline) return;
+    setPowerBusy(true);
+    try { await onControl("set_power", [device.power === "on" ? "off" : "on"]); } finally { setPowerBusy(false); }
+  };
 
   const hourlyData = useMemo(() => {
     if (!metricKey) return [];
@@ -211,12 +226,96 @@ export function IndoorCard({
     ));
   };
 
+  const isOn = device?.power === "on";
+  const offline = device != null && !device.isOnline;
+  const filterLow = device?.filter_life != null && device.filter_life <= 20;
+  const hasPurifier = device != null && onControl != null;
+
   return (
     <MetricCard flash={flash} className="p-4 pb-0 flex flex-col">
       <div className="flex flex-col z-10 w-full mb-[100px]">
-        <h3 className="text-[0.95rem] font-medium text-text mb-2">{title}</h3>
+        {/* Top Header Row with Unified "Nano Banana" Pill */}
+        <div className="flex justify-between items-start w-full gap-2 mb-2">
+          <h3 className="text-[0.95rem] font-medium text-text mt-1">{title}</h3>
 
-        <div className="flex items-baseline gap-3 md:gap-5">
+          {hasPurifier && (
+            <div className={cn(
+              "flex items-center gap-1.5 bg-[#171920]/90 border border-white/[0.05] p-1 rounded-full shadow-[0_4px_12px_-4px_rgba(0,0,0,0.5)] backdrop-blur-xl transition-all",
+              offline ? "opacity-40" : "hover:border-white/10 hover:bg-[#1a1c23]/95"
+            )}>
+              {/* Status / AQI Pill */}
+              <div className={cn(
+                "flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-colors h-7",
+                isOn ? "bg-emerald-500/15 text-emerald-400 shadow-inner" : "bg-white/[0.03] text-dim"
+              )}>
+                <Fan className={cn("w-3.5 h-3.5", isOn && "animate-[spin_3s_linear_infinite]")} />
+                {device.isOnline && device.aqi != null ? (
+                  <span className="text-[0.7rem] font-bold text-text ml-0.5 tracking-wide flex items-baseline gap-1">
+                    {device.aqi} <span className="text-[0.55rem] text-dim font-bold uppercase">AQI</span>
+                  </span>
+                ) : (
+                  <span className="text-[0.65rem] font-semibold tracking-wider uppercase flex items-center h-full">Purifier</span>
+                )}
+              </div>
+
+              {/* Filter Watch-Style Progress Ring */}
+              {device.isOnline && device.filter_life != null && (
+                <>
+                  <div className="w-[1px] h-3.5 bg-white/[0.08] mx-0.5" />
+                  <div
+                    className="relative flex items-center justify-center w-7 h-7 rounded-full"
+                    title={`Filter: ${device.filter_life}%`}
+                  >
+                    <svg className="w-full h-full transform -rotate-90" viewBox="0 0 16 16">
+                      <circle cx="8" cy="8" r="6" className="stroke-[#000000]/30 drop-shadow-sm" strokeWidth="2.5" fill="none" />
+                      <circle
+                        cx="8" cy="8" r="6"
+                        className={cn("transition-all duration-1000 ease-out", filterLow ? "stroke-red-500" : "stroke-emerald-400")}
+                        strokeWidth="2.2" strokeDasharray={37.7} strokeDashoffset={37.7 * (1 - Math.max(0, device.filter_life) / 100)} strokeLinecap="round" fill="none"
+                      />
+                    </svg>
+                    <div className={cn("absolute flex items-center justify-center text-[0.45rem] font-bold tabular-nums tracking-tighter", filterLow ? "text-red-400" : "text-text/90")}>
+                      {device.filter_life}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              <div className="w-[1px] h-3.5 bg-white/[0.08] mx-0.5" />
+
+              {/* Power button */}
+              <button
+                onClick={handlePowerToggle}
+                disabled={offline || powerBusy}
+                className={cn(
+                  "relative flex items-center justify-center w-7 h-7 rounded-full transition-all shrink-0",
+                  isOn
+                    ? "bg-emerald-500 text-black hover:bg-emerald-400 shadow-[0_0_12px_rgba(16,185,129,0.3)]"
+                    : "bg-white/[0.03] text-dim hover:bg-white/10 hover:text-white",
+                  (offline || powerBusy) && "cursor-not-allowed",
+                )}
+                title={offline ? "Offline" : isOn ? "Turn off" : "Turn on"}
+              >
+                {powerBusy
+                  ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  : <Power className="w-3.5 h-3.5" strokeWidth={2.5} />
+                }
+              </button>
+
+              {/* Settings button */}
+              <button
+                onClick={() => setShowDetail(true)}
+                className="flex items-center justify-center w-7 h-7 rounded-full text-dim hover:text-white hover:bg-white/10 transition-colors shrink-0"
+                title="Purifier settings"
+              >
+                <Settings className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Main Weather Data */}
+        <div className="flex items-baseline gap-3 md:gap-5 mt-1">
           <div className="flex flex-col">
             <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight" style={getTempGradientStyle(temp)}>
               {fmtTemp(temp)}<span className="text-xl">{tempLabel}</span>
@@ -231,24 +330,7 @@ export function IndoorCard({
             <span className="text-[0.75rem] text-text font-medium mt-1">Humidity</span>
           </div>
 
-          {dewPoint != null && (
-            <div className="flex flex-col ml-auto">
-              <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
-                {fmtTemp(dewPoint)}<span className="text-sm">{tempLabel}</span>
-              </span>
-              <span className="text-[0.75rem] text-text font-medium mt-1">Dew Point</span>
-            </div>
-          )}
-
-          {feelsLike != null && (
-            <div className="flex flex-col">
-              <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
-                {fmtTemp(feelsLike)}<span className="text-sm">{tempLabel}</span>
-              </span>
-              <span className="text-[0.75rem] text-text font-medium mt-1">Feels Like</span>
-            </div>
-          )}
-
+          {/* Noise (Kitchen only) */}
           {noise !== undefined && noiseStatus && (
             <div className="flex flex-col ml-auto">
               <span className="text-lg font-semibold leading-none tracking-tight text-[#94a3b8]">
@@ -263,6 +345,22 @@ export function IndoorCard({
             </div>
           )}
         </div>
+
+        {/* Secondary Info Row */}
+        <div className="flex flex-wrap items-center justify-between gap-2 mt-4">
+          {(dewPoint != null || feelsLike != null) ? (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim">
+              {dewPoint != null && (
+                <span>Dew Point <span className="text-text font-medium">{fmtTemp(dewPoint)}{tempLabel}</span></span>
+              )}
+              {feelsLike != null && (
+                <span>Feels Like <span className="text-text font-medium">{fmtTemp(feelsLike)}{tempLabel}</span></span>
+              )}
+            </div>
+          ) : (
+            <div />
+          )}
+        </div>
       </div>
 
       <div
@@ -274,6 +372,14 @@ export function IndoorCard({
         </div>
         {hourlyData.length > 0 && <Line data={chartData} options={chartOptions} />}
       </div>
+
+      {showDetail && device && onControl && (
+        <PurifierDetailOverlay
+          device={device as PurifierDevice}
+          onControl={onControl}
+          onClose={() => setShowDetail(false)}
+        />
+      )}
     </MetricCard>
   );
 }
