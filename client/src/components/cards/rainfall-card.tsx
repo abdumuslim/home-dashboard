@@ -3,6 +3,7 @@ import { Chart } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useUnits } from "@/hooks/use-units";
+import { useChartsVisible } from "@/hooks/use-charts-visible";
 import { fmt } from "@/constants/thresholds";
 import { convertPressure, convertRainfall, PRESSURE_DECIMALS } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
@@ -125,6 +126,7 @@ export function RainfallCard({
   lastRain, pressure, weatherHistory = [], openOverlay,
 }: RainfallCardProps) {
   const { fmtRain, fmtPressure, rainLabel, pressureLabel, units: { pressure: pressureUnit, rainfall: rainUnit } } = useUnits();
+  const { chartsVisible } = useChartsVisible();
 
   const baroTrend = useMemo(() => {
     const threeHoursAgo = Date.now() - 3 * 3600000;
@@ -240,7 +242,7 @@ export function RainfallCard({
 
   return (
     <MetricCard className="p-4 pb-0 flex flex-col">
-      <div className="flex flex-col z-10 w-full mb-[100px]">
+      <div className={`flex flex-col z-10 w-full transition-[margin] duration-300 ${chartsVisible ? "mb-[100px]" : "mb-3"}`}>
         <h3 className="text-[0.95rem] font-medium text-text mb-2">Rainfall</h3>
 
         <div className="flex items-end gap-3 md:gap-8 mb-2">
@@ -284,7 +286,7 @@ export function RainfallCard({
       </div>
 
       <div
-        className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer"
+        className={`absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer transition-opacity duration-300 ${chartsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`}
         onClick={handleExpand}
       >
         <div className="absolute top-1 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">

@@ -3,6 +3,7 @@ import { Line } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useUnits } from "@/hooks/use-units";
+import { useChartsVisible } from "@/hooks/use-charts-visible";
 import { degDir } from "@/constants/thresholds";
 import { convertWindSpeed } from "@/constants/units";
 import { getBucketMs, bucketMedian, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
@@ -71,6 +72,7 @@ function ExpandedWindChart({ range, weatherHistory }: { range: TimeRange; weathe
 
 export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], openOverlay }: WindCardProps) {
   const { fmtWind, windLabel, units: { windSpeed: windUnit } } = useUnits();
+  const { chartsVisible } = useChartsVisible();
 
   const getMedianSpeed = (history: WeatherReading[], timestamp: number, windowMs: number = 600000) => {
     const windowPoints = history.filter(
@@ -170,7 +172,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
 
   return (
     <MetricCard className="p-4 pb-0 flex flex-col">
-      <div className="flex flex-col z-10 w-full mb-[100px]">
+      <div className={`flex flex-col z-10 w-full transition-[margin] duration-300 ${chartsVisible ? "mb-[100px]" : "mb-3"}`}>
         <h3 className="text-[0.95rem] font-medium text-text mb-2">Wind</h3>
 
         <div className="flex items-start gap-3 md:gap-6 mb-2">
@@ -235,7 +237,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
       </div>
 
       <div
-        className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer"
+        className={`absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer transition-opacity duration-300 ${chartsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`}
         onClick={handleExpand}
       >
         <div className="absolute top-1 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">

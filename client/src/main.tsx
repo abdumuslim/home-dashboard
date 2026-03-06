@@ -17,6 +17,7 @@ import "chartjs-adapter-date-fns";
 import "./index.css";
 import App from "./App";
 import { UnitsProvider } from "@/hooks/use-units";
+import { ChartsVisibleProvider } from "@/hooks/use-charts-visible";
 
 Chart.register(
   CategoryScale,
@@ -38,7 +39,9 @@ if ("serviceWorker" in navigator) {
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <UnitsProvider>
-      <App />
+      <ChartsVisibleProvider>
+        <App />
+      </ChartsVisibleProvider>
     </UnitsProvider>
   </StrictMode>
 );
