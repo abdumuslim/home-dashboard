@@ -6,6 +6,7 @@ import { MetricCard } from "@/components/ui/metric-card";
 import { PurifierDetailOverlay } from "@/components/ui/purifier-detail-overlay";
 import { useFlash } from "@/hooks/use-flash";
 import { useUnits } from "@/hooks/use-units";
+import { useChartsVisible } from "@/hooks/use-charts-visible";
 import { fmt, getStatus, getTempGradientStyle } from "@/constants/thresholds";
 import { convertTemp } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
@@ -145,6 +146,7 @@ export function IndoorCard({
   onControl,
 }: IndoorCardProps) {
   const { fmtTemp, tempLabel, units: { temperature: tempUnit } } = useUnits();
+  const { chartsVisible } = useChartsVisible();
   const flash = useFlash(temp != null ? fmtTemp(temp) : null);
   const noiseStatus = noise !== undefined ? getStatus("noise", noise) : null;
   const [showDetail, setShowDetail] = useState(false);
@@ -233,7 +235,7 @@ export function IndoorCard({
 
   return (
     <MetricCard flash={flash} className="p-4 pb-0 flex flex-col">
-      <div className="flex z-10 w-full mb-[100px] gap-3">
+      <div className={`flex z-10 w-full transition-[margin] duration-300 ${chartsVisible ? "mb-[100px]" : "mb-3"} gap-3`}>
         {/* Left: main content */}
         <div className="flex flex-col flex-1 min-w-0">
           {/* Title */}
@@ -383,7 +385,7 @@ export function IndoorCard({
       </div>
 
       <div
-        className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer"
+        className={`absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer transition-opacity duration-300 ${chartsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`}
         onClick={handleExpand}
       >
         <div className="absolute top-1 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">

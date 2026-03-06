@@ -4,6 +4,7 @@ import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
 import { useUnits } from "@/hooks/use-units";
+import { useChartsVisible } from "@/hooks/use-charts-visible";
 import { fmt, getTempGradientStyle } from "@/constants/thresholds";
 import { convertTemp, convertTempDelta } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
@@ -83,6 +84,7 @@ function ExpandedTemperatureChart({ range, weatherHistory }: { range: TimeRange;
 
 export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHistory = [], openOverlay }: TemperatureCardProps) {
   const { fmtTemp, tempLabel, units: { temperature: tempUnit } } = useUnits();
+  const { chartsVisible } = useChartsVisible();
   const flash = useFlash(temp != null ? fmtTemp(temp) : null);
 
   const { hiTemp, loTemp } = useMemo(() => {
@@ -190,7 +192,7 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
 
   return (
     <MetricCard flash={flash} className="p-4 pb-0 flex flex-col">
-      <div className="flex flex-col z-10 w-full mb-[100px]">
+      <div className={`flex flex-col z-10 w-full transition-[margin] duration-300 ${chartsVisible ? "mb-[100px]" : "mb-3"}`}>
         <h3 className="text-[0.95rem] font-medium text-text mb-2">Temp &amp; Humidity</h3>
 
         <div className="flex items-baseline gap-4 md:gap-8 mb-2">
@@ -238,7 +240,7 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
       </div>
 
       <div
-        className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer"
+        className={`absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer transition-opacity duration-300 ${chartsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`}
         onClick={handleExpand}
       >
         <div className="absolute top-1 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">

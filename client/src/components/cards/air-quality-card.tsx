@@ -3,6 +3,7 @@ import { Bar } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
+import { useChartsVisible } from "@/hooks/use-charts-visible";
 import { fmt, getStatus } from "@/constants/thresholds";
 import { getBucketMs, expandedChartOptions } from "@/constants/chart-utils";
 import type { AirReading, OpenOverlayFn, TimeRange } from "@/types/api";
@@ -119,6 +120,7 @@ export function AirQualityCard({
   openOverlay,
 }: AirQualityCardProps) {
   const flash = useFlash(value != null ? value : null);
+  const { chartsVisible } = useChartsVisible();
   const status = getStatus(metric, value);
   const activeColor = status.level ? levelColors[status.level] : "#7a8ba8";
 
@@ -192,8 +194,8 @@ export function AirQualityCard({
   };
 
   return (
-    <MetricCard flash={flash} className="p-3 sm:p-4 pb-0 flex flex-col !min-h-[200px]">
-      <div className="flex items-center gap-2 md:gap-5 z-10 w-full mb-[70px]">
+    <MetricCard flash={flash} className={`p-3 sm:p-4 pb-0 flex flex-col ${chartsVisible ? "!min-h-[200px]" : "!min-h-0"}`}>
+      <div className={`flex items-center gap-2 md:gap-5 z-10 w-full transition-[margin] duration-300 ${chartsVisible ? "mb-[70px]" : "mb-0"}`}>
         <div className="relative shrink-0 size-[60px] md:size-[80px] flex justify-center items-center">
           <svg viewBox="0 0 80 80" className="absolute inset-0 w-full h-full">
             <circle cx="40" cy="40" r="36" fill="rgba(255,255,255,0.02)" stroke="rgba(255,255,255,0.06)" strokeWidth="4" />
@@ -223,7 +225,7 @@ export function AirQualityCard({
       )}
 
       <div
-        className="absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer"
+        className={`absolute bottom-0 left-0 right-0 h-[100px] w-full px-2 pb-1 z-0 rounded-b-xl overflow-hidden group cursor-pointer transition-opacity duration-300 ${chartsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`}
         onClick={handleExpand}
       >
         <div className="absolute top-1 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">

@@ -2,7 +2,7 @@ import { useState, useCallback, type ReactNode } from "react";
 import { useCurrentData } from "@/hooks/use-current-data";
 import { useHistoryData } from "@/hooks/use-history-data";
 import { usePushNotifications } from "@/hooks/use-push-notifications";
-import { Header } from "@/components/header";
+import { Header } from "@/components/Header";
 import { DashboardTab } from "@/components/dashboard-tab";
 import { ChartOverlay } from "@/components/ui/chart-overlay";
 import { SettingsModal } from "@/components/ui/settings-modal";
