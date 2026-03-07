@@ -257,15 +257,6 @@ export function IndoorCard({
               <span className="text-[0.75rem] text-text font-medium mt-1">Temp.</span>
             </div>
 
-            {feelsLike != null && (
-              <div className="flex flex-col">
-                <span className="text-xl md:text-2xl font-semibold leading-none tracking-tight text-white">
-                  {fmtTemp(feelsLike)}<span className="text-base">{tempLabel}</span>
-                </span>
-                <span className="text-[0.75rem] text-text font-medium mt-1">Feels like</span>
-              </div>
-            )}
-
             <div className="flex flex-col">
               <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight text-cyan">
                 {fmt(humidity, 0)}<span className="text-xl">%</span>
@@ -290,9 +281,14 @@ export function IndoorCard({
           </div>
 
           {/* Secondary Info Row */}
-          {dewPoint != null && (
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim mt-4">
-              <span>Dew Point <span className="text-text font-medium">{fmtTemp(dewPoint)}{tempLabel}</span></span>
+          {(feelsLike != null || dewPoint != null) && (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim mt-1">
+              {feelsLike != null && (
+                <span>Feels Like <span className={`font-medium ${temp != null && feelsLike != null ? (feelsLike > temp ? "text-red-400" : feelsLike < temp ? "text-blue-400" : "text-text") : "text-text"}`}>{fmtTemp(feelsLike)}{tempLabel}</span></span>
+              )}
+              {dewPoint != null && (
+                <span>Dew Point <span className="text-text font-medium">{fmtTemp(dewPoint)}{tempLabel}</span></span>
+              )}
             </div>
           )}
         </div>
@@ -303,6 +299,9 @@ export function IndoorCard({
             "flex flex-col items-center bg-[#171920]/90 border border-white/[0.05] p-1 rounded-2xl shadow-[0_4px_12px_-4px_rgba(0,0,0,0.5)] backdrop-blur-xl transition-all shrink-0 self-start",
             offline ? "opacity-40" : "hover:border-white/10 hover:bg-[#1a1c23]/95"
           )}>
+            {/* Header */}
+            <span className="text-[0.65rem] text-text/70 font-bold uppercase tracking-wider mt-0.5 mb-0.5">Purifier</span>
+
             {/* Row 1: Power + Settings */}
             <div className="flex items-center gap-1">
               <button
@@ -333,26 +332,23 @@ export function IndoorCard({
 
             <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
 
-            {/* Row 2: AQI Status */}
+            {/* Row 2: AQI Status (only when online and has data) */}
             {(() => {
               const aqiStatus = device!.isOnline && device!.aqi != null ? getStatus("pm25", device!.aqi) : null;
-              const aqiColor = aqiStatus?.level ? statusLevelColors[aqiStatus.level] : undefined;
+              if (!aqiStatus) return null;
+              const aqiColor = aqiStatus.level ? statusLevelColors[aqiStatus.level] : undefined;
               return (
                 <div
                   className={cn(
                     "flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-colors h-7",
-                    isOn ? "shadow-inner" : "bg-white/[0.03] text-dim"
+                    isOn ? "shadow-inner" : "bg-white/[0.03]"
                   )}
                   style={isOn ? { backgroundColor: aqiColor ? `${aqiColor}15` : "rgba(16,185,129,0.15)", color: aqiColor || "#34d399" } : undefined}
                 >
                   <Fan className={cn("w-3.5 h-3.5", isOn && "animate-[spin_3s_linear_infinite]")} />
-                  {aqiStatus ? (
-                    <span className="text-[0.7rem] font-bold text-text ml-0.5 tracking-wide flex items-baseline gap-1">
-                      {device!.aqi} <span className="text-[0.55rem] text-dim font-bold uppercase">AQI</span>
-                    </span>
-                  ) : (
-                    <span className="text-[0.65rem] font-semibold tracking-wider uppercase flex items-center h-full">Purifier</span>
-                  )}
+                  <span className="text-[0.7rem] font-bold text-text ml-0.5 tracking-wide flex items-baseline gap-1">
+                    {device!.aqi} <span className="text-[0.55rem] text-dim font-bold uppercase">AQI</span>
+                  </span>
                 </div>
               );
             })()}
