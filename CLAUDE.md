@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.js/Express backend with React/TypeScript frontend, collects data from two sensor APIs, stores in PostgreSQL, and serves a dark-themed dashboard with live-updating cards and Chart.js charts. It also automates Xiaomi Mi Air Purifiers based on air quality metrics.
 
-**4 physical sensors, 2 APIs, 2 Purifiers:**
+**4 physical sensors, 2 APIs, 2 Purifiers, 3 ACs:**
 - **Ambient Weather WS-2000** (1 API device, 3 sensor groups in `lastData`):
   - Outdoor: temp, humidity, wind, rain, pressure, UV, solar (~1 min updates)
   - Indoor console: temp, humidity, feels like, dew point (`tempinf`, `humidityin`, `feelsLikein`, `dewPointin`)
@@ -15,6 +15,8 @@ Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.j
 - **Xiaomi Mi Air Purifiers**:
   - "mom": `zhimi.airpurifier.v7` (older MiIO protocol)
   - "Abdu": `zhimi.airpurifier.vb2` (modern MIoT protocol)
+- **TCL Split ACs** (3 units, 2 on dashboard via TCL Home cloud API):
+  - "Najat" → Mom card, "Abdu AC" → Abdu card, "Abdullah AC" (not displayed)
 
 ## Architecture
 
@@ -30,11 +32,15 @@ Browser → Cloudflare → Traefik (VPS, existing) → dashboard container (port
   - Supports 2FA (credentials/token cached in persistent volume).
   - Handles both **MiIO** (`get_prop`, `set_power`) and **MIoT** (`get_properties`, `set_properties`) protocols.
   - **MIoT Mappings**: Power (2:2), Fan Level (2:4), Mode (2:5), AQI (3:6), Humidity (3:7), Temperature (3:8), Filter Life (4:3), Buzzer (5:1), LED (6:6), Child Lock (7:1).
+- **TCL Cloud**: Custom API client in `tcl-cloud.ts` (reverse-engineered TCL Home app).
+  - Auth chain: TCL login → token refresh (saasToken + cognitoToken) → AWS Cognito credentials
+  - Device state via AWS IoT Shadow (`GetThingShadow`), control via shadow publish
+  - Credentials cached in `/app/data/tcl-credentials.json`
 - **Automations**: Two types processed in the collector loop, configurable via dashboard:
   - **Metric-based**: AQI threshold triggers (e.g., PM2.5 above 50 → turn on purifier, off when below).
   - **Schedule-based**: Daily time window enforcement (e.g., 22:00–07:00 → keep purifier ON, re-sends turn-on every ~5s if device found off). Uses `getDevicePower()` with 5s cache.
 - **Separate docker-compose**: Lives at `/opt/home-dashboard/` on the VPS, joins the existing `rag_default` network.
-  - Mounts `dashboard_data` volume to `/app/data` for `xiaomi-credentials.json`.
+  - Mounts `dashboard_data` volume to `/app/data` for `xiaomi-credentials.json` and `tcl-credentials.json`.
 - **Multi-stage Docker build**: Stage 1 builds client (Vite), Stage 2 builds server (tsc), Stage 3 runs production Node.js
 - **Database**: Uses the existing `rag-postgres-1` container (pgvector:pg16). The `home` database is auto-created on first startup
 
@@ -45,9 +51,10 @@ D:\dev\home\
 ├── server/                 # Node.js backend (Express + TypeScript)
 │   ├── src/
 │   │   ├── index.ts        # Express app, static serving, collector startup
-│   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status, /api/alerts CRUD, /api/xiaomi/*)
+│   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status, /api/alerts CRUD, /api/xiaomi/*, /api/ac/*)
 │   │   ├── collector.ts    # Collector class (AW polling + Qingping MQTT/cloud + AQI automation loop)
 │   │   ├── xiaomi-cloud.ts # Wrapper for xmihome, protocol routing, device discovery, auth
+│   │   ├── tcl-cloud.ts    # TCL Home API client (auth chain, AWS IoT shadow, SigV4 signing)
 │   │   ├── alert-metrics.ts # Shared metrics catalog, getMetricValue, PRAYER_LABELS
 │   │   ├── database.ts     # pg pool, schema init, migrations (added automations table)
 │   │   └── config.ts       # Env vars (dotenv)
@@ -58,9 +65,9 @@ D:\dev\home\
 │   │   ├── main.tsx        # Entry point, Chart.js registration
 │   │   ├── App.tsx         # Root component with tabs
 │   │   ├── index.css       # Tailwind theme + custom wind/flash CSS
-│   │   ├── hooks/          # useCurrentData, useHistoryData, useClock, useFlash, useAlerts, usePushNotifications, useDevices, useAutomations
+│   │   ├── hooks/          # useCurrentData, useHistoryData, useClock, useFlash, useAlerts, usePushNotifications, useDevices, useAcDevices, useAutomations
 │   │   ├── components/     # Header, sections, cards, charts, AlertsModal
-│   │   ├── types/          # API type definitions (api.ts, alerts.ts, automations.ts)
+│   │   ├── types/          # API type definitions (api.ts, alerts.ts, automations.ts, ac.ts)
 │   │   └── constants/      # Thresholds, directions, helpers, alert-metrics
 │   ├── vite.config.ts
 │   └── package.json
@@ -69,7 +76,7 @@ D:\dev\home\
 │       └── mosquitto.conf  # Broker config (passwd file generated on VPS)
 ├── Dockerfile              # Multi-stage (node:22-slim)
 ├── docker-compose.yml      # dashboard + mosquitto services + data volume
-└── .env                    # On VPS only (added MI_EMAIL, MI_PASSWORD, MI_REGION=sg)
+└── .env                    # On VPS only (MI_EMAIL, MI_PASSWORD, MI_REGION=sg, TCL_USERNAME, TCL_PASSWORD)
 ```
 
 ## Development
@@ -128,9 +135,11 @@ New columns/tables added via `MIGRATIONS` list in `database.ts`. Deduplication: 
 
 4 sections with tabs (Dashboard / Charts):
 - **Outdoor** (4-col grid): Temperature, Wind, Rainfall (+ Barometer), Solar
-- **Indoor** (3-col grid): Mom, Abdu, Kitchen — each with temp + humidity
+- **Indoor** (3-col grid): Mom, Abdu, Kitchen — each with temp + humidity + inline purifier/AC controls
 - **Air Quality** (5-col grid): CO2, PM2.5, PM10, tVOC, Noise — battery in section header
-- **Purifiers** (2-col grid): "mom" and "Abdu" cards + Inline AQI Automation Trigger panel
+- **Prayer Times**: Daily prayer schedule (Dubai method, calibrated for Baghdad)
+
+Purifier and AC controls are integrated inline within Indoor cards (Mom, Abdu) as vertical capsule widgets.
 
 ## Card Design Language
 
@@ -151,6 +160,13 @@ All metric cards follow a consistent design language established in the Temperat
 - Displays device name, status (online/offline), power, mode (Auto/Favorite/Sleep), fan level, and auxiliary controls (LED, Buzzer, Child Lock).
 - Handles different capabilities based on protocol (e.g., specific MIoT properties).
 - Includes status indicators for filter life.
+
+### AC Widget
+- Vertical capsule (`ac-widget.tsx`) matching purifier design language.
+- Mode-based color theming: Auto=emerald, Cool=sky, Dry=teal, Fan=slate, Heat=orange.
+- Main capsule: power button (mode-colored glow), target temp, fan speed indicator.
+- Detail overlay (portal): temp +/- controls, mode selector (5 icons), fan speed (6 levels), toggles (ECO, Swing, Turbo, Screen).
+- Allowed commands: `set_power`, `set_mode`, `set_temperature`, `set_fan_speed`, `set_eco`, `set_screen`, `set_sleep`, `set_swing`, `set_turbo`.
 
 ### Chart Defaults
 - Line charts: `borderWidth: 2, pointRadius: 0, tension: 0.4, cubicInterpolationMode: "monotone", fill: true`
@@ -179,6 +195,7 @@ All metric cards follow a consistent design language established in the Temperat
 - Qingping MQTT (primary): Device pushes to self-hosted Mosquitto broker every ~30s. Collector subscribes to `qingping/{MAC}/up`. Interval configured via downlink to `qingping/{MAC}/down`.
 - Qingping Cloud API (fallback): OAuth token expires in ~2 hours, refreshed 5 min before expiry. Automatically resumes when MQTT is silent >2 minutes.
 - Xiaomi Cloud: Managed by `xmihome`. Avoid aggressive polling. Commands are sent as needed for automations or UI interactions.
+- TCL Cloud: No continuous polling. Device state fetched on-demand via `/api/ac/devices` (frontend polls every 10s). Control commands sent via AWS IoT shadow publish.
 
 
 ## Frontend Update Intervals

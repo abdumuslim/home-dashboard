@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { WeatherReading, AirReading, OpenOverlayFn } from "@/types/api";
 import { useSectionLayout, type SectionId } from "@/hooks/use-section-layout";
 import { useDevices } from "@/hooks/use-devices";
+import { useAcDevices } from "@/hooks/use-ac-devices";
 import { SectionWrapper } from "./ui/section-wrapper";
 import { OutdoorSection } from "./sections/outdoor-section";
 import { IndoorSection } from "./sections/indoor-section";
@@ -19,6 +20,7 @@ interface DashboardTabProps {
 export function DashboardTab({ weather, air, weatherHistory, airHistory, openOverlay }: DashboardTabProps) {
   const { order, collapsed, toggleCollapsed, moveUp, moveDown } = useSectionLayout();
   const { devices, sendControl } = useDevices();
+  const { devices: acDevices, sendControl: acSendControl } = useAcDevices();
 
   const sections: Record<SectionId, { header: ReactNode; headerRight?: ReactNode; content: ReactNode }> = {
     outdoor: {
@@ -40,6 +42,8 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
           openOverlay={openOverlay}
           devices={devices}
           sendControl={sendControl}
+          acDevices={acDevices}
+          acSendControl={acSendControl}
         />
       ),
     },
