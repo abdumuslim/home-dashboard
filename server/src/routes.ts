@@ -569,7 +569,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
   });
 
-  const ALLOWED_AC_COMMANDS = ["set_power", "set_mode", "set_temperature", "set_fan_speed", "set_eco", "set_screen", "set_sleep", "set_swing", "set_turbo"];
+  const ALLOWED_AC_COMMANDS = ["set_power", "set_mode", "set_temperature", "set_fan_speed", "set_eco", "set_screen", "set_sleep", "set_swing", "set_turbo", "set_generator_mode"];
 
   router.post("/api/ac/devices/:id/control", async (req: Request, res: Response) => {
     const cloud = getTclCloud?.();

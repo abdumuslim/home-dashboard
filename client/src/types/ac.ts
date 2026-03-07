@@ -12,4 +12,6 @@ export interface AcDevice {
   screen: boolean;
   swing: boolean;
   turbo: boolean;
+  generatorMode: number;
+  maxGeneratorLevel: number;
 }

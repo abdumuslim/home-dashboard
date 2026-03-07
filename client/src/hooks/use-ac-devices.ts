@@ -12,6 +12,7 @@ function getOptimisticUpdate(command: string, value: unknown): Partial<AcDevice>
     case "set_sleep": return { sleep: value as number };
     case "set_swing": return { swing: value === 1 };
     case "set_turbo": return { turbo: value === 1 };
+    case "set_generator_mode": return { generatorMode: value as number };
     default: return null;
   }
 }
