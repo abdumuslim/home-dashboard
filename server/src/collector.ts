@@ -152,7 +152,7 @@ export class Collector {
   // Alert system
   private alertRules: AlertRule[] = [];
   private alertRulesLastFetch = 0;
-  private sensorAlertState = new Map<number, "idle" | "triggered">();
+  private sensorAlertState = new Map<number, { state: "idle" | "triggered"; resolvedAt?: number }>();
   private latestWeatherRow: Record<string, unknown> | null = null;
   private latestWeatherTs: Date | null = null;
   private latestAirRow: Record<string, unknown> | null = null;
@@ -305,14 +305,18 @@ export class Collector {
           ? value > rule.threshold
           : value < rule.threshold;
 
-        const state = this.sensorAlertState.get(rule.id) ?? "idle";
+        const QUIET_PERIOD_MS = 10 * 60 * 1000; // 10 minutes
+        const entry = this.sensorAlertState.get(rule.id) ?? { state: "idle" };
 
-        if (conditionMet && state === "idle") {
-          this.sensorAlertState.set(rule.id, "triggered");
-          await this.sendAlertPush(rule, value);
-        } else if (!conditionMet && state === "triggered") {
-          // Value returned to normal — reset to idle (hysteresis)
-          this.sensorAlertState.set(rule.id, "idle");
+        if (conditionMet && entry.state === "idle") {
+          // Only fire if quiet period has elapsed (or no prior resolution)
+          if (!entry.resolvedAt || (Date.now() - entry.resolvedAt) >= QUIET_PERIOD_MS) {
+            this.sensorAlertState.set(rule.id, { state: "triggered" });
+            await this.sendAlertPush(rule, value);
+          }
+        } else if (!conditionMet && entry.state === "triggered") {
+          // Value returned to normal — start quiet period
+          this.sensorAlertState.set(rule.id, { state: "idle", resolvedAt: Date.now() });
         }
       }
     }
