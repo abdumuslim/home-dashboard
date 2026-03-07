@@ -36,7 +36,7 @@ Browser → Cloudflare → Traefik (VPS, existing) → dashboard container (port
   - Auth chain: TCL login → token refresh (saasToken + cognitoToken) → AWS Cognito credentials
   - Device state via AWS IoT Shadow (`GetThingShadow` with manual SigV4)
   - Control via `@aws-sdk/client-iot-data-plane` `PublishCommand` (manual SigV4 fails for publish)
-  - Credentials cached in `/app/data/tcl-credentials.json`
+  - Credentials cached in `/app/data/tcl-credentials.json`, last AC state in `/app/data/ac-last-state.json`
   - Retry-on-403 in `sendControl`: clears creds, re-auths, retries once
 - **Automations**: Two types processed in the collector loop, configurable via dashboard:
   - **Metric-based**: AQI threshold triggers (e.g., PM2.5 above 50 → turn on purifier, off when below).
@@ -165,10 +165,13 @@ All metric cards follow a consistent design language established in the Temperat
 
 ### AC Widget
 - Vertical capsule (`ac-widget.tsx`) matching purifier design language.
-- Mode-based color theming: Auto=emerald, Cool=sky, Dry=teal, Fan=slate, Heat=orange.
-- Main capsule: power button (mode-colored glow), target temp, fan speed indicator.
-- Detail overlay (portal): temp +/- controls, mode selector (5 icons), fan speed (6 levels), toggles (ECO, Swing, Turbo, Screen).
-- Allowed commands: `set_power`, `set_mode`, `set_temperature`, `set_fan_speed`, `set_eco`, `set_screen`, `set_sleep`, `set_swing`, `set_turbo`, `set_generator_mode`.
+- "AC" header label inside capsule (always visible, `text-[0.65rem] text-text/70 font-bold uppercase`).
+- Mode-based color theming: Auto=emerald, Cool=sky, Dry=teal, Fan=slate, Heat=red.
+- Main capsule row 2: two-column layout — left=target temp, right=fan speed + generator indicator.
+- Detail overlay (portal): temp +/- controls (0.5° step for Najat, 1° for others), mode selector (5 icons), fan speed (Auto + 1-7 single row, Abdu: 1=silent/7=max via silenceSwitch/turbo), vertical/horizontal swing selectors (swing modes + fixed positions with SVG dot indicators), toggles (ECO, Turbo, Screen, Fresh Air for Najat only), generator mode.
+- Allowed commands: `set_power`, `set_mode`, `set_temperature`, `set_fan_speed`, `set_eco`, `set_screen`, `set_sleep`, `set_vertical_swing`, `set_horizontal_swing`, `set_turbo`, `set_fresh_air`, `set_generator_mode`.
+- **Last state restore**: On power-on, backend restores all saved properties (mode, temp, fan, swing, etc.) from `/app/data/ac-last-state.json`. State saved every shadow poll when device is on.
+- **Two AC models with different shadow properties**: Najat (TAC-24CHSA) uses `windSpeed7Gear`, `verticalWind`/`horizontalWind`, `newWindSwitch`; Abdu (TAC-12CHSD) uses `windSpeed`, `verticalSwitch`/`horizontalSwitch`, `ECO`, `turbo`, `silenceSwitch`. Detected via `autoGeneratorMode` presence in shadow.
 
 ### Chart Defaults
 - Line charts: `borderWidth: 2, pointRadius: 0, tension: 0.4, cubicInterpolationMode: "monotone", fill: true`

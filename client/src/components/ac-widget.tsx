@@ -28,7 +28,7 @@ function getModeColors(mode: number) {
 }
 
 const FAN_LABELS: Record<number, string> = {
-  0: "Auto",
+  0: "A",
   1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7",
 };
 
@@ -114,7 +114,7 @@ export function AcWidget({ device: d, onControl }: AcWidgetProps) {
               <div className="flex items-center gap-0.5">
                 <Wind className="w-2.5 h-2.5 text-dim" />
                 <span className="text-[0.55rem] text-dim font-bold tabular-nums">
-                  {FAN_LABELS[d.fanSpeed] ?? "Auto"}
+                  {FAN_LABELS[d.fanSpeed] ?? "A"}
                 </span>
               </div>
               {d.generatorMode > 0 && (
@@ -264,7 +264,7 @@ function AcDetailOverlay({ device: d, onControl, onClose }: {
               <div>
                 <span className="text-xs text-dim mb-1.5 block">Fan Speed</span>
                 <div className="flex gap-1.5">
-                  {([0, 1, 2, 3, 4, 5, 6, 7] as const).map((s) => (
+                  {[0, ...Array.from({ length: (d.maxFanSpeed || 7) - (d.minFanSpeed || 1) + 1 }, (_, i) => i + (d.minFanSpeed || 1))].map((s) => (
                     <button
                       key={s}
                       onClick={() => send("set_fan_speed", s)}
