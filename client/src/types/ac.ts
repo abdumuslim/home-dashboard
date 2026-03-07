@@ -10,7 +10,8 @@ export interface AcDevice {
   eco: boolean;
   sleep: number;
   screen: boolean;
-  swing: boolean;
+  verticalSwing: number;
+  horizontalSwing: number;
   turbo: boolean;
   generatorMode: number;
   maxGeneratorLevel: number;

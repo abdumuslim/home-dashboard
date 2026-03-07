@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, Snowflake, Sun, Wind, Droplets, Zap, Gauge } from "lucide-react";
+import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AcDevice } from "@/types/ac";
 
@@ -131,6 +131,7 @@ export function AcWidget({ device: d, onControl }: AcWidgetProps) {
                 </div>
               </>
             )}
+
           </>
         )}
       </div>
@@ -285,10 +286,27 @@ function AcDetailOverlay({ device: d, onControl, onClose }: {
                 </div>
               </div>
 
+              {/* Vertical swing */}
+              <SwingSelector
+                label="Vertical"
+                value={d.verticalSwing}
+                onChange={(v) => send("set_vertical_swing", v)}
+                axis="vertical"
+                colors={colors}
+              />
+
+              {/* Horizontal swing */}
+              <SwingSelector
+                label="Horizontal"
+                value={d.horizontalSwing}
+                onChange={(v) => send("set_horizontal_swing", v)}
+                axis="horizontal"
+                colors={colors}
+              />
+
               {/* Toggles */}
               <div className="grid grid-cols-3 gap-1.5">
                 <AcToggle label="ECO" value={d.eco} onChange={(v) => send("set_eco", v ? 1 : 0)} colors={colors} />
-                <AcToggle label="Swing" value={d.swing} onChange={(v) => send("set_swing", v ? 1 : 0)} colors={colors} />
                 <AcToggle label="Turbo" value={d.turbo} onChange={(v) => send("set_turbo", v ? 1 : 0)} icon={<Zap className="w-3 h-3" />} colors={colors} />
                 <AcToggle label="Screen" value={d.screen} onChange={(v) => send("set_screen", v ? 1 : 0)} colors={colors} />
               </div>
@@ -322,6 +340,122 @@ function AcDetailOverlay({ device: d, onControl, onClose }: {
       </div>
     </div>,
     document.body,
+  );
+}
+
+// ---------- Swing Selector ----------
+
+const VERTICAL_OPTIONS: { value: number; label: string; type: "swing" | "fix" }[] = [
+  { value: 0, label: "Off", type: "swing" },
+  { value: 1, label: "Full", type: "swing" },
+  { value: 2, label: "Up", type: "swing" },
+  { value: 3, label: "Down", type: "swing" },
+  { value: 9, label: "Top", type: "fix" },
+  { value: 10, label: "Upper", type: "fix" },
+  { value: 11, label: "Mid", type: "fix" },
+  { value: 12, label: "Lower", type: "fix" },
+  { value: 13, label: "Bottom", type: "fix" },
+];
+
+const HORIZONTAL_OPTIONS: { value: number; label: string; type: "swing" | "fix" }[] = [
+  { value: 0, label: "Off", type: "swing" },
+  { value: 1, label: "Full", type: "swing" },
+  { value: 2, label: "Left", type: "swing" },
+  { value: 3, label: "Mid", type: "swing" },
+  { value: 4, label: "Right", type: "swing" },
+  { value: 9, label: "L", type: "fix" },
+  { value: 10, label: "CL", type: "fix" },
+  { value: 11, label: "M", type: "fix" },
+  { value: 12, label: "CR", type: "fix" },
+  { value: 13, label: "R", type: "fix" },
+];
+
+function VerticalIcon({ value }: { value: number }) {
+  switch (value) {
+    case 0: return <X className="w-3.5 h-3.5" />;
+    case 1: return <ChevronsUpDown className="w-3.5 h-3.5" />;
+    case 2: return <ChevronUp className="w-3.5 h-3.5" />;
+    case 3: return <ChevronDown className="w-3.5 h-3.5" />;
+    default: return <FixedPositionDot axis="vertical" position={value} />;
+  }
+}
+
+function HorizontalIcon({ value }: { value: number }) {
+  switch (value) {
+    case 0: return <X className="w-3.5 h-3.5" />;
+    case 1: return <ChevronsLeftRight className="w-3.5 h-3.5" />;
+    case 2: return <ChevronLeft className="w-3.5 h-3.5" />;
+    case 3: return <Minus className="w-3.5 h-3.5" />;
+    case 4: return <ChevronRight className="w-3.5 h-3.5" />;
+    default: return <FixedPositionDot axis="horizontal" position={value} />;
+  }
+}
+
+function FixedPositionDot({ axis, position }: { axis: "vertical" | "horizontal"; position: number }) {
+  const idx = position - 9; // 0-4
+  if (axis === "vertical") {
+    return (
+      <svg width="14" height="14" viewBox="0 0 14 14">
+        <line x1="7" y1="1" x2="7" y2="13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity={0.3} />
+        <circle cx="7" cy={1 + idx * 3} r="2" fill="currentColor" />
+      </svg>
+    );
+  }
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14">
+      <line x1="1" y1="7" x2="13" y2="7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity={0.3} />
+      <circle cx={1 + idx * 3} cy="7" r="2" fill="currentColor" />
+    </svg>
+  );
+}
+
+function SwingSelector({ label, value, onChange, axis, colors }: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  axis: "vertical" | "horizontal";
+  colors: { border: string; bg: string; text: string };
+}) {
+  const options = axis === "vertical" ? VERTICAL_OPTIONS : HORIZONTAL_OPTIONS;
+  const swingOpts = options.filter(o => o.type === "swing");
+  const fixOpts = options.filter(o => o.type === "fix");
+  const IconComponent = axis === "vertical" ? VerticalIcon : HorizontalIcon;
+
+  return (
+    <div>
+      <span className="text-[0.65rem] text-dim uppercase tracking-wider mb-1.5 block">{label}</span>
+      <div className="flex gap-1 flex-wrap">
+        {swingOpts.map((o) => (
+          <button
+            key={o.value}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              "flex items-center justify-center w-8 h-8 rounded-lg border transition-colors",
+              value !== o.value && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+            )}
+            style={value === o.value ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
+            title={o.label}
+          >
+            <IconComponent value={o.value} />
+          </button>
+        ))}
+        <div className="w-px bg-white/10 mx-0.5 self-stretch" />
+        {fixOpts.map((o) => (
+          <button
+            key={o.value}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              "flex items-center justify-center w-8 h-8 rounded-lg border transition-colors",
+              value !== o.value && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+            )}
+            style={value === o.value ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
+            title={o.label}
+          >
+            <IconComponent value={o.value} />
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 

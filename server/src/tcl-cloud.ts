@@ -14,7 +14,8 @@ export interface AcDevice {
   eco: boolean;
   sleep: number;
   screen: boolean;
-  swing: boolean;
+  verticalSwing: number;
+  horizontalSwing: number;
   turbo: boolean;
   generatorMode: number;
   maxGeneratorLevel: number;
@@ -122,6 +123,40 @@ export class TclCloud {
   async sendControl(deviceId: string, command: string, value: unknown): Promise<void> {
     await this.ensureValidTokens();
 
+    // Handle swing commands specially (sets both switch + direction)
+    if (command === "set_vertical_swing" || command === "set_horizontal_swing") {
+      const v = value as number;
+      const prefix = command === "set_vertical_swing" ? "vertical" : "horizontal";
+      let desired: Record<string, unknown>;
+      if (v === 0) {
+        desired = { [`${prefix}Switch`]: 0, [`${prefix}Direction`]: 8 };
+      } else if (v >= 1 && v <= 4) {
+        desired = { [`${prefix}Switch`]: 1, [`${prefix}Direction`]: v };
+      } else if (v >= 9 && v <= 13) {
+        desired = { [`${prefix}Switch`]: 0, [`${prefix}Direction`]: v };
+      } else {
+        throw new Error(`Invalid swing value: ${v}`);
+      }
+      try {
+        await this.publishShadowUpdate(deviceId, desired);
+      } catch (err) {
+        const msg = (err as Error).message ?? "";
+        const name = (err as { name?: string }).name ?? "";
+        if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
+          console.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
+          this.awsCreds = null;
+          this.tokenExpiry = 0;
+          this.tokenData = null;
+          await this.ensureValidTokens();
+          await this.publishShadowUpdate(deviceId, desired);
+        } else {
+          throw err;
+        }
+      }
+      console.log(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
+      return;
+    }
+
     const propMap: Record<string, string> = {
       set_power: "powerSwitch",
       set_mode: "workMode",
@@ -130,7 +165,6 @@ export class TclCloud {
       set_eco: "ECO",
       set_screen: "screen",
       set_sleep: "sleep",
-      set_swing: "verticalSwitch",
       set_turbo: "turbo",
       set_generator_mode: "generatorMode",
     };
@@ -461,7 +495,12 @@ export class TclCloud {
           eco: shadow.ECO === 1,
           sleep: shadow.sleep ?? 0,
           screen: shadow.screen === 1,
-          swing: shadow.verticalSwitch === 1,
+          verticalSwing: shadow.verticalSwitch === 1
+            ? (shadow.verticalDirection ?? 1)
+            : (shadow.verticalDirection >= 9 ? shadow.verticalDirection : 0),
+          horizontalSwing: shadow.horizontalSwitch === 1
+            ? (shadow.horizontalDirection ?? 1)
+            : (shadow.horizontalDirection >= 9 ? shadow.horizontalDirection : 0),
           turbo: shadow.turbo === 1,
           generatorMode: shadow.generatorMode ?? 0,
           maxGeneratorLevel: ('autoGeneratorMode' in shadow) ? 6 : 3,
