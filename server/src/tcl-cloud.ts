@@ -1,5 +1,6 @@
 import { createHash, createHmac } from "crypto";
 import { readFile, writeFile } from "fs/promises";
+import { IoTDataPlaneClient, PublishCommand } from "@aws-sdk/client-iot-data-plane";
 
 export interface AcDevice {
   id: string;
@@ -15,6 +16,8 @@ export interface AcDevice {
   screen: boolean;
   swing: boolean;
   turbo: boolean;
+  generatorMode: number;
+  maxGeneratorLevel: number;
 }
 
 interface AuthData {
@@ -129,13 +132,29 @@ export class TclCloud {
       set_sleep: "sleep",
       set_swing: "verticalSwitch",
       set_turbo: "turbo",
+      set_generator_mode: "generatorMode",
     };
 
     const prop = propMap[command];
     if (!prop) throw new Error(`Unknown command: ${command}`);
 
     const desired: Record<string, unknown> = { [prop]: value };
-    await this.publishShadowUpdate(deviceId, desired);
+    try {
+      await this.publishShadowUpdate(deviceId, desired);
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      const name = (err as { name?: string }).name ?? "";
+      if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
+        console.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
+        this.awsCreds = null;
+        this.tokenExpiry = 0;
+        this.tokenData = null;
+        await this.ensureValidTokens();
+        await this.publishShadowUpdate(deviceId, desired);
+      } else {
+        throw err;
+      }
+    }
     console.log(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
   }
 
@@ -444,6 +463,8 @@ export class TclCloud {
           screen: shadow.screen === 1,
           swing: shadow.verticalSwitch === 1,
           turbo: shadow.turbo === 1,
+          generatorMode: shadow.generatorMode ?? 0,
+          maxGeneratorLevel: ('autoGeneratorMode' in shadow) ? 6 : 3,
         });
       }
     }
@@ -481,27 +502,29 @@ export class TclCloud {
     if (!this.awsCreds) throw new Error("No AWS credentials");
 
     const region = this.awsCreds.region;
-    const host = `data-ats.iot.${region}.amazonaws.com`;
+    const client = new IoTDataPlaneClient({
+      region,
+      endpoint: `https://data-ats.iot.${region}.amazonaws.com`,
+      credentials: {
+        accessKeyId: this.awsCreds.accessKeyId,
+        secretAccessKey: this.awsCreds.secretKey,
+        sessionToken: this.awsCreds.sessionToken,
+      },
+    });
+
     const topic = `$aws/things/${deviceId}/shadow/update`;
-    const path = `/topics/${encodeURIComponent(topic)}?qos=1`;
-    const method = "POST";
-    const body = JSON.stringify({
+    const payload = JSON.stringify({
       state: { desired },
       clientToken: `mobile_${Date.now()}`,
     });
 
-    const headers = this.signAwsRequest(method, host, path, body, region, "iotdata");
+    await client.send(new PublishCommand({
+      topic,
+      qos: 1,
+      payload: new TextEncoder().encode(payload),
+    }));
 
-    const resp = await fetch(`https://${host}${path}`, {
-      method,
-      headers: { ...headers, "Content-Type": "application/json" },
-      body,
-      signal: AbortSignal.timeout(15_000),
-    });
-
-    if (!resp.ok) {
-      throw new Error(`IoT Publish HTTP ${resp.status}: ${await resp.text()}`);
-    }
+    client.destroy();
   }
 
   // ---------- AWS SigV4 Signing ----------

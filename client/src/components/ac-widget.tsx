@@ -110,7 +110,7 @@ export function AcWidget({ device: d, onControl }: AcWidgetProps) {
           )}
         </div>
 
-        {/* Row 3: Fan speed indicator (when on) */}
+        {/* Row 3: Fan speed + generator indicator (when on) */}
         {isOn && (
           <>
             <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
@@ -120,6 +120,17 @@ export function AcWidget({ device: d, onControl }: AcWidgetProps) {
                 {FAN_LABELS[d.fanSpeed] ?? "Auto"}
               </span>
             </div>
+            {d.generatorMode > 0 && (
+              <>
+                <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
+                <div className="flex items-center gap-1 px-2 py-0.5">
+                  <Zap className="w-3 h-3" style={{ color: colors.accent }} />
+                  <span className="text-[0.6rem] font-bold tabular-nums" style={{ color: colors.accent }}>
+                    L{d.generatorMode}
+                  </span>
+                </div>
+              </>
+            )}
           </>
         )}
       </div>
@@ -280,6 +291,26 @@ function AcDetailOverlay({ device: d, onControl, onClose }: {
                 <AcToggle label="Swing" value={d.swing} onChange={(v) => send("set_swing", v ? 1 : 0)} colors={colors} />
                 <AcToggle label="Turbo" value={d.turbo} onChange={(v) => send("set_turbo", v ? 1 : 0)} icon={<Zap className="w-3 h-3" />} colors={colors} />
                 <AcToggle label="Screen" value={d.screen} onChange={(v) => send("set_screen", v ? 1 : 0)} colors={colors} />
+              </div>
+
+              {/* Generator mode */}
+              <div>
+                <span className="text-[0.65rem] text-dim uppercase tracking-wider mb-1.5 block">Generator</span>
+                <div className="flex gap-1.5 flex-wrap">
+                  {[0, ...Array.from({ length: d.maxGeneratorLevel }, (_, i) => i + 1)].map((lvl) => (
+                    <button
+                      key={lvl}
+                      onClick={() => send("set_generator_mode", lvl)}
+                      className={cn(
+                        "px-2.5 py-1.5 rounded-lg text-xs border transition-colors",
+                        d.generatorMode !== lvl && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+                      )}
+                      style={d.generatorMode === lvl ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
+                    >
+                      {lvl === 0 ? "OFF" : lvl}
+                    </button>
+                  ))}
+                </div>
               </div>
             </>
           )}

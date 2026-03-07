@@ -34,8 +34,10 @@ Browser → Cloudflare → Traefik (VPS, existing) → dashboard container (port
   - **MIoT Mappings**: Power (2:2), Fan Level (2:4), Mode (2:5), AQI (3:6), Humidity (3:7), Temperature (3:8), Filter Life (4:3), Buzzer (5:1), LED (6:6), Child Lock (7:1).
 - **TCL Cloud**: Custom API client in `tcl-cloud.ts` (reverse-engineered TCL Home app).
   - Auth chain: TCL login → token refresh (saasToken + cognitoToken) → AWS Cognito credentials
-  - Device state via AWS IoT Shadow (`GetThingShadow`), control via shadow publish
+  - Device state via AWS IoT Shadow (`GetThingShadow` with manual SigV4)
+  - Control via `@aws-sdk/client-iot-data-plane` `PublishCommand` (manual SigV4 fails for publish)
   - Credentials cached in `/app/data/tcl-credentials.json`
+  - Retry-on-403 in `sendControl`: clears creds, re-auths, retries once
 - **Automations**: Two types processed in the collector loop, configurable via dashboard:
   - **Metric-based**: AQI threshold triggers (e.g., PM2.5 above 50 → turn on purifier, off when below).
   - **Schedule-based**: Daily time window enforcement (e.g., 22:00–07:00 → keep purifier ON, re-sends turn-on every ~5s if device found off). Uses `getDevicePower()` with 5s cache.
@@ -166,7 +168,7 @@ All metric cards follow a consistent design language established in the Temperat
 - Mode-based color theming: Auto=emerald, Cool=sky, Dry=teal, Fan=slate, Heat=orange.
 - Main capsule: power button (mode-colored glow), target temp, fan speed indicator.
 - Detail overlay (portal): temp +/- controls, mode selector (5 icons), fan speed (6 levels), toggles (ECO, Swing, Turbo, Screen).
-- Allowed commands: `set_power`, `set_mode`, `set_temperature`, `set_fan_speed`, `set_eco`, `set_screen`, `set_sleep`, `set_swing`, `set_turbo`.
+- Allowed commands: `set_power`, `set_mode`, `set_temperature`, `set_fan_speed`, `set_eco`, `set_screen`, `set_sleep`, `set_swing`, `set_turbo`, `set_generator_mode`.
 
 ### Chart Defaults
 - Line charts: `borderWidth: 2, pointRadius: 0, tension: 0.4, cubicInterpolationMode: "monotone", fill: true`
