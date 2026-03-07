@@ -18,7 +18,7 @@ const MODE_COLORS: Record<number, { accent: string; bg: string; border: string; 
   1: { accent: "#38bdf8", bg: "rgba(56,189,248,0.1)", border: "rgba(56,189,248,0.5)", glow: "rgba(56,189,248,0.3)", text: "#38bdf8", toggleBg: "rgba(56,189,248,0.3)", toggleDot: "#38bdf8" },   // sky
   2: { accent: "#2dd4bf", bg: "rgba(45,212,191,0.1)", border: "rgba(45,212,191,0.5)", glow: "rgba(45,212,191,0.3)", text: "#2dd4bf", toggleBg: "rgba(45,212,191,0.3)", toggleDot: "#2dd4bf" },   // teal
   3: { accent: "#94a3b8", bg: "rgba(148,163,184,0.1)", border: "rgba(148,163,184,0.5)", glow: "rgba(148,163,184,0.3)", text: "#94a3b8", toggleBg: "rgba(148,163,184,0.3)", toggleDot: "#94a3b8" }, // slate
-  4: { accent: "#fb923c", bg: "rgba(251,146,60,0.1)",  border: "rgba(251,146,60,0.5)",  glow: "rgba(251,146,60,0.3)",  text: "#fb923c", toggleBg: "rgba(251,146,60,0.3)",  toggleDot: "#fb923c" },  // orange
+  4: { accent: "#f87171", bg: "rgba(248,113,113,0.1)",  border: "rgba(248,113,113,0.5)",  glow: "rgba(248,113,113,0.3)",  text: "#f87171", toggleBg: "rgba(248,113,113,0.3)",  toggleDot: "#f87171" },  // red
 };
 
 const DEFAULT_COLORS = MODE_COLORS[1];
