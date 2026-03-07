@@ -1,6 +1,7 @@
 import { Home, User, CookingPot } from "lucide-react";
 import type { WeatherReading, AirReading, OpenOverlayFn } from "@/types/api";
 import type { PurifierDevice } from "@/types/automations";
+import type { AcDevice } from "@/types/ac";
 import { IndoorCard } from "@/components/cards/indoor-card";
 
 interface IndoorSectionProps {
@@ -11,6 +12,8 @@ interface IndoorSectionProps {
   openOverlay: OpenOverlayFn;
   devices?: PurifierDevice[];
   sendControl?: (deviceId: string, command: string, params: unknown[]) => Promise<void>;
+  acDevices?: AcDevice[];
+  acSendControl?: (deviceId: string, command: string, value: unknown) => Promise<void>;
 }
 
 // Steadman approximation for feels-like (indoor, no wind/sun)
@@ -24,13 +27,17 @@ function calcFeelsLike(t: number, rh: number): number {
   return hi;
 }
 
-export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay, devices = [], sendControl }: IndoorSectionProps) {
+export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay, devices = [], sendControl, acDevices = [], acSendControl }: IndoorSectionProps) {
   const kitchenFeelsLike = air?.temperature != null && air?.humidity != null
     ? calcFeelsLike(air.temperature, air.humidity) : undefined;
 
   // Match purifier devices to indoor cards by name (case-insensitive)
   const momDevice = devices.find((d) => d.name.toLowerCase() === "mom");
   const abduDevice = devices.find((d) => d.name.toLowerCase() === "abdu");
+
+  // Match AC devices by name: "Najat" → Mom card, "Abdu AC" → Abdu card
+  const momAc = acDevices.find((d) => d.name.toLowerCase().includes("najat"));
+  const abduAc = acDevices.find((d) => d.name.toLowerCase().startsWith("abdu") && !d.name.toLowerCase().includes("abdullah"));
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
@@ -46,6 +53,8 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         openOverlay={openOverlay}
         device={momDevice}
         onControl={momDevice && sendControl ? (cmd, params) => sendControl(momDevice.id, cmd, params) : undefined}
+        acDevice={momAc}
+        onAcControl={momAc && acSendControl ? (cmd, val) => acSendControl(momAc.id, cmd, val) : undefined}
       />
       <IndoorCard
         title="Abdu"
@@ -59,6 +68,8 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         openOverlay={openOverlay}
         device={abduDevice}
         onControl={abduDevice && sendControl ? (cmd, params) => sendControl(abduDevice.id, cmd, params) : undefined}
+        acDevice={abduAc}
+        onAcControl={abduAc && acSendControl ? (cmd, val) => acSendControl(abduAc.id, cmd, val) : undefined}
       />
       <IndoorCard
         title="Kitchen"

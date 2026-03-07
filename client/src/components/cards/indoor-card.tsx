@@ -4,6 +4,7 @@ import { Maximize2, Power, Fan, Settings, Loader2, Hourglass } from "lucide-reac
 import { cn } from "@/lib/utils";
 import { MetricCard } from "@/components/ui/metric-card";
 import { PurifierDetailOverlay } from "@/components/ui/purifier-detail-overlay";
+import { AcWidget } from "@/components/ac-widget";
 import { useFlash } from "@/hooks/use-flash";
 import { useUnits } from "@/hooks/use-units";
 import { useChartsVisible } from "@/hooks/use-charts-visible";
@@ -12,6 +13,7 @@ import { convertTemp } from "@/constants/units";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
 import type { WeatherReading, AirReading, OpenOverlayFn, TimeRange } from "@/types/api";
 import type { PurifierDevice } from "@/types/automations";
+import type { AcDevice } from "@/types/ac";
 
 const statusLevelColors: Record<string, string> = {
   excellent: "#0df41e",
@@ -48,6 +50,8 @@ interface IndoorCardProps {
   openOverlay: OpenOverlayFn;
   device?: PurifierDevice;
   onControl?: (command: string, params: unknown[]) => Promise<void>;
+  acDevice?: AcDevice;
+  onAcControl?: (command: string, value: unknown) => Promise<void>;
 }
 
 function ExpandedIndoorChart({
@@ -144,6 +148,8 @@ export function IndoorCard({
   openOverlay,
   device,
   onControl,
+  acDevice,
+  onAcControl,
 }: IndoorCardProps) {
   const { fmtTemp, tempLabel, units: { temperature: tempUnit } } = useUnits();
   const { chartsVisible } = useChartsVisible();
@@ -232,6 +238,7 @@ export function IndoorCard({
   const offline = device != null && !device.isOnline;
   const filterLow = device?.filter_life != null && device.filter_life <= 20;
   const hasPurifier = device != null && onControl != null;
+  const hasAc = acDevice != null && onAcControl != null;
 
   return (
     <MetricCard flash={flash} className="p-4 pb-0 flex flex-col">
@@ -381,6 +388,11 @@ export function IndoorCard({
               </>
             )}
           </div>
+        )}
+
+        {/* AC widget */}
+        {hasAc && (
+          <AcWidget device={acDevice} onControl={onAcControl} />
         )}
       </div>
 

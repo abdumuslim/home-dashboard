@@ -3,6 +3,7 @@ import pg from "pg";
 import type { Config } from "./config.js";
 import { ALERT_METRICS, VALID_PRAYER_NAMES } from "./alert-metrics.js";
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
+import type { TclCloud } from "./tcl-cloud.js";
 
 const RANGE_MAP: Record<string, string> = {
   "6h": "6 hours",
@@ -39,7 +40,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null): Router {
   const router = Router();
 
   router.get("/api/current", async (_req: Request, res: Response) => {
@@ -550,6 +551,44 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     );
     if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
     res.json({ automation: result.rows[0] });
+  });
+
+  // ---------- AC Devices (TCL Cloud) ----------
+
+  router.get("/api/ac/devices", async (_req: Request, res: Response) => {
+    const cloud = getTclCloud?.();
+    if (!cloud || !cloud.isReady()) {
+      res.json({ devices: [], available: false });
+      return;
+    }
+    try {
+      const devices = await cloud.fetchDevicesLive();
+      res.json({ devices, available: true });
+    } catch (err) {
+      res.json({ devices: cloud.getDevices(), available: true, error: (err as Error).message });
+    }
+  });
+
+  const ALLOWED_AC_COMMANDS = ["set_power", "set_mode", "set_temperature", "set_fan_speed", "set_eco", "set_screen", "set_sleep", "set_swing", "set_turbo"];
+
+  router.post("/api/ac/devices/:id/control", async (req: Request, res: Response) => {
+    const cloud = getTclCloud?.();
+    if (!cloud || !cloud.isReady()) {
+      res.status(503).json({ error: "TCL Cloud not available" });
+      return;
+    }
+    const id = String(req.params.id);
+    const { command, value } = req.body as { command: string; value: unknown };
+    if (!command || !ALLOWED_AC_COMMANDS.includes(command)) {
+      res.status(400).json({ error: `Invalid command. Allowed: ${ALLOWED_AC_COMMANDS.join(", ")}` });
+      return;
+    }
+    try {
+      await cloud.sendControl(id, command, value);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
   });
 
   return router;

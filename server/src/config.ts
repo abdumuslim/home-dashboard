@@ -16,6 +16,8 @@ export interface Config {
   miEmail: string;
   miPassword: string;
   miRegion: string;
+  tclUsername: string;
+  tclPassword: string;
 }
 
 export const config: Config = {
@@ -34,4 +36,6 @@ export const config: Config = {
   miEmail: process.env.MI_EMAIL ?? "",
   miPassword: process.env.MI_PASSWORD ?? "",
   miRegion: process.env.MI_REGION ?? "sg",
+  tclUsername: process.env.TCL_USERNAME ?? "",
+  tclPassword: process.env.TCL_PASSWORD ?? "",
 };

@@ -5,6 +5,7 @@ import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import type { Config } from "./config.js";
 import { getMetricValue, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
+import { TclCloud } from "./tcl-cloud.js";
 
 interface WeatherRow {
   ts: Date;
@@ -161,6 +162,7 @@ export class Collector {
   private cachedPrayerDateKey = "";
   // Automation system
   xiaomiCloud: XiaomiCloud | null = null;
+  tclCloud: TclCloud | null = null;
   private automationRules: AutomationRule[] = [];
   private automationRulesLastFetch = 0;
   private automationState = new Map<number, AutomationState>();
@@ -191,6 +193,7 @@ export class Collector {
     await this.backfillQingpingHistory();
     this.startMqtt();
     await this.initXiaomiCloud();
+    await this.initTclCloud();
     while (!this.stopped) {
       try {
         await this.collectAll();
@@ -216,6 +219,20 @@ export class Collector {
     } catch (err) {
       console.error("[collector] Xiaomi Cloud init failed:", (err as Error).message);
       this.xiaomiCloud = null;
+    }
+  }
+
+  private async initTclCloud(): Promise<void> {
+    if (!this.config.tclUsername || !this.config.tclPassword) {
+      console.log("[collector] TCL Cloud not configured (TCL_USERNAME empty), AC controls disabled");
+      return;
+    }
+    try {
+      this.tclCloud = new TclCloud(this.config.tclUsername, this.config.tclPassword);
+      await this.tclCloud.init();
+    } catch (err) {
+      console.error("[collector] TCL Cloud init failed:", (err as Error).message);
+      this.tclCloud = null;
     }
   }
 
