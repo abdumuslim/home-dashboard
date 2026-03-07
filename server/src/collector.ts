@@ -163,6 +163,7 @@ export class Collector {
   // Automation system
   xiaomiCloud: XiaomiCloud | null = null;
   tclCloud: TclCloud | null = null;
+  private tclRetryAt = 0;
   private automationRules: AutomationRule[] = [];
   private automationRulesLastFetch = 0;
   private automationState = new Map<number, AutomationState>();
@@ -264,6 +265,12 @@ export class Collector {
       console.error("[collector] Automation check failed:", err);
     }
 
+    // Retry TCL Cloud init if it failed previously (every 5 minutes)
+    if (!this.tclCloud && this.config.tclUsername && this.config.tclPassword && Date.now() >= this.tclRetryAt) {
+      this.tclRetryAt = Date.now() + 5 * 60_000;
+      console.log("[collector] Retrying TCL Cloud init...");
+      await this.initTclCloud();
+    }
   }
 
   private async refreshAlertRules(): Promise<void> {

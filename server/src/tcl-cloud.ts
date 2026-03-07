@@ -83,10 +83,10 @@ export class TclCloud {
   async init(): Promise<void> {
     await this.loadCredentials();
 
-    try {
-      await this.ensureValidTokens();
-      console.log("[tcl] Cloud initialized successfully");
+    await this.ensureValidTokens();
+    console.log("[tcl] Cloud initialized successfully");
 
+    try {
       const devices = await this.fetchDevices();
       this.cachedDevices = devices;
       this.deviceCacheTime = Date.now();
@@ -96,8 +96,7 @@ export class TclCloud {
         console.log(`[tcl]   - ${d.name} (${d.id}, ${d.isOnline ? "online" : "offline"}, power=${d.power ? "on" : "off"})`);
       }
     } catch (err) {
-      console.error("[tcl] Cloud init failed:", (err as Error).message);
-      throw err;
+      console.warn("[tcl] Device fetch during init failed (will retry on first API call):", (err as Error).message);
     }
   }
 
@@ -329,7 +328,7 @@ export class TclCloud {
 
   // ---------- Device Operations ----------
 
-  private async fetchDevices(): Promise<AcDevice[]> {
+  private async fetchDevices(isRetry = false): Promise<AcDevice[]> {
     if (!this.tokenData || !this.authData) {
       throw new Error("Not authenticated");
     }
@@ -361,10 +360,6 @@ export class TclCloud {
       signal: AbortSignal.timeout(15_000),
     });
 
-    if (!resp.ok) {
-      throw new Error(`user_groups/get HTTP ${resp.status}: ${await resp.text()}`);
-    }
-
     interface Identifier {
       identifier?: string;
       value?: number;
@@ -380,11 +375,37 @@ export class TclCloud {
       devices?: DeviceRaw[];
     }
 
+    // Handle expired token: force re-auth and retry once
+    if (!resp.ok) {
+      const body = await resp.text();
+      if (!isRetry && (resp.status === 403 || body.includes("10022"))) {
+        console.warn(`[tcl] fetchDevices got ${resp.status} (expired token), forcing re-auth and retrying`);
+        this.awsCreds = null;
+        this.tokenExpiry = 0;
+        this.tokenData = null;
+        await this.ensureValidTokens();
+        return this.fetchDevices(true);
+      }
+      throw new Error(`user_groups/get HTTP ${resp.status}: ${body}`);
+    }
+
     const data = await resp.json() as {
       code?: number;
       message?: string;
       data?: GroupRaw[];
     };
+
+    // Also check for error code in JSON response body
+    if (data.code != null && data.code !== 0 && !isRetry) {
+      if (data.code === 10022 || data.message?.toLowerCase().includes("expired")) {
+        console.warn(`[tcl] fetchDevices got code ${data.code} (${data.message}), forcing re-auth and retrying`);
+        this.awsCreds = null;
+        this.tokenExpiry = 0;
+        this.tokenData = null;
+        await this.ensureValidTokens();
+        return this.fetchDevices(true);
+      }
+    }
 
     const groups = data.data ?? [];
     const devices: AcDevice[] = [];
