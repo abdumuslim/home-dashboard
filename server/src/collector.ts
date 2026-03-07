@@ -490,18 +490,9 @@ export class Collector {
       } catch (err) {
         console.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
       }
-    } else if (!conditionMet && state.status === "triggered" && rule.action_off && (now - state.lastToggle >= cooldownMs)) {
-      console.log(
-        `[collector] Automation "${rule.name}": ${rule.metric}=${value} returned below ${rule.threshold}, turning OFF [${deviceNames}]`,
-      );
-      try {
-        for (const did of deviceIds) {
-          await this.xiaomiCloud!.executeAction(did, rule.action_off);
-        }
-        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null });
-      } catch (err) {
-        console.error(`[collector] Automation "${rule.name}" action_off failed:`, (err as Error).message);
-      }
+    } else if (!conditionMet && state.status === "triggered") {
+      // Condition no longer met — reset to idle so the trigger can fire again
+      this.automationState.set(rule.id, { status: "idle", lastToggle: state.lastToggle, conditionSince: null });
     }
   }
 

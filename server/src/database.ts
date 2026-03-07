@@ -99,6 +99,7 @@ const MIGRATIONS: string[] = [
   "ALTER TABLE automations ALTER COLUMN threshold DROP NOT NULL",
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS turn_off_at_end BOOLEAN NOT NULL DEFAULT false",
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS sustained_minutes INTEGER NOT NULL DEFAULT 0",
+  "UPDATE automations SET action_off = NULL WHERE automation_type = 'metric'",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

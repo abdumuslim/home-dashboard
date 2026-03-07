@@ -5,6 +5,7 @@ export interface PurifierDevice {
   isOnline: boolean;
   power?: "on" | "off";
   mode?: string;
+  fan_level?: number;
   favorite_level?: number;
   aqi?: number;
   temperature?: number;
