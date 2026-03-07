@@ -13,6 +13,7 @@ function getOptimisticUpdate(command: string, value: unknown): Partial<AcDevice>
     case "set_vertical_swing": return { verticalSwing: value as number };
     case "set_horizontal_swing": return { horizontalSwing: value as number };
     case "set_turbo": return { turbo: value === 1 };
+    case "set_fresh_air": return { freshAir: value === 1 };
     case "set_generator_mode": return { generatorMode: value as number };
     default: return null;
   }

@@ -13,6 +13,9 @@ export interface AcDevice {
   verticalSwing: number;
   horizontalSwing: number;
   turbo: boolean;
+  freshAir: boolean;
+  hasFreshAir: boolean;
   generatorMode: number;
   maxGeneratorLevel: number;
+  tempStep: number;
 }

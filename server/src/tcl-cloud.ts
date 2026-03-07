@@ -17,8 +17,11 @@ export interface AcDevice {
   verticalSwing: number;
   horizontalSwing: number;
   turbo: boolean;
+  freshAir: boolean;
+  hasFreshAir: boolean;
   generatorMode: number;
   maxGeneratorLevel: number;
+  tempStep: number;
 }
 
 interface AuthData {
@@ -120,6 +123,11 @@ export class TclCloud {
     return devices;
   }
 
+  private isNajatModel(deviceId: string): boolean {
+    const dev = this.cachedDevices.find(d => d.id === deviceId);
+    return dev ? dev.maxGeneratorLevel === 6 : false;
+  }
+
   async sendControl(deviceId: string, command: string, value: unknown): Promise<void> {
     await this.ensureValidTokens();
 
@@ -127,13 +135,14 @@ export class TclCloud {
     if (command === "set_vertical_swing" || command === "set_horizontal_swing") {
       const v = value as number;
       const prefix = command === "set_vertical_swing" ? "vertical" : "horizontal";
+      const switchProp = this.isNajatModel(deviceId) ? `${prefix}Wind` : `${prefix}Switch`;
       let desired: Record<string, unknown>;
       if (v === 0) {
-        desired = { [`${prefix}Switch`]: 0, [`${prefix}Direction`]: 8 };
+        desired = { [switchProp]: 0, [`${prefix}Direction`]: 8 };
       } else if (v >= 1 && v <= 4) {
-        desired = { [`${prefix}Switch`]: 1, [`${prefix}Direction`]: v };
+        desired = { [switchProp]: 1, [`${prefix}Direction`]: v };
       } else if (v >= 9 && v <= 13) {
-        desired = { [`${prefix}Switch`]: 0, [`${prefix}Direction`]: v };
+        desired = { [switchProp]: 0, [`${prefix}Direction`]: v };
       } else {
         throw new Error(`Invalid swing value: ${v}`);
       }
@@ -157,15 +166,17 @@ export class TclCloud {
       return;
     }
 
+    const najat = this.isNajatModel(deviceId);
     const propMap: Record<string, string> = {
       set_power: "powerSwitch",
       set_mode: "workMode",
       set_temperature: "targetTemperature",
-      set_fan_speed: "windSpeed",
+      set_fan_speed: najat ? "windSpeed7Gear" : "windSpeed",
       set_eco: "ECO",
       set_screen: "screen",
       set_sleep: "sleep",
       set_turbo: "turbo",
+      set_fresh_air: "newWindSwitch",
       set_generator_mode: "generatorMode",
     };
 
@@ -483,6 +494,11 @@ export class TclCloud {
 
         const powerFromId = (dev.identifiers ?? []).find(i => i.identifier === "powerSwitch");
 
+        // Najat uses different property names than Abdu/Abdullah
+        const isNajatModel = 'autoGeneratorMode' in shadow;
+        const vSwitch = isNajatModel ? shadow.verticalWind : shadow.verticalSwitch;
+        const hSwitch = isNajatModel ? shadow.horizontalWind : shadow.horizontalSwitch;
+
         devices.push({
           id: dev.deviceId,
           name: dev.nickName || dev.deviceName || dev.deviceId,
@@ -491,19 +507,22 @@ export class TclCloud {
           mode: shadow.workMode ?? 0,
           targetTemp: shadow.targetTemperature ?? 24,
           currentTemp: shadow.currentTemperature ?? 0,
-          fanSpeed: shadow.windSpeed ?? 0,
+          fanSpeed: shadow.windSpeed7Gear ?? shadow.windSpeed ?? 0,
           eco: shadow.ECO === 1,
           sleep: shadow.sleep ?? 0,
           screen: shadow.screen === 1,
-          verticalSwing: shadow.verticalSwitch === 1
+          verticalSwing: vSwitch === 1
             ? (shadow.verticalDirection ?? 1)
             : (shadow.verticalDirection >= 9 ? shadow.verticalDirection : 0),
-          horizontalSwing: shadow.horizontalSwitch === 1
+          horizontalSwing: hSwitch === 1
             ? (shadow.horizontalDirection ?? 1)
             : (shadow.horizontalDirection >= 9 ? shadow.horizontalDirection : 0),
           turbo: shadow.turbo === 1,
+          freshAir: shadow.newWindSwitch === 1,
+          hasFreshAir: 'newWindSwitch' in shadow,
           generatorMode: shadow.generatorMode ?? 0,
-          maxGeneratorLevel: ('autoGeneratorMode' in shadow) ? 6 : 3,
+          maxGeneratorLevel: isNajatModel ? 6 : 3,
+          tempStep: isNajatModel ? 0.5 : 1,
         });
       }
     }

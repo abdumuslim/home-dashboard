@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge } from "lucide-react";
+import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AcDevice } from "@/types/ac";
 
@@ -29,11 +29,7 @@ function getModeColors(mode: number) {
 
 const FAN_LABELS: Record<number, string> = {
   0: "Auto",
-  2: "Low",
-  3: "Mid-Lo",
-  4: "Med",
-  5: "Mid-Hi",
-  6: "High",
+  1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7",
 };
 
 interface AcWidgetProps {
@@ -207,7 +203,7 @@ function AcDetailOverlay({ device: d, onControl, onClose }: {
           {/* Temperature control */}
           <div className="flex items-center justify-center gap-6">
             <button
-              onClick={() => send("set_temperature", Math.max(16, d.targetTemp - 1))}
+              onClick={() => send("set_temperature", Math.max(16, +(d.targetTemp - (d.tempStep || 1)).toFixed(1)))}
               disabled={offline || !isOn}
               className="p-2 rounded-xl bg-white/5 hover:bg-white/10 text-dim hover:text-white transition-colors disabled:opacity-30"
             >
@@ -220,7 +216,7 @@ function AcDetailOverlay({ device: d, onControl, onClose }: {
               <span className="text-xs text-dim mt-1">Target</span>
             </div>
             <button
-              onClick={() => send("set_temperature", Math.min(36, d.targetTemp + 1))}
+              onClick={() => send("set_temperature", Math.min(36, +(d.targetTemp + (d.tempStep || 1)).toFixed(1)))}
               disabled={offline || !isOn}
               className="p-2 rounded-xl bg-white/5 hover:bg-white/10 text-dim hover:text-white transition-colors disabled:opacity-30"
             >
@@ -267,13 +263,13 @@ function AcDetailOverlay({ device: d, onControl, onClose }: {
               {/* Fan speed selector */}
               <div>
                 <span className="text-xs text-dim mb-1.5 block">Fan Speed</span>
-                <div className="grid grid-cols-3 gap-1.5">
-                  {([0, 2, 3, 4, 5, 6] as const).map((s) => (
+                <div className="flex gap-1.5">
+                  {([0, 1, 2, 3, 4, 5, 6, 7] as const).map((s) => (
                     <button
                       key={s}
                       onClick={() => send("set_fan_speed", s)}
                       className={cn(
-                        "px-2 py-1.5 rounded-lg text-xs border transition-colors",
+                        "flex-1 py-1.5 rounded-lg text-xs border transition-colors",
                         d.fanSpeed !== s && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
                       )}
                       style={d.fanSpeed === s ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
@@ -307,6 +303,9 @@ function AcDetailOverlay({ device: d, onControl, onClose }: {
                 <AcToggle label="ECO" value={d.eco} onChange={(v) => send("set_eco", v ? 1 : 0)} colors={colors} />
                 <AcToggle label="Turbo" value={d.turbo} onChange={(v) => send("set_turbo", v ? 1 : 0)} icon={<Zap className="w-3 h-3" />} colors={colors} />
                 <AcToggle label="Screen" value={d.screen} onChange={(v) => send("set_screen", v ? 1 : 0)} colors={colors} />
+                {d.hasFreshAir && (
+                  <AcToggle label="Fresh" value={d.freshAir} onChange={(v) => send("set_fresh_air", v ? 1 : 0)} icon={<AirVent className="w-3 h-3" />} colors={colors} />
+                )}
               </div>
 
               {/* Generator mode */}
