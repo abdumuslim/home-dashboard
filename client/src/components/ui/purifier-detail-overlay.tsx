@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { X, Power, Loader2 } from "lucide-react";
+import { X, Power } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { PurifierDevice } from "@/types/automations";
 
@@ -32,11 +32,8 @@ interface PurifierDetailOverlayProps {
 
 export function PurifierDetailOverlay({ device: d, onControl, onClose }: PurifierDetailOverlayProps) {
   const [phase, setPhase] = useState<"in" | "out">("in");
-  const [busy, setBusy] = useState<string | null>(null);
 
   const isMiot = MIOT_MODELS.includes(d.model);
-  const modes = isMiot ? ["auto", "silent", "favorite", "fan"] : ["auto", "silent", "favorite"];
-  const fanMax = isMiot ? 3 : 16;
   const isOn = d.power === "on";
   const offline = !d.isOnline;
 
@@ -56,9 +53,8 @@ export function PurifierDetailOverlay({ device: d, onControl, onClose }: Purifie
     return () => { document.body.style.overflow = ""; };
   }, []);
 
-  const send = async (command: string, params: unknown[]) => {
-    setBusy(command);
-    try { await onControl(command, params); } finally { setBusy(null); }
+  const send = (command: string, params: unknown[]) => {
+    onControl(command, params).catch(() => {});
   };
 
   return createPortal(
@@ -83,14 +79,14 @@ export function PurifierDetailOverlay({ device: d, onControl, onClose }: Purifie
           <div className="flex items-center gap-1">
             <button
               onClick={() => send("set_power", [isOn ? "off" : "on"])}
-              disabled={offline || busy !== null}
+              disabled={offline}
               className={cn(
                 "p-2 rounded-lg transition-colors",
                 isOn ? "bg-cyan/20 text-cyan hover:bg-cyan/30" : "bg-white/5 text-dim hover:bg-white/10",
-                (offline || busy !== null) && "opacity-40 cursor-not-allowed",
+                offline && "opacity-40 cursor-not-allowed",
               )}
             >
-              {busy === "set_power" ? <Loader2 className="w-5 h-5 animate-spin" /> : <Power className="w-5 h-5" />}
+              <Power className="w-5 h-5" />
             </button>
             <button
               onClick={handleClose}
@@ -136,38 +132,70 @@ export function PurifierDetailOverlay({ device: d, onControl, onClose }: Purifie
               {/* Mode selector */}
               <div>
                 <span className="text-xs text-dim mb-1.5 block">Mode</span>
-                <div className="flex gap-1.5">
-                  {modes.map((m) => (
-                    <button
-                      key={m}
-                      onClick={() => send("set_mode", [m])}
-                      disabled={busy !== null}
-                      className={cn(
-                        "flex-1 px-2 py-1.5 rounded-lg text-xs border transition-colors",
-                        d.mode === m
-                          ? "border-cyan/50 bg-cyan/10 text-cyan"
-                          : "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
-                      )}
-                    >
-                      {m === "auto" ? "Auto" : m === "silent" ? "Silent" : m === "favorite" ? "Favorite" : "Fan"}
-                    </button>
-                  ))}
-                </div>
+                {isMiot ? (
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {([
+                      { key: "auto", label: "Auto", active: d.mode === "auto" },
+                      { key: "silent", label: "Sleep", active: d.mode === "silent" },
+                      { key: "fan-1", label: "Fan 1", active: d.mode === "fan" && d.fan_level === 1 },
+                      { key: "fan-2", label: "Fan 2", active: d.mode === "fan" && d.fan_level === 2 },
+                      { key: "fan-3", label: "Fan 3", active: d.mode === "fan" && d.fan_level === 3 },
+                      { key: "favorite", label: "Favorite", active: d.mode === "favorite" },
+                    ] as const).map((m) => (
+                      <button
+                        key={m.key}
+                        onClick={() => {
+                          if (m.key === "auto" || m.key === "silent" || m.key === "favorite") {
+                            send("set_mode", [m.key]);
+                          } else {
+                            const level = parseInt(m.key.split("-")[1], 10);
+                            if (d.mode !== "fan") send("set_mode", ["fan"]);
+                            send("set_fan_level", [level]);
+                          }
+                        }}
+                        className={cn(
+                          "px-2 py-1.5 rounded-lg text-xs border transition-colors",
+                          m.active
+                            ? "border-cyan/50 bg-cyan/10 text-cyan"
+                            : "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+                        )}
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="flex gap-1.5">
+                    {(["auto", "silent", "favorite"] as const).map((m) => (
+                      <button
+                        key={m}
+                        onClick={() => send("set_mode", [m])}
+                        className={cn(
+                          "flex-1 px-2 py-1.5 rounded-lg text-xs border transition-colors",
+                          d.mode === m
+                            ? "border-cyan/50 bg-cyan/10 text-cyan"
+                            : "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+                        )}
+                      >
+                        {m === "auto" ? "Auto" : m === "silent" ? "Silent" : "Favorite"}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
 
-              {/* Fan level (only in favorite mode) */}
+              {/* Favorite level slider */}
               {d.mode === "favorite" && (
                 <div>
                   <span className="text-xs text-dim mb-1.5 block">
-                    Fan Level <span className="text-text font-medium">{d.favorite_level ?? 0}</span>
+                    Favorite Level <span className="text-text font-medium">{d.favorite_level ?? 0}</span>
                   </span>
                   <input
                     type="range"
                     min={0}
-                    max={fanMax}
+                    max={isMiot ? 9 : 16}
                     value={d.favorite_level ?? 0}
                     onChange={(e) => send("set_level_favorite", [parseInt(e.target.value, 10)])}
-                    disabled={busy !== null}
                     className="w-full accent-cyan h-1.5"
                   />
                 </div>
@@ -175,9 +203,9 @@ export function PurifierDetailOverlay({ device: d, onControl, onClose }: Purifie
 
               {/* Toggles */}
               <div className="grid grid-cols-3 gap-1.5">
-                <Toggle label="LED" value={d.led ?? false} onChange={(v) => send("set_led", [v ? "on" : "off"])} disabled={busy !== null} />
-                <Toggle label="Buzzer" value={d.buzzer ?? false} onChange={(v) => send("set_buzzer", [v ? "on" : "off"])} disabled={busy !== null} />
-                <Toggle label="Lock" value={d.child_lock ?? false} onChange={(v) => send("set_child_lock", [v ? "on" : "off"])} disabled={busy !== null} />
+                <Toggle label="LED" value={d.led ?? false} onChange={(v) => send("set_led", [v ? "on" : "off"])} />
+                <Toggle label="Buzzer" value={d.buzzer ?? false} onChange={(v) => send("set_buzzer", [v ? "on" : "off"])} />
+                <Toggle label="Lock" value={d.child_lock ?? false} onChange={(v) => send("set_child_lock", [v ? "on" : "off"])} />
               </div>
             </>
           )}

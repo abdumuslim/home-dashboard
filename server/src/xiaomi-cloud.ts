@@ -8,7 +8,8 @@ export interface PurifierDevice {
   isOnline: boolean;
   power?: "on" | "off";
   mode?: string;
-  favorite_level?: number;
+  fan_level?: number;       // 1-3 (Fan mode level, MIoT only)
+  favorite_level?: number;  // 0-14 for MIoT, 0-16 for MiIO
   aqi?: number;
   temperature?: number;
   humidity?: number;
@@ -34,17 +35,18 @@ const MIOT_MODELS = ["zhimi.airpurifier.mb3", "zhimi.airpurifier.mb4", "zhimi.ai
 
 // MIoT property mappings (siid.piid)
 const MIOT_PROPS = {
-  power:       { siid: 2, piid: 2 },   // bool
-  fan_level:   { siid: 2, piid: 4 },   // int 0-3
-  mode:        { siid: 2, piid: 5 },   // int: 0=auto, 1=silent, 2=favorite, 3=fan
-  aqi:         { siid: 3, piid: 6 },   // int
-  humidity:    { siid: 3, piid: 7 },   // int
-  temperature: { siid: 3, piid: 8 },   // float
-  filter_life: { siid: 4, piid: 3 },   // int %
-  buzzer:      { siid: 5, piid: 1 },   // bool
-  led_bright:  { siid: 6, piid: 1 },   // int 0-2
-  led:         { siid: 6, piid: 6 },   // bool
-  child_lock:  { siid: 7, piid: 1 },   // bool
+  power:          { siid: 2,  piid: 2 },   // bool
+  fan_level:      { siid: 2,  piid: 4 },   // int 1-3 (Fan mode)
+  mode:           { siid: 2,  piid: 5 },   // int: 0=auto, 1=silent, 2=favorite, 3=fan
+  aqi:            { siid: 3,  piid: 6 },   // int
+  humidity:       { siid: 3,  piid: 7 },   // int
+  temperature:    { siid: 3,  piid: 8 },   // float
+  filter_life:    { siid: 4,  piid: 3 },   // int %
+  buzzer:         { siid: 5,  piid: 1 },   // bool
+  led_bright:     { siid: 6,  piid: 1 },   // int 0-2
+  led:            { siid: 6,  piid: 6 },   // bool
+  child_lock:     { siid: 7,  piid: 1 },   // bool
+  favorite_level: { siid: 10, piid: 10 },  // int 0-14 (Favorite mode)
 } as const;
 
 const MIOT_MODE_MAP: Record<number, string> = { 0: "auto", 1: "silent", 2: "favorite", 3: "fan" };
@@ -298,11 +300,11 @@ export class XiaomiCloud {
   }
 
   private async getMiotProps(deviceId: string): Promise<Partial<PurifierDevice>> {
-    const propKeys = ["power", "mode", "fan_level", "aqi", "temperature", "humidity", "filter_life", "led", "buzzer", "child_lock"] as const;
+    const propKeys = ["power", "mode", "fan_level", "aqi", "temperature", "humidity", "filter_life", "led", "buzzer", "child_lock", "favorite_level"] as const;
     const params = propKeys.map((k) => ({
       did: k,
-      siid: MIOT_PROPS[k === "fan_level" ? "fan_level" : k].siid,
-      piid: MIOT_PROPS[k === "fan_level" ? "fan_level" : k].piid,
+      siid: MIOT_PROPS[k].siid,
+      piid: MIOT_PROPS[k].piid,
     }));
     const result = await this.sendCommand(deviceId, "get_properties", params) as Array<{ did: string; value: unknown; code: number }>;
     const vals: Record<string, unknown> = {};
@@ -312,7 +314,8 @@ export class XiaomiCloud {
     return {
       power: vals.power === true ? "on" : vals.power === false ? "off" : undefined,
       mode: typeof vals.mode === "number" ? (MIOT_MODE_MAP[vals.mode] ?? String(vals.mode)) : undefined,
-      favorite_level: typeof vals.fan_level === "number" ? vals.fan_level : undefined,
+      fan_level: typeof vals.fan_level === "number" ? vals.fan_level : undefined,
+      favorite_level: typeof vals.favorite_level === "number" ? vals.favorite_level : undefined,
       aqi: typeof vals.aqi === "number" ? vals.aqi : undefined,
       temperature: typeof vals.temperature === "number" ? vals.temperature : undefined,
       humidity: typeof vals.humidity === "number" ? vals.humidity : undefined,
@@ -416,6 +419,8 @@ export class XiaomiCloud {
         return this.sendCommand(deviceId, "set_properties", [{ did: "mode", ...MIOT_PROPS.mode, value: modeNum }]);
       }
       case "set_level_favorite":
+        return this.sendCommand(deviceId, "set_properties", [{ did: "favorite_level", ...MIOT_PROPS.favorite_level, value: val }]);
+      case "set_fan_level":
         return this.sendCommand(deviceId, "set_properties", [{ did: "fan_level", ...MIOT_PROPS.fan_level, value: val }]);
       case "set_led":
         return this.sendCommand(deviceId, "set_properties", [{ did: "led", ...MIOT_PROPS.led, value: val === "on" }]);

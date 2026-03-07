@@ -361,7 +361,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   // ---------- Device Control ----------
 
-  const ALLOWED_COMMANDS = ["set_power", "set_mode", "set_level_favorite", "set_led", "set_buzzer", "set_child_lock"];
+  const ALLOWED_COMMANDS = ["set_power", "set_mode", "set_level_favorite", "set_fan_level", "set_led", "set_buzzer", "set_child_lock"];
 
   router.post("/api/devices/:id/control", async (req: Request, res: Response) => {
     const cloud = getXiaomiCloud?.();
@@ -459,7 +459,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}${mins > 0 ? ` for ${mins}min` : ""}`;
       const result = await pool.query(
         `INSERT INTO automations (name, enabled, automation_type, metric, condition, threshold, sustained_minutes, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
-         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, '{"power":"on"}', '{"power":"off"}', 300) RETURNING *`,
+         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, '{"power":"on"}', NULL, 300) RETURNING *`,
         [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mins, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names],
       );
       res.json({ automation: result.rows[0] });
@@ -499,7 +499,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}${mins > 0 ? ` for ${mins}min` : ""}`;
       const result = await pool.query(
         `UPDATE automations SET name=$1, enabled=$2, automation_type='metric', metric=$3, condition=$4, threshold=$5, sustained_minutes=$6,
-         time_start=NULL, time_end=NULL, turn_off_at_end=false,
+         time_start=NULL, time_end=NULL, turn_off_at_end=false, action_off=NULL,
          device_id=$7, device_name=$8, device_ids=$9, device_names=$10
          WHERE id=$11 RETURNING *`,
         [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mins, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, id],
