@@ -10,7 +10,8 @@ function getOptimisticUpdate(command: string, value: unknown): Partial<AcDevice>
     case "set_eco": return { eco: value === 1 };
     case "set_screen": return { screen: value === 1 };
     case "set_sleep": return { sleep: value as number };
-    case "set_swing": return { swing: value === 1 };
+    case "set_vertical_swing": return { verticalSwing: value as number };
+    case "set_horizontal_swing": return { horizontalSwing: value as number };
     case "set_turbo": return { turbo: value === 1 };
     case "set_generator_mode": return { generatorMode: value as number };
     default: return null;
