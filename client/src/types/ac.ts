@@ -18,4 +18,6 @@ export interface AcDevice {
   generatorMode: number;
   maxGeneratorLevel: number;
   tempStep: number;
+  minFanSpeed: number;
+  maxFanSpeed: number;
 }

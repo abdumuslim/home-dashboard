@@ -22,6 +22,8 @@ export interface AcDevice {
   generatorMode: number;
   maxGeneratorLevel: number;
   tempStep: number;
+  minFanSpeed: number;
+  maxFanSpeed: number;
 }
 
 interface AuthData {
@@ -81,10 +83,26 @@ export class TclCloud {
   private baseApiUrl = DEFAULT_BASE_API;
   private cachedDevices: AcDevice[] = [];
   private deviceCacheTime = 0;
+  private lastState: Record<string, Record<string, unknown>> = {};
+
+  private static readonly STATE_FILE = "/app/data/ac-last-state.json";
+
+  // Properties to save/restore per model type
+  private static readonly SAVE_PROPS_NAJAT = [
+    "workMode", "targetTemperature", "screen", "sleep",
+    "verticalWind", "horizontalWind", "verticalDirection", "horizontalDirection",
+    "generatorMode", "windSpeed7Gear", "newWindSwitch",
+  ];
+  private static readonly SAVE_PROPS_OTHER = [
+    "workMode", "targetTemperature", "screen", "sleep",
+    "verticalSwitch", "horizontalSwitch", "verticalDirection", "horizontalDirection",
+    "generatorMode", "windSpeed", "ECO", "turbo", "silenceSwitch",
+  ];
 
   constructor(username: string, password: string) {
     this.username = username;
     this.passwordMd5 = md5hex(password);
+    this.loadLastState();
   }
 
   async init(): Promise<void> {
@@ -131,6 +149,30 @@ export class TclCloud {
   async sendControl(deviceId: string, command: string, value: unknown): Promise<void> {
     await this.ensureValidTokens();
 
+    // Handle power-on: restore last saved state
+    if (command === "set_power" && value === 1) {
+      const desired: Record<string, unknown> = { powerSwitch: 1 };
+      try {
+        await this.publishShadowUpdate(deviceId, desired);
+      } catch (err) {
+        const msg = (err as Error).message ?? "";
+        const name = (err as { name?: string }).name ?? "";
+        if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
+          console.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
+          this.awsCreds = null;
+          this.tokenExpiry = 0;
+          this.tokenData = null;
+          await this.ensureValidTokens();
+          await this.publishShadowUpdate(deviceId, desired);
+        } else {
+          throw err;
+        }
+      }
+      console.log(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
+      await this.restoreLastState(deviceId);
+      return;
+    }
+
     // Handle swing commands specially (sets both switch + direction)
     if (command === "set_vertical_swing" || command === "set_horizontal_swing") {
       const v = value as number;
@@ -167,11 +209,43 @@ export class TclCloud {
     }
 
     const najat = this.isNajatModel(deviceId);
+
+    // Handle fan speed specially for non-Najat: 1=silent, 7=turbo/max
+    if (command === "set_fan_speed" && !najat) {
+      const v = value as number;
+      let desired: Record<string, unknown>;
+      if (v === 1) {
+        desired = { windSpeed: 0, silenceSwitch: 1, turbo: 0 };
+      } else if (v === 7) {
+        desired = { windSpeed: 0, silenceSwitch: 0, turbo: 1 };
+      } else {
+        desired = { windSpeed: v, silenceSwitch: 0, turbo: 0 };
+      }
+      try {
+        await this.publishShadowUpdate(deviceId, desired);
+      } catch (err) {
+        const msg = (err as Error).message ?? "";
+        const name = (err as { name?: string }).name ?? "";
+        if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
+          console.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
+          this.awsCreds = null;
+          this.tokenExpiry = 0;
+          this.tokenData = null;
+          await this.ensureValidTokens();
+          await this.publishShadowUpdate(deviceId, desired);
+        } else {
+          throw err;
+        }
+      }
+      console.log(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
+      return;
+    }
+
     const propMap: Record<string, string> = {
       set_power: "powerSwitch",
       set_mode: "workMode",
       set_temperature: "targetTemperature",
-      set_fan_speed: najat ? "windSpeed7Gear" : "windSpeed",
+      set_fan_speed: "windSpeed7Gear",
       set_eco: "ECO",
       set_screen: "screen",
       set_sleep: "sleep",
@@ -507,7 +581,9 @@ export class TclCloud {
           mode: shadow.workMode ?? 0,
           targetTemp: shadow.targetTemperature ?? 24,
           currentTemp: shadow.currentTemperature ?? 0,
-          fanSpeed: shadow.windSpeed7Gear ?? shadow.windSpeed ?? 0,
+          fanSpeed: isNajatModel
+            ? (shadow.windSpeed7Gear ?? 0)
+            : (shadow.silenceSwitch === 1 ? 1 : shadow.turbo === 1 ? 7 : (shadow.windSpeed ?? 0)),
           eco: shadow.ECO === 1,
           sleep: shadow.sleep ?? 0,
           screen: shadow.screen === 1,
@@ -523,7 +599,14 @@ export class TclCloud {
           generatorMode: shadow.generatorMode ?? 0,
           maxGeneratorLevel: isNajatModel ? 6 : 3,
           tempStep: isNajatModel ? 0.5 : 1,
+          minFanSpeed: 1,
+          maxFanSpeed: 7,
         });
+
+        // Save state when device is on (for restore on next power-on)
+        if (shadow.powerSwitch === 1) {
+          this.saveStateProps(dev.deviceId, shadow, isNajatModel);
+        }
       }
     }
 
@@ -652,6 +735,42 @@ export class TclCloud {
     const kRegion = createHmac("sha256", kDate).update(region).digest();
     const kService = createHmac("sha256", kRegion).update(service).digest();
     return createHmac("sha256", kService).update("aws4_request").digest();
+  }
+
+  // ---------- Last State Persistence ----------
+
+  private saveStateProps(deviceId: string, shadow: Record<string, number>, isNajat: boolean): void {
+    const props = isNajat ? TclCloud.SAVE_PROPS_NAJAT : TclCloud.SAVE_PROPS_OTHER;
+    const state: Record<string, unknown> = {};
+    for (const p of props) {
+      if (p in shadow) state[p] = shadow[p];
+    }
+    if (Object.keys(state).length > 0) {
+      this.lastState[deviceId] = state;
+      this.saveLastState();
+    }
+  }
+
+  private async restoreLastState(deviceId: string): Promise<void> {
+    const saved = this.lastState[deviceId];
+    if (!saved || Object.keys(saved).length === 0) return;
+    try {
+      await new Promise(r => setTimeout(r, 1000));
+      await this.publishShadowUpdate(deviceId, saved);
+      console.log(`[tcl] Restored last state for device ${deviceId}:`, JSON.stringify(saved));
+    } catch (err) {
+      console.warn(`[tcl] Failed to restore last state for ${deviceId}:`, (err as Error).message);
+    }
+  }
+
+  private saveLastState(): void {
+    writeFile(TclCloud.STATE_FILE, JSON.stringify(this.lastState)).catch(() => {});
+  }
+
+  private loadLastState(): void {
+    readFile(TclCloud.STATE_FILE, "utf-8")
+      .then(raw => { this.lastState = JSON.parse(raw); })
+      .catch(() => {});
   }
 
   // ---------- Credential Persistence ----------
