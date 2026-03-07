@@ -62,6 +62,9 @@ export function AcWidget({ device: d, onControl }: AcWidgetProps) {
         "flex flex-col items-center bg-[#171920]/90 border border-white/[0.05] p-1 rounded-2xl shadow-[0_4px_12px_-4px_rgba(0,0,0,0.5)] backdrop-blur-xl transition-all shrink-0 self-start",
         offline ? "opacity-40" : "hover:border-white/10 hover:bg-[#1a1c23]/95"
       )}>
+        {/* Header */}
+        <span className="text-[0.65rem] text-text/70 font-bold uppercase tracking-wider mt-0.5 mb-0.5">AC</span>
+
         {/* Row 1: Power + Settings */}
         <div className="flex items-center gap-1">
           <button
@@ -91,49 +94,44 @@ export function AcWidget({ device: d, onControl }: AcWidgetProps) {
 
         <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
 
-        {/* Row 2: Temperature */}
-        <div className="flex flex-col items-center px-2 py-1">
-          {isOn ? (
-            <>
-              <span className="text-lg font-bold leading-none tabular-nums" style={{ color: colors.text }}>
-                {d.targetTemp}°
-              </span>
-              <span className="text-[0.55rem] text-dim font-medium mt-0.5">
-                {d.currentTemp > 0 ? `${d.currentTemp}° now` : modeInfo.label}
-              </span>
-            </>
-          ) : (
-            <>
-              <Snowflake className="w-4 h-4 text-dim" />
-              <span className="text-[0.6rem] text-dim font-semibold tracking-wider uppercase mt-0.5">AC</span>
-            </>
-          )}
-        </div>
-
-        {/* Row 3: Fan speed + generator indicator (when on) */}
-        {isOn && (
-          <>
-            <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
-            <div className="flex items-center gap-1 px-2 py-0.5">
-              <Wind className="w-3 h-3 text-dim" />
-              <span className="text-[0.6rem] text-dim font-bold tabular-nums">
-                {FAN_LABELS[d.fanSpeed] ?? "Auto"}
-              </span>
-            </div>
-            {d.generatorMode > 0 && (
+        {/* Row 2: Temperature + Fan/Power indicators */}
+        <div className="flex items-center gap-2 px-2 py-1">
+          {/* Left col: Temperature */}
+          <div className="flex flex-col items-center">
+            {isOn ? (
               <>
-                <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
-                <div className="flex items-center gap-1 px-2 py-0.5">
-                  <Zap className="w-3 h-3" style={{ color: colors.accent }} />
-                  <span className="text-[0.6rem] font-bold tabular-nums" style={{ color: colors.accent }}>
+                <span className="text-lg font-bold leading-none tabular-nums" style={{ color: colors.text }}>
+                  {d.targetTemp}°
+                </span>
+                <span className="text-[0.55rem] text-dim font-medium mt-0.5">
+                  {d.currentTemp > 0 ? `${d.currentTemp}° now` : modeInfo.label}
+                </span>
+              </>
+            ) : (
+              <Snowflake className="w-4 h-4 text-dim" />
+            )}
+          </div>
+
+          {/* Right col: Fan + Generator (when on) */}
+          {isOn && (
+            <div className="flex flex-col items-center gap-0.5">
+              <div className="flex items-center gap-0.5">
+                <Wind className="w-2.5 h-2.5 text-dim" />
+                <span className="text-[0.55rem] text-dim font-bold tabular-nums">
+                  {FAN_LABELS[d.fanSpeed] ?? "Auto"}
+                </span>
+              </div>
+              {d.generatorMode > 0 && (
+                <div className="flex items-center gap-0.5">
+                  <Zap className="w-2.5 h-2.5" style={{ color: colors.accent }} />
+                  <span className="text-[0.55rem] font-bold tabular-nums" style={{ color: colors.accent }}>
                     L{d.generatorMode}
                   </span>
                 </div>
-              </>
-            )}
-
-          </>
-        )}
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       {showDetail && (
