@@ -26,6 +26,7 @@
   --animate-panel-in: panel-in 200ms ease-out;
   --animate-panel-out: panel-out 150ms ease-in forwards;
   --animate-prayer-blink: prayer-blink 1s ease-in-out infinite;
+  --animate-preset-blink: preset-blink 1s ease-in-out infinite;
 }
 
 @keyframes card-flash {
@@ -46,6 +47,11 @@
 @keyframes panel-out {
   from { opacity: 1; transform: scale(1) translateY(0); }
   to { opacity: 0; transform: scale(0.95) translateY(8px); }
+}
+
+@keyframes preset-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
 }
 
 @keyframes prayer-blink {
