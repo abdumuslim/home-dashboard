@@ -43,7 +43,7 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
   const abduAc = acDevices.find((d) => d.name.toLowerCase().startsWith("abdu") && !d.name.toLowerCase().includes("abdullah"));
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-[3fr_3fr_2fr_2fr] gap-3">
       <IndoorCard
         title="Mom"
         icon={<Home className="w-full h-full" />}

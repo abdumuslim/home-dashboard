@@ -140,7 +140,7 @@ New columns/tables added via `MIGRATIONS` list in `database.ts`. Deduplication: 
 
 4 sections with tabs (Dashboard / Charts):
 - **Outdoor** (4-col grid): Temperature, Wind, Rainfall (+ Barometer), Solar
-- **Indoor** (4-col grid): Mom, Abdu, Kitchen (temp + humidity + inline purifier/AC controls), Power (voltage, current, power with Grid/Generator source LED pills, dual-line chart indigo=Grid/rose=Generator)
+- **Indoor** (4-col grid, `3fr 3fr 2fr 2fr`): Mom, Abdu (wider, with purifier/AC controls), Kitchen, Power (narrower). Power card shows hero W/V/A from active source, Grid/Gen LED pills, bar chart (30-min buckets, colored by source: indigo=Grid, rose=Generator)
 - **Air Quality** (5-col grid): CO2, PM2.5, PM10, tVOC, Noise — battery in section header
 - **Prayer Times**: Daily prayer schedule (Dubai method, calibrated for Baghdad)
 
