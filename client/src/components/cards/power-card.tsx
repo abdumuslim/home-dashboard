@@ -144,55 +144,41 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
   const heroPower = activeSource === "grid" ? power?.power_1 : activeSource === "gen" ? power?.power_2 : null;
   const heroColor = activeSource === "grid" ? GRID_COLOR : activeSource === "gen" ? GEN_COLOR : "#7a8ba8";
 
-  const flash = useFlash(heroPower != null ? fmt(heroPower, 0) : null);
+  // Only flash on source change, not on every wattage fluctuation
+  const flash = useFlash(activeSource);
 
-  const hourlyData1 = useMemo(() => {
-    const buckets = new Map<number, { sum: number; count: number }>();
+  // 30-min buckets, single bar colored by dominant source
+  const BUCKET_MS = 30 * 60_000;
+  const { barData, barColors } = useMemo(() => {
+    const buckets = new Map<number, { sum1: number; cnt1: number; sum2: number; cnt2: number }>();
     for (const r of powerHistory) {
-      if (r.current_1 == null) continue;
       const ts = new Date(r.ts).getTime();
-      const key = Math.floor(ts / 3600000) * 3600000;
-      const b = buckets.get(key) || { sum: 0, count: 0 };
-      b.sum += r.current_1;
-      b.count += 1;
+      const key = Math.floor(ts / BUCKET_MS) * BUCKET_MS;
+      const b = buckets.get(key) || { sum1: 0, cnt1: 0, sum2: 0, cnt2: 0 };
+      if (r.current_1 != null) { b.sum1 += r.current_1; b.cnt1 += 1; }
+      if (r.current_2 != null) { b.sum2 += r.current_2; b.cnt2 += 1; }
       buckets.set(key, b);
     }
-    return Array.from(buckets.entries())
-      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: d.sum / d.count }))
-      .sort((a, b) => a.x.localeCompare(b.x));
-  }, [powerHistory]);
-
-  const hourlyData2 = useMemo(() => {
-    const buckets = new Map<number, { sum: number; count: number }>();
-    for (const r of powerHistory) {
-      if (r.current_2 == null) continue;
-      const ts = new Date(r.ts).getTime();
-      const key = Math.floor(ts / 3600000) * 3600000;
-      const b = buckets.get(key) || { sum: 0, count: 0 };
-      b.sum += r.current_2;
-      b.count += 1;
-      buckets.set(key, b);
+    const sorted = Array.from(buckets.entries()).sort((a, b) => a[0] - b[0]);
+    const data: { x: string; y: number }[] = [];
+    const colors: string[] = [];
+    for (const [ts, b] of sorted) {
+      const avg1 = b.cnt1 > 0 ? b.sum1 / b.cnt1 : 0;
+      const avg2 = b.cnt2 > 0 ? b.sum2 / b.cnt2 : 0;
+      const isGrid = avg1 >= avg2;
+      data.push({ x: new Date(ts).toISOString(), y: isGrid ? avg1 : avg2 });
+      colors.push(isGrid ? GRID_COLOR : GEN_COLOR);
     }
-    return Array.from(buckets.entries())
-      .map(([ts, d]) => ({ x: new Date(ts).toISOString(), y: d.sum / d.count }))
-      .sort((a, b) => a.x.localeCompare(b.x));
+    return { barData: data, barColors: colors };
   }, [powerHistory]);
 
   const chartData = {
     datasets: [
       {
-        data: hourlyData1,
-        backgroundColor: `${GRID_COLOR}90`,
-        borderColor: GRID_COLOR,
-        borderWidth: 1,
-        borderRadius: 2,
-      },
-      {
-        data: hourlyData2,
-        backgroundColor: `${GEN_COLOR}90`,
-        borderColor: GEN_COLOR,
-        borderWidth: 1,
-        borderRadius: 2,
+        data: barData,
+        backgroundColor: barColors,
+        borderRadius: 1,
+        barThickness: 2,
       },
     ],
   };
@@ -204,17 +190,17 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
     scales: {
       x: {
         type: "time" as const,
-        stacked: true,
+        offset: true,
         time: { unit: "hour" as const, stepSize: 1, displayFormats: { hour: "h" } },
         grid: { display: false },
         ticks: { color: "#7a8ba8", font: { size: 9 }, maxRotation: 0, autoSkip: false, autoSkipPadding: 0, padding: 0 },
       },
       y: {
         display: true,
-        stacked: true,
         position: "left" as const,
+        beginAtZero: true,
         grid: { color: "rgba(255,255,255,0.05)" },
-        ticks: { color: "#7a8ba8", font: { size: 10 }, maxTicksLimit: 5 },
+        ticks: { color: "#7a8ba8", font: { size: 10 }, maxTicksLimit: 4 },
       },
     },
     interaction: { intersect: false, mode: "index" as const },
@@ -276,7 +262,7 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
         <div className="absolute top-1 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity">
           <Maximize2 className="w-3.5 h-3.5 text-dim" />
         </div>
-        {(hourlyData1.length > 0 || hourlyData2.length > 0) && (
+        {barData.length > 0 && (
           <Bar data={chartData} options={chartOptions} />
         )}
       </div>
