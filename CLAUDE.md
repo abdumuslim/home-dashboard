@@ -17,6 +17,7 @@ Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.j
   - "Abdu": `zhimi.airpurifier.vb2` (modern MIoT protocol)
 - **TCL Split ACs** (3 units, 2 on dashboard via TCL Home cloud API):
   - "Najat" → Mom card, "Abdu AC" → Abdu card, "Abdullah AC" (not displayed)
+- **ESP Power Monitor**: Custom ESP device on home mains, sends voltage + current on two lines (Grid=I1, Generator=I2) via `POST /api/power/ingest` every 5s. Server computes power (W = V × A) and stores in `power_readings` table.
 
 ## Architecture
 
@@ -45,6 +46,7 @@ Browser → Cloudflare → Traefik (VPS, existing) → dashboard container (port
   - Mounts `dashboard_data` volume to `/app/data` for `xiaomi-credentials.json` and `tcl-credentials.json`.
 - **Multi-stage Docker build**: Stage 1 builds client (Vite), Stage 2 builds server (tsc), Stage 3 runs production Node.js
 - **Database**: Uses the existing `rag-postgres-1` container (pgvector:pg16). The `home` database is auto-created on first startup
+- **Push Notifications**: Web Push via VAPID keys (in VPS `.env`). Service worker at `client/public/sw.js` handles push display + click-to-focus. Subscriptions synced to `push_subscriptions` table on page load.
 
 ## Project Structure
 
@@ -53,7 +55,7 @@ D:\dev\home\
 ├── server/                 # Node.js backend (Express + TypeScript)
 │   ├── src/
 │   │   ├── index.ts        # Express app, static serving, collector startup
-│   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status, /api/alerts CRUD, /api/xiaomi/*, /api/ac/*)
+│   │   ├── routes.ts       # API routes (/api/current, /api/history, /api/status, /api/solar-reference, /api/alerts CRUD, /api/xiaomi/*, /api/ac/*, /api/automations CRUD+test)
 │   │   ├── collector.ts    # Collector class (AW polling + Qingping MQTT/cloud + AQI automation loop)
 │   │   ├── xiaomi-cloud.ts # Wrapper for xmihome, protocol routing, device discovery, auth
 │   │   ├── tcl-cloud.ts    # TCL Home API client (auth chain, AWS IoT shadow, SigV4 signing)
@@ -130,6 +132,7 @@ Three main tables in the `home` database:
 - `air_readings` — 9 columns, keyed by `ts TIMESTAMPTZ` with BRIN index
 - `alert_rules` — per-subscription alert configurations (FK to `push_subscriptions.endpoint` with CASCADE). Fields: `alert_type` (sensor/prayer), `metric`, `condition` (above/below), `threshold`, `prayer_timing` (at_time/before), `prayer_minutes`, `prayer_names TEXT[]`.
 - `automations` — Purifier automation rules. Fields: `id`, `automation_type` (metric/schedule), `device_ids`, `device_names`, `metric`, `condition`, `threshold`, `sustained_minutes` (metric type), `time_start`, `time_end`, `turn_off_at_end` (schedule type), `action_on`, `action_off`, `cooldown_secs`, `enabled`.
+- `power_readings` — 6 columns (ts, voltage, current_1, current_2, power_1, power_2), keyed by `ts TIMESTAMPTZ` with BRIN index
 
 New columns/tables added via `MIGRATIONS` list in `database.ts`. Deduplication: `ON CONFLICT (ts) DO NOTHING`. The 30-day history endpoint downsamples to hourly averages.
 
@@ -137,7 +140,7 @@ New columns/tables added via `MIGRATIONS` list in `database.ts`. Deduplication: 
 
 4 sections with tabs (Dashboard / Charts):
 - **Outdoor** (4-col grid): Temperature, Wind, Rainfall (+ Barometer), Solar
-- **Indoor** (3-col grid): Mom, Abdu, Kitchen — each with temp + humidity + inline purifier/AC controls
+- **Indoor** (4-col grid): Mom, Abdu, Kitchen (temp + humidity + inline purifier/AC controls), Power (voltage, current, power with Grid/Generator source LED pills, dual-line chart indigo=Grid/rose=Generator)
 - **Air Quality** (5-col grid): CO2, PM2.5, PM10, tVOC, Noise — battery in section header
 - **Prayer Times**: Daily prayer schedule (Dubai method, calibrated for Baghdad)
 
@@ -176,8 +179,8 @@ All metric cards follow a consistent design language established in the Temperat
 ### Chart Defaults
 - Line charts: `borderWidth: 2, pointRadius: 0, tension: 0.4, cubicInterpolationMode: "monotone", fill: true`
 - Bar charts: `borderRadius: 2` (or 1 for AQ), colored per severity
-- Smoothing: hourly bucketed averages (or 30-min median for wind)
-- X-axis: `type: "time", unit: "hour", stepSize: 1, displayFormats: { hour: "h" }`, no rotation
+- Smoothing: range-adaptive bucketing — 6h/24h/48h: 5-min buckets, 1w: 1-hr buckets, 30d: server hourly avg → frontend 3-hr buckets. Three bucket functions: `bucketAverage`, `bucketMedian` (wind), `bucketMax`. See `constants/chart-utils.ts`.
+- X-axis: `type: "time"`, unit/stepSize adapts per range (hour for short, day for long)
 - Y-axis: `position: "left"`, subtle grid `rgba(255,255,255,0.05)`
 
 ### Colors

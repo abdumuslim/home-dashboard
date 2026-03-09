@@ -15,8 +15,8 @@ interface OverlayState {
 }
 
 export default function App() {
-  const { weather, air } = useCurrentData();
-  const { weatherHistory, airHistory } = useHistoryData("24h", true);
+  const { weather, air, power } = useCurrentData();
+  const { weatherHistory, airHistory, powerHistory } = useHistoryData("24h", true);
   const [overlay, setOverlay] = useState<OverlayState | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showAlerts, setShowAlerts] = useState(false);
@@ -49,6 +49,8 @@ export default function App() {
         weatherHistory={weatherHistory}
         airHistory={airHistory}
         openOverlay={openOverlay}
+        power={power ?? null}
+        powerHistory={powerHistory}
       />
 
       {overlay && (

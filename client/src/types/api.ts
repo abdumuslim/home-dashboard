@@ -42,9 +42,19 @@ export interface AirReading {
   battery: number | null;
 }
 
+export interface PowerReading {
+  ts: string;
+  voltage: number | null;
+  current_1: number | null;
+  current_2: number | null;
+  power_1: number | null;
+  power_2: number | null;
+}
+
 export interface CurrentData {
   weather: WeatherReading | null;
   air: AirReading | null;
+  power: PowerReading | null;
 }
 
 export type TimeRange = "6h" | "24h" | "25h" | "48h" | "1w" | "30d";
