@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { Line, Bar } from "react-chartjs-2";
+import { Bar } from "react-chartjs-2";
 import { Zap, Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
@@ -63,37 +63,54 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
   }, [range]);
 
   const bMs = getBucketMs(range);
-  const p1Data = useMemo(() => bucketAverage(history, "power_1", bMs), [history, bMs]);
-  const p2Data = useMemo(() => bucketAverage(history, "power_2", bMs), [history, bMs]);
+
+  // Single bar dataset colored per-source, based on current
+  const { barData, barColors } = useMemo(() => {
+    const buckets = new Map<number, { sum1: number; cnt1: number; sum2: number; cnt2: number; pSum1: number; pCnt1: number; pSum2: number; pCnt2: number }>();
+    for (const r of history) {
+      const ts = new Date(r.ts).getTime();
+      const key = Math.floor(ts / bMs) * bMs;
+      const b = buckets.get(key) || { sum1: 0, cnt1: 0, sum2: 0, cnt2: 0, pSum1: 0, pCnt1: 0, pSum2: 0, pCnt2: 0 };
+      if (r.current_1 != null) { b.sum1 += r.current_1; b.cnt1 += 1; }
+      if (r.current_2 != null) { b.sum2 += r.current_2; b.cnt2 += 1; }
+      if (r.power_1 != null) { b.pSum1 += r.power_1; b.pCnt1 += 1; }
+      if (r.power_2 != null) { b.pSum2 += r.power_2; b.pCnt2 += 1; }
+      buckets.set(key, b);
+    }
+    const sorted = Array.from(buckets.entries()).sort((a, b) => a[0] - b[0]);
+    const data: { x: string; y: number }[] = [];
+    const colors: string[] = [];
+    for (const [ts, b] of sorted) {
+      const avg1 = b.cnt1 > 0 ? b.sum1 / b.cnt1 : 0;
+      const avg2 = b.cnt2 > 0 ? b.sum2 / b.cnt2 : 0;
+      const isGrid = avg1 >= avg2;
+      const power = isGrid
+        ? (b.pCnt1 > 0 ? b.pSum1 / b.pCnt1 : 0)
+        : (b.pCnt2 > 0 ? b.pSum2 / b.pCnt2 : 0);
+      data.push({ x: new Date(ts).toISOString(), y: power });
+      colors.push(isGrid ? GRID_COLOR : GEN_COLOR);
+    }
+    return { barData: data, barColors: colors };
+  }, [history, bMs]);
+
   const vData = useMemo(() => bucketAverage(history, "voltage", bMs), [history, bMs]);
+
+  const barThickness = range === "6h" ? 6 : range === "24h" ? 4 : 3;
 
   const data = {
     datasets: [
       {
-        label: "Grid (W)",
-        data: p1Data,
-        borderColor: GRID_COLOR,
-        backgroundColor: `${GRID_COLOR}18`,
-        fill: true,
-        borderWidth: 2,
-        pointRadius: 0,
-        tension: 0.4,
-        cubicInterpolationMode: "monotone" as const,
+        type: "bar" as const,
+        label: "Power (W)",
+        data: barData,
+        backgroundColor: barColors,
+        borderRadius: 2,
+        barThickness,
         yAxisID: "y",
+        order: 2,
       },
       {
-        label: "Generator (W)",
-        data: p2Data,
-        borderColor: GEN_COLOR,
-        backgroundColor: `${GEN_COLOR}18`,
-        fill: true,
-        borderWidth: 2,
-        pointRadius: 0,
-        tension: 0.4,
-        cubicInterpolationMode: "monotone" as const,
-        yAxisID: "y",
-      },
-      {
+        type: "line" as const,
         label: "Voltage (V)",
         data: vData,
         borderColor: "#94a3b8",
@@ -105,6 +122,7 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
         cubicInterpolationMode: "monotone" as const,
         borderDash: [4, 2],
         yAxisID: "y2",
+        order: 1,
       },
     ],
   };
@@ -118,6 +136,14 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
     },
     scales: {
       ...base.scales,
+      x: {
+        ...base.scales.x,
+        offset: true,
+      },
+      y: {
+        ...base.scales.y,
+        beginAtZero: true,
+      },
       y2: {
         position: "right" as const,
         title: { display: true, text: "V", color: "#94a3b8", font: { size: 11 } },
@@ -127,7 +153,8 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
     },
   };
 
-  return <div className="h-full"><Line data={data} options={options} /></div>;
+  // Chart.js mixed charts use the Chart component via Bar with type overrides
+  return <div className="h-full"><Bar data={data as any} options={options} /></div>;
 }
 
 export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) {
@@ -142,6 +169,7 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
     : gridActive ? "grid" : genActive ? "gen" : null;
 
   const heroPower = activeSource === "grid" ? power?.power_1 : activeSource === "gen" ? power?.power_2 : null;
+  const heroCurrent = activeSource === "grid" ? power?.current_1 : activeSource === "gen" ? power?.current_2 : null;
   const heroColor = activeSource === "grid" ? GRID_COLOR : activeSource === "gen" ? GEN_COLOR : "#7a8ba8";
 
   // Only flash on source change, not on every wattage fluctuation
@@ -222,7 +250,7 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
         </h3>
 
         {/* Hero row */}
-        <div className="flex items-baseline gap-5 mt-1">
+        <div className="flex items-baseline gap-4 mt-1">
           <div className="flex flex-col">
             <span
               className="text-2xl md:text-3xl font-semibold leading-none tracking-tight"
@@ -231,9 +259,7 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
               {heroPower != null ? fmt(heroPower, 0) : "--"}
               <span className="text-sm text-dim ml-1">W</span>
             </span>
-            <span className="text-[0.75rem] text-text font-medium mt-1">
-              {activeSource === "grid" ? "Grid" : activeSource === "gen" ? "Generator" : "Power"}
-            </span>
+            <span className="text-[0.75rem] text-text font-medium mt-1">Power</span>
           </div>
 
           <div className="flex flex-col">
@@ -243,14 +269,23 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Voltage</span>
           </div>
+
+          <div className="flex flex-col">
+            <span
+              className="text-2xl md:text-3xl font-semibold leading-none tracking-tight"
+              style={{ color: heroColor }}
+            >
+              {heroCurrent != null ? fmt(heroCurrent, 1) : "--"}
+              <span className="text-sm text-dim ml-1">A</span>
+            </span>
+            <span className="text-[0.75rem] text-text font-medium mt-1">Current</span>
+          </div>
         </div>
 
-        {/* Secondary row: source pills + current values */}
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-dim mt-2">
+        {/* Source indicators */}
+        <div className="flex items-center gap-x-3 text-xs mt-2">
           <SourcePill label="Grid" active={gridActive} color={GRID_COLOR} />
-          <span className="text-text font-medium">{fmt(power?.current_1, 1)}A</span>
           <SourcePill label="Gen" active={genActive} color={GEN_COLOR} />
-          <span className="text-text font-medium">{fmt(power?.current_2, 1)}A</span>
         </div>
       </div>
 
