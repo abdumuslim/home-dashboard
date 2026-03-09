@@ -29,6 +29,10 @@ const AIR_AVG_COLS: string[] = [
   "tvoc", "noise", "battery",
 ];
 
+const POWER_AVG_COLS: string[] = [
+  "voltage", "current_1", "current_2", "power_1", "power_2",
+];
+
 function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   const d: Record<string, unknown> = { ...row };
   for (const key of Object.keys(d)) {
@@ -44,17 +48,18 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   const router = Router();
 
   router.get("/api/current", async (_req: Request, res: Response) => {
-    const weatherResult = await pool.query(
-      "SELECT * FROM weather_readings ORDER BY ts DESC LIMIT 1"
-    );
-    const airResult = await pool.query(
-      "SELECT * FROM air_readings ORDER BY ts DESC LIMIT 1"
-    );
+    const [weatherResult, airResult, powerResult] = await Promise.all([
+      pool.query("SELECT * FROM weather_readings ORDER BY ts DESC LIMIT 1"),
+      pool.query("SELECT * FROM air_readings ORDER BY ts DESC LIMIT 1"),
+      pool.query("SELECT * FROM power_readings ORDER BY ts DESC LIMIT 1"),
+    ]);
     const weather = weatherResult.rows[0] ?? null;
     const air = airResult.rows[0] ?? null;
+    const power = powerResult.rows[0] ?? null;
     res.json({
       weather: weather ? rowToDict(weather) : null,
       air: air ? rowToDict(air) : null,
+      power: power ? rowToDict(power) : null,
     });
   });
 
@@ -62,7 +67,12 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     const source = (req.query.source as string) || "weather";
     const range = (req.query.range as string) || "24h";
 
-    const table = source === "weather" ? "weather_readings" : "air_readings";
+    const tableMap: Record<string, string> = { weather: "weather_readings", air: "air_readings", power: "power_readings" };
+    const table = tableMap[source];
+    if (!table) {
+      res.status(400).json({ error: `Invalid source: ${source}` });
+      return;
+    }
     const interval = RANGE_MAP[range];
     if (!interval) {
       res.status(400).json({ error: `Invalid range: ${range}` });
@@ -72,7 +82,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     let rows: Record<string, unknown>[];
 
     if (range === "30d") {
-      const cols = source === "weather" ? WEATHER_AVG_COLS : AIR_AVG_COLS;
+      const cols = source === "weather" ? WEATHER_AVG_COLS : source === "power" ? POWER_AVG_COLS : AIR_AVG_COLS;
       const avgExprs = cols.map((c) => `AVG(${c})::REAL AS ${c}`).join(", ");
       const result = await pool.query(
         `SELECT date_trunc('hour', ts) AS ts, ${avgExprs}
@@ -132,29 +142,51 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   });
 
   router.get("/api/status", async (_req: Request, res: Response) => {
-    const weatherLastResult = await pool.query(
-      "SELECT ts FROM weather_readings ORDER BY ts DESC LIMIT 1"
-    );
-    const airLastResult = await pool.query(
-      "SELECT ts FROM air_readings ORDER BY ts DESC LIMIT 1"
-    );
-    const weatherCountResult = await pool.query(
-      "SELECT COUNT(*) FROM weather_readings"
-    );
-    const airCountResult = await pool.query(
-      "SELECT COUNT(*) FROM air_readings"
-    );
+    const [weatherLastResult, airLastResult, powerLastResult, weatherCountResult, airCountResult, powerCountResult] = await Promise.all([
+      pool.query("SELECT ts FROM weather_readings ORDER BY ts DESC LIMIT 1"),
+      pool.query("SELECT ts FROM air_readings ORDER BY ts DESC LIMIT 1"),
+      pool.query("SELECT ts FROM power_readings ORDER BY ts DESC LIMIT 1"),
+      pool.query("SELECT COUNT(*) FROM weather_readings"),
+      pool.query("SELECT COUNT(*) FROM air_readings"),
+      pool.query("SELECT COUNT(*) FROM power_readings"),
+    ]);
 
     const weatherLast: Date | null = weatherLastResult.rows[0]?.ts ?? null;
     const airLast: Date | null = airLastResult.rows[0]?.ts ?? null;
+    const powerLast: Date | null = powerLastResult.rows[0]?.ts ?? null;
 
     res.json({
       weather_last_update: weatherLast ? weatherLast.toISOString() : null,
       air_last_update: airLast ? airLast.toISOString() : null,
+      power_last_update: powerLast ? powerLast.toISOString() : null,
       weather_total_readings: parseInt(weatherCountResult.rows[0].count as string, 10),
       air_total_readings: parseInt(airCountResult.rows[0].count as string, 10),
+      power_total_readings: parseInt(powerCountResult.rows[0].count as string, 10),
       collector_interval_seconds: 300,
     });
+  });
+
+  // ---------- Power Ingest (ESP) ----------
+
+  router.post("/api/power/ingest", async (req: Request, res: Response) => {
+    const { v, i1, i2 } = req.body as { v: number; i1: number; i2: number };
+    if (typeof v !== "number" || typeof i1 !== "number" || typeof i2 !== "number") {
+      res.status(400).json({ error: "Missing or invalid fields: v, i1, i2 (all required, numeric)" });
+      return;
+    }
+    if (!isFinite(v) || !isFinite(i1) || !isFinite(i2)) {
+      res.status(400).json({ error: "Values must be finite numbers" });
+      return;
+    }
+    const p1 = v * i1;
+    const p2 = v * i2;
+    await pool.query(
+      `INSERT INTO power_readings (ts, voltage, current_1, current_2, power_1, power_2)
+       VALUES (NOW(), $1, $2, $3, $4, $5)
+       ON CONFLICT (ts) DO NOTHING`,
+      [v, i1, i2, p1, p2],
+    );
+    res.json({ ok: true });
   });
 
   // ---------- Push Notifications ----------

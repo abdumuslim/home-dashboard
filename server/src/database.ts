@@ -100,6 +100,15 @@ const MIGRATIONS: string[] = [
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS turn_off_at_end BOOLEAN NOT NULL DEFAULT false",
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS sustained_minutes INTEGER NOT NULL DEFAULT 0",
   "UPDATE automations SET action_off = NULL WHERE automation_type = 'metric'",
+  `CREATE TABLE IF NOT EXISTS power_readings (
+    ts          TIMESTAMPTZ PRIMARY KEY,
+    voltage     REAL NOT NULL,
+    current_1   REAL NOT NULL,
+    current_2   REAL NOT NULL,
+    power_1     REAL NOT NULL,
+    power_2     REAL NOT NULL
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_power_ts_brin ON power_readings USING BRIN (ts)",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

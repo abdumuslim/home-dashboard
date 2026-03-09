@@ -1,8 +1,9 @@
 import { Home, User, CookingPot } from "lucide-react";
-import type { WeatherReading, AirReading, OpenOverlayFn } from "@/types/api";
+import type { WeatherReading, AirReading, PowerReading, OpenOverlayFn } from "@/types/api";
 import type { PurifierDevice } from "@/types/automations";
 import type { AcDevice } from "@/types/ac";
 import { IndoorCard } from "@/components/cards/indoor-card";
+import { PowerCard } from "@/components/cards/power-card";
 
 interface IndoorSectionProps {
   weather: WeatherReading | null;
@@ -14,6 +15,8 @@ interface IndoorSectionProps {
   sendControl?: (deviceId: string, command: string, params: unknown[]) => Promise<void>;
   acDevices?: AcDevice[];
   acSendControl?: (deviceId: string, command: string, value: unknown) => Promise<void>;
+  power?: PowerReading | null;
+  powerHistory?: PowerReading[];
 }
 
 // Steadman approximation for feels-like (indoor, no wind/sun)
@@ -27,7 +30,7 @@ function calcFeelsLike(t: number, rh: number): number {
   return hi;
 }
 
-export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay, devices = [], sendControl, acDevices = [], acSendControl }: IndoorSectionProps) {
+export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay, devices = [], sendControl, acDevices = [], acSendControl, power, powerHistory = [] }: IndoorSectionProps) {
   const kitchenFeelsLike = air?.temperature != null && air?.humidity != null
     ? calcFeelsLike(air.temperature, air.humidity) : undefined;
 
@@ -40,7 +43,7 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
   const abduAc = acDevices.find((d) => d.name.toLowerCase().startsWith("abdu") && !d.name.toLowerCase().includes("abdullah"));
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
       <IndoorCard
         title="Mom"
         icon={<Home className="w-full h-full" />}
@@ -81,6 +84,11 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         noise={air?.noise}
         history={airHistory}
         metricKey="temperature"
+        openOverlay={openOverlay}
+      />
+      <PowerCard
+        power={power ?? null}
+        powerHistory={powerHistory}
         openOverlay={openOverlay}
       />
     </div>

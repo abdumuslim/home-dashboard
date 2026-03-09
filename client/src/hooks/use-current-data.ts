@@ -3,8 +3,8 @@ import type { CurrentData } from "@/types/api";
 import { REFRESH } from "@/constants/thresholds";
 
 export function useCurrentData() {
-  const [data, setData] = useState<CurrentData>({ weather: null, air: null });
-  const prevRef = useRef<CurrentData>({ weather: null, air: null });
+  const [data, setData] = useState<CurrentData>({ weather: null, air: null, power: null });
+  const prevRef = useRef<CurrentData>({ weather: null, air: null, power: null });
 
   useEffect(() => {
     let mounted = true;
