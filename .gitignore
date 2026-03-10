@@ -21,5 +21,16 @@ yarn-error.log
 Thumbs.db
 
 # Other logs
-ssh_out.txt
+ssh_out*.txt
 *.log
+
+# Claude Code / AI context (contain credentials, VPS details)
+CLAUDE.md
+GEMINI.md
+HANDOFF.md
+home-dashboard-plan.md
+.claude/
+
+# Misc
+test.md
+docs/conversation.jsonl
