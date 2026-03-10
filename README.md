@@ -21,6 +21,7 @@
 - Metric-based & scheduled automations (e.g., PM2.5 > 50 → turn on purifier)
 - ESP power monitoring with grid/generator source detection and usage charts
 - Push notifications with configurable alerts (sensor thresholds + prayer times)
+- Admin/guest access control — indoor section & device controls gated behind cookie-based JWT auth
 - Dark-themed responsive UI with live-updating cards and smooth Chart.js visualizations
 
 ## Hardware
@@ -61,6 +62,7 @@ Browser → Cloudflare → Traefik (VPS) → Dashboard Container (port 8000)
 ├── server/src/
 │   ├── index.ts            # Express app, static serving, collector startup
 │   ├── routes.ts           # REST API endpoints
+│   ├── auth.ts             # JWT auth (HMAC-SHA256), cookie middleware, requireAuth guard
 │   ├── collector.ts        # Sensor polling, MQTT, automation loop
 │   ├── database.ts         # PostgreSQL pool, schema, migrations
 │   ├── xiaomi-cloud.ts     # Xiaomi device discovery & control
@@ -104,6 +106,9 @@ Browser → Cloudflare → Traefik (VPS) → Dashboard Container (port 8000)
 | `MI_REGION` | Xiaomi server region (e.g., `sg`) |
 | `TCL_USERNAME` | TCL Home account username |
 | `TCL_PASSWORD` | TCL Home account password |
+| `AUTH_SECRET` | HMAC-SHA256 secret for JWT signing (`openssl rand -hex 32`) |
+| `ADMIN_USER` | Admin username |
+| `ADMIN_PASSWORD` | Admin password |
 | `VAPID_PUBLIC_KEY` | Web Push VAPID public key |
 | `VAPID_PRIVATE_KEY` | Web Push VAPID private key |
 | `VAPID_EMAIL` | Web Push contact email |
@@ -133,6 +138,9 @@ The multi-stage Dockerfile builds the client (Vite), compiles the server (tsc), 
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| `POST` | `/api/auth/login` | Admin login (sets httpOnly cookie) |
+| `POST` | `/api/auth/logout` | Logout (clears cookie) |
+| `GET` | `/api/auth/me` | Check auth status |
 | `GET` | `/api/current` | Latest sensor readings |
 | `GET` | `/api/current/power` | Current power readings |
 | `GET` | `/api/history?range=24h` | Historical data (6h / 24h / 48h / 1w / 30d) |

@@ -2,11 +2,13 @@ import { useState, useCallback, type ReactNode } from "react";
 import { useCurrentData } from "@/hooks/use-current-data";
 import { useHistoryData } from "@/hooks/use-history-data";
 import { usePushNotifications } from "@/hooks/use-push-notifications";
+import { AuthProvider, useAuth } from "@/hooks/use-auth";
 import { Header } from "@/components/Header";
 import { DashboardTab } from "@/components/dashboard-tab";
 import { ChartOverlay } from "@/components/ui/chart-overlay";
 import { SettingsModal } from "@/components/ui/settings-modal";
 import { AlertsModal } from "@/components/ui/alerts-modal";
+import { LoginModal } from "@/components/ui/login-modal";
 import type { TimeRange, WeatherReading, AirReading } from "@/types/api";
 
 interface OverlayState {
@@ -14,12 +16,14 @@ interface OverlayState {
   renderExpanded: (range: TimeRange, wh: WeatherReading[], ah: AirReading[]) => ReactNode;
 }
 
-export default function App() {
+function AppInner() {
+  const { isAdmin, logout } = useAuth();
   const { weather, air, power } = useCurrentData();
   const { weatherHistory, airHistory, powerHistory } = useHistoryData("24h", true);
   const [overlay, setOverlay] = useState<OverlayState | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showAlerts, setShowAlerts] = useState(false);
+  const [showLogin, setShowLogin] = useState(false);
   const { isSubscribed } = usePushNotifications();
 
   const openOverlay = useCallback(
@@ -37,6 +41,9 @@ export default function App() {
         onOpenSettings={() => setShowSettings(true)}
         onOpenAlerts={() => setShowAlerts(true)}
         alertsActive={isSubscribed}
+        isAdmin={isAdmin}
+        onLoginClick={() => setShowLogin(true)}
+        onLogout={logout}
       />
 
       <div className="max-w-[1440px] mx-auto px-5 pt-8 pb-2">
@@ -51,6 +58,7 @@ export default function App() {
         openOverlay={openOverlay}
         power={power ?? null}
         powerHistory={powerHistory}
+        isAdmin={isAdmin}
       />
 
       {overlay && (
@@ -62,7 +70,16 @@ export default function App() {
       )}
 
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
-      {showAlerts && <AlertsModal onClose={() => setShowAlerts(false)} />}
+      {showAlerts && <AlertsModal onClose={() => setShowAlerts(false)} isAdmin={isAdmin} />}
+      {showLogin && <LoginModal onClose={() => setShowLogin(false)} />}
     </>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppInner />
+    </AuthProvider>
   );
 }

@@ -23,7 +23,7 @@ function getOptimisticUpdate(command: string, params: unknown[]): Partial<Purifi
   }
 }
 
-export function useDevices() {
+export function useDevices(enabled = true) {
   const [devices, setDevices] = useState<PurifierDevice[]>([]);
   const [available, setAvailable] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -55,11 +55,17 @@ export function useDevices() {
   }, []);
 
   useEffect(() => {
+    if (!enabled) {
+      setDevices([]);
+      setAvailable(false);
+      setLoading(false);
+      return;
+    }
     fetchAll(true);
     // Poll every 10s while mounted
     const interval = setInterval(() => fetchAll(), 10_000);
     return () => clearInterval(interval);
-  }, [fetchAll]);
+  }, [fetchAll, enabled]);
 
   const submitVerification = useCallback(async (code: string): Promise<{ ok: boolean; error?: string }> => {
     const resp = await fetch("/api/xiaomi/verify", {

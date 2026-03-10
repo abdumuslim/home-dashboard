@@ -4,6 +4,7 @@ import type { Config } from "./config.js";
 import { ALERT_METRICS, VALID_PRAYER_NAMES } from "./alert-metrics.js";
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
+import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus } from "./auth.js";
 
 const RANGE_MAP: Record<string, string> = {
   "6h": "6 hours",
@@ -46,6 +47,16 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
 
 export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null): Router {
   const router = Router();
+
+  // Auth middleware — sets req.authenticated on every request
+  if (config) {
+    router.use(createAuthMiddleware(config));
+  }
+
+  // Auth routes
+  router.post("/api/auth/login", handleLogin(config!));
+  router.post("/api/auth/logout", handleLogout);
+  router.get("/api/auth/me", handleAuthStatus);
 
   // In-memory latest power reading (updated every ingest ~1s), saved to DB every 60s
   let latestPower: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number } | null = null;
@@ -373,7 +384,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   // ---------- Xiaomi Cloud Auth ----------
 
-  router.get("/api/xiaomi/auth-status", (_req: Request, res: Response) => {
+  router.get("/api/xiaomi/auth-status", requireAuth, (_req: Request, res: Response) => {
     const cloud = getXiaomiCloud?.();
     if (!cloud) {
       res.json({ status: "not_configured" });
@@ -382,7 +393,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     res.json(cloud.getAuthStatus());
   });
 
-  router.post("/api/xiaomi/verify", async (req: Request, res: Response) => {
+  router.post("/api/xiaomi/verify", requireAuth, async (req: Request, res: Response) => {
     const cloud = getXiaomiCloud?.();
     if (!cloud) {
       res.status(503).json({ error: "Xiaomi Cloud not available" });
@@ -399,7 +410,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   // ---------- Devices (Xiaomi Cloud) ----------
 
-  router.get("/api/devices", async (_req: Request, res: Response) => {
+  router.get("/api/devices", requireAuth, async (_req: Request, res: Response) => {
     const cloud = getXiaomiCloud?.();
     if (!cloud) {
       res.json({ devices: [], available: false });
@@ -417,7 +428,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   const ALLOWED_COMMANDS = ["set_power", "set_mode", "set_level_favorite", "set_fan_level", "set_led", "set_buzzer", "set_child_lock"];
 
-  router.post("/api/devices/:id/control", async (req: Request, res: Response) => {
+  router.post("/api/devices/:id/control", requireAuth, async (req: Request, res: Response) => {
     const cloud = getXiaomiCloud?.();
     if (!cloud) { res.status(503).json({ error: "Xiaomi Cloud not available" }); return; }
     const id = String(req.params.id);
@@ -436,7 +447,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   // ---------- Automations ----------
 
-  router.get("/api/automations", async (_req: Request, res: Response) => {
+  router.get("/api/automations", requireAuth, async (_req: Request, res: Response) => {
     const result = await pool.query("SELECT * FROM automations ORDER BY created_at ASC");
     res.json({ automations: result.rows });
   });
@@ -486,7 +497,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     return null;
   }
 
-  router.post("/api/automations", async (req: Request, res: Response) => {
+  router.post("/api/automations", requireAuth, async (req: Request, res: Response) => {
     const body = req.body as AutomationBody;
     const isSchedule = body.automation_type === "schedule";
 
@@ -520,7 +531,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
   });
 
-  router.put("/api/automations/:id", async (req: Request, res: Response) => {
+  router.put("/api/automations/:id", requireAuth, async (req: Request, res: Response) => {
     const id = parseInt(String(req.params.id), 10);
     if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
 
@@ -563,14 +574,14 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
   });
 
-  router.delete("/api/automations/:id", async (req: Request, res: Response) => {
+  router.delete("/api/automations/:id", requireAuth, async (req: Request, res: Response) => {
     const id = parseInt(String(req.params.id), 10);
     if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
     await pool.query("DELETE FROM automations WHERE id = $1", [id]);
     res.json({ ok: true });
   });
 
-  router.post("/api/automations/:id/test", async (req: Request, res: Response) => {
+  router.post("/api/automations/:id/test", requireAuth, async (req: Request, res: Response) => {
     const cloud = getXiaomiCloud?.();
     if (!cloud) { res.status(503).json({ error: "Xiaomi Cloud not available" }); return; }
     const id = parseInt(String(req.params.id), 10);
@@ -592,7 +603,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   });
 
   // Enable/disable toggle
-  router.patch("/api/automations/:id", async (req: Request, res: Response) => {
+  router.patch("/api/automations/:id", requireAuth, async (req: Request, res: Response) => {
     const id = parseInt(String(req.params.id), 10);
     if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
     const { enabled } = req.body as { enabled: boolean };
@@ -608,7 +619,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   // ---------- AC Devices (TCL Cloud) ----------
 
-  router.get("/api/ac/devices", async (_req: Request, res: Response) => {
+  router.get("/api/ac/devices", requireAuth, async (_req: Request, res: Response) => {
     const cloud = getTclCloud?.();
     if (!cloud || !cloud.isReady()) {
       res.json({ devices: [], available: false });
@@ -624,7 +635,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   const ALLOWED_AC_COMMANDS = ["set_power", "set_mode", "set_temperature", "set_fan_speed", "set_eco", "set_screen", "set_sleep", "set_vertical_swing", "set_horizontal_swing", "set_turbo", "set_fresh_air", "set_generator_mode"];
 
-  router.post("/api/ac/devices/:id/control", async (req: Request, res: Response) => {
+  router.post("/api/ac/devices/:id/control", requireAuth, async (req: Request, res: Response) => {
     const cloud = getTclCloud?.();
     if (!cloud || !cloud.isReady()) {
       res.status(503).json({ error: "TCL Cloud not available" });

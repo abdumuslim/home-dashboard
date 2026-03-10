@@ -18,6 +18,9 @@ export interface Config {
   miRegion: string;
   tclUsername: string;
   tclPassword: string;
+  authSecret: string;
+  adminUser: string;
+  adminPassword: string;
 }
 
 export const config: Config = {
@@ -38,4 +41,7 @@ export const config: Config = {
   miRegion: process.env.MI_REGION ?? "sg",
   tclUsername: process.env.TCL_USERNAME ?? "",
   tclPassword: process.env.TCL_PASSWORD ?? "",
+  authSecret: process.env.AUTH_SECRET ?? "",
+  adminUser: process.env.ADMIN_USER ?? "",
+  adminPassword: process.env.ADMIN_PASSWORD ?? "",
 };

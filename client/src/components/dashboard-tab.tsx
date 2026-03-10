@@ -17,12 +17,15 @@ interface DashboardTabProps {
   openOverlay: OpenOverlayFn;
   power: PowerReading | null;
   powerHistory: PowerReading[];
+  isAdmin: boolean;
 }
 
-export function DashboardTab({ weather, air, weatherHistory, airHistory, openOverlay, power, powerHistory }: DashboardTabProps) {
+export function DashboardTab({ weather, air, weatherHistory, airHistory, openOverlay, power, powerHistory, isAdmin }: DashboardTabProps) {
   const { order, collapsed, toggleCollapsed, moveUp, moveDown } = useSectionLayout();
-  const { devices, sendControl } = useDevices();
-  const { devices: acDevices, sendControl: acSendControl } = useAcDevices();
+  const { devices, sendControl } = useDevices(isAdmin);
+  const { devices: acDevices, sendControl: acSendControl } = useAcDevices(isAdmin);
+
+  const visibleOrder = isAdmin ? order : order.filter((id) => id !== "indoor");
 
   const sections: Record<SectionId, { header: ReactNode; headerRight?: ReactNode; content: ReactNode }> = {
     outdoor: {
@@ -70,13 +73,13 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
 
   return (
     <div className="max-w-[1440px] mx-auto px-5 pt-2 pb-8">
-      {order.map((id, idx) => (
+      {visibleOrder.map((id, idx) => (
         <SectionWrapper
           key={id}
           id={id}
           collapsed={collapsed[id]}
           isFirst={idx === 0}
-          isLast={idx === order.length - 1}
+          isLast={idx === visibleOrder.length - 1}
           onToggleCollapse={() => toggleCollapsed(id)}
           onMoveUp={() => moveUp(id)}
           onMoveDown={() => moveDown(id)}

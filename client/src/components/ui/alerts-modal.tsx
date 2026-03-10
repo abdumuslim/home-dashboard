@@ -31,6 +31,7 @@ function describeAlert(alert: AlertRule, metrics: Record<string, MetricInfo>): s
 
 interface AlertsModalProps {
   onClose: () => void;
+  isAdmin?: boolean;
 }
 
 // Only AQ metrics relevant for purifier triggers (exclude noise, temp, humidity)
@@ -60,7 +61,7 @@ function describeTrigger(r: AutomationRule): string {
   return `${label} ${r.condition} ${r.threshold}${unit}${dur} → ${names}`;
 }
 
-export function AlertsModal({ onClose }: AlertsModalProps) {
+export function AlertsModal({ onClose, isAdmin }: AlertsModalProps) {
   const { isSupported, isSubscribed, permission, endpoint, subscribe, unsubscribe } = usePushNotifications();
   const { alerts, loading, createAlert, updateAlert, deleteAlert } = useAlerts(endpoint);
   const { automations, createAutomation, updateAutomation, deleteAutomation, toggleAutomation } = useAutomations();
@@ -264,15 +265,17 @@ export function AlertsModal({ onClose }: AlertsModalProps) {
             </div>
           )}
 
-          {/* Automations — always visible (no push subscription required) */}
-          <AutomationsPanel
-            automations={automations}
-            devices={devices}
-            onCreate={createAutomation}
-            onUpdate={updateAutomation}
-            onDelete={deleteAutomation}
-            onToggle={toggleAutomation}
-          />
+          {/* Automations — admin only */}
+          {isAdmin && (
+            <AutomationsPanel
+              automations={automations}
+              devices={devices}
+              onCreate={createAutomation}
+              onUpdate={updateAutomation}
+              onDelete={deleteAutomation}
+              onToggle={toggleAutomation}
+            />
+          )}
         </div>
       </div>
     </div>,

@@ -19,7 +19,7 @@ function getOptimisticUpdate(command: string, value: unknown): Partial<AcDevice>
   }
 }
 
-export function useAcDevices() {
+export function useAcDevices(enabled = true) {
   const [devices, setDevices] = useState<AcDevice[]>([]);
   const [available, setAvailable] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -43,10 +43,16 @@ export function useAcDevices() {
   }, []);
 
   useEffect(() => {
+    if (!enabled) {
+      setDevices([]);
+      setAvailable(false);
+      setLoading(false);
+      return;
+    }
     fetchAll(true);
     const interval = setInterval(() => fetchAll(), 10_000);
     return () => clearInterval(interval);
-  }, [fetchAll]);
+  }, [fetchAll, enabled]);
 
   const sendControl = useCallback(async (deviceId: string, command: string, value: unknown): Promise<void> => {
     const optimistic = getOptimisticUpdate(command, value);

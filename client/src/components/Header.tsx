@@ -1,4 +1,4 @@
-import { Bell, Settings } from "lucide-react";
+import { Bell, Settings, LogOut } from "lucide-react";
 import { useClock } from "@/hooks/use-clock";
 import { useChartsVisible } from "@/hooks/use-charts-visible";
 import { StatusPill } from "./status-pill";
@@ -9,9 +9,12 @@ interface HeaderProps {
   onOpenSettings: () => void;
   onOpenAlerts: () => void;
   alertsActive: boolean;
+  isAdmin: boolean;
+  onLoginClick: () => void;
+  onLogout: () => void;
 }
 
-export function Header({ weatherTs, airTs, onOpenSettings, onOpenAlerts, alertsActive }: HeaderProps) {
+export function Header({ weatherTs, airTs, onOpenSettings, onOpenAlerts, alertsActive, isAdmin, onLoginClick, onLogout }: HeaderProps) {
   const { formatTime, formatDate, getAgo } = useClock();
   const { chartsVisible, toggleCharts } = useChartsVisible();
   const weatherAgo = getAgo(weatherTs);
@@ -59,6 +62,22 @@ export function Header({ weatherTs, airTs, onOpenSettings, onOpenAlerts, alertsA
         >
           <Settings className="w-4 h-4" />
         </button>
+        {isAdmin ? (
+          <button
+            onClick={onLogout}
+            className="p-1.5 rounded-lg text-cyan hover:text-white hover:bg-white/10 transition-colors"
+            title="Sign out"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
+        ) : (
+          <button
+            onClick={onLoginClick}
+            className="px-3 py-1 rounded-full text-[0.7rem] font-medium tracking-wide bg-cyan/15 text-cyan hover:bg-cyan/25 transition-colors"
+          >
+            Login
+          </button>
+        )}
       </div>
 
       {/* Mobile-only status row */}
