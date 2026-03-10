@@ -47,20 +47,34 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
 export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null): Router {
   const router = Router();
 
+  // In-memory latest power reading (updated every ingest ~1s), saved to DB every 60s
+  let latestPower: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number } | null = null;
+  let lastPowerSave = 0;
+  const POWER_SAVE_INTERVAL = 60_000;
+
   router.get("/api/current", async (_req: Request, res: Response) => {
-    const [weatherResult, airResult, powerResult] = await Promise.all([
+    const [weatherResult, airResult] = await Promise.all([
       pool.query("SELECT * FROM weather_readings ORDER BY ts DESC LIMIT 1"),
       pool.query("SELECT * FROM air_readings ORDER BY ts DESC LIMIT 1"),
-      pool.query("SELECT * FROM power_readings ORDER BY ts DESC LIMIT 1"),
     ]);
     const weather = weatherResult.rows[0] ?? null;
     const air = airResult.rows[0] ?? null;
-    const power = powerResult.rows[0] ?? null;
+    // Use in-memory latest power (updated every ~1s) if available, else fall back to DB
+    let power = latestPower;
+    if (!power) {
+      const powerResult = await pool.query("SELECT * FROM power_readings ORDER BY ts DESC LIMIT 1");
+      power = powerResult.rows[0] ? rowToDict(powerResult.rows[0]) as any : null;
+    }
     res.json({
       weather: weather ? rowToDict(weather) : null,
       air: air ? rowToDict(air) : null,
-      power: power ? rowToDict(power) : null,
+      power,
     });
+  });
+
+  // Lightweight power-only endpoint for 1s polling
+  router.get("/api/current/power", (_req: Request, res: Response) => {
+    res.json(latestPower);
   });
 
   router.get("/api/history", async (req: Request, res: Response) => {
@@ -180,12 +194,19 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
     const p1 = v * i1;
     const p2 = v * i2;
-    await pool.query(
-      `INSERT INTO power_readings (ts, voltage, current_1, current_2, power_1, power_2)
-       VALUES (NOW(), $1, $2, $3, $4, $5)
-       ON CONFLICT (ts) DO NOTHING`,
-      [v, i1, i2, p1, p2],
-    );
+    const now = new Date();
+    latestPower = { ts: now.toISOString(), voltage: v, current_1: i1, current_2: i2, power_1: p1, power_2: p2 };
+
+    // Only persist to DB every 60 seconds
+    if (now.getTime() - lastPowerSave >= POWER_SAVE_INTERVAL) {
+      lastPowerSave = now.getTime();
+      await pool.query(
+        `INSERT INTO power_readings (ts, voltage, current_1, current_2, power_1, power_2)
+         VALUES (NOW(), $1, $2, $3, $4, $5)
+         ON CONFLICT (ts) DO NOTHING`,
+        [v, i1, i2, p1, p2],
+      );
+    }
     res.json({ ok: true });
   });
 
