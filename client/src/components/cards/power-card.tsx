@@ -8,8 +8,8 @@ import { fmt } from "@/constants/thresholds";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
 import type { PowerReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
-const GRID_COLOR = "#818cf8";
-const GEN_COLOR = "#fb7185";
+const GRID_COLOR = "#38bdf8";
+const GEN_COLOR = "#fb923c";
 const NOISE_THRESHOLD = 0.1;
 
 interface PowerCardProps {
@@ -66,15 +66,13 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
 
   // Single bar dataset colored per-source, based on current
   const { barData, barColors } = useMemo(() => {
-    const buckets = new Map<number, { sum1: number; cnt1: number; sum2: number; cnt2: number; pSum1: number; pCnt1: number; pSum2: number; pCnt2: number }>();
+    const buckets = new Map<number, { sum1: number; cnt1: number; sum2: number; cnt2: number }>();
     for (const r of history) {
       const ts = new Date(r.ts).getTime();
       const key = Math.floor(ts / bMs) * bMs;
-      const b = buckets.get(key) || { sum1: 0, cnt1: 0, sum2: 0, cnt2: 0, pSum1: 0, pCnt1: 0, pSum2: 0, pCnt2: 0 };
+      const b = buckets.get(key) || { sum1: 0, cnt1: 0, sum2: 0, cnt2: 0 };
       if (r.current_1 != null) { b.sum1 += r.current_1; b.cnt1 += 1; }
       if (r.current_2 != null) { b.sum2 += r.current_2; b.cnt2 += 1; }
-      if (r.power_1 != null) { b.pSum1 += r.power_1; b.pCnt1 += 1; }
-      if (r.power_2 != null) { b.pSum2 += r.power_2; b.pCnt2 += 1; }
       buckets.set(key, b);
     }
     const sorted = Array.from(buckets.entries()).sort((a, b) => a[0] - b[0]);
@@ -84,10 +82,7 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
       const avg1 = b.cnt1 > 0 ? b.sum1 / b.cnt1 : 0;
       const avg2 = b.cnt2 > 0 ? b.sum2 / b.cnt2 : 0;
       const isGrid = avg1 >= avg2;
-      const power = isGrid
-        ? (b.pCnt1 > 0 ? b.pSum1 / b.pCnt1 : 0)
-        : (b.pCnt2 > 0 ? b.pSum2 / b.pCnt2 : 0);
-      data.push({ x: new Date(ts).toISOString(), y: power });
+      data.push({ x: new Date(ts).toISOString(), y: isGrid ? avg1 : avg2 });
       colors.push(isGrid ? GRID_COLOR : GEN_COLOR);
     }
     return { barData: data, barColors: colors };
@@ -101,7 +96,7 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
     datasets: [
       {
         type: "bar" as const,
-        label: "Power (W)",
+        label: "Current (A)",
         data: barData,
         backgroundColor: barColors,
         borderRadius: 2,
@@ -127,7 +122,7 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
     ],
   };
 
-  const base = expandedChartOptions(range, "W");
+  const base = expandedChartOptions(range, "A");
   const options = {
     ...base,
     plugins: {
@@ -256,14 +251,17 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
               className="text-2xl md:text-3xl font-semibold leading-none tracking-tight"
               style={{ color: heroColor }}
             >
-              {heroPower != null ? fmt(heroPower, 0) : "--"}
-              <span className="text-sm text-dim ml-1">W</span>
+              {heroPower != null ? (heroPower / 1000).toFixed(2) : "--"}
+              <span className="text-sm text-dim ml-1">kW</span>
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Power</span>
           </div>
 
           <div className="flex flex-col">
-            <span className="text-2xl md:text-3xl font-semibold leading-none tracking-tight text-white">
+            <span
+              className="text-2xl md:text-3xl font-semibold leading-none tracking-tight"
+              style={{ color: heroColor }}
+            >
               {fmt(power?.voltage, 0)}
               <span className="text-sm text-dim ml-1">V</span>
             </span>
