@@ -38,7 +38,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   // Mount API routes
-  app.use(createRouter(pool, config, () => collector.xiaomiCloud, () => collector.tclCloud));
+  app.use(createRouter(pool, config, () => collector.xiaomiCloud, () => collector.tclCloud, () => collector.getLatestAir()));
 
   // Serve static files from ../static (relative to dist/ or src/)
   const staticDir = path.resolve(__dirname, "..", "static");

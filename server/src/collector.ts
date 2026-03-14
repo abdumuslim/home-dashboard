@@ -138,6 +138,7 @@ interface AutomationState {
   status: "idle" | "triggered";
   lastToggle: number;
   conditionSince: number | null;
+  conditionLostAt: number | null;
 }
 
 export class Collector {
@@ -158,6 +159,9 @@ export class Collector {
   private latestWeatherTs: Date | null = null;
   private latestAirRow: Record<string, unknown> | null = null;
   private latestAirTs: Date | null = null;
+  private airBuffer: AirRow[] = [];
+  private lastAirSave = 0;
+  private readonly AIR_SAVE_INTERVAL = 60_000;
   private cachedPrayerTimes: PrayerTimes | null = null;
   private cachedPrayerDateKey = "";
   // Automation system
@@ -169,6 +173,10 @@ export class Collector {
   private automationState = new Map<number, AutomationState>();
   private devicePowerCache = new Map<string, { power: "on" | "off" | undefined; ts: number }>();
   private readonly POWER_CACHE_TTL = 5_000;
+
+  getLatestAir(): Record<string, unknown> | null {
+    return this.latestAirRow;
+  }
 
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
@@ -477,50 +485,72 @@ export class Collector {
     if (value == null) return;
 
     const conditionMet = rule.condition === "above"
-      ? value > rule.threshold
-      : value < rule.threshold;
+      ? value >= rule.threshold
+      : value <= rule.threshold;
 
-    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null };
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null };
     const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
 
     const deviceIds = rule.device_ids ?? [rule.device_id];
     const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
 
     // Sustained duration: track how long condition has been continuously met
+    // Grace period: tolerate brief sensor dips (60s) before resetting the timer
+    const GRACE_MS = 60_000;
     if (conditionMet) {
-      if (state.conditionSince == null) {
-        state.conditionSince = now;
-        this.automationState.set(rule.id, state);
-      }
+      if (state.conditionSince == null) state.conditionSince = now;
+      state.conditionLostAt = null;
     } else {
-      // Condition not met — reset sustained timer (strict: any dip resets)
-      if (state.conditionSince != null) {
+      if (state.conditionLostAt == null) state.conditionLostAt = now;
+      if (now - state.conditionLostAt >= GRACE_MS) {
         state.conditionSince = null;
-        this.automationState.set(rule.id, state);
       }
     }
+    this.automationState.set(rule.id, state);
 
     // Check if sustained long enough
     const sustainedMs = (rule.sustained_minutes ?? 0) * 60_000;
     const sustainedEnough = sustainedMs === 0 || (state.conditionSince != null && (now - state.conditionSince >= sustainedMs));
 
-    if (conditionMet && sustainedEnough && state.status === "idle" && (now - state.lastToggle >= cooldownMs)) {
-      console.log(
-        `[collector] Automation "${rule.name}": ${rule.metric}=${value} ${rule.condition} ${rule.threshold}` +
-        (sustainedMs > 0 ? ` for ${rule.sustained_minutes}min` : "") +
-        `, turning ON [${deviceNames}]`,
-      );
-      try {
-        for (const did of deviceIds) {
-          await this.xiaomiCloud!.executeAction(did, rule.action_on);
+    if (conditionMet && sustainedEnough && (now - state.lastToggle >= cooldownMs)) {
+      if (state.status === "idle") {
+        // First trigger — turn on all devices
+        console.log(
+          `[collector] Automation "${rule.name}": ${rule.metric}=${value} ${rule.condition} ${rule.threshold}` +
+          (sustainedMs > 0 ? ` for ${rule.sustained_minutes}min` : "") +
+          `, turning ON [${deviceNames}]`,
+        );
+        try {
+          for (const did of deviceIds) {
+            await this.xiaomiCloud!.executeAction(did, rule.action_on);
+          }
+          this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null });
+        } catch (err) {
+          console.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
         }
-        this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince });
-      } catch (err) {
-        console.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
+      } else {
+        // Already triggered — re-check device power and re-send turn-on if off
+        for (const did of deviceIds) {
+          try {
+            const power = await this.getDevicePowerCached(did);
+            if (power === "off" || power === undefined) {
+              console.log(
+                `[collector] Automation "${rule.name}": device ${did} is OFF while ${rule.metric}=${value} still ${rule.condition} ${rule.threshold}, re-turning ON [${deviceNames}]`,
+              );
+              await this.xiaomiCloud!.executeAction(did, rule.action_on);
+              this.devicePowerCache.set(did, { power: "on", ts: Date.now() });
+            }
+          } catch (err) {
+            console.error(`[collector] Automation "${rule.name}" re-check failed for ${did}:`, (err as Error).message);
+          }
+        }
+        this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null });
       }
     } else if (!conditionMet && state.status === "triggered") {
-      // Condition no longer met — reset to idle so the trigger can fire again
-      this.automationState.set(rule.id, { status: "idle", lastToggle: state.lastToggle, conditionSince: null });
+      // Condition no longer met — only reset after grace period (tolerate brief dips)
+      if (state.conditionLostAt != null && now - state.conditionLostAt >= GRACE_MS) {
+        this.automationState.set(rule.id, { status: "idle", lastToggle: state.lastToggle, conditionSince: null, conditionLostAt: null });
+      }
     }
   }
 
@@ -545,7 +575,7 @@ export class Collector {
       ? (nowMinutes >= startMinutes && nowMinutes < endMinutes)
       : (nowMinutes >= startMinutes || nowMinutes < endMinutes);
 
-    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null };
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null };
     const now = Date.now();
     const cooldownMs = (rule.cooldown_secs ?? 60) * 1000;
 
@@ -565,7 +595,7 @@ export class Collector {
             await this.xiaomiCloud!.executeAction(did, rule.action_on);
             // Update cache immediately after turning on
             this.devicePowerCache.set(did, { power: "on", ts: Date.now() });
-            this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null });
+            this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
           }
         } catch (err) {
           console.error(`[collector] Schedule "${rule.name}" check failed for ${did}:`, (err as Error).message);
@@ -586,7 +616,7 @@ export class Collector {
             }
           }
         }
-        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null });
+        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null });
       }
     }
   }
@@ -943,11 +973,17 @@ export class Collector {
     }
 
     const row = this.toAirRow(new Date(), sensors);
-    await this.storeAir(row);
     this.latestAirRow = row as unknown as Record<string, unknown>;
     this.latestAirTs = row.ts;
     this.lastMqttMessage = Date.now();
-    console.log(`[collector] MQTT air reading stored at ${row.ts.toISOString()}`);
+    this.airBuffer.push(row);
+
+    // Persist median of buffered readings to DB every 60 seconds
+    const now = Date.now();
+    if (now - this.lastAirSave >= this.AIR_SAVE_INTERVAL && this.airBuffer.length > 0) {
+      this.lastAirSave = now;
+      await this.storeAirMedian();
+    }
   }
 
   private sendIntervalConfig(): void {
@@ -961,10 +997,10 @@ export class Collector {
       need_ack: 1,
       type: QP_MSG_INTERVAL_CONFIG,
       setting: {
-        report_interval: 30,
-        collect_interval: 30,
-        co2_sampling_interval: 30,
-        pm_sampling_interval: 30,
+        report_interval: 15,
+        collect_interval: 15,
+        co2_sampling_interval: 15,
+        pm_sampling_interval: 15,
       },
     };
 
@@ -972,7 +1008,7 @@ export class Collector {
       if (err) {
         console.error("[collector] MQTT interval config publish failed:", err);
       } else {
-        console.log("[collector] MQTT interval config sent (30s intervals)");
+        console.log("[collector] MQTT interval config sent (15s intervals)");
       }
     });
   }
@@ -1041,6 +1077,34 @@ export class Collector {
     this.latestAirRow = row as unknown as Record<string, unknown>;
     this.latestAirTs = row.ts;
     console.log(`[collector] Stored air reading at ${row.ts.toISOString()}`);
+  }
+
+  private async storeAirMedian(): Promise<void> {
+    const buf = this.airBuffer;
+    this.airBuffer = [];
+
+    const med = (fn: (r: AirRow) => number | null): number | null => {
+      const vals = buf.map(fn).filter((v): v is number => v != null);
+      if (vals.length === 0) return null;
+      vals.sort((a, b) => a - b);
+      const mid = Math.floor(vals.length / 2);
+      return vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+    };
+
+    const row: AirRow = {
+      ts: new Date(),
+      temperature: med(r => r.temperature),
+      humidity: med(r => r.humidity),
+      co2: med(r => r.co2),
+      pm25: med(r => r.pm25),
+      pm10: med(r => r.pm10),
+      tvoc: med(r => r.tvoc),
+      noise: med(r => r.noise),
+      battery: med(r => r.battery),
+    };
+
+    await this.storeAir(row);
+    console.log(`[collector] Air median saved (from ${buf.length} samples)`);
   }
 
   private async storeAir(row: AirRow): Promise<void> {

@@ -6,6 +6,12 @@ import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus } from "./auth.js";
 
+function median(arr: number[]): number {
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 const RANGE_MAP: Record<string, string> = {
   "6h": "6 hours",
   "24h": "24 hours",
@@ -45,7 +51,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null): Router {
   const router = Router();
 
   // Auth middleware — sets req.authenticated on every request
@@ -62,14 +68,17 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   let latestPower: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number } | null = null;
   let lastPowerSave = 0;
   const POWER_SAVE_INTERVAL = 60_000;
+  const powerBuffer: { v: number; i1: number; i2: number }[] = [];
 
   router.get("/api/current", async (_req: Request, res: Response) => {
-    const [weatherResult, airResult] = await Promise.all([
-      pool.query("SELECT * FROM weather_readings ORDER BY ts DESC LIMIT 1"),
-      pool.query("SELECT * FROM air_readings ORDER BY ts DESC LIMIT 1"),
-    ]);
+    const weatherResult = await pool.query("SELECT * FROM weather_readings ORDER BY ts DESC LIMIT 1");
     const weather = weatherResult.rows[0] ?? null;
-    const air = airResult.rows[0] ?? null;
+    // Use in-memory latest air (updated every ~15s) if available, else fall back to DB
+    let air: Record<string, unknown> | null = getLatestAir?.() ?? null;
+    if (!air) {
+      const airResult = await pool.query("SELECT * FROM air_readings ORDER BY ts DESC LIMIT 1");
+      air = airResult.rows[0] ? rowToDict(airResult.rows[0]) : null;
+    }
     // Use in-memory latest power (updated every ~1s) if available, else fall back to DB
     let power = latestPower;
     if (!power) {
@@ -78,7 +87,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
     res.json({
       weather: weather ? rowToDict(weather) : null,
-      air: air ? rowToDict(air) : null,
+      air,
       power,
     });
   });
@@ -207,15 +216,22 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     const p2 = v * i2;
     const now = new Date();
     latestPower = { ts: now.toISOString(), voltage: v, current_1: i1, current_2: i2, power_1: p1, power_2: p2 };
+    powerBuffer.push({ v, i1, i2 });
 
-    // Only persist to DB every 60 seconds
-    if (now.getTime() - lastPowerSave >= POWER_SAVE_INTERVAL) {
+    // Persist median of buffered readings to DB every 60 seconds
+    if (now.getTime() - lastPowerSave >= POWER_SAVE_INTERVAL && powerBuffer.length > 0) {
       lastPowerSave = now.getTime();
+      const medV = median(powerBuffer.map(r => r.v));
+      const medI1 = median(powerBuffer.map(r => r.i1));
+      const medI2 = median(powerBuffer.map(r => r.i2));
+      const medP1 = medV * medI1;
+      const medP2 = medV * medI2;
+      powerBuffer.length = 0;
       await pool.query(
         `INSERT INTO power_readings (ts, voltage, current_1, current_2, power_1, power_2)
          VALUES (NOW(), $1, $2, $3, $4, $5)
          ON CONFLICT (ts) DO NOTHING`,
-        [v, i1, i2, p1, p2],
+        [medV, medI1, medI2, medP1, medP2],
       );
     }
     res.json({ ok: true });
