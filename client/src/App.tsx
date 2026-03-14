@@ -1,15 +1,16 @@
-import { useState, useCallback, type ReactNode } from "react";
+import { useState, useCallback, lazy, Suspense, type ReactNode } from "react";
 import { useCurrentData } from "@/hooks/use-current-data";
 import { useHistoryData } from "@/hooks/use-history-data";
 import { usePushNotifications } from "@/hooks/use-push-notifications";
 import { AuthProvider, useAuth } from "@/hooks/use-auth";
 import { Header } from "@/components/Header";
 import { DashboardTab } from "@/components/dashboard-tab";
-import { ChartOverlay } from "@/components/ui/chart-overlay";
-import { SettingsModal } from "@/components/ui/settings-modal";
-import { AlertsModal } from "@/components/ui/alerts-modal";
-import { LoginModal } from "@/components/ui/login-modal";
 import type { TimeRange, WeatherReading, AirReading } from "@/types/api";
+
+const ChartOverlay = lazy(() => import("@/components/ui/chart-overlay").then(m => ({ default: m.ChartOverlay })));
+const SettingsModal = lazy(() => import("@/components/ui/settings-modal").then(m => ({ default: m.SettingsModal })));
+const AlertsModal = lazy(() => import("@/components/ui/alerts-modal").then(m => ({ default: m.AlertsModal })));
+const LoginModal = lazy(() => import("@/components/ui/login-modal").then(m => ({ default: m.LoginModal })));
 
 interface OverlayState {
   title: string;
@@ -61,17 +62,19 @@ function AppInner() {
         isAdmin={isAdmin}
       />
 
-      {overlay && (
-        <ChartOverlay
-          title={overlay.title}
-          renderExpanded={overlay.renderExpanded}
-          onClose={() => setOverlay(null)}
-        />
-      )}
+      <Suspense>
+        {overlay && (
+          <ChartOverlay
+            title={overlay.title}
+            renderExpanded={overlay.renderExpanded}
+            onClose={() => setOverlay(null)}
+          />
+        )}
 
-      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
-      {showAlerts && <AlertsModal onClose={() => setShowAlerts(false)} isAdmin={isAdmin} />}
-      {showLogin && <LoginModal onClose={() => setShowLogin(false)} />}
+        {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+        {showAlerts && <AlertsModal onClose={() => setShowAlerts(false)} isAdmin={isAdmin} />}
+        {showLogin && <LoginModal onClose={() => setShowLogin(false)} />}
+      </Suspense>
     </>
   );
 }

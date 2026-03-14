@@ -49,11 +49,12 @@ Browser → Cloudflare → Traefik (VPS) → Dashboard Container (port 8000)
 | Backend | Frontend |
 |---------|----------|
 | Express 5 (Node.js 22) | React 19 + Vite 7 |
-| TypeScript 5 | Tailwind CSS 4 |
+| TypeScript 5 (strict) | Tailwind CSS 4 (JIT) |
 | PostgreSQL 16 (BRIN indexes) | Chart.js 4 + react-chartjs-2 |
 | MQTT 5 (Mosquitto broker) | Lucide React icons |
-| Web Push (VAPID) | date-fns |
-| xmihome (Xiaomi Cloud) | Service Worker (push notifications) |
+| Pino (structured logging) | date-fns |
+| Web Push (VAPID) | Service Worker (push notifications) |
+| xmihome (Xiaomi Cloud) | Vitest (testing) |
 | AWS IoT (TCL AC shadow) | |
 
 ## Project Structure
@@ -61,22 +62,25 @@ Browser → Cloudflare → Traefik (VPS) → Dashboard Container (port 8000)
 ```
 ├── server/src/
 │   ├── index.ts            # Express app, static serving, collector startup
-│   ├── routes.ts           # REST API endpoints
-│   ├── auth.ts             # JWT auth (HMAC-SHA256), cookie middleware, requireAuth guard
-│   ├── collector.ts        # Sensor polling, MQTT, automation loop
+│   ├── routes.ts           # REST API endpoints + /api/health
+│   ├── auth.ts             # JWT auth (HMAC-SHA256), rate limiting (5/15min per IP)
+│   ├── collector.ts        # Sensor polling, MQTT, automation loop, background backfill
 │   ├── database.ts         # PostgreSQL pool, schema, migrations
+│   ├── logger.ts           # Structured logging (pino) with console-compatible API
 │   ├── xiaomi-cloud.ts     # Xiaomi device discovery & control
 │   ├── tcl-cloud.ts        # TCL AC cloud API (auth, shadow, control)
-│   └── alert-metrics.ts    # Metrics catalog, prayer time labels
+│   ├── alert-metrics.ts    # Metrics catalog, prayer time labels
+│   ├── auth.test.ts        # JWT auth tests (vitest)
+│   └── routes.test.ts      # Utility function tests (vitest)
 ├── client/src/
-│   ├── App.tsx             # Root component with tab navigation
-│   ├── components/         # Cards, charts, modals, widgets
-│   ├── hooks/              # Data fetching, clock, flash, alerts
+│   ├── App.tsx             # Root component, lazy-loaded modals
+│   ├── components/         # Cards (React.memo), charts (useMemo), modals, widgets
+│   ├── hooks/              # Data fetching (with caching), clock, flash, alerts
 │   ├── types/              # API type definitions
 │   └── constants/          # Thresholds, chart utils, helpers
 ├── mosquitto/              # MQTT broker configuration
 ├── Dockerfile              # Multi-stage build (client → server → production)
-└── docker-compose.yml      # Dashboard + Mosquitto services
+└── docker-compose.yml      # Dashboard + Mosquitto (resource limits, healthcheck)
 ```
 
 ## Getting Started
@@ -124,6 +128,9 @@ cd server && npm install && npx tsc --noEmit
 
 # Type-check client
 cd client && npx tsc -b
+
+# Run server tests
+cd server && npm test
 ```
 
 ### Production (Docker)
@@ -138,7 +145,8 @@ The multi-stage Dockerfile builds the client (Vite), compiles the server (tsc), 
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/auth/login` | Admin login (sets httpOnly cookie) |
+| `GET` | `/api/health` | Health check (DB connectivity + uptime) |
+| `POST` | `/api/auth/login` | Admin login (rate-limited: 5/15min per IP) |
 | `POST` | `/api/auth/logout` | Logout (clears cookie) |
 | `GET` | `/api/auth/me` | Check auth status |
 | `GET` | `/api/current` | Latest sensor readings |

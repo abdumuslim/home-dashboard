@@ -1,6 +1,9 @@
 import { createHash, createHmac } from "crypto";
 import { readFile, writeFile } from "fs/promises";
 import { IoTDataPlaneClient, PublishCommand } from "@aws-sdk/client-iot-data-plane";
+import { childLogger } from "./logger.js";
+
+const log = childLogger("tcl");
 
 export interface AcDevice {
   id: string;
@@ -109,19 +112,19 @@ export class TclCloud {
     await this.loadCredentials();
 
     await this.ensureValidTokens();
-    console.log("[tcl] Cloud initialized successfully");
+    log.info("[tcl] Cloud initialized successfully");
 
     try {
       const devices = await this.fetchDevices();
       this.cachedDevices = devices;
       this.deviceCacheTime = Date.now();
 
-      console.log(`[tcl] Found ${devices.length} AC device(s)`);
+      log.info(`[tcl] Found ${devices.length} AC device(s)`);
       for (const d of devices) {
-        console.log(`[tcl]   - ${d.name} (${d.id}, ${d.isOnline ? "online" : "offline"}, power=${d.power ? "on" : "off"})`);
+        log.info(`[tcl]   - ${d.name} (${d.id}, ${d.isOnline ? "online" : "offline"}, power=${d.power ? "on" : "off"})`);
       }
     } catch (err) {
-      console.warn("[tcl] Device fetch during init failed (will retry on first API call):", (err as Error).message);
+      log.warn("[tcl] Device fetch during init failed (will retry on first API call):", (err as Error).message);
     }
   }
 
@@ -158,7 +161,7 @@ export class TclCloud {
         const msg = (err as Error).message ?? "";
         const name = (err as { name?: string }).name ?? "";
         if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
-          console.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
+          log.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
           this.awsCreds = null;
           this.tokenExpiry = 0;
           this.tokenData = null;
@@ -168,7 +171,7 @@ export class TclCloud {
           throw err;
         }
       }
-      console.log(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
+      log.info(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
       await this.restoreLastState(deviceId);
       return;
     }
@@ -194,7 +197,7 @@ export class TclCloud {
         const msg = (err as Error).message ?? "";
         const name = (err as { name?: string }).name ?? "";
         if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
-          console.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
+          log.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
           this.awsCreds = null;
           this.tokenExpiry = 0;
           this.tokenData = null;
@@ -204,7 +207,7 @@ export class TclCloud {
           throw err;
         }
       }
-      console.log(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
+      log.info(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
       return;
     }
 
@@ -227,7 +230,7 @@ export class TclCloud {
         const msg = (err as Error).message ?? "";
         const name = (err as { name?: string }).name ?? "";
         if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
-          console.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
+          log.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
           this.awsCreds = null;
           this.tokenExpiry = 0;
           this.tokenData = null;
@@ -237,7 +240,7 @@ export class TclCloud {
           throw err;
         }
       }
-      console.log(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
+      log.info(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
       return;
     }
 
@@ -264,7 +267,7 @@ export class TclCloud {
       const msg = (err as Error).message ?? "";
       const name = (err as { name?: string }).name ?? "";
       if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
-        console.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
+        log.warn(`[tcl] Control publish failed (${name}), forcing re-auth and retrying`);
         this.awsCreds = null;
         this.tokenExpiry = 0;
         this.tokenData = null;
@@ -274,7 +277,7 @@ export class TclCloud {
         throw err;
       }
     }
-    console.log(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
+    log.info(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
   }
 
   // ---------- Auth Chain ----------
@@ -319,7 +322,7 @@ export class TclCloud {
       throw new Error(`TCL login failed: ${data.msg || JSON.stringify(data)}`);
     }
 
-    console.log(`[tcl] Login OK — user=${data.user.username}, country=${data.user.countryAbbr}`);
+    log.info(`[tcl] Login OK — user=${data.user.username}, country=${data.user.countryAbbr}`);
     return {
       token: data.token,
       refreshToken: data.refreshtoken ?? "",
@@ -366,7 +369,7 @@ export class TclCloud {
       throw new Error(`TCL refresh_tokens failed: ${data.message || JSON.stringify(data)}`);
     }
 
-    console.log(`[tcl] Tokens refreshed — mqtt=${d.mqttEndpoint}, cognitoId=${d.cognitoId}`);
+    log.info(`[tcl] Tokens refreshed — mqtt=${d.mqttEndpoint}, cognitoId=${d.cognitoId}`);
     return {
       saasToken: d.saasToken,
       cognitoToken: d.cognitoToken,
@@ -416,7 +419,7 @@ export class TclCloud {
       throw new Error("Cognito: missing credentials in response");
     }
 
-    console.log(`[tcl] AWS credentials obtained for region ${region}`);
+    log.info(`[tcl] AWS credentials obtained for region ${region}`);
     return {
       accessKeyId: c.AccessKeyId,
       secretKey: c.SecretKey,
@@ -517,7 +520,7 @@ export class TclCloud {
     if (!resp.ok) {
       const body = await resp.text();
       if (!isRetry && (resp.status === 403 || body.includes("10022"))) {
-        console.warn(`[tcl] fetchDevices got ${resp.status} (expired token), forcing re-auth and retrying`);
+        log.warn(`[tcl] fetchDevices got ${resp.status} (expired token), forcing re-auth and retrying`);
         this.awsCreds = null;
         this.tokenExpiry = 0;
         this.tokenData = null;
@@ -536,7 +539,7 @@ export class TclCloud {
     // Also check for error code in JSON response body
     if (data.code != null && data.code !== 0 && !isRetry) {
       if (data.code === 10022 || data.message?.toLowerCase().includes("expired")) {
-        console.warn(`[tcl] fetchDevices got code ${data.code} (${data.message}), forcing re-auth and retrying`);
+        log.warn(`[tcl] fetchDevices got code ${data.code} (${data.message}), forcing re-auth and retrying`);
         this.awsCreds = null;
         this.tokenExpiry = 0;
         this.tokenData = null;
@@ -562,7 +565,7 @@ export class TclCloud {
           try {
             shadow = await this.getThingShadow(dev.deviceId);
           } catch (err) {
-            console.warn(`[tcl] Shadow read failed for ${dev.deviceId}:`, (err as Error).message);
+            log.warn(`[tcl] Shadow read failed for ${dev.deviceId}:`, (err as Error).message);
           }
         }
 
@@ -757,9 +760,9 @@ export class TclCloud {
     try {
       await new Promise(r => setTimeout(r, 1000));
       await this.publishShadowUpdate(deviceId, saved);
-      console.log(`[tcl] Restored last state for device ${deviceId}:`, JSON.stringify(saved));
+      log.info(`[tcl] Restored last state for device ${deviceId}:`, JSON.stringify(saved));
     } catch (err) {
-      console.warn(`[tcl] Failed to restore last state for ${deviceId}:`, (err as Error).message);
+      log.warn(`[tcl] Failed to restore last state for ${deviceId}:`, (err as Error).message);
     }
   }
 
@@ -785,9 +788,9 @@ export class TclCloud {
         baseApiUrl: this.baseApiUrl,
       };
       await writeFile(CREDENTIALS_FILE, JSON.stringify(state));
-      console.log("[tcl] Credentials saved");
+      log.info("[tcl] Credentials saved");
     } catch (err) {
-      console.warn("[tcl] Failed to save credentials:", (err as Error).message);
+      log.warn("[tcl] Failed to save credentials:", (err as Error).message);
     }
   }
 
@@ -800,7 +803,7 @@ export class TclCloud {
       this.awsCreds = state.awsCreds ?? null;
       this.tokenExpiry = state.tokenExpiry ?? 0;
       if (state.baseApiUrl) this.baseApiUrl = state.baseApiUrl;
-      console.log("[tcl] Loaded cached credentials");
+      log.info("[tcl] Loaded cached credentials");
     } catch {
       // No cached credentials, will do fresh login
     }

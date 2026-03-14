@@ -1,6 +1,8 @@
 import pg from "pg";
+import { childLogger } from "./logger.js";
 
 const { Pool } = pg;
+const log = childLogger("database");
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS weather_readings (
@@ -135,7 +137,7 @@ async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {
       );
     }
   }
-  console.log(`[database] Migrated legacy breakpoints for ${subs.rowCount} subscriptions`);
+  log.info(`[database] Migrated legacy breakpoints for ${subs.rowCount} subscriptions`);
 }
 
 export async function createPool(dsn: string): Promise<pg.Pool> {
@@ -149,14 +151,14 @@ export async function createPool(dsn: string): Promise<pg.Pool> {
     );
     if (result.rowCount === 0) {
       await bootstrapClient.query("CREATE DATABASE home");
-      console.log("[database] Created database 'home'");
+      log.info("[database] Created database 'home'");
     }
   } finally {
     await bootstrapClient.end();
   }
 
   const pool = new Pool({ connectionString: dsn, min: 2, max: 5 });
-  console.log("[database] Database pool created");
+  log.info("[database] Database pool created");
   return pool;
 }
 
@@ -172,5 +174,5 @@ export async function initDb(pool: pg.Pool): Promise<void> {
   } finally {
     client.release();
   }
-  console.log("[database] Database schema initialized");
+  log.info("[database] Database schema initialized");
 }

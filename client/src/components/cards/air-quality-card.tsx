@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { useMemo, memo, type ReactNode } from "react";
 import { Bar } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
@@ -111,7 +111,7 @@ const METRIC_TITLES: Record<string, string> = {
   co2: "CO\u2082",
 };
 
-export function AirQualityCard({
+export const AirQualityCard = memo(function AirQualityCard({
   title,
   value,
   unit,
@@ -162,7 +162,7 @@ export function AirQualityCard({
     ],
   }), [aggregatedHistory, metric]);
 
-  const chartOptions = {
+  const chartOptions = useMemo(() => ({
     responsive: true,
     maintainAspectRatio: false,
     plugins: { legend: { display: false }, tooltip: { enabled: false } },
@@ -185,7 +185,7 @@ export function AirQualityCard({
     },
     elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 } },
     interaction: { intersect: false, mode: "index" as const },
-  };
+  }), [yMax]);
 
   const handleExpand = () => {
     openOverlay(METRIC_TITLES[metric] || metric, (_range, _wh, ah) => (
@@ -235,4 +235,4 @@ export function AirQualityCard({
       </div>
     </MetricCard>
   );
-}
+});

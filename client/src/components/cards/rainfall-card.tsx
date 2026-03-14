@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, memo } from "react";
 import { Chart } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
@@ -121,7 +121,7 @@ function ExpandedRainfallChart({ range, weatherHistory }: { range: TimeRange; we
   return <div className="h-full"><Chart type="line" data={data} options={options} /></div>;
 }
 
-export function RainfallCard({
+export const RainfallCard = memo(function RainfallCard({
   hourly, event, daily, weekly, monthly, yearly,
   lastRain, pressure, weatherHistory = [], openOverlay,
 }: RainfallCardProps) {
@@ -174,7 +174,7 @@ export function RainfallCard({
 
   const hasRain = rainData.some((d) => d.y > 0);
 
-  const chartData = {
+  const chartData = useMemo(() => ({
     datasets: [
       {
         type: "line" as const,
@@ -201,9 +201,9 @@ export function RainfallCard({
         yAxisID: "y2",
       }] : []),
     ],
-  };
+  }), [hourlyPressure, rainData, hasRain]);
 
-  const chartOptions = {
+  const chartOptions = useMemo(() => ({
     responsive: true,
     maintainAspectRatio: false,
     plugins: { legend: { display: false }, tooltip: { enabled: false } },
@@ -232,7 +232,7 @@ export function RainfallCard({
     },
     elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 } },
     interaction: { intersect: false, mode: "index" as const },
-  };
+  }), [hasRain]);
 
   const handleExpand = () => {
     openOverlay("Rainfall & Pressure", (range, wh) => (
@@ -296,4 +296,4 @@ export function RainfallCard({
       </div>
     </MetricCard>
   );
-}
+});

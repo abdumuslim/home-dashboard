@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, memo } from "react";
 import { Line } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
@@ -82,7 +82,7 @@ function ExpandedTemperatureChart({ range, weatherHistory }: { range: TimeRange;
   return <div className="h-full"><Line data={data} options={options} /></div>;
 }
 
-export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHistory = [], openOverlay }: TemperatureCardProps) {
+export const TemperatureCard = memo(function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHistory = [], openOverlay }: TemperatureCardProps) {
   const { fmtTemp, tempLabel, units: { temperature: tempUnit } } = useUnits();
   const { chartsVisible } = useChartsVisible();
   const flash = useFlash(temp != null ? fmtTemp(temp) : null);
@@ -147,7 +147,7 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
   }, [weatherHistory, tempUnit]);
 
-  const chartData = {
+  const chartData = useMemo(() => ({
     datasets: [
       {
         data: hourlyData,
@@ -160,9 +160,9 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
         cubicInterpolationMode: "monotone" as const,
       },
     ],
-  };
+  }), [hourlyData]);
 
-  const chartOptions = {
+  const chartOptions = useMemo(() => ({
     responsive: true,
     maintainAspectRatio: false,
     plugins: { legend: { display: false }, tooltip: { enabled: false } },
@@ -182,7 +182,7 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
     },
     elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 } },
     interaction: { intersect: false, mode: "index" as const },
-  };
+  }), []);
 
   const handleExpand = () => {
     openOverlay("Temp & Humidity", (range, wh) => (
@@ -250,4 +250,4 @@ export function TemperatureCard({ temp, humidity, dewPoint, feelsLike, weatherHi
       </div>
     </MetricCard>
   );
-}
+});

@@ -2,6 +2,8 @@ services:
   mosquitto:
     image: eclipse-mosquitto:2
     restart: unless-stopped
+    mem_limit: 64m
+    cpus: 0.25
     ports:
       - "1883:1883"
     volumes:
@@ -15,11 +17,19 @@ services:
   dashboard:
     build: .
     restart: unless-stopped
+    mem_limit: 2g
+    cpus: 2.0
     env_file: .env
     volumes:
       - dashboard_data:/app/data
     depends_on:
       - mosquitto
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     networks:
       - rag_default
     labels:

@@ -79,8 +79,38 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+// In-memory rate limiter for login: max 5 attempts per IP per 15 minutes
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000;
+const RATE_LIMIT_MAX = 5;
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now > entry.resetAt) {
+    loginAttempts.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= RATE_LIMIT_MAX;
+}
+
+// Periodic cleanup of expired entries (every 15 min)
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of loginAttempts) {
+    if (now > entry.resetAt) loginAttempts.delete(ip);
+  }
+}, RATE_LIMIT_WINDOW);
+
 export function handleLogin(config: Config) {
   return (req: Request, res: Response) => {
+    const ip = req.ip || req.socket.remoteAddress || "unknown";
+    if (!checkRateLimit(ip)) {
+      res.status(429).json({ error: "Too many login attempts. Try again later." });
+      return;
+    }
+
     const { username, password } = req.body as { username?: string; password?: string };
     if (!username || !password) {
       res.status(400).json({ error: "Missing username or password" });

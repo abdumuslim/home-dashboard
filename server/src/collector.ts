@@ -6,6 +6,9 @@ import type { Config } from "./config.js";
 import { getMetricValue, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
 import { TclCloud } from "./tcl-cloud.js";
+import { childLogger } from "./logger.js";
+
+const log = childLogger("collector");
 
 interface WeatherRow {
   ts: Date;
@@ -184,7 +187,7 @@ export class Collector {
 
     if (config.vapidPublicKey && config.vapidPrivateKey) {
       webpush.setVapidDetails(config.vapidSubject, config.vapidPublicKey, config.vapidPrivateKey);
-      console.log("[collector] Web Push configured");
+      log.info("[collector] Web Push configured");
     }
   }
 
@@ -192,30 +195,43 @@ export class Collector {
     this.stopped = true;
     if (this.mqttClient) {
       this.mqttClient.end(true);
-      console.log("[collector] MQTT client closed");
+      log.info("[collector] MQTT client closed");
     }
   }
 
   async runForever(): Promise<void> {
-    await this.backfillAmbientHistory();
-    await sleep(2000);
-    await this.backfillQingpingHistory();
     this.startMqtt();
     await this.initXiaomiCloud();
     await this.initTclCloud();
+
+    // Run backfills in background — don't block the main collection/automation loop
+    this.runBackfills();
+
     while (!this.stopped) {
       try {
         await this.collectAll();
       } catch (err) {
-        console.error("[collector] Collection cycle failed:", err);
+        log.error("[collector] Collection cycle failed:", err);
       }
       await sleep(5000);
     }
   }
 
+  private runBackfills(): void {
+    (async () => {
+      try {
+        await this.backfillAmbientHistory();
+        await sleep(2000);
+        await this.backfillQingpingHistory();
+      } catch (err) {
+        log.error("[collector] Backfill failed:", err);
+      }
+    })();
+  }
+
   private async initXiaomiCloud(): Promise<void> {
     if (!this.config.miEmail || !this.config.miPassword) {
-      console.log("[collector] Xiaomi Cloud not configured (MI_EMAIL empty), automations disabled");
+      log.info("[collector] Xiaomi Cloud not configured (MI_EMAIL empty), automations disabled");
       return;
     }
     try {
@@ -226,21 +242,21 @@ export class Collector {
       );
       await this.xiaomiCloud.init();
     } catch (err) {
-      console.error("[collector] Xiaomi Cloud init failed:", (err as Error).message);
+      log.error("[collector] Xiaomi Cloud init failed:", (err as Error).message);
       this.xiaomiCloud = null;
     }
   }
 
   private async initTclCloud(): Promise<void> {
     if (!this.config.tclUsername || !this.config.tclPassword) {
-      console.log("[collector] TCL Cloud not configured (TCL_USERNAME empty), AC controls disabled");
+      log.info("[collector] TCL Cloud not configured (TCL_USERNAME empty), AC controls disabled");
       return;
     }
     try {
       this.tclCloud = new TclCloud(this.config.tclUsername, this.config.tclPassword);
       await this.tclCloud.init();
     } catch (err) {
-      console.error("[collector] TCL Cloud init failed:", (err as Error).message);
+      log.error("[collector] TCL Cloud init failed:", (err as Error).message);
       this.tclCloud = null;
     }
   }
@@ -257,26 +273,26 @@ export class Collector {
     const results = await Promise.allSettled(tasks);
     for (const r of results) {
       if (r.status === "rejected") {
-        console.error("[collector] Collection error:", r.reason);
+        log.error("[collector] Collection error:", r.reason);
       }
     }
 
     try {
       await this.checkAlerts();
     } catch (err) {
-      console.error("[collector] Alert check failed:", err);
+      log.error("[collector] Alert check failed:", err);
     }
 
     try {
       await this.checkAutomations();
     } catch (err) {
-      console.error("[collector] Automation check failed:", err);
+      log.error("[collector] Automation check failed:", err);
     }
 
     // Retry TCL Cloud init if it failed previously (every 5 minutes)
     if (!this.tclCloud && this.config.tclUsername && this.config.tclPassword && Date.now() >= this.tclRetryAt) {
       this.tclRetryAt = Date.now() + 5 * 60_000;
-      console.log("[collector] Retrying TCL Cloud init...");
+      log.info("[collector] Retrying TCL Cloud init...");
       await this.initTclCloud();
     }
   }
@@ -420,18 +436,18 @@ export class Collector {
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await webpush.sendNotification(subscription as any, JSON.stringify(payload));
-      console.log(`[collector] Sent push: ${payload.title}`);
+      log.info(`[collector] Sent push: ${payload.title}`);
     } catch (err: unknown) {
       const status = (err as { statusCode?: number }).statusCode;
       if (status === 404 || status === 410) {
         const endpoint = (subscription as { endpoint?: string }).endpoint;
         if (endpoint) {
           await this.pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [endpoint]);
-          console.log("[collector] Removed stale push subscription");
+          log.info("[collector] Removed stale push subscription");
           this.alertRulesLastFetch = 0; // Force refresh on next cycle
         }
       } else {
-        console.error(`[collector] Push failed (${status}):`, (err as Error).message);
+        log.error(`[collector] Push failed (${status}):`, (err as Error).message);
       }
     }
   }
@@ -515,7 +531,7 @@ export class Collector {
     if (conditionMet && sustainedEnough && (now - state.lastToggle >= cooldownMs)) {
       if (state.status === "idle") {
         // First trigger — turn on all devices
-        console.log(
+        log.info(
           `[collector] Automation "${rule.name}": ${rule.metric}=${value} ${rule.condition} ${rule.threshold}` +
           (sustainedMs > 0 ? ` for ${rule.sustained_minutes}min` : "") +
           `, turning ON [${deviceNames}]`,
@@ -526,7 +542,7 @@ export class Collector {
           }
           this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null });
         } catch (err) {
-          console.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
+          log.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
         }
       } else {
         // Already triggered — re-check device power and re-send turn-on if off
@@ -534,14 +550,14 @@ export class Collector {
           try {
             const power = await this.getDevicePowerCached(did);
             if (power === "off" || power === undefined) {
-              console.log(
+              log.info(
                 `[collector] Automation "${rule.name}": device ${did} is OFF while ${rule.metric}=${value} still ${rule.condition} ${rule.threshold}, re-turning ON [${deviceNames}]`,
               );
               await this.xiaomiCloud!.executeAction(did, rule.action_on);
               this.devicePowerCache.set(did, { power: "on", ts: Date.now() });
             }
           } catch (err) {
-            console.error(`[collector] Automation "${rule.name}" re-check failed for ${did}:`, (err as Error).message);
+            log.error(`[collector] Automation "${rule.name}" re-check failed for ${did}:`, (err as Error).message);
           }
         }
         this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null });
@@ -589,7 +605,7 @@ export class Collector {
         try {
           const power = await this.getDevicePowerCached(did);
           if (power === "off" || power === undefined) {
-            console.log(
+            log.info(
               `[collector] Schedule "${rule.name}": device ${did} is OFF during active window, turning ON [${deviceNames}]`,
             );
             await this.xiaomiCloud!.executeAction(did, rule.action_on);
@@ -598,7 +614,7 @@ export class Collector {
             this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
           }
         } catch (err) {
-          console.error(`[collector] Schedule "${rule.name}" check failed for ${did}:`, (err as Error).message);
+          log.error(`[collector] Schedule "${rule.name}" check failed for ${did}:`, (err as Error).message);
         }
       }
     } else {
@@ -607,12 +623,12 @@ export class Collector {
         if (rule.turn_off_at_end) {
           const deviceIds = rule.device_ids ?? [rule.device_id];
           const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
-          console.log(`[collector] Schedule "${rule.name}": window ended, turning OFF [${deviceNames}]`);
+          log.info(`[collector] Schedule "${rule.name}": window ended, turning OFF [${deviceNames}]`);
           for (const did of deviceIds) {
             try {
               await this.xiaomiCloud!.executeAction(did, { power: "off" });
             } catch (err) {
-              console.error(`[collector] Schedule "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
+              log.error(`[collector] Schedule "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
             }
           }
         }
@@ -636,7 +652,7 @@ export class Collector {
     }
     const devices: AWData[] = await resp.json() as AWData[];
     if (!devices.length) {
-      console.warn("[collector] No devices from Ambient Weather");
+      log.warn("[collector] No devices from Ambient Weather");
       return;
     }
     const data = devices[0].lastData as AWData;
@@ -644,7 +660,7 @@ export class Collector {
     await this.storeWeather(row);
     this.latestWeatherRow = row as unknown as Record<string, unknown>;
     this.latestWeatherTs = row.ts;
-    console.log(`[collector] Stored weather reading at ${row.ts.toISOString()}`);
+    log.info(`[collector] Stored weather reading at ${row.ts.toISOString()}`);
   }
 
   private convertAW(d: AWData): WeatherRow {
@@ -751,7 +767,7 @@ export class Collector {
     const oldestTs = oldest.rows[0]?.ts as Date | undefined;
     if (oldestTs && oldestTs.getTime() <= thirtyDaysAgo) {
       // Already have 30+ days — just fetch the latest batch to fill gap since last shutdown
-      console.log("[collector] Weather data already spans 30+ days, fetching latest batch only");
+      log.info("[collector] Weather data already spans 30+ days, fetching latest batch only");
       await this.fetchAWBatch(mac);
       return;
     }
@@ -767,7 +783,7 @@ export class Collector {
         totalCount += count;
 
         if (count < 288) {
-          console.log(`[collector] AW backfill: got ${count} < 288 records, no more data`);
+          log.info(`[collector] AW backfill: got ${count} < 288 records, no more data`);
           break;
         }
 
@@ -784,9 +800,9 @@ export class Collector {
         // Respect rate limit: 1 req/sec
         await sleep(1100);
       }
-      console.log(`[collector] Backfilled ${totalCount} weather records total`);
+      log.info(`[collector] Backfilled ${totalCount} weather records total`);
     } catch (err) {
-      console.error(`[collector] AW backfill stopped after ${totalCount} records:`, err);
+      log.error(`[collector] AW backfill stopped after ${totalCount} records:`, err);
     }
   }
 
@@ -806,12 +822,11 @@ export class Collector {
       throw new Error(`AW backfill API ${resp.status}: ${await resp.text()}`);
     }
     const records: AWData[] = await resp.json() as AWData[];
-    for (const record of records) {
-      const row = this.convertAW(record);
-      await this.storeWeather(row);
+    if (records.length > 0) {
+      await this.storeWeatherBatch(records.map(r => this.convertAW(r)));
     }
     if (records.length > 0) {
-      console.log(`[collector] AW backfill page: ${records.length} records`);
+      log.info(`[collector] AW backfill page: ${records.length} records`);
     }
     return records.length;
   }
@@ -840,7 +855,7 @@ export class Collector {
     );
     const oldestTs = oldest.rows[0]?.ts as Date | undefined;
     if (oldestTs && oldestTs.getTime() / 1000 <= thirtyDaysAgo) {
-      console.log("[collector] Air data already spans 30+ days, skipping backfill");
+      log.info("[collector] Air data already spans 30+ days, skipping backfill");
       return;
     }
 
@@ -879,22 +894,20 @@ export class Collector {
         const items = body.data ?? [];
         if (items.length === 0) break;
 
-        for (const d of items) {
-          await this.storeAir(this.toAirRow(new Date(d.timestamp.value * 1000), d));
-        }
+        await this.storeAirBatch(items.map(d => this.toAirRow(new Date(d.timestamp.value * 1000), d)));
 
         totalCount += items.length;
         offset += items.length;
-        console.log(`[collector] QP backfill page: ${items.length} records (total: ${totalCount})`);
+        log.info(`[collector] QP backfill page: ${items.length} records (total: ${totalCount})`);
 
         const total = body.total ?? 0;
         if (offset >= total) break;
 
         await sleep(500);
       }
-      console.log(`[collector] Backfilled ${totalCount} air records total`);
+      log.info(`[collector] Backfilled ${totalCount} air records total`);
     } catch (err) {
-      console.error("[collector] QP backfill failed:", err);
+      log.error("[collector] QP backfill failed:", err);
     }
   }
 
@@ -902,7 +915,7 @@ export class Collector {
 
   private startMqtt(): void {
     if (!this.config.mqttUsername) {
-      console.log("[collector] MQTT not configured, skipping");
+      log.info("[collector] MQTT not configured, skipping");
       return;
     }
 
@@ -919,12 +932,12 @@ export class Collector {
     });
 
     this.mqttClient.on("connect", () => {
-      console.log("[collector] MQTT connected to broker");
+      log.info("[collector] MQTT connected to broker");
       this.mqttClient!.subscribe(topic, { qos: 1 }, (err) => {
         if (err) {
-          console.error("[collector] MQTT subscribe error:", err);
+          log.error("[collector] MQTT subscribe error:", err);
         } else {
-          console.log(`[collector] MQTT subscribed to ${topic}`);
+          log.info(`[collector] MQTT subscribed to ${topic}`);
           this.sendIntervalConfig();
         }
       });
@@ -932,16 +945,16 @@ export class Collector {
 
     this.mqttClient.on("message", (_topic: string, payload: Buffer) => {
       this.handleMqttMessage(payload).catch((err) => {
-        console.error("[collector] MQTT message handling error:", err);
+        log.error("[collector] MQTT message handling error:", err);
       });
     });
 
     this.mqttClient.on("error", (err) => {
-      console.error("[collector] MQTT error:", err);
+      log.error("[collector] MQTT error:", err);
     });
 
     this.mqttClient.on("reconnect", () => {
-      console.log("[collector] MQTT reconnecting...");
+      log.info("[collector] MQTT reconnecting...");
     });
   }
 
@@ -957,18 +970,18 @@ export class Collector {
     try {
       msg = JSON.parse(raw) as QpMqttPayload;
     } catch {
-      console.warn("[collector] MQTT: non-JSON message, ignoring");
+      log.warn("[collector] MQTT: non-JSON message, ignoring");
       return;
     }
 
     if (msg.type === QP_MSG_SETTINGS_ACK) {
-      console.log("[collector] MQTT: received settings ack");
+      log.info("[collector] MQTT: received settings ack");
       return;
     }
 
     const sensors = msg.sensorData?.[0];
     if (!sensors) {
-      console.warn("[collector] MQTT: no sensorData in message");
+      log.warn("[collector] MQTT: no sensorData in message");
       return;
     }
 
@@ -1006,9 +1019,9 @@ export class Collector {
 
     this.mqttClient.publish(topic, JSON.stringify(cfg), { qos: 1 }, (err) => {
       if (err) {
-        console.error("[collector] MQTT interval config publish failed:", err);
+        log.error("[collector] MQTT interval config publish failed:", err);
       } else {
-        console.log("[collector] MQTT interval config sent (15s intervals)");
+        log.info("[collector] MQTT interval config sent (15s intervals)");
       }
     });
   }
@@ -1042,7 +1055,7 @@ export class Collector {
     this.qpToken = body.access_token;
     const expiresIn = body.expires_in ?? 7200;
     this.qpTokenExpires = Date.now() / 1000 + expiresIn;
-    console.log(`[collector] Qingping token refreshed, expires in ${expiresIn}s`);
+    log.info(`[collector] Qingping token refreshed, expires in ${expiresIn}s`);
   }
 
   private async collectQingping(): Promise<void> {
@@ -1068,7 +1081,7 @@ export class Collector {
 
     const body = (await resp.json()) as QpResponse;
     if (!body.devices?.length) {
-      console.warn("[collector] No devices from Qingping");
+      log.warn("[collector] No devices from Qingping");
       return;
     }
     const data = body.devices[0].data;
@@ -1076,7 +1089,7 @@ export class Collector {
     await this.storeAir(row);
     this.latestAirRow = row as unknown as Record<string, unknown>;
     this.latestAirTs = row.ts;
-    console.log(`[collector] Stored air reading at ${row.ts.toISOString()}`);
+    log.info(`[collector] Stored air reading at ${row.ts.toISOString()}`);
   }
 
   private async storeAirMedian(): Promise<void> {
@@ -1104,7 +1117,7 @@ export class Collector {
     };
 
     await this.storeAir(row);
-    console.log(`[collector] Air median saved (from ${buf.length} samples)`);
+    log.info(`[collector] Air median saved (from ${buf.length} samples)`);
   }
 
   private async storeAir(row: AirRow): Promise<void> {
@@ -1118,6 +1131,64 @@ export class Collector {
         row.ts, row.temperature, row.humidity, row.co2, row.pm25, row.pm10,
         row.tvoc, row.noise, row.battery,
       ]
+    );
+  }
+
+  private async storeAirBatch(rows: AirRow[]): Promise<void> {
+    if (rows.length === 0) return;
+    const COLS = 9;
+    const placeholders: string[] = [];
+    const values: unknown[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const off = i * COLS;
+      placeholders.push(`($${off+1},$${off+2},$${off+3},$${off+4},$${off+5},$${off+6},$${off+7},$${off+8},$${off+9})`);
+      const r = rows[i];
+      values.push(r.ts, r.temperature, r.humidity, r.co2, r.pm25, r.pm10, r.tvoc, r.noise, r.battery);
+    }
+    await this.pool.query(
+      `INSERT INTO air_readings (ts, temperature, humidity, co2, pm25, pm10, tvoc, noise, battery)
+       VALUES ${placeholders.join(",")} ON CONFLICT (ts) DO NOTHING`,
+      values
+    );
+  }
+
+  private async storeWeatherBatch(rows: WeatherRow[]): Promise<void> {
+    if (rows.length === 0) return;
+    const COLS = 32;
+    const placeholders: string[] = [];
+    const values: unknown[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const off = i * COLS;
+      const nums = Array.from({ length: COLS }, (_, j) => `$${off + j + 1}`).join(",");
+      placeholders.push(`(${nums})`);
+      const r = rows[i];
+      values.push(
+        r.ts, r.temp_c, r.humidity, r.wind_speed_kmh, r.wind_gust_kmh,
+        r.max_daily_gust_kmh, r.wind_dir, r.wind_dir_avg10m,
+        r.pressure_rel_hpa, r.pressure_abs_hpa,
+        r.rain_hourly_mm, r.rain_event_mm, r.rain_daily_mm,
+        r.rain_weekly_mm, r.rain_monthly_mm, r.rain_yearly_mm,
+        r.solar_radiation, r.uv_index, r.temp_indoor_c, r.humidity_indoor,
+        r.feels_like_c, r.dew_point_c, r.temp_ch8_c, r.humidity_ch8,
+        r.feels_like_indoor_c, r.dew_point_indoor_c,
+        r.feels_like_ch8_c, r.dew_point_ch8_c,
+        r.batt_outdoor, r.batt_indoor, r.batt_ch8, r.last_rain,
+      );
+    }
+    await this.pool.query(
+      `INSERT INTO weather_readings (
+        ts, temp_c, humidity, wind_speed_kmh, wind_gust_kmh,
+        max_daily_gust_kmh, wind_dir, wind_dir_avg10m,
+        pressure_rel_hpa, pressure_abs_hpa,
+        rain_hourly_mm, rain_event_mm, rain_daily_mm,
+        rain_weekly_mm, rain_monthly_mm, rain_yearly_mm,
+        solar_radiation, uv_index, temp_indoor_c, humidity_indoor,
+        feels_like_c, dew_point_c, temp_ch8_c, humidity_ch8,
+        feels_like_indoor_c, dew_point_indoor_c,
+        feels_like_ch8_c, dew_point_ch8_c,
+        batt_outdoor, batt_indoor, batt_ch8, last_rain
+      ) VALUES ${placeholders.join(",")} ON CONFLICT (ts) DO NOTHING`,
+      values
     );
   }
 }

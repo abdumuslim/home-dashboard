@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, memo } from "react";
 import { Bar } from "react-chartjs-2";
 import { Zap, Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
@@ -44,16 +44,28 @@ function SourcePill({ label, active, color }: { label: string; active: boolean; 
   );
 }
 
+const powerHistoryCache = new Map<TimeRange, PowerReading[]>();
+
 function ExpandedPowerChart({ range }: { range: TimeRange }) {
-  const [history, setHistory] = useState<PowerReading[]>([]);
+  const [history, setHistory] = useState<PowerReading[]>(
+    () => powerHistoryCache.get(range) || []
+  );
 
   useEffect(() => {
     let mounted = true;
+    // Restore from cache immediately on range switch
+    const cached = powerHistoryCache.get(range);
+    if (cached) setHistory(cached);
+
     const load = async () => {
       try {
         const res = await fetch(`/api/history?source=power&range=${range}`);
         const json = await res.json();
-        if (mounted) setHistory(json.data || []);
+        if (mounted) {
+          const data = json.data || [];
+          setHistory(data);
+          powerHistoryCache.set(range, data);
+        }
       } catch (e) {
         console.error("Failed to fetch power history:", e);
       }
@@ -152,7 +164,7 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
   return <div className="h-full"><Bar data={data as any} options={options} /></div>;
 }
 
-export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) {
+export const PowerCard = memo(function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) {
   const { chartsVisible } = useChartsVisible();
 
   const gridActive = (power?.current_1 ?? 0) > NOISE_THRESHOLD;
@@ -195,7 +207,7 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
     return { barData: data, barColors: colors };
   }, [powerHistory]);
 
-  const chartData = {
+  const chartData = useMemo(() => ({
     datasets: [
       {
         data: barData,
@@ -204,9 +216,9 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
         barThickness: 2,
       },
     ],
-  };
+  }), [barData, barColors]);
 
-  const chartOptions = {
+  const chartOptions = useMemo(() => ({
     responsive: true,
     maintainAspectRatio: false,
     plugins: { legend: { display: false }, tooltip: { enabled: false } },
@@ -227,7 +239,7 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
       },
     },
     interaction: { intersect: false, mode: "index" as const },
-  };
+  }), []);
 
   const handleExpand = () => {
     openOverlay("Power", (_range) => (
@@ -301,4 +313,4 @@ export function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) 
       </div>
     </MetricCard>
   );
-}
+});

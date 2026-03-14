@@ -6,7 +6,7 @@ import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus } from "./auth.js";
 
-function median(arr: number[]): number {
+export function median(arr: number[]): number {
   const sorted = [...arr].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
@@ -54,6 +54,16 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
 export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null): Router {
   const router = Router();
 
+  // Health check — before auth middleware, no auth required
+  router.get("/api/health", async (_req: Request, res: Response) => {
+    try {
+      await pool.query("SELECT 1");
+      res.json({ status: "ok", uptime: process.uptime() });
+    } catch {
+      res.status(503).json({ status: "unhealthy", error: "database unreachable" });
+    }
+  });
+
   // Auth middleware — sets req.authenticated on every request
   if (config) {
     router.use(createAuthMiddleware(config));
@@ -71,24 +81,20 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   const powerBuffer: { v: number; i1: number; i2: number }[] = [];
 
   router.get("/api/current", async (_req: Request, res: Response) => {
-    const weatherResult = await pool.query("SELECT * FROM weather_readings ORDER BY ts DESC LIMIT 1");
-    const weather = weatherResult.rows[0] ?? null;
-    // Use in-memory latest air (updated every ~15s) if available, else fall back to DB
-    let air: Record<string, unknown> | null = getLatestAir?.() ?? null;
-    if (!air) {
-      const airResult = await pool.query("SELECT * FROM air_readings ORDER BY ts DESC LIMIT 1");
-      air = airResult.rows[0] ? rowToDict(airResult.rows[0]) : null;
-    }
-    // Use in-memory latest power (updated every ~1s) if available, else fall back to DB
-    let power = latestPower;
-    if (!power) {
-      const powerResult = await pool.query("SELECT * FROM power_readings ORDER BY ts DESC LIMIT 1");
-      power = powerResult.rows[0] ? rowToDict(powerResult.rows[0]) as any : null;
-    }
+    // Use in-memory caches where available, fall back to DB in parallel
+    const air: Record<string, unknown> | null = getLatestAir?.() ?? null;
+    const power = latestPower;
+
+    const [weatherResult, airResult, powerResult] = await Promise.all([
+      pool.query("SELECT * FROM weather_readings ORDER BY ts DESC LIMIT 1"),
+      air ? null : pool.query("SELECT * FROM air_readings ORDER BY ts DESC LIMIT 1"),
+      power ? null : pool.query("SELECT * FROM power_readings ORDER BY ts DESC LIMIT 1"),
+    ]);
+
     res.json({
-      weather: weather ? rowToDict(weather) : null,
-      air,
-      power,
+      weather: weatherResult.rows[0] ? rowToDict(weatherResult.rows[0]) : null,
+      air: air ?? (airResult?.rows[0] ? rowToDict(airResult.rows[0]) : null),
+      power: power ?? (powerResult?.rows[0] ? rowToDict(powerResult.rows[0]) as any : null),
     });
   });
 

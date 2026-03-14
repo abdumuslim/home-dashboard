@@ -2,10 +2,13 @@ import { config } from "./config.js";
 import { createPool, initDb } from "./database.js";
 import { Collector } from "./collector.js";
 import { createRouter } from "./routes.js";
+import { childLogger } from "./logger.js";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+const log = childLogger("index");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,7 +22,7 @@ async function main(): Promise<void> {
   const collector = new Collector(pool, config);
   const collectorPromise = collector.runForever();
   collectorPromise.catch((err) => {
-    console.error("[index] Collector crashed:", err);
+    log.error("[index] Collector crashed:", err);
   });
 
   // Create Express app
@@ -51,18 +54,18 @@ async function main(): Promise<void> {
 
   const PORT = 8000;
   app.listen(PORT, () => {
-    console.log(`[index] Dashboard server running on http://localhost:${PORT}`);
+    log.info(`[index] Dashboard server running on http://localhost:${PORT}`);
   });
 
   // Graceful shutdown
   const shutdown = (): void => {
-    console.log("[index] Shutting down...");
+    log.info("[index] Shutting down...");
     collector.stop();
     pool.end().then(() => {
-      console.log("[index] Database pool closed");
+      log.info("[index] Database pool closed");
       process.exit(0);
     }).catch((err) => {
-      console.error("[index] Error closing pool:", err);
+      log.error("[index] Error closing pool:", err);
       process.exit(1);
     });
   };
@@ -72,6 +75,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error("[index] Fatal error:", err);
+  log.error("[index] Fatal error:", err);
   process.exit(1);
 });

@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, memo } from "react";
 import { Line } from "react-chartjs-2";
 import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
@@ -70,7 +70,7 @@ function ExpandedWindChart({ range, weatherHistory }: { range: TimeRange; weathe
   return <div className="h-full"><Line data={data} options={options} /></div>;
 }
 
-export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], openOverlay }: WindCardProps) {
+export const WindCard = memo(function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], openOverlay }: WindCardProps) {
   const { fmtWind, windLabel, units: { windSpeed: windUnit } } = useUnits();
   const { chartsVisible } = useChartsVisible();
 
@@ -129,7 +129,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
   }, [weatherHistory, windUnit]);
 
-  const chartData = {
+  const chartData = useMemo(() => ({
     datasets: [
       {
         data: chartDataPoints,
@@ -142,9 +142,9 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
         cubicInterpolationMode: "monotone" as const,
       },
     ],
-  };
+  }), [chartDataPoints]);
 
-  const chartOptions = {
+  const chartOptions = useMemo(() => ({
     responsive: true,
     maintainAspectRatio: false,
     plugins: { legend: { display: false }, tooltip: { enabled: false } },
@@ -162,7 +162,7 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
         ticks: { color: "#7a8ba8", font: { size: 10 }, stepSize: 5 },
       },
     },
-  };
+  }), []);
 
   const handleExpand = () => {
     openOverlay("Wind", (range, wh) => (
@@ -247,4 +247,4 @@ export function WindCard({ speed, gust, maxDailyGust, dir, weatherHistory = [], 
       </div>
     </MetricCard>
   );
-}
+});

@@ -1,4 +1,4 @@
-import { useState, useMemo, type ReactNode } from "react";
+import { useState, useMemo, memo, type ReactNode } from "react";
 import { Line } from "react-chartjs-2";
 import { Maximize2, Power, Fan, Settings, Loader2, Hourglass } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -136,7 +136,7 @@ function ExpandedIndoorChart({
   return <div className="h-full"><Line data={data} options={options} /></div>;
 }
 
-export function IndoorCard({
+export const IndoorCard = memo(function IndoorCard({
   title,
   temp,
   humidity,
@@ -180,7 +180,7 @@ export function IndoorCard({
       .sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime());
   }, [history, metricKey, tempUnit]);
 
-  const chartData = {
+  const chartData = useMemo(() => ({
     datasets: [
       {
         data: hourlyData,
@@ -193,9 +193,9 @@ export function IndoorCard({
         cubicInterpolationMode: "monotone" as const,
       },
     ],
-  };
+  }), [hourlyData]);
 
-  const chartOptions = {
+  const chartOptions = useMemo(() => ({
     responsive: true,
     maintainAspectRatio: false,
     plugins: { legend: { display: false }, tooltip: { enabled: false } },
@@ -215,7 +215,7 @@ export function IndoorCard({
     },
     elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 } },
     interaction: { intersect: false, mode: "index" as const },
-  };
+  }), []);
 
   const isAirSource = metricKey === "temperature";
   const humidityKey = metricKey ? HUMIDITY_KEY_MAP[metricKey as string] || "humidity" : "humidity";
@@ -411,4 +411,4 @@ export function IndoorCard({
       )}
     </MetricCard>
   );
-}
+});

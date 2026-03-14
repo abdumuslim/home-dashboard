@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, memo } from "react";
 import { Chart } from "react-chartjs-2";
 import { Sun, CloudSun, Cloud, Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
@@ -132,7 +132,7 @@ function ExpandedSolarChart({ range, weatherHistory }: { range: TimeRange; weath
   return <div className="h-full"><Chart type="line" data={data} options={options} /></div>;
 }
 
-export function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay }: SolarCardProps) {
+export const SolarCard = memo(function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay }: SolarCardProps) {
   const { fmtSolar, solarLabel, units: { solar: solarUnit } } = useUnits();
   const { chartsVisible } = useChartsVisible();
   const flashRad = useFlash(radiation != null ? fmtSolar(radiation) : null);
@@ -339,4 +339,4 @@ export function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay
       </div>
     </MetricCard>
   );
-}
+});

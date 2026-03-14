@@ -1,5 +1,8 @@
 import XiaomiMiHome from "xmihome";
 import { writeFile } from "fs/promises";
+import { childLogger } from "./logger.js";
+
+const log = childLogger("xiaomi");
 
 export interface PurifierDevice {
   id: string;
@@ -93,14 +96,14 @@ export class XiaomiCloud {
     try {
       await this.client.miot.login({
         on2fa: async (_url: string) => {
-          console.log("[xiaomi] 2FA verification required — waiting for code via /api/xiaomi/verify");
+          log.info("[xiaomi] 2FA verification required — waiting for code via /api/xiaomi/verify");
           this.authStatus = "needs_2fa";
           return new Promise<string>((resolve) => {
             this.pending2faResolve = resolve;
           });
         },
         onCaptcha: async (imageB64: string) => {
-          console.log("[xiaomi] CAPTCHA required — waiting for solution via /api/xiaomi/verify");
+          log.info("[xiaomi] CAPTCHA required — waiting for solution via /api/xiaomi/verify");
           this.authStatus = "needs_captcha";
           this.captchaImage = imageB64;
           return new Promise<string>((resolve) => {
@@ -112,21 +115,21 @@ export class XiaomiCloud {
       // Save credentials to file for next restart
       await this.saveCredentials();
       this.authStatus = "authenticated";
-      console.log("[xiaomi] Cloud login successful");
+      log.info("[xiaomi] Cloud login successful");
 
       await this.discoverRegionAndDevices();
-      console.log(
+      log.info(
         `[xiaomi] Region: ${this.region}, found ${this.cachedDevices.length} purifier(s)`,
       );
       for (const d of this.cachedDevices) {
-        console.log(`[xiaomi]   - ${d.name} (${d.model}, ${d.isOnline ? "online" : "offline"})`);
+        log.info(`[xiaomi]   - ${d.name} (${d.model}, ${d.isOnline ? "online" : "offline"})`);
       }
     } catch (err) {
       this.authError = (err as Error).message;
       if (this.authStatus !== "needs_2fa" && this.authStatus !== "needs_captcha") {
         this.authStatus = "error";
       }
-      console.error("[xiaomi] Cloud init failed:", this.authError);
+      log.error("[xiaomi] Cloud init failed:", this.authError);
     }
   }
 
@@ -172,10 +175,10 @@ export class XiaomiCloud {
           serviceToken: creds.serviceToken,
           country: creds.country ?? this.region,
         }));
-        console.log("[xiaomi] Credentials saved to", CREDENTIALS_FILE);
+        log.info("[xiaomi] Credentials saved to", CREDENTIALS_FILE);
       }
     } catch (err) {
-      console.warn("[xiaomi] Failed to save credentials:", (err as Error).message);
+      log.warn("[xiaomi] Failed to save credentials:", (err as Error).message);
     }
   }
 
@@ -187,13 +190,13 @@ export class XiaomiCloud {
       return;
     }
 
-    console.log(`[xiaomi] No purifiers in region "${this.region}", scanning all regions...`);
+    log.info(`[xiaomi] No purifiers in region "${this.region}", scanning all regions...`);
     for (const region of ALL_REGIONS) {
       if (region === this.region) continue;
       try {
         const found = await this.fetchPurifiersForRegion(region);
         if (found.length > 0) {
-          console.log(`[xiaomi] Found ${found.length} purifier(s) in region "${region}"`);
+          log.info(`[xiaomi] Found ${found.length} purifier(s) in region "${region}"`);
           this.region = region;
           // Update the client's country for future requests
           this.client.config.credentials!.country = region;
@@ -203,10 +206,10 @@ export class XiaomiCloud {
           return;
         }
       } catch (err) {
-        console.warn(`[xiaomi] Region "${region}" scan failed: ${(err as Error).message}`);
+        log.warn(`[xiaomi] Region "${region}" scan failed: ${(err as Error).message}`);
       }
     }
-    console.warn("[xiaomi] No purifiers found in any region");
+    log.warn("[xiaomi] No purifiers found in any region");
     this.cachedDevices = [];
     this.deviceCacheTime = Date.now();
   }
@@ -224,11 +227,11 @@ export class XiaomiCloud {
         .filter((d) => isPurifier(d.model))
         .map((d) => ({ id: d.did, name: d.name, model: d.model, isOnline: d.isOnline }));
       if (all.length > 0) {
-        console.log(`[xiaomi] Region "${region}": ${all.length} device(s), ${purifiers.length} purifier(s)`);
+        log.info(`[xiaomi] Region "${region}": ${all.length} device(s), ${purifiers.length} purifier(s)`);
       }
       return purifiers;
     } catch (err) {
-      console.warn(`[xiaomi] Fetch devices for region "${region}" failed:`, (err as Error).message);
+      log.warn(`[xiaomi] Fetch devices for region "${region}" failed:`, (err as Error).message);
       return [];
     } finally {
       creds.country = savedCountry;
@@ -358,7 +361,7 @@ export class XiaomiCloud {
       method,
       params,
     }) as { result: unknown };
-    console.log(`[xiaomi] Command ${method}(${JSON.stringify(params)}) → device ${deviceId}: OK`);
+    log.info(`[xiaomi] Command ${method}(${JSON.stringify(params)}) → device ${deviceId}: OK`);
     return result;
   }
 
