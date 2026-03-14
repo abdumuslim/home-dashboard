@@ -65,7 +65,7 @@ interface QpSensorFields {
   pm10?: { value: number };
   tvoc_index?: { value: number };
   noise?: { value: number };
-  battery?: { value: number };
+  battery?: { value: number; status?: number };
 }
 
 const QP_MSG_SETTINGS_ACK = "28";
@@ -1016,7 +1016,10 @@ export class Collector {
     }
 
     const row = this.toAirRow(new Date(), sensors);
-    this.latestAirRow = row as unknown as Record<string, unknown>;
+    const live = row as unknown as Record<string, unknown>;
+    // battery.status: 1 = charging (USB plugged), 0 = discharging
+    live.batteryCharging = sensors.battery?.status === 1;
+    this.latestAirRow = live;
     this.latestAirTs = row.ts;
     this.lastMqttMessage = Date.now();
     this.airBuffer.push(row);
@@ -1117,7 +1120,9 @@ export class Collector {
     const data = body.devices[0].data;
     const row = this.toAirRow(new Date(data.timestamp.value * 1000), data);
     await this.storeAir(row);
-    this.latestAirRow = row as unknown as Record<string, unknown>;
+    const live = row as unknown as Record<string, unknown>;
+    live.batteryCharging = data.battery?.status === 1;
+    this.latestAirRow = live;
     this.latestAirTs = row.ts;
     log.info(`[collector] Stored air reading at ${row.ts.toISOString()}`);
   }

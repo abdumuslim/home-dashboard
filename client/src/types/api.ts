@@ -40,6 +40,7 @@ export interface AirReading {
   tvoc: number | null;
   noise: number | null;
   battery: number | null;
+  batteryCharging?: boolean;
 }
 
 export interface PowerReading {

@@ -8,6 +8,7 @@ import { OutdoorSection } from "./sections/outdoor-section";
 import { IndoorSection } from "./sections/indoor-section";
 import { AirQualitySection } from "./sections/air-quality-section";
 import { PrayerSectionHeader, PrayerSectionContent } from "./sections/prayer-section";
+import { BatteryIndicator } from "./ui/battery-indicator";
 
 interface DashboardTabProps {
   weather: WeatherReading | null;
@@ -56,10 +57,10 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
     },
     "air-quality": {
       header: (
-        <h2 className="text-base font-medium tracking-wider text-white">
+        <h2 className="text-base font-medium tracking-wider text-white inline-flex items-center">
           AIR QUALITY{" "}
-          <span className="text-dim text-[0.85rem] tracking-normal ml-2">
-            Qingping CGS1 {air?.battery ?? "--"}%
+          <span className="text-dim text-[0.85rem] tracking-normal ml-2 inline-flex items-center gap-1.5">
+            Qingping CGS2 <BatteryIndicator percentage={air?.battery ?? null} charging={air?.batteryCharging} />
           </span>
         </h2>
       ),
