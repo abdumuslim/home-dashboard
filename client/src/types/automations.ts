@@ -26,6 +26,12 @@ export interface AutomationRule {
   threshold: number | null;
   time_start: string | null;
   time_end: string | null;
+  start_mode: "exact" | "prayer";
+  start_prayer: string | null;
+  start_prayer_offset: number | null;
+  end_mode: "exact" | "prayer";
+  end_prayer: string | null;
+  end_prayer_offset: number | null;
   device_ids: string[] | null;
   device_names: string[] | null;
   turn_off_at_end: boolean;

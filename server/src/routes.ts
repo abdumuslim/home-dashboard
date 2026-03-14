@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import pg from "pg";
 import type { Config } from "./config.js";
-import { ALERT_METRICS, VALID_PRAYER_NAMES } from "./alert-metrics.js";
+import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus } from "./auth.js";
@@ -489,6 +489,12 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     automation_type: "schedule";
     time_start: string;
     time_end: string;
+    start_mode?: "exact" | "prayer";
+    start_prayer?: string;
+    start_prayer_offset?: number;
+    end_mode?: "exact" | "prayer";
+    end_prayer?: string;
+    end_prayer_offset?: number;
     turn_off_at_end?: boolean;
     device_ids: string[];
     device_names: string[];
@@ -510,11 +516,45 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     return null;
   }
 
+  function validatePrayerField(prayer?: string, offset?: number, label = "Prayer"): string | null {
+    const validNames = VALID_PRAYER_NAMES as readonly string[];
+    if (!prayer || !validNames.includes(prayer)) return `Invalid ${label.toLowerCase()} prayer name`;
+    if (offset == null || !Number.isInteger(offset) || offset < -120 || offset > 120)
+      return `${label} offset must be an integer between -120 and 120`;
+    return null;
+  }
+
+  function formatTimeLabel(mode: string, time: string | undefined, prayer: string | undefined, offset: number | undefined): string {
+    if (mode === "prayer" && prayer) {
+      const abs = Math.abs(offset ?? 0);
+      const dir = (offset ?? 0) < 0 ? "before" : (offset ?? 0) > 0 ? "after" : "at";
+      return abs > 0 ? `${abs}min ${dir} ${PRAYER_LABELS[prayer] ?? prayer}` : PRAYER_LABELS[prayer] ?? prayer;
+    }
+    return time ?? "??:??";
+  }
+
   function validateScheduleAutomation(body: ScheduleAutomationBody): string | null {
     const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
-    if (!body.time_start || !timeRegex.test(body.time_start)) return "Invalid start time (HH:MM)";
-    if (!body.time_end || !timeRegex.test(body.time_end)) return "Invalid end time (HH:MM)";
-    if (body.time_start === body.time_end) return "Start and end time cannot be the same";
+    const startMode = body.start_mode ?? "exact";
+    const endMode = body.end_mode ?? "exact";
+
+    if (startMode === "prayer") {
+      const err = validatePrayerField(body.start_prayer, body.start_prayer_offset, "Start");
+      if (err) return err;
+    } else {
+      if (!body.time_start || !timeRegex.test(body.time_start)) return "Invalid start time (HH:MM)";
+    }
+
+    if (endMode === "prayer") {
+      const err = validatePrayerField(body.end_prayer, body.end_prayer_offset, "End");
+      if (err) return err;
+    } else {
+      if (!body.time_end || !timeRegex.test(body.time_end)) return "Invalid end time (HH:MM)";
+    }
+
+    if (startMode === "exact" && endMode === "exact" && body.time_start === body.time_end)
+      return "Start and end time cannot be the same";
+
     if (!Array.isArray(body.device_ids) || body.device_ids.length === 0) return "Select at least one device";
     return null;
   }
@@ -529,12 +569,22 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       if (err) { res.status(400).json({ error: err }); return; }
 
       const turnOff = sb.turn_off_at_end ?? false;
-      const name = `Schedule ${sb.time_start} – ${sb.time_end}${turnOff ? " (off at end)" : ""}`;
+      const startMode = sb.start_mode ?? "exact";
+      const endMode = sb.end_mode ?? "exact";
+      const startLabel = formatTimeLabel(startMode, sb.time_start, sb.start_prayer, sb.start_prayer_offset);
+      const endLabel = formatTimeLabel(endMode, sb.time_end, sb.end_prayer, sb.end_prayer_offset);
+      const name = `Schedule ${startLabel} – ${endLabel}${turnOff ? " (off at end)" : ""}`;
       const actionOff = turnOff ? '{"power":"off"}' : null;
       const result = await pool.query(
-        `INSERT INTO automations (name, enabled, automation_type, time_start, time_end, turn_off_at_end, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
-         VALUES ($1, $2, 'schedule', $3, $4, $5, $6, $7, $8, $9, '{"power":"on"}', $10, 60) RETURNING *`,
-        [name, sb.enabled ?? true, sb.time_start, sb.time_end, turnOff, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, actionOff],
+        `INSERT INTO automations (name, enabled, automation_type, time_start, time_end, turn_off_at_end,
+         start_mode, start_prayer, start_prayer_offset, end_mode, end_prayer, end_prayer_offset,
+         device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
+         VALUES ($1, $2, 'schedule', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, '{"power":"on"}', $16, 60) RETURNING *`,
+        [name, sb.enabled ?? true,
+         startMode === "exact" ? sb.time_start : null, endMode === "exact" ? sb.time_end : null, turnOff,
+         startMode, startMode === "prayer" ? sb.start_prayer : null, startMode === "prayer" ? sb.start_prayer_offset : null,
+         endMode, endMode === "prayer" ? sb.end_prayer : null, endMode === "prayer" ? sb.end_prayer_offset : null,
+         sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, actionOff],
       );
       res.json({ automation: result.rows[0] });
     } else {
@@ -566,14 +616,25 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       if (err) { res.status(400).json({ error: err }); return; }
 
       const turnOff = sb.turn_off_at_end ?? false;
-      const name = `Schedule ${sb.time_start} – ${sb.time_end}${turnOff ? " (off at end)" : ""}`;
+      const startMode = sb.start_mode ?? "exact";
+      const endMode = sb.end_mode ?? "exact";
+      const startLabel = formatTimeLabel(startMode, sb.time_start, sb.start_prayer, sb.start_prayer_offset);
+      const endLabel = formatTimeLabel(endMode, sb.time_end, sb.end_prayer, sb.end_prayer_offset);
+      const name = `Schedule ${startLabel} – ${endLabel}${turnOff ? " (off at end)" : ""}`;
       const actionOff = turnOff ? '{"power":"off"}' : null;
       const result = await pool.query(
-        `UPDATE automations SET name=$1, enabled=$2, automation_type='schedule', time_start=$3, time_end=$4, turn_off_at_end=$5,
+        `UPDATE automations SET name=$1, enabled=$2, automation_type='schedule',
+         time_start=$3, time_end=$4, turn_off_at_end=$5,
+         start_mode=$6, start_prayer=$7, start_prayer_offset=$8,
+         end_mode=$9, end_prayer=$10, end_prayer_offset=$11,
          metric=NULL, condition=NULL, threshold=NULL, sustained_minutes=0,
-         action_off=$6, device_id=$7, device_name=$8, device_ids=$9, device_names=$10
-         WHERE id=$11 RETURNING *`,
-        [name, sb.enabled ?? true, sb.time_start, sb.time_end, turnOff, actionOff, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, id],
+         action_off=$12, device_id=$13, device_name=$14, device_ids=$15, device_names=$16
+         WHERE id=$17 RETURNING *`,
+        [name, sb.enabled ?? true,
+         startMode === "exact" ? sb.time_start : null, endMode === "exact" ? sb.time_end : null, turnOff,
+         startMode, startMode === "prayer" ? sb.start_prayer : null, startMode === "prayer" ? sb.start_prayer_offset : null,
+         endMode, endMode === "prayer" ? sb.end_prayer : null, endMode === "prayer" ? sb.end_prayer_offset : null,
+         actionOff, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, id],
       );
       if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
       res.json({ automation: result.rows[0] });
@@ -587,6 +648,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const result = await pool.query(
         `UPDATE automations SET name=$1, enabled=$2, automation_type='metric', metric=$3, condition=$4, threshold=$5, sustained_minutes=$6,
          time_start=NULL, time_end=NULL, turn_off_at_end=false, action_off=NULL,
+         start_mode='exact', start_prayer=NULL, start_prayer_offset=NULL,
+         end_mode='exact', end_prayer=NULL, end_prayer_offset=NULL,
          device_id=$7, device_name=$8, device_ids=$9, device_names=$10
          WHERE id=$11 RETURNING *`,
         [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mins, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, id],

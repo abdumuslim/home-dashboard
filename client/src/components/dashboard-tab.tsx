@@ -72,7 +72,7 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
   };
 
   return (
-    <div className="max-w-[1440px] mx-auto px-5 pt-2 pb-8">
+    <div className="max-w-[1536px] mx-auto px-5 pt-2 pb-8">
       {visibleOrder.map((id, idx) => (
         <SectionWrapper
           key={id}

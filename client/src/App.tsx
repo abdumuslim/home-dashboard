@@ -47,7 +47,7 @@ function AppInner() {
         onLogout={logout}
       />
 
-      <div className="max-w-[1440px] mx-auto px-5 pt-8 pb-2">
+      <div className="max-w-[1536px] mx-auto px-5 pt-8 pb-2">
         <h1 className="text-3xl font-medium tracking-wide text-white">Home Dashboard</h1>
       </div>
 

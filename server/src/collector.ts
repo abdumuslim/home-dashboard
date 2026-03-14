@@ -127,6 +127,12 @@ interface AutomationRule {
   device_names: string[] | null;
   turn_off_at_end: boolean;
   sustained_minutes: number;
+  start_mode: "exact" | "prayer";
+  start_prayer: string | null;
+  start_prayer_offset: number | null;
+  end_mode: "exact" | "prayer";
+  end_prayer: string | null;
+  end_prayer_offset: number | null;
   action_on: PurifierAction;
   action_off: PurifierAction | null;
   cooldown_secs: number;
@@ -370,11 +376,7 @@ export class Collector {
     }
 
     // Check prayer alerts (cache PrayerTimes per day — changes only at midnight)
-    if (dateKey !== this.cachedPrayerDateKey) {
-      this.cachedPrayerTimes = new PrayerTimes(BAGHDAD_COORDS, now, PRAYER_PARAMS);
-      this.cachedPrayerDateKey = dateKey;
-    }
-    const pt = this.cachedPrayerTimes!;
+    const pt = this.ensurePrayerTimesForToday();
     const nowMs = now.getTime();
 
     for (const rule of this.alertRules) {
@@ -450,6 +452,28 @@ export class Collector {
         log.error(`[collector] Push failed (${status}):`, (err as Error).message);
       }
     }
+  }
+
+  // ---------- Prayer Time Helpers ----------
+
+  private ensurePrayerTimesForToday(): PrayerTimes {
+    const dateKey = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
+    if (dateKey !== this.cachedPrayerDateKey) {
+      this.cachedPrayerTimes = new PrayerTimes(BAGHDAD_COORDS, new Date(), PRAYER_PARAMS);
+      this.cachedPrayerDateKey = dateKey;
+    }
+    return this.cachedPrayerTimes!;
+  }
+
+  private resolvePrayerMinutes(prayer: string, offset: number): number | null {
+    const pt = this.ensurePrayerTimesForToday();
+    const raw = pt[prayer as keyof PrayerTimes] as Date | undefined;
+    if (!(raw instanceof Date)) return null;
+    const rounded = roundPrayerTime(raw, prayer);
+    const bStr = rounded.toLocaleString("en-US", { timeZone: "Asia/Baghdad" });
+    const bd = new Date(bStr);
+    const mins = bd.getHours() * 60 + bd.getMinutes();
+    return ((mins + offset) % 1440 + 1440) % 1440;
   }
 
   // ---------- Automations ----------
@@ -579,12 +603,18 @@ export class Collector {
   }
 
   private async checkScheduleAutomation(rule: AutomationRule): Promise<void> {
-    if (!rule.time_start || !rule.time_end) return;
+    const startMinutes = rule.start_mode === "prayer" && rule.start_prayer
+      ? this.resolvePrayerMinutes(rule.start_prayer, rule.start_prayer_offset ?? 0)
+      : rule.time_start ? parseTimeToMinutes(rule.time_start) : null;
+
+    const endMinutes = rule.end_mode === "prayer" && rule.end_prayer
+      ? this.resolvePrayerMinutes(rule.end_prayer, rule.end_prayer_offset ?? 0)
+      : rule.time_end ? parseTimeToMinutes(rule.time_end) : null;
+
+    if (startMinutes == null || endMinutes == null) return;
 
     const baghdadNow = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Baghdad" }));
     const nowMinutes = baghdadNow.getHours() * 60 + baghdadNow.getMinutes();
-    const startMinutes = parseTimeToMinutes(rule.time_start);
-    const endMinutes = parseTimeToMinutes(rule.time_end);
 
     // Handle overnight ranges (e.g., 22:00 → 07:00)
     const inWindow = startMinutes <= endMinutes

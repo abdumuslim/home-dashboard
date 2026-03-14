@@ -48,11 +48,23 @@ function formatTimeAmPm(time: string): string {
   return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
 }
 
+function formatPrayerLabel(mode: string | undefined, time: string | null, prayer: string | null, offset: number | null): string {
+  if (mode === "prayer" && prayer) {
+    const abs = Math.abs(offset ?? 0);
+    const dir = (offset ?? 0) < 0 ? "before" : (offset ?? 0) > 0 ? "after" : "at";
+    const label = PRAYER_LABELS[prayer] ?? prayer;
+    return abs > 0 ? `${abs}m ${dir} ${label}` : label;
+  }
+  return time ?? "??:??";
+}
+
 function describeTrigger(r: AutomationRule): string {
   const names = (r.device_names ?? [r.device_name]).join(", ");
   if (r.automation_type === "schedule") {
     const off = r.turn_off_at_end ? " (off)" : "";
-    return `${r.time_start} – ${r.time_end}${off} → ${names}`;
+    const startLabel = formatPrayerLabel(r.start_mode, r.time_start, r.start_prayer, r.start_prayer_offset);
+    const endLabel = formatPrayerLabel(r.end_mode, r.time_end, r.end_prayer, r.end_prayer_offset);
+    return `${startLabel} – ${endLabel}${off} → ${names}`;
   }
   const m = r.metric ? ALERT_METRICS[r.metric] : null;
   const label = m?.label ?? r.metric ?? "";
@@ -732,6 +744,20 @@ function AutomationTriggerForm({ devices, editing, onSave, onCancel }: {
   const [timeStart, setTimeStart] = useState(editing?.time_start ?? "22:00");
   const [timeEnd, setTimeEnd] = useState(editing?.time_end ?? "07:00");
   const [turnOffAtEnd, setTurnOffAtEnd] = useState(editing?.turn_off_at_end ?? false);
+  // Start prayer-relative
+  const [startMode, setStartMode] = useState<"exact" | "prayer">(editing?.start_mode ?? "exact");
+  const [startPrayer, setStartPrayer] = useState(editing?.start_prayer ?? "isha");
+  const [startOffsetDir, setStartOffsetDir] = useState<"before" | "after">(
+    () => (editing?.start_prayer_offset ?? 0) < 0 ? "before" : "after",
+  );
+  const [startOffsetMin, setStartOffsetMin] = useState(() => String(Math.abs(editing?.start_prayer_offset ?? 0)));
+  // End prayer-relative
+  const [endMode, setEndMode] = useState<"exact" | "prayer">(editing?.end_mode ?? "exact");
+  const [endPrayer, setEndPrayer] = useState(editing?.end_prayer ?? "fajr");
+  const [endOffsetDir, setEndOffsetDir] = useState<"before" | "after">(
+    () => (editing?.end_prayer_offset ?? 0) < 0 ? "before" : "after",
+  );
+  const [endOffsetMin, setEndOffsetMin] = useState(() => String(Math.abs(editing?.end_prayer_offset ?? 30)));
   // Shared state
   const [selectedDevices, setSelectedDevices] = useState<Set<string>>(() => {
     const ids = editing?.device_ids ?? (editing ? [editing.device_id] : null);
@@ -745,7 +771,15 @@ function AutomationTriggerForm({ devices, editing, onSave, onCancel }: {
   const thresholdValid = metricDef && threshold !== "" && isFinite(thresholdNum) && thresholdNum >= metricDef.min && thresholdNum <= metricDef.max;
 
   const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
-  const timeValid = timeRegex.test(timeStart) && timeRegex.test(timeEnd) && timeStart !== timeEnd;
+  const prayerNames = PRAYER_NAMES as readonly string[];
+  const startValid = startMode === "exact"
+    ? timeRegex.test(timeStart)
+    : prayerNames.includes(startPrayer) && parseInt(startOffsetMin) >= 0 && parseInt(startOffsetMin) <= 120;
+  const endValid = endMode === "exact"
+    ? timeRegex.test(timeEnd)
+    : prayerNames.includes(endPrayer) && parseInt(endOffsetMin) >= 0 && parseInt(endOffsetMin) <= 120;
+  const timeValid = startValid && endValid
+    && !(startMode === "exact" && endMode === "exact" && timeStart === timeEnd);
 
   const canSaveMetric = automationType === "metric" && metric !== "" && condition !== "" && thresholdValid && selectedDevices.size > 0;
   const canSaveSchedule = automationType === "schedule" && timeValid && selectedDevices.size > 0;
@@ -839,37 +873,98 @@ function AutomationTriggerForm({ devices, editing, onSave, onCancel }: {
       {/* Schedule path */}
       {automationType === "schedule" && (
         <>
-          <div className="flex gap-2 items-center">
-            <div className="flex-1">
-              <label className="text-xs text-dim block mb-1">From</label>
-              <input
-                type="time"
-                step={60}
-                value={timeStart}
-                onChange={(e) => setTimeStart(e.target.value)}
-                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
-              />
-              <span className="text-[10px] text-dim mt-0.5 block">{formatTimeAmPm(timeStart)}</span>
+          {/* From */}
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs text-dim">From</label>
+            <div className="flex gap-1">
+              {(["exact", "prayer"] as const).map((m) => (
+                <button key={m} onClick={() => setStartMode(m)} className={cn(
+                  "px-2 py-0.5 rounded text-[10px] border transition-colors",
+                  startMode === m ? "border-cyan/50 bg-cyan/10 text-cyan" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                )}>
+                  {m === "exact" ? "Time" : "Prayer"}
+                </button>
+              ))}
             </div>
-            <span className="text-dim text-sm mt-2">–</span>
-            <div className="flex-1">
-              <label className="text-xs text-dim block mb-1">To</label>
-              <input
-                type="time"
-                step={60}
-                value={timeEnd}
-                onChange={(e) => setTimeEnd(e.target.value)}
-                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
-              />
-              <span className="text-[10px] text-dim mt-0.5 block">{formatTimeAmPm(timeEnd)}</span>
-            </div>
+            {startMode === "exact" ? (
+              <>
+                <input type="time" step={60} value={timeStart} onChange={(e) => setTimeStart(e.target.value)}
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]" />
+                <span className="text-[10px] text-dim">{formatTimeAmPm(timeStart)}</span>
+              </>
+            ) : (
+              <>
+                <select value={startPrayer} onChange={(e) => setStartPrayer(e.target.value)}
+                  className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50">
+                  {PRAYER_NAMES.map((p) => <option key={p} value={p} className="bg-[#1a1a2e]">{PRAYER_LABELS[p]}</option>)}
+                </select>
+                <div className="flex items-center gap-1.5">
+                  {(["before", "after"] as const).map((d) => (
+                    <button key={d} onClick={() => setStartOffsetDir(d)} className={cn(
+                      "px-2 py-0.5 rounded text-[10px] border transition-colors",
+                      startOffsetDir === d ? "border-cyan/50 bg-cyan/10 text-cyan" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                    )}>
+                      {d}
+                    </button>
+                  ))}
+                  <input type="number" value={startOffsetMin} onChange={(e) => setStartOffsetMin(e.target.value)}
+                    min={0} max={120}
+                    className="w-14 bg-white/5 border border-white/10 rounded-lg px-2 py-0.5 text-sm text-text outline-none focus:border-cyan/50 text-center" />
+                  <span className="text-[10px] text-dim">min</span>
+                </div>
+              </>
+            )}
           </div>
+
+          {/* To */}
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs text-dim">To</label>
+            <div className="flex gap-1">
+              {(["exact", "prayer"] as const).map((m) => (
+                <button key={m} onClick={() => setEndMode(m)} className={cn(
+                  "px-2 py-0.5 rounded text-[10px] border transition-colors",
+                  endMode === m ? "border-cyan/50 bg-cyan/10 text-cyan" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                )}>
+                  {m === "exact" ? "Time" : "Prayer"}
+                </button>
+              ))}
+            </div>
+            {endMode === "exact" ? (
+              <>
+                <input type="time" step={60} value={timeEnd} onChange={(e) => setTimeEnd(e.target.value)}
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50 [color-scheme:dark]" />
+                <span className="text-[10px] text-dim">{formatTimeAmPm(timeEnd)}</span>
+              </>
+            ) : (
+              <>
+                <select value={endPrayer} onChange={(e) => setEndPrayer(e.target.value)}
+                  className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50">
+                  {PRAYER_NAMES.map((p) => <option key={p} value={p} className="bg-[#1a1a2e]">{PRAYER_LABELS[p]}</option>)}
+                </select>
+                <div className="flex items-center gap-1.5">
+                  {(["before", "after"] as const).map((d) => (
+                    <button key={d} onClick={() => setEndOffsetDir(d)} className={cn(
+                      "px-2 py-0.5 rounded text-[10px] border transition-colors",
+                      endOffsetDir === d ? "border-cyan/50 bg-cyan/10 text-cyan" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                    )}>
+                      {d}
+                    </button>
+                  ))}
+                  <input type="number" value={endOffsetMin} onChange={(e) => setEndOffsetMin(e.target.value)}
+                    min={0} max={120}
+                    className="w-14 bg-white/5 border border-white/10 rounded-lg px-2 py-0.5 text-sm text-text outline-none focus:border-cyan/50 text-center" />
+                  <span className="text-[10px] text-dim">min</span>
+                </div>
+              </>
+            )}
+          </div>
+
           <label className="flex items-center gap-1.5 cursor-pointer text-xs text-dim">
             <span className={cn("w-3.5 h-3.5 rounded border flex items-center justify-center", turnOffAtEnd ? "border-cyan bg-cyan/20" : "border-dim")}>
               {turnOffAtEnd && <span className="text-cyan text-[10px]">&#10003;</span>}
             </span>
             <input type="checkbox" checked={turnOffAtEnd} onChange={(e) => setTurnOffAtEnd(e.target.checked)} className="sr-only" />
-            <span className={turnOffAtEnd ? "text-text" : ""}>Turn off at end time</span>
+            <span className={turnOffAtEnd ? "text-text" : ""}>Turn off at end</span>
           </label>
         </>
       )}
@@ -890,7 +985,24 @@ function AutomationTriggerForm({ devices, editing, onSave, onCancel }: {
             const ids = Array.from(selectedDevices);
             const names = ids.map((id) => devices.find((d) => d.id === id)?.name ?? id);
             if (automationType === "schedule") {
-              await onSave({ automation_type: "schedule", time_start: timeStart, time_end: timeEnd, turn_off_at_end: turnOffAtEnd, device_ids: ids, device_names: names });
+              await onSave({
+                automation_type: "schedule",
+                time_start: startMode === "exact" ? timeStart : null,
+                time_end: endMode === "exact" ? timeEnd : null,
+                start_mode: startMode,
+                start_prayer: startMode === "prayer" ? startPrayer : null,
+                start_prayer_offset: startMode === "prayer"
+                  ? (startOffsetDir === "before" ? -parseInt(startOffsetMin) : parseInt(startOffsetMin))
+                  : null,
+                end_mode: endMode,
+                end_prayer: endMode === "prayer" ? endPrayer : null,
+                end_prayer_offset: endMode === "prayer"
+                  ? (endOffsetDir === "before" ? -parseInt(endOffsetMin) : parseInt(endOffsetMin))
+                  : null,
+                turn_off_at_end: turnOffAtEnd,
+                device_ids: ids,
+                device_names: names,
+              });
             } else {
               const mins = parseInt(sustainedMinutes, 10);
               await onSave({ metric, condition, threshold: thresholdNum, sustained_minutes: isFinite(mins) && mins > 0 ? mins : 0, device_ids: ids, device_names: names });

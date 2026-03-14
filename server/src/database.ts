@@ -102,6 +102,13 @@ const MIGRATIONS: string[] = [
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS turn_off_at_end BOOLEAN NOT NULL DEFAULT false",
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS sustained_minutes INTEGER NOT NULL DEFAULT 0",
   "UPDATE automations SET action_off = NULL WHERE automation_type = 'metric'",
+  // Prayer-relative schedule times
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS start_mode TEXT NOT NULL DEFAULT 'exact'",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS start_prayer TEXT",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS start_prayer_offset INTEGER",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS end_mode TEXT NOT NULL DEFAULT 'exact'",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS end_prayer TEXT",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS end_prayer_offset INTEGER",
   `CREATE TABLE IF NOT EXISTS power_readings (
     ts          TIMESTAMPTZ PRIMARY KEY,
     voltage     REAL NOT NULL,
