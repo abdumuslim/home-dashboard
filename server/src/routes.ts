@@ -99,7 +99,15 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   });
 
   // Lightweight power-only endpoint for 1s polling
+  // Returns null if no reading received in 15s (ESP sends every 5s — 3 missed = no electricity)
   router.get("/api/current/power", (_req: Request, res: Response) => {
+    if (latestPower) {
+      const age = Date.now() - new Date(latestPower.ts).getTime();
+      if (age > 15_000) {
+        res.json(null);
+        return;
+      }
+    }
     res.json(latestPower);
   });
 

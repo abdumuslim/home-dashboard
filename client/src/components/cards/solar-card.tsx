@@ -1,6 +1,6 @@
-import { useMemo, useState, useEffect, memo } from "react";
+import { useMemo, memo } from "react";
 import { Chart } from "react-chartjs-2";
-import { Sun, CloudSun, Cloud, Maximize2 } from "lucide-react";
+import { Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
 import { useUnits } from "@/hooks/use-units";
@@ -8,6 +8,7 @@ import { useChartsVisible } from "@/hooks/use-charts-visible";
 import { fmt, getStatus } from "@/constants/thresholds";
 import { convertSolar } from "@/constants/units";
 import { getBucketMs, bucketAverage, bucketMax, expandedChartOptions } from "@/constants/chart-utils";
+import { getSkyCondition } from "@/constants/sky-condition";
 import type { WeatherReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
 const UV_COLORS: Record<string, string> = {
@@ -21,48 +22,12 @@ const UV_COLORS: Record<string, string> = {
 interface SolarCardProps {
   radiation: number | null | undefined;
   uvIndex: number | null | undefined;
+  rainHourlyMm: number | null | undefined;
+  humidity: number | null | undefined;
+  dewPointC: number | null | undefined;
+  tempC: number | null | undefined;
   weatherHistory?: WeatherReading[];
   openOverlay: OpenOverlayFn;
-}
-
-interface SkyResult { label: string; Icon: typeof Sun; color: string }
-
-function getSkyCondition(
-  radiation: number | null | undefined,
-  ref: number | null,
-  history: WeatherReading[],
-): SkyResult | null {
-  if (ref == null || ref < 1 || radiation == null) return null;
-  const level = radiation / ref;
-  const now = Date.now();
-  const pts = history
-    .filter((r) => r.solar_radiation != null && now - new Date(r.ts).getTime() <= 600000)
-    .map((r) => ({ t: new Date(r.ts).getTime(), v: r.solar_radiation as number }))
-    .sort((a, b) => a.t - b.t);
-
-  let variability = 0;
-  if (pts.length >= 3) {
-    const first = pts[0], last = pts[pts.length - 1];
-    const dt = last.t - first.t;
-    const slope = dt > 0 ? (last.v - first.v) / dt : 0;
-    let maxDev = 0;
-    for (const pt of pts) {
-      const expected = first.v + slope * (pt.t - first.t);
-      maxDev = Math.max(maxDev, Math.abs(pt.v - expected));
-    }
-    variability = ref > 0 ? maxDev / ref : 0;
-  }
-
-  if (level > 0.7) {
-    if (variability < 0.15) return { label: "Sunny", Icon: Sun, color: "#ffc107" };
-    return { label: "Partly Cloudy", Icon: CloudSun, color: "#fbbf24" };
-  }
-  if (level > 0.4) {
-    if (variability < 0.15) return { label: "Partly Cloudy", Icon: CloudSun, color: "#fbbf24" };
-    return { label: "Mostly Cloudy", Icon: Cloud, color: "#94a3b8" };
-  }
-  if (level > 0.15) return { label: "Mostly Cloudy", Icon: Cloud, color: "#94a3b8" };
-  return { label: "Overcast", Icon: Cloud, color: "#64748b" };
 }
 
 function ExpandedSolarChart({ range, weatherHistory }: { range: TimeRange; weatherHistory: WeatherReading[] }) {
@@ -132,7 +97,7 @@ function ExpandedSolarChart({ range, weatherHistory }: { range: TimeRange; weath
   return <div className="h-full"><Chart type="line" data={data} options={options} /></div>;
 }
 
-export const SolarCard = memo(function SolarCard({ radiation, uvIndex, weatherHistory = [], openOverlay }: SolarCardProps) {
+export const SolarCard = memo(function SolarCard({ radiation, uvIndex, rainHourlyMm, humidity, dewPointC, tempC, weatherHistory = [], openOverlay }: SolarCardProps) {
   const { fmtSolar, solarLabel, units: { solar: solarUnit } } = useUnits();
   const { chartsVisible } = useChartsVisible();
   const flashRad = useFlash(radiation != null ? fmtSolar(radiation) : null);
@@ -141,37 +106,7 @@ export const SolarCard = memo(function SolarCard({ radiation, uvIndex, weatherHi
   const uvStatus = getStatus("uv", uvIndex);
   const uvColor = uvStatus.level ? UV_COLORS[uvStatus.level] : "#7a8ba8";
 
-  const [quarterMax, setQuarterMax] = useState<Record<string, number> | null>(null);
-
-  useEffect(() => {
-    let mounted = true;
-    const fetchRef = async () => {
-      try {
-        const res = await fetch("/api/solar-reference");
-        const data = await res.json();
-        if (mounted) setQuarterMax(data.quarter_hourly_max);
-      } catch { /* ignore */ }
-    };
-    fetchRef();
-    const id = setInterval(fetchRef, 300000);
-    return () => { mounted = false; clearInterval(id); };
-  }, []);
-
-  const now = new Date();
-  const h = now.getHours();
-  const slot5 = Math.floor(now.getMinutes() / 5);
-  const getRef = (qm: Record<string, number>): number | null => {
-    const key = `${h}:${slot5}`;
-    if (key in qm) return qm[key];
-    for (const adj of [slot5 - 1, slot5 + 1]) {
-      const adjH = adj < 0 ? h - 1 : adj > 11 ? h + 1 : h;
-      const adjS = ((adj % 12) + 12) % 12;
-      const adjKey = `${adjH}:${adjS}`;
-      if (adjKey in qm) return qm[adjKey];
-    }
-    return null;
-  };
-  const sky = getSkyCondition(radiation, quarterMax ? getRef(quarterMax) : null, weatherHistory);
+  const sky = getSkyCondition(radiation, rainHourlyMm, humidity, dewPointC, tempC, weatherHistory);
 
   const { peakRad, peakUv, peakUvColor } = useMemo(() => {
     const midnight = new Date();

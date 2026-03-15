@@ -175,9 +175,10 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
     ? ((power?.current_1 ?? 0) >= (power?.current_2 ?? 0) ? "grid" : "gen")
     : gridActive ? "grid" : genActive ? "gen" : null;
 
+  const noData = !power;
   const heroPower = activeSource === "grid" ? power?.power_1 : activeSource === "gen" ? power?.power_2 : null;
   const heroCurrent = activeSource === "grid" ? power?.current_1 : activeSource === "gen" ? power?.current_2 : null;
-  const heroColor = activeSource === "grid" ? GRID_COLOR : activeSource === "gen" ? GEN_COLOR : "#7a8ba8";
+  const heroColor = noData ? "#ffffff" : activeSource === "grid" ? GRID_COLOR : activeSource === "gen" ? GEN_COLOR : "#7a8ba8";
 
   // Only flash on source change, not on every wattage fluctuation
   const flash = useFlash(activeSource);
@@ -263,7 +264,7 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
               className="text-2xl md:text-3xl font-semibold leading-none tracking-tight"
               style={{ color: heroColor }}
             >
-              {heroPower != null ? (heroPower / 1000).toFixed(2) : "--"}
+              {noData ? "0.00" : heroPower != null ? (heroPower / 1000).toFixed(2) : "--"}
               <span className="text-sm text-dim ml-1">kW</span>
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Power</span>
@@ -274,7 +275,7 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
               className="text-2xl md:text-3xl font-semibold leading-none tracking-tight"
               style={{ color: heroColor }}
             >
-              {fmt(power?.voltage, 0)}
+              {noData ? "0" : fmt(power?.voltage, 0)}
               <span className="text-sm text-dim ml-1">V</span>
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Voltage</span>
@@ -285,7 +286,7 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
               className="text-2xl md:text-3xl font-semibold leading-none tracking-tight"
               style={{ color: heroColor }}
             >
-              {heroCurrent != null ? fmt(heroCurrent, 1) : "--"}
+              {noData ? "0.0" : heroCurrent != null ? fmt(heroCurrent, 1) : "--"}
               <span className="text-sm text-dim ml-1">A</span>
             </span>
             <span className="text-[0.75rem] text-text font-medium mt-1">Current</span>

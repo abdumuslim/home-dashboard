@@ -43,7 +43,7 @@ export function useCurrentData() {
       try {
         const res = await fetch("/api/current/power");
         const json: PowerReading | null = await res.json();
-        if (mounted && json) {
+        if (mounted) {
           setData((prev) => {
             prevRef.current = prev;
             return { ...prev, power: json };

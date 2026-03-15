@@ -44,6 +44,10 @@ export function OutdoorSection({ weather, weatherHistory, openOverlay }: Outdoor
       <SolarCard
         radiation={weather?.solar_radiation}
         uvIndex={weather?.uv_index}
+        rainHourlyMm={weather?.rain_hourly_mm}
+        humidity={weather?.humidity}
+        dewPointC={weather?.dew_point_c}
+        tempC={weather?.temp_c}
         weatherHistory={weatherHistory}
         openOverlay={openOverlay}
       />
