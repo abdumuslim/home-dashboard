@@ -1,25 +1,15 @@
-import {
-  Sun,
-  CloudSun,
-  Cloud,
-  Cloudy,
-  CloudDrizzle,
-  CloudRain,
-  MoonStar,
-  CloudMoon,
-} from "lucide-react";
 import { getClearSky } from "./solar-model";
 import type { WeatherReading } from "@/types/api";
 
 export interface SkyResult {
   label: string;
-  Icon: typeof Sun;
+  icon: string;
   color: string;
 }
 
 /**
  * Determine sky condition from current weather readings + theoretical clear-sky model.
- * Returns one of 8 states, each with a unique icon.
+ * Returns one of 8 states, each with a unique animated Meteocon SVG.
  */
 export function getSkyCondition(
   radiation: number | null | undefined,
@@ -33,8 +23,8 @@ export function getSkyCondition(
   // Rain overrides everything (check first)
   if (rainHourlyMm != null && rainHourlyMm > 0) {
     if (rainHourlyMm > 2.5)
-      return { label: "Heavy Rain", Icon: CloudRain, color: "#1976d2" };
-    return { label: "Light Rain", Icon: CloudDrizzle, color: "#2196ff" };
+      return { label: "Heavy Rain", icon: "/weather-icons/rain.svg", color: "#1976d2" };
+    return { label: "Light Rain", icon: "/weather-icons/drizzle.svg", color: "#2196ff" };
   }
 
   const { clearSkyGHI, isNight } = getClearSky(date);
@@ -47,9 +37,9 @@ export function getSkyCondition(
       (humidity != null && humidity >= 70) ||
       (dewSpread != null && dewSpread < 4)
     ) {
-      return { label: "Cloudy Night", Icon: CloudMoon, color: "#64748b" };
+      return { label: "Cloudy Night", icon: "/weather-icons/overcast-night.svg", color: "#c0c7d0" };
     }
-    return { label: "Clear Night", Icon: MoonStar, color: "#a78bfa" };
+    return { label: "Clear Night", icon: "/weather-icons/clear-night.svg", color: "#a78bfa" };
   }
 
   // Daytime: need radiation and a valid reference
@@ -87,15 +77,15 @@ export function getSkyCondition(
   // Classification
   if (level > 0.7) {
     if (variability < 0.15)
-      return { label: "Sunny", Icon: Sun, color: "#ffc107" };
-    return { label: "Partly Cloudy", Icon: CloudSun, color: "#fbbf24" };
+      return { label: "Sunny", icon: "/weather-icons/clear-day.svg", color: "#ffc107" };
+    return { label: "Partly Cloudy", icon: "/weather-icons/partly-cloudy-day.svg", color: "#fbbf24" };
   }
   if (level > 0.4) {
     if (variability < 0.15)
-      return { label: "Partly Cloudy", Icon: CloudSun, color: "#fbbf24" };
-    return { label: "Mostly Cloudy", Icon: Cloud, color: "#94a3b8" };
+      return { label: "Partly Cloudy", icon: "/weather-icons/partly-cloudy-day.svg", color: "#fbbf24" };
+    return { label: "Mostly Cloudy", icon: "/weather-icons/overcast-day.svg", color: "#d1d5db" };
   }
   if (level > 0.15)
-    return { label: "Mostly Cloudy", Icon: Cloud, color: "#94a3b8" };
-  return { label: "Cloudy", Icon: Cloudy, color: "#64748b" };
+    return { label: "Mostly Cloudy", icon: "/weather-icons/overcast-day.svg", color: "#d1d5db" };
+  return { label: "Cloudy", icon: "/weather-icons/cloudy.svg", color: "#c0c7d0" };
 }

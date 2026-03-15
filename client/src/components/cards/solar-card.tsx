@@ -251,7 +251,7 @@ export const SolarCard = memo(function SolarCard({ radiation, uvIndex, rainHourl
 
           {sky && (
             <div className="flex flex-col items-center ml-auto self-center">
-              <sky.Icon className="w-7 h-7" style={{ color: sky.color }} strokeWidth={1.8} />
+              <img src={sky.icon} alt={sky.label} className="w-16 h-16 -my-3" />
               <span className="text-[0.65rem] text-dim mt-0.5">{sky.label}</span>
             </div>
           )}
