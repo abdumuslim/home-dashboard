@@ -34,8 +34,8 @@ export function getSkyCondition(
     const dewSpread =
       tempC != null && dewPointC != null ? tempC - dewPointC : null;
     if (
-      (humidity != null && humidity >= 70) ||
-      (dewSpread != null && dewSpread < 4)
+      (humidity != null && humidity >= 85) ||
+      (dewSpread != null && dewSpread < 2.5)
     ) {
       return { label: "Cloudy Night", icon: "/weather-icons/overcast-night.svg", color: "#c0c7d0" };
     }
@@ -66,12 +66,17 @@ export function getSkyCondition(
       last = pts[pts.length - 1];
     const dt = last.t - first.t;
     const slope = dt > 0 ? (last.v - first.v) / dt : 0;
-    let maxDev = 0;
+    let sumSq = 0;
     for (const pt of pts) {
       const expected = first.v + slope * (pt.t - first.t);
-      maxDev = Math.max(maxDev, Math.abs(pt.v - expected));
+      const dev = pt.v - expected;
+      sumSq += dev * dev;
     }
-    variability = clearSkyGHI > 0 ? maxDev / clearSkyGHI : 0;
+    const rmsDev = Math.sqrt(sumSq / pts.length);
+    // Below 15 W/m² RMS = sensor noise at any time of day
+    if (rmsDev > 15) {
+      variability = rmsDev / Math.max(clearSkyGHI, 200);
+    }
   }
 
   // Classification

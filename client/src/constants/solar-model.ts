@@ -48,10 +48,10 @@ export function getClearSky(date: Date = new Date()): ClearSkyResult {
     return { clearSkyGHI: 0, solarElevation: elevation, isNight: true };
   }
 
-  // Haurwitz clear-sky model
+  // Haurwitz clear-sky model (calibrated for Baghdad's dusty atmosphere)
   const zenith = (90 - elevation) * DEG;
   const cosZ = Math.cos(zenith);
-  const ghi = 1098 * cosZ * Math.exp(-0.057 / cosZ);
+  const ghi = 1250 * cosZ * Math.exp(-0.43 / cosZ);
 
   return {
     clearSkyGHI: Math.max(0, ghi),
