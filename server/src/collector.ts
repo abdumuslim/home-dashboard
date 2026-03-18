@@ -723,7 +723,7 @@ export class Collector {
       humidity: d.humidity ?? null,
       wind_speed_kmh: mph2kmh(d.windspeedmph),
       wind_gust_kmh: mph2kmh(d.windgustmph),
-      max_daily_gust_kmh: mph2kmh(d.maxdailygust),
+      max_daily_gust_kmh: null,
       wind_dir: d.winddir ?? null,
       wind_dir_avg10m: d.winddir_avg10m ?? null,
       pressure_rel_hpa: inhg2hpa(d.baromrelin),

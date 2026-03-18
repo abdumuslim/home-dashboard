@@ -4,6 +4,7 @@ import type { Config } from "./config.js";
 import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
+import type { ForecastResponse } from "./forecast.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus } from "./auth.js";
 
 export function median(arr: number[]): number {
@@ -51,7 +52,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null): Router {
   const router = Router();
 
   // Health check — before auth middleware, no auth required
@@ -62,6 +63,16 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     } catch {
       res.status(503).json({ status: "unhealthy", error: "database unreachable" });
     }
+  });
+
+  // Forecast — public endpoint, before auth middleware
+  router.get("/api/forecast", (_req: Request, res: Response) => {
+    const data = getForecast?.();
+    if (!data) {
+      res.status(503).json({ error: "Forecast not available yet" });
+      return;
+    }
+    res.json(data);
   });
 
   // Auth middleware — sets req.authenticated on every request
@@ -85,14 +96,20 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     const air: Record<string, unknown> | null = getLatestAir?.() ?? null;
     const power = latestPower;
 
-    const [weatherResult, airResult, powerResult] = await Promise.all([
+    const [weatherResult, airResult, powerResult, maxGustResult] = await Promise.all([
       pool.query("SELECT * FROM weather_readings ORDER BY ts DESC LIMIT 1"),
       air ? null : pool.query("SELECT * FROM air_readings ORDER BY ts DESC LIMIT 1"),
       power ? null : pool.query("SELECT * FROM power_readings ORDER BY ts DESC LIMIT 1"),
+      pool.query("SELECT MAX(wind_gust_kmh) as max_gust FROM weather_readings WHERE ts >= date_trunc('day', now())"),
     ]);
 
+    const weatherRow = weatherResult.rows[0] ? rowToDict(weatherResult.rows[0]) : null;
+    if (weatherRow) {
+      weatherRow.max_daily_gust_kmh = maxGustResult.rows[0]?.max_gust ?? null;
+    }
+
     res.json({
-      weather: weatherResult.rows[0] ? rowToDict(weatherResult.rows[0]) : null,
+      weather: weatherRow,
       air: air ?? (airResult?.rows[0] ? rowToDict(airResult.rows[0]) : null),
       power: power ?? (powerResult?.rows[0] ? rowToDict(powerResult.rows[0]) as any : null),
     });
