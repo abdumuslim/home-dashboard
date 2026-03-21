@@ -70,7 +70,8 @@ function describeTrigger(r: AutomationRule): string {
   const label = m?.label ?? r.metric ?? "";
   const unit = m?.unit ? ` ${m.unit}` : "";
   const dur = r.sustained_minutes > 0 ? ` for ${r.sustained_minutes}min` : "";
-  return `${label} ${r.condition} ${r.threshold}${unit}${dur} → ${names}`;
+  const off = r.turn_off_at_end ? " (off)" : "";
+  return `${label} ${r.condition} ${r.threshold}${unit}${dur}${off} → ${names}`;
 }
 
 export function AlertsModal({ onClose, isAdmin }: AlertsModalProps) {
@@ -959,15 +960,16 @@ function AutomationTriggerForm({ devices, editing, onSave, onCancel }: {
             )}
           </div>
 
-          <label className="flex items-center gap-1.5 cursor-pointer text-xs text-dim">
-            <span className={cn("w-3.5 h-3.5 rounded border flex items-center justify-center", turnOffAtEnd ? "border-cyan bg-cyan/20" : "border-dim")}>
-              {turnOffAtEnd && <span className="text-cyan text-[10px]">&#10003;</span>}
-            </span>
-            <input type="checkbox" checked={turnOffAtEnd} onChange={(e) => setTurnOffAtEnd(e.target.checked)} className="sr-only" />
-            <span className={turnOffAtEnd ? "text-text" : ""}>Turn off at end</span>
-          </label>
         </>
       )}
+
+      <label className="flex items-center gap-1.5 cursor-pointer text-xs text-dim">
+        <span className={cn("w-3.5 h-3.5 rounded border flex items-center justify-center", turnOffAtEnd ? "border-cyan bg-cyan/20" : "border-dim")}>
+          {turnOffAtEnd && <span className="text-cyan text-[10px]">&#10003;</span>}
+        </span>
+        <input type="checkbox" checked={turnOffAtEnd} onChange={(e) => setTurnOffAtEnd(e.target.checked)} className="sr-only" />
+        <span className={turnOffAtEnd ? "text-text" : ""}>{automationType === "schedule" ? "Turn off at end" : "Turn off when resolved"}</span>
+      </label>
 
       {/* Device selection (shared) */}
       {showDevices && (
@@ -1005,7 +1007,7 @@ function AutomationTriggerForm({ devices, editing, onSave, onCancel }: {
               });
             } else {
               const mins = parseInt(sustainedMinutes, 10);
-              await onSave({ metric, condition, threshold: thresholdNum, sustained_minutes: isFinite(mins) && mins > 0 ? mins : 0, device_ids: ids, device_names: names });
+              await onSave({ metric, condition, threshold: thresholdNum, sustained_minutes: isFinite(mins) && mins > 0 ? mins : 0, turn_off_at_end: turnOffAtEnd, device_ids: ids, device_names: names });
             }
           } catch (err: unknown) {
             setError((err as Error).message);

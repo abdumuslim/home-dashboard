@@ -589,6 +589,18 @@ export class Collector {
     } else if (!conditionMet && state.status === "triggered") {
       // Condition no longer met — only reset after grace period (tolerate brief dips)
       if (state.conditionLostAt != null && now - state.conditionLostAt >= GRACE_MS) {
+        if (rule.turn_off_at_end && rule.action_off) {
+          const deviceIds = rule.device_ids ?? [rule.device_id];
+          for (const did of deviceIds) {
+            try {
+              await this.xiaomiCloud!.executeAction(did, rule.action_off);
+              this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
+            } catch (err) {
+              log.error(`Automation "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
+            }
+          }
+          log.info(`Automation "${rule.name}" condition cleared → turning OFF devices`);
+        }
         this.automationState.set(rule.id, { status: "idle", lastToggle: state.lastToggle, conditionSince: null, conditionLostAt: null });
       }
     }
