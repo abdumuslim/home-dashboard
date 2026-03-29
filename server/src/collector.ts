@@ -459,8 +459,12 @@ export class Collector {
   private ensurePrayerTimesForToday(): PrayerTimes {
     const dateKey = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
     if (dateKey !== this.cachedPrayerDateKey) {
-      this.cachedPrayerTimes = new PrayerTimes(BAGHDAD_COORDS, new Date(), PRAYER_PARAMS);
+      // Parse Baghdad date so adhan's getFullYear/getMonth/getDate return the correct day
+      // regardless of server timezone (VPS is UTC, Baghdad is UTC+3)
+      const [y, m, d] = dateKey.split("-").map(Number);
+      this.cachedPrayerTimes = new PrayerTimes(BAGHDAD_COORDS, new Date(y, m - 1, d, 12, 0, 0), PRAYER_PARAMS);
       this.cachedPrayerDateKey = dateKey;
+      log.debug(`[prayer-cache] Refreshed for ${dateKey}`);
     }
     return this.cachedPrayerTimes!;
   }
