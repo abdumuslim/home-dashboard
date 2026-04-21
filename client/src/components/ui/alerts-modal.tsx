@@ -860,6 +860,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
       horizontal_swing: (presetData as Record<string, unknown>).horizontalSwing,
       fresh_air: (presetData as Record<string, unknown>).freshAir ? 1 : 0,
       generator_mode: (presetData as Record<string, unknown>).generatorMode,
+      _preset_slot: selectedPreset,
     } : undefined;
     const isAcMetric = deviceType === "ac" && automationType === "metric";
     const effectiveTurnOff = isAcMetric ? true : turnOffAtEnd;

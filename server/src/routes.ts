@@ -889,5 +889,35 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     res.json({ ok: true });
   });
 
+  // ---------- Preset Sync ----------
+
+  router.post("/api/ac/preset-sync", requireAuth, async (req: Request, res: Response) => {
+    const { deviceId, slot, presetData } = req.body as { deviceId: string; slot: number; presetData: Record<string, unknown> };
+    if (!deviceId || !slot || !presetData) { res.status(400).json({ error: "deviceId, slot, presetData required" }); return; }
+
+    const actionOn = JSON.stringify({
+      power: 1,
+      mode: presetData.mode,
+      temperature: presetData.targetTemp,
+      fan_speed: presetData.fanSpeed,
+      eco: presetData.eco ? 1 : 0,
+      turbo: presetData.turbo ? 1 : 0,
+      screen: presetData.screen ? 1 : 0,
+      vertical_swing: presetData.verticalSwing,
+      horizontal_swing: presetData.horizontalSwing,
+      fresh_air: presetData.freshAir ? 1 : 0,
+      generator_mode: presetData.generatorMode,
+      _preset_slot: slot,
+    });
+
+    const result = await pool.query(
+      `UPDATE automations SET action_on = $1::jsonb
+       WHERE device_type = 'ac' AND $2 = ANY(device_ids)
+       AND (action_on->>'_preset_slot')::int = $3`,
+      [actionOn, deviceId, slot],
+    );
+    res.json({ ok: true, updated: result.rowCount });
+  });
+
   return router;
 }

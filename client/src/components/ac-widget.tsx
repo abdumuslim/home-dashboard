@@ -57,8 +57,15 @@ function loadPresets(deviceId: string): PresetSlots {
   return { 1: null, 2: null, 3: null, 4: null, 5: null };
 }
 
-function savePresets(deviceId: string, presets: PresetSlots) {
+function savePresets(deviceId: string, presets: PresetSlots, changedSlot?: number) {
   localStorage.setItem(`ac-presets-${deviceId}`, JSON.stringify(presets));
+  if (changedSlot != null && presets[changedSlot]) {
+    fetch("/api/ac/preset-sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId, slot: changedSlot, presetData: presets[changedSlot] }),
+    }).catch(() => {});
+  }
 }
 
 function capturePreset(d: AcDevice): PresetData {
@@ -615,7 +622,7 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                           if (saveMode) {
                             const next = { ...presets, [slot]: capturePreset(d) };
                             setPresets(next);
-                            savePresets(d.id, next);
+                            savePresets(d.id, next, slot);
                             setSaveMode(false);
                           } else if (filled) {
                             setActivePreset(slot);

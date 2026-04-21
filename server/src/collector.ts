@@ -688,6 +688,28 @@ export class Collector {
         } else {
           this.automationState.set(rule.id, state);
         }
+      } else if (now - state.lastToggle >= cooldownMs) {
+        for (const did of deviceIds) {
+          try {
+            const power = await this.getDevicePowerCached(did, "ac");
+            if (power === "on") {
+              if (shouldTurnOff) {
+                log.info(`[collector] AC range "${rule.name}": device ${did} is ON past turn-off limit (${rule.metric}=${value}), turning OFF`);
+                await this.executeAutomationAction(rule, { power: 0 } as AcAction, [did]);
+                this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
+              } else {
+                log.info(`[collector] AC range "${rule.name}": device ${did} is ON in dead zone (${rule.metric}=${value}), adopting and re-enforcing profile`);
+                const { power: _p, ...profileOnly } = rule.action_on as AcAction;
+                await this.tclCloud!.executeAcAction(did, profileOnly);
+                this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
+              }
+            }
+          } catch (err) {
+            log.error(`[collector] AC range "${rule.name}" adopt-check failed for ${did}:`, (err as Error).message);
+          }
+        }
+        state.conditionSince = null;
+        if (state.status === "idle") this.automationState.set(rule.id, state);
       } else {
         state.conditionSince = null;
         this.automationState.set(rule.id, state);
