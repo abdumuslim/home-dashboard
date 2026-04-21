@@ -20,4 +20,5 @@ export interface AcDevice {
   tempStep: number;
   minFanSpeed: number;
   maxFanSpeed: number;
+  beep: boolean;
 }

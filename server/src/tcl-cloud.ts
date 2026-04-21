@@ -41,6 +41,7 @@ export interface AcDevice {
   tempStep: number;
   minFanSpeed: number;
   maxFanSpeed: number;
+  beep: boolean;
 }
 
 interface AuthData {
@@ -269,6 +270,7 @@ export class TclCloud {
       set_turbo: "turbo",
       set_fresh_air: "newWindSwitch",
       set_generator_mode: "generatorMode",
+      set_beep: "beepSwitch",
     };
 
     const prop = propMap[command];
@@ -618,6 +620,7 @@ export class TclCloud {
           tempStep: isNajatModel ? 0.5 : 1,
           minFanSpeed: 1,
           maxFanSpeed: 7,
+          beep: shadow.beepSwitch === 1,
         });
 
         // Save state when device is on (for restore on next power-on)

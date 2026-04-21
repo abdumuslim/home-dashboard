@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
-import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent, Save, Check, Timer, TimerOff } from "lucide-react";
+import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent, Save, Check, Timer, TimerOff, Volume2, EarOff } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AcDevice } from "@/types/ac";
 
@@ -519,7 +519,11 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                           ...(isStaged ? { outline: `2px dashed ${colors.accent}`, outlineOffset: "-2px", color: colors.text, borderColor: "transparent", backgroundColor: `${colors.accent}08` } : undefined),
                         }}
                       >
-                        {FAN_LABELS[s] ?? `${s}`}
+                        {d.maxGeneratorLevel !== 6 && s === 1
+                          ? <EarOff className="w-3 h-3 mx-auto" />
+                          : d.maxGeneratorLevel !== 6 && s >= 2
+                            ? `${s - 1}`
+                            : (FAN_LABELS[s] ?? `${s}`)}
                       </button>
                     );
                   })}
@@ -551,6 +555,7 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                 <AcToggle label="ECO" value={d.eco} onChange={(v) => send("set_eco", v ? 1 : 0)} colors={colors} />
                 <AcToggle label="Turbo" value={d.turbo} onChange={(v) => send("set_turbo", v ? 1 : 0)} icon={<Zap className="w-3 h-3" />} colors={colors} />
                 <AcToggle label="Screen" value={d.screen} onChange={(v) => send("set_screen", v ? 1 : 0)} colors={colors} />
+                <AcToggle label="Beep" value={d.beep} onChange={(v) => send("set_beep", v ? 1 : 0)} icon={<Volume2 className="w-3 h-3" />} colors={colors} />
                 {d.hasFreshAir && (
                   <AcToggle label="Fresh" value={d.freshAir} onChange={(v) => send("set_fresh_air", v ? 1 : 0)} icon={<AirVent className="w-3 h-3" />} colors={colors} />
                 )}
