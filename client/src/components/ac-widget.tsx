@@ -1,6 +1,6 @@
-import { useState, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
-import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent, Save, Check } from "lucide-react";
+import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent, Save, Check, Timer, TimerOff } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AcDevice } from "@/types/ac";
 
@@ -76,14 +76,84 @@ function capturePreset(d: AcDevice): PresetData {
   };
 }
 
+// ---------- Timer helpers ----------
+
+interface AcTimerData {
+  deviceId: string;
+  action: "on" | "off";
+  preset?: Record<string, unknown>;
+  fireAt: number;
+}
+
+function useAcTimers() {
+  const [timers, setTimers] = useState<AcTimerData[]>([]);
+  const intervalRef = useRef<ReturnType<typeof setInterval>>(undefined);
+
+  const fetchTimers = useCallback(async () => {
+    try {
+      const resp = await fetch("/api/ac/timers");
+      if (resp.ok) {
+        const data = (await resp.json()) as { timers: AcTimerData[] };
+        setTimers(data.timers);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    fetchTimers();
+    intervalRef.current = setInterval(fetchTimers, 5_000);
+    return () => clearInterval(intervalRef.current);
+  }, [fetchTimers]);
+
+  const setTimer = async (deviceId: string, action: "on" | "off", minutes: number, preset?: Record<string, unknown>) => {
+    await fetch("/api/ac/timer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId, action, minutes, preset }),
+    });
+    await fetchTimers();
+  };
+
+  const cancelTimer = async (deviceId: string) => {
+    await fetch(`/api/ac/timer/${deviceId}`, { method: "DELETE" });
+    await fetchTimers();
+  };
+
+  return { timers, setTimer, cancelTimer, refetch: fetchTimers };
+}
+
+function formatCountdown(fireAt: number): string {
+  const remaining = Math.max(0, fireAt - Date.now());
+  const mins = Math.ceil(remaining / 60_000);
+  if (mins >= 60) {
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  }
+  return `${mins}m`;
+}
+
 interface AcWidgetProps {
   device: AcDevice;
   onControl: (command: string, value: unknown) => Promise<void>;
+  timer?: AcTimerData | null;
+  onSetTimer?: (action: "on" | "off", minutes: number, preset?: Record<string, unknown>) => Promise<void>;
+  onCancelTimer?: () => Promise<void>;
 }
 
-export function AcWidget({ device: d, onControl }: AcWidgetProps) {
+export { useAcTimers, type AcTimerData };
+
+export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTimer }: AcWidgetProps) {
   const [showDetail, setShowDetail] = useState(false);
   const [powerBusy, setPowerBusy] = useState(false);
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    if (!timer) return;
+    const id = setInterval(() => setTick(t => t + 1), 10_000);
+    return () => clearInterval(id);
+  }, [timer]);
+  void tick;
 
   const isOn = d.power;
   const offline = !d.isOnline;
@@ -172,10 +242,20 @@ export function AcWidget({ device: d, onControl }: AcWidgetProps) {
             </div>
           )}
         </div>
+
+        {/* Timer countdown indicator */}
+        {timer && (
+          <div className="flex items-center gap-0.5 px-1.5 py-0.5 mt-0.5">
+            <Timer className="w-2.5 h-2.5" style={{ color: timer.action === "on" ? "#34d399" : "#f87171" }} />
+            <span className="text-[0.55rem] font-bold tabular-nums" style={{ color: timer.action === "on" ? "#34d399" : "#f87171" }}>
+              {formatCountdown(timer.fireAt)}
+            </span>
+          </div>
+        )}
       </div>
 
       {showDetail && (
-        <AcDetailOverlay device={d} onControl={onControl} onClose={() => setShowDetail(false)} />
+        <AcDetailOverlay device={d} onControl={onControl} onClose={() => setShowDetail(false)} timer={timer} onSetTimer={onSetTimer} onCancelTimer={onCancelTimer} />
       )}
     </>
   );
@@ -183,16 +263,23 @@ export function AcWidget({ device: d, onControl }: AcWidgetProps) {
 
 // ---------- Detail Overlay ----------
 
-function AcDetailOverlay({ device: d, onControl, onClose }: {
+function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onCancelTimer }: {
   device: AcDevice;
   onControl: (command: string, value: unknown) => Promise<void>;
   onClose: () => void;
+  timer?: AcTimerData | null;
+  onSetTimer?: (action: "on" | "off", minutes: number, preset?: Record<string, unknown>) => Promise<void>;
+  onCancelTimer?: () => Promise<void>;
 }) {
   const [phase, setPhase] = useState<"in" | "out">("in");
   const [saveMode, setSaveMode] = useState(false);
   const [activePreset, setActivePreset] = useState<number | null>(null);
   const [stagedValues, setStagedValues] = useState<PresetData | null>(null);
   const [presets, setPresets] = useState<PresetSlots>(() => loadPresets(d.id));
+  const [timerOpen, setTimerOpen] = useState(false);
+  const [timerMinutes, setTimerMinutes] = useState(60);
+  const [timerAction, setTimerAction] = useState<"on" | "off">("off");
+  const [timerPreset, setTimerPreset] = useState<number | null>(null);
   const isOn = d.power;
   const offline = !d.isOnline;
   const colors = getModeColors(d.mode);
@@ -280,6 +367,104 @@ function AcDetailOverlay({ device: d, onControl, onClose }: {
             <div className="text-center">
               <span className="text-sm text-dim">Room: </span>
               <span className="text-sm text-text font-medium">{d.currentTemp}°C</span>
+            </div>
+          )}
+
+          {/* Timer — always visible */}
+          {!offline && (
+            <div>
+              <span className="text-[0.65rem] text-dim uppercase tracking-wider mb-1.5 block">Timer</span>
+              {timer ? (
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5 flex-1">
+                    <Timer className="w-3.5 h-3.5" style={{ color: timer.action === "on" ? "#34d399" : "#f87171" }} />
+                    <span className="text-sm font-medium" style={{ color: timer.action === "on" ? "#34d399" : "#f87171" }}>
+                      {timer.action === "on" ? "Turn ON" : "Turn OFF"} in {formatCountdown(timer.fireAt)}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => onCancelTimer?.()}
+                    className="flex items-center gap-1 px-2 py-1 rounded-lg border border-red-400/30 bg-red-400/10 text-red-400 text-xs hover:bg-red-400/20 transition-colors"
+                  >
+                    <TimerOff className="w-3 h-3" /> Cancel
+                  </button>
+                </div>
+              ) : !timerOpen ? (
+                <button
+                  onClick={() => { setTimerOpen(true); setTimerAction(isOn ? "off" : "on"); }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 bg-white/5 text-dim text-xs hover:text-text hover:border-white/20 transition-colors"
+                >
+                  <Timer className="w-3.5 h-3.5" /> Set timer
+                </button>
+              ) : (
+                <div className="flex flex-col gap-2 p-2.5 rounded-lg bg-white/5 border border-white/10">
+                  <div className="flex gap-1.5">
+                    {(["on", "off"] as const).map((a) => (
+                      <button key={a} onClick={() => setTimerAction(a)} className={cn(
+                        "flex-1 px-2 py-1 rounded-lg text-xs border transition-colors",
+                        timerAction === a
+                          ? a === "on" ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-400" : "border-red-400/50 bg-red-400/10 text-red-400"
+                          : "border-white/10 bg-white/5 text-dim hover:text-text",
+                      )}>
+                        Turn {a.toUpperCase()}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {[15, 30, 60, 90, 120, 180, 240].map((m) => (
+                      <button key={m} onClick={() => setTimerMinutes(m)} className={cn(
+                        "px-2 py-1 rounded text-xs border transition-colors",
+                        timerMinutes === m ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                      )}>
+                        {m >= 60 ? `${m / 60}h` : `${m}m`}
+                      </button>
+                    ))}
+                  </div>
+                  {timerAction === "on" && (
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] text-dim">Preset:</span>
+                      <button onClick={() => setTimerPreset(null)} className={cn(
+                        "px-2 py-0.5 rounded text-[10px] border transition-colors",
+                        timerPreset == null ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim",
+                      )}>None</button>
+                      {[1, 2, 3, 4, 5].filter(s => presets[s] != null).map(s => (
+                        <button key={s} onClick={() => setTimerPreset(s)} className={cn(
+                          "px-2 py-0.5 rounded text-[10px] border transition-colors",
+                          timerPreset === s ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim",
+                        )}>{s}</button>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex gap-1.5">
+                    <button
+                      onClick={() => setTimerOpen(false)}
+                      className="flex-1 px-2 py-1 rounded-lg text-xs border border-white/10 bg-white/5 text-dim hover:text-text transition-colors"
+                    >Cancel</button>
+                    <button
+                      onClick={async () => {
+                        const preset = timerAction === "on" && timerPreset != null && presets[timerPreset]
+                          ? {
+                              mode: presets[timerPreset]!.mode,
+                              temperature: presets[timerPreset]!.targetTemp,
+                              fan_speed: presets[timerPreset]!.fanSpeed,
+                              eco: presets[timerPreset]!.eco ? 1 : 0,
+                              turbo: presets[timerPreset]!.turbo ? 1 : 0,
+                              screen: presets[timerPreset]!.screen ? 1 : 0,
+                              vertical_swing: presets[timerPreset]!.verticalSwing,
+                              horizontal_swing: presets[timerPreset]!.horizontalSwing,
+                              fresh_air: presets[timerPreset]!.freshAir ? 1 : 0,
+                              generator_mode: presets[timerPreset]!.generatorMode,
+                            }
+                          : undefined;
+                        await onSetTimer?.(timerAction, timerMinutes, preset);
+                        setTimerOpen(false);
+                      }}
+                      className="flex-1 px-2 py-1 rounded-lg text-xs border transition-colors"
+                      style={{ borderColor: colors.border, backgroundColor: colors.bg, color: colors.text }}
+                    >Start</button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

@@ -5,6 +5,20 @@ import { childLogger } from "./logger.js";
 
 const log = childLogger("tcl");
 
+export interface AcAction {
+  power?: 0 | 1;
+  mode?: number;
+  temperature?: number;
+  fan_speed?: number;
+  eco?: number;
+  turbo?: number;
+  screen?: number;
+  vertical_swing?: number;
+  horizontal_swing?: number;
+  fresh_air?: number;
+  generator_mode?: number;
+}
+
 export interface AcDevice {
   id: string;
   name: string;
@@ -751,6 +765,36 @@ export class TclCloud {
     if (Object.keys(state).length > 0) {
       this.lastState[deviceId] = state;
       this.saveLastState();
+    }
+  }
+
+  async executeAcAction(deviceId: string, action: AcAction): Promise<void> {
+    if (action.power === 0) {
+      await this.sendControl(deviceId, "set_power", 0);
+      return;
+    }
+
+    const profileCmds: Array<[string, unknown]> = [];
+    if (action.mode != null) profileCmds.push(["set_mode", action.mode]);
+    if (action.temperature != null) profileCmds.push(["set_temperature", action.temperature]);
+    if (action.fan_speed != null) profileCmds.push(["set_fan_speed", action.fan_speed]);
+    if (action.eco != null) profileCmds.push(["set_eco", action.eco]);
+    if (action.turbo != null) profileCmds.push(["set_turbo", action.turbo]);
+    if (action.screen != null) profileCmds.push(["set_screen", action.screen]);
+    if (action.vertical_swing != null) profileCmds.push(["set_vertical_swing", action.vertical_swing]);
+    if (action.horizontal_swing != null) profileCmds.push(["set_horizontal_swing", action.horizontal_swing]);
+    if (action.fresh_air != null) profileCmds.push(["set_fresh_air", action.fresh_air]);
+    if (action.generator_mode != null) profileCmds.push(["set_generator_mode", action.generator_mode]);
+
+    if (action.power === 1) {
+      await this.sendControl(deviceId, "set_power", 1);
+      if (profileCmds.length > 0) {
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    for (const [cmd, val] of profileCmds) {
+      await this.sendControl(deviceId, cmd, val);
     }
   }
 

@@ -16,14 +16,23 @@ export interface PurifierDevice {
   child_lock?: boolean;
 }
 
+export interface AcProfile {
+  mode: number;
+  temperature: number;
+  fan_speed: number;
+}
+
 export interface AutomationRule {
   id: number;
   name: string;
   enabled: boolean;
   automation_type: "metric" | "schedule";
+  device_type: "purifier" | "ac";
+  action_on?: Record<string, unknown>;
   metric: string | null;
   condition: "above" | "below" | null;
   threshold: number | null;
+  threshold_low: number | null;
   time_start: string | null;
   time_end: string | null;
   start_mode: "exact" | "prayer";

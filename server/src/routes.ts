@@ -7,6 +7,15 @@ import type { TclCloud } from "./tcl-cloud.js";
 import type { ForecastResponse } from "./forecast.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus } from "./auth.js";
 
+export interface AcTimer {
+  deviceId: string;
+  action: "on" | "off";
+  preset?: Record<string, unknown>;
+  fireAt: number;
+}
+
+export const acTimers = new Map<string, AcTimer>();
+
 export function median(arr: number[]): number {
   const sorted = [...arr].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
@@ -494,6 +503,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   // ---------- Automations ----------
 
+  const AC_MODE_NAMES: Record<number, string> = { 0: "Auto", 1: "Cool", 2: "Dry", 3: "Fan", 4: "Heat" };
+
   router.get("/api/automations", requireAuth, async (_req: Request, res: Response) => {
     const result = await pool.query("SELECT * FROM automations ORDER BY created_at ASC");
     res.json({ automations: result.rows });
@@ -501,18 +512,22 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   interface MetricAutomationBody {
     automation_type?: "metric";
+    device_type?: "purifier" | "ac";
     metric: string;
     condition: string;
     threshold: number;
+    threshold_low?: number;
     sustained_minutes?: number;
     turn_off_at_end?: boolean;
     device_ids: string[];
     device_names: string[];
     enabled?: boolean;
+    ac_profile?: Record<string, unknown>;
   }
 
   interface ScheduleAutomationBody {
     automation_type: "schedule";
+    device_type?: "purifier" | "ac";
     time_start: string;
     time_end: string;
     start_mode?: "exact" | "prayer";
@@ -525,17 +540,37 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     device_ids: string[];
     device_names: string[];
     enabled?: boolean;
+    ac_profile?: { mode: number; temperature: number; fan_speed: number };
   }
 
   type AutomationBody = MetricAutomationBody | ScheduleAutomationBody;
 
+  function validateAcProfile(p: unknown): string | null {
+    if (!p || typeof p !== "object") return "AC profile required";
+    const { mode, temperature, fan_speed } = p as Record<string, number>;
+    if (mode == null || !Number.isInteger(mode) || mode < 0 || mode > 4) return "Mode must be 0–4";
+    if (temperature == null || !Number.isInteger(temperature) || temperature < 16 || temperature > 36) return "Temperature must be 16–36";
+    if (fan_speed == null || !Number.isInteger(fan_speed) || fan_speed < 0 || fan_speed > 7) return "Fan speed must be 0–7";
+    return null;
+  }
+
   function validateMetricAutomation(body: MetricAutomationBody): string | null {
     if (!body.metric || !(body.metric in ALERT_METRICS)) return "Invalid metric";
-    if (ALERT_METRICS[body.metric].source !== "air") return "Only air quality metrics allowed";
-    if (body.condition !== "above" && body.condition !== "below") return "Condition must be 'above' or 'below'";
-    if (typeof body.threshold !== "number" || !isFinite(body.threshold)) return "Threshold must be a finite number";
+    if (body.device_type !== "ac" && ALERT_METRICS[body.metric].source !== "air") return "Only air quality metrics allowed for purifiers";
     const def = ALERT_METRICS[body.metric];
+    if (typeof body.threshold !== "number" || !isFinite(body.threshold)) return "Threshold must be a finite number";
     if (body.threshold < def.min || body.threshold > def.max) return `Threshold must be between ${def.min} and ${def.max}`;
+
+    if (body.device_type === "ac") {
+      if (typeof body.threshold_low !== "number" || !isFinite(body.threshold_low)) return "Low threshold required for AC range";
+      if (body.threshold_low < def.min || body.threshold_low > def.max) return `Low threshold must be between ${def.min} and ${def.max}`;
+      if (body.threshold_low >= body.threshold) return "Low threshold must be less than high threshold";
+      const profileErr = validateAcProfile(body.ac_profile);
+      if (profileErr) return profileErr;
+    } else {
+      if (body.condition !== "above" && body.condition !== "below") return "Condition must be 'above' or 'below'";
+    }
+
     if (body.sustained_minutes != null && (!Number.isInteger(body.sustained_minutes) || body.sustained_minutes < 0 || body.sustained_minutes > 60))
       return "Sustained minutes must be 0–60";
     if (!Array.isArray(body.device_ids) || body.device_ids.length === 0) return "Select at least one device";
@@ -582,6 +617,10 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       return "Start and end time cannot be the same";
 
     if (!Array.isArray(body.device_ids) || body.device_ids.length === 0) return "Select at least one device";
+    if (body.device_type === "ac") {
+      const profileErr = validateAcProfile(body.ac_profile);
+      if (profileErr) return profileErr;
+    }
     return null;
   }
 
@@ -595,22 +634,29 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       if (err) { res.status(400).json({ error: err }); return; }
 
       const turnOff = sb.turn_off_at_end ?? false;
+      const devType = sb.device_type ?? "purifier";
       const startMode = sb.start_mode ?? "exact";
       const endMode = sb.end_mode ?? "exact";
       const startLabel = formatTimeLabel(startMode, sb.time_start, sb.start_prayer, sb.start_prayer_offset);
       const endLabel = formatTimeLabel(endMode, sb.time_end, sb.end_prayer, sb.end_prayer_offset);
-      const name = `Schedule ${startLabel} – ${endLabel}${turnOff ? " (off at end)" : ""}`;
-      const actionOff = turnOff ? '{"power":"off"}' : null;
+      const prefix = devType === "ac" ? "AC " : "";
+      const name = `${prefix}Schedule ${startLabel} – ${endLabel}${turnOff ? " (off at end)" : ""}`;
+      const actionOn = devType === "ac" && sb.ac_profile
+        ? JSON.stringify({ power: 1, ...sb.ac_profile })
+        : '{"power":"on"}';
+      const actionOff = turnOff
+        ? (devType === "ac" ? '{"power":0}' : '{"power":"off"}')
+        : null;
       const result = await pool.query(
-        `INSERT INTO automations (name, enabled, automation_type, time_start, time_end, turn_off_at_end,
+        `INSERT INTO automations (name, enabled, automation_type, device_type, time_start, time_end, turn_off_at_end,
          start_mode, start_prayer, start_prayer_offset, end_mode, end_prayer, end_prayer_offset,
          device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
-         VALUES ($1, $2, 'schedule', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, '{"power":"on"}', $16, 60) RETURNING *`,
-        [name, sb.enabled ?? true,
+         VALUES ($1, $2, 'schedule', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, 60) RETURNING *`,
+        [name, sb.enabled ?? true, devType,
          startMode === "exact" ? sb.time_start : null, endMode === "exact" ? sb.time_end : null, turnOff,
          startMode, startMode === "prayer" ? sb.start_prayer : null, startMode === "prayer" ? sb.start_prayer_offset : null,
          endMode, endMode === "prayer" ? sb.end_prayer : null, endMode === "prayer" ? sb.end_prayer_offset : null,
-         sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, actionOff],
+         sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, actionOn, actionOff],
       );
       res.json({ automation: result.rows[0] });
     } else {
@@ -619,14 +665,31 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       if (err) { res.status(400).json({ error: err }); return; }
 
       const mins = mb.sustained_minutes ?? 0;
-      const turnOff = mb.turn_off_at_end ?? false;
-      const offSuffix = turnOff ? " (off)" : "";
-      const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}${mins > 0 ? ` for ${mins}min` : ""}${offSuffix}`;
-      const actionOff = turnOff ? '{"power":"off"}' : null;
+      const devType = mb.device_type ?? "purifier";
+      const isAcRange = devType === "ac" && mb.threshold_low != null;
+      const turnOff = isAcRange ? true : (mb.turn_off_at_end ?? false);
+      const condition = isAcRange ? "above" : mb.condition;
+
+      let name: string;
+      if (isAcRange && mb.ac_profile) {
+        const modeName = AC_MODE_NAMES[mb.ac_profile.mode as number] ?? "?";
+        name = `${ALERT_METRICS[mb.metric].label} ${mb.threshold_low}°–${mb.threshold}° → ${modeName} ${mb.ac_profile.temperature}°`;
+      } else {
+        const offSuffix = turnOff ? " (off)" : "";
+        const acLabel = devType === "ac" && mb.ac_profile ? ` → ${AC_MODE_NAMES[mb.ac_profile.mode as number] ?? "?"} ${mb.ac_profile.temperature}°` : "";
+        name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}${mins > 0 ? ` for ${mins}min` : ""}${acLabel}${offSuffix}`;
+      }
+
+      const actionOn = devType === "ac" && mb.ac_profile
+        ? JSON.stringify({ power: 1, ...mb.ac_profile })
+        : '{"power":"on"}';
+      const actionOff = turnOff
+        ? (devType === "ac" ? '{"power":0}' : '{"power":"off"}')
+        : null;
       const result = await pool.query(
-        `INSERT INTO automations (name, enabled, automation_type, metric, condition, threshold, sustained_minutes, turn_off_at_end, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
-         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, $11, '{"power":"on"}', $12, 300) RETURNING *`,
-        [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mins, turnOff, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, actionOff],
+        `INSERT INTO automations (name, enabled, automation_type, device_type, metric, condition, threshold, threshold_low, sustained_minutes, turn_off_at_end, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
+         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, 300) RETURNING *`,
+        [name, mb.enabled ?? true, devType, mb.metric, condition, mb.threshold, mb.threshold_low ?? null, mins, turnOff, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, actionOn, actionOff],
       );
       res.json({ automation: result.rows[0] });
     }
@@ -645,25 +708,32 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       if (err) { res.status(400).json({ error: err }); return; }
 
       const turnOff = sb.turn_off_at_end ?? false;
+      const devType = sb.device_type ?? "purifier";
       const startMode = sb.start_mode ?? "exact";
       const endMode = sb.end_mode ?? "exact";
       const startLabel = formatTimeLabel(startMode, sb.time_start, sb.start_prayer, sb.start_prayer_offset);
       const endLabel = formatTimeLabel(endMode, sb.time_end, sb.end_prayer, sb.end_prayer_offset);
-      const name = `Schedule ${startLabel} – ${endLabel}${turnOff ? " (off at end)" : ""}`;
-      const actionOff = turnOff ? '{"power":"off"}' : null;
+      const prefix = devType === "ac" ? "AC " : "";
+      const name = `${prefix}Schedule ${startLabel} – ${endLabel}${turnOff ? " (off at end)" : ""}`;
+      const actionOn = devType === "ac" && sb.ac_profile
+        ? JSON.stringify({ power: 1, ...sb.ac_profile })
+        : '{"power":"on"}';
+      const actionOff = turnOff
+        ? (devType === "ac" ? '{"power":0}' : '{"power":"off"}')
+        : null;
       const result = await pool.query(
-        `UPDATE automations SET name=$1, enabled=$2, automation_type='schedule',
-         time_start=$3, time_end=$4, turn_off_at_end=$5,
-         start_mode=$6, start_prayer=$7, start_prayer_offset=$8,
-         end_mode=$9, end_prayer=$10, end_prayer_offset=$11,
+        `UPDATE automations SET name=$1, enabled=$2, automation_type='schedule', device_type=$3,
+         time_start=$4, time_end=$5, turn_off_at_end=$6,
+         start_mode=$7, start_prayer=$8, start_prayer_offset=$9,
+         end_mode=$10, end_prayer=$11, end_prayer_offset=$12,
          metric=NULL, condition=NULL, threshold=NULL, sustained_minutes=0,
-         action_off=$12, device_id=$13, device_name=$14, device_ids=$15, device_names=$16
-         WHERE id=$17 RETURNING *`,
-        [name, sb.enabled ?? true,
+         action_on=$13::jsonb, action_off=$14::jsonb, device_id=$15, device_name=$16, device_ids=$17, device_names=$18
+         WHERE id=$19 RETURNING *`,
+        [name, sb.enabled ?? true, devType,
          startMode === "exact" ? sb.time_start : null, endMode === "exact" ? sb.time_end : null, turnOff,
          startMode, startMode === "prayer" ? sb.start_prayer : null, startMode === "prayer" ? sb.start_prayer_offset : null,
          endMode, endMode === "prayer" ? sb.end_prayer : null, endMode === "prayer" ? sb.end_prayer_offset : null,
-         actionOff, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, id],
+         actionOn, actionOff, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, id],
       );
       if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
       res.json({ automation: result.rows[0] });
@@ -673,18 +743,35 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       if (err) { res.status(400).json({ error: err }); return; }
 
       const mins = mb.sustained_minutes ?? 0;
-      const turnOff = mb.turn_off_at_end ?? false;
-      const offSuffix = turnOff ? " (off)" : "";
-      const name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}${mins > 0 ? ` for ${mins}min` : ""}${offSuffix}`;
-      const actionOff = turnOff ? '{"power":"off"}' : null;
+      const devType = mb.device_type ?? "purifier";
+      const isAcRange = devType === "ac" && mb.threshold_low != null;
+      const turnOff = isAcRange ? true : (mb.turn_off_at_end ?? false);
+      const condition = isAcRange ? "above" : mb.condition;
+
+      let name: string;
+      if (isAcRange && mb.ac_profile) {
+        const modeName = AC_MODE_NAMES[mb.ac_profile.mode as number] ?? "?";
+        name = `${ALERT_METRICS[mb.metric].label} ${mb.threshold_low}°–${mb.threshold}° → ${modeName} ${mb.ac_profile.temperature}°`;
+      } else {
+        const offSuffix = turnOff ? " (off)" : "";
+        const acLabel = devType === "ac" && mb.ac_profile ? ` → ${AC_MODE_NAMES[mb.ac_profile.mode as number] ?? "?"} ${mb.ac_profile.temperature}°` : "";
+        name = `${ALERT_METRICS[mb.metric].label} ${mb.condition} ${mb.threshold}${mins > 0 ? ` for ${mins}min` : ""}${acLabel}${offSuffix}`;
+      }
+
+      const actionOn = devType === "ac" && mb.ac_profile
+        ? JSON.stringify({ power: 1, ...mb.ac_profile })
+        : '{"power":"on"}';
+      const actionOff = turnOff
+        ? (devType === "ac" ? '{"power":0}' : '{"power":"off"}')
+        : null;
       const result = await pool.query(
-        `UPDATE automations SET name=$1, enabled=$2, automation_type='metric', metric=$3, condition=$4, threshold=$5, sustained_minutes=$6,
-         time_start=NULL, time_end=NULL, turn_off_at_end=$7, action_off=$8,
+        `UPDATE automations SET name=$1, enabled=$2, automation_type='metric', device_type=$3, metric=$4, condition=$5, threshold=$6, threshold_low=$7, sustained_minutes=$8,
+         time_start=NULL, time_end=NULL, turn_off_at_end=$9, action_on=$10::jsonb, action_off=$11::jsonb,
          start_mode='exact', start_prayer=NULL, start_prayer_offset=NULL,
          end_mode='exact', end_prayer=NULL, end_prayer_offset=NULL,
-         device_id=$9, device_name=$10, device_ids=$11, device_names=$12
-         WHERE id=$13 RETURNING *`,
-        [name, mb.enabled ?? true, mb.metric, mb.condition, mb.threshold, mins, turnOff, actionOff, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, id],
+         device_id=$12, device_name=$13, device_ids=$14, device_names=$15
+         WHERE id=$16 RETURNING *`,
+        [name, mb.enabled ?? true, devType, mb.metric, condition, mb.threshold, mb.threshold_low ?? null, mins, turnOff, actionOn, actionOff, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, id],
       );
       if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
       res.json({ automation: result.rows[0] });
@@ -699,19 +786,27 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   });
 
   router.post("/api/automations/:id/test", requireAuth, async (req: Request, res: Response) => {
-    const cloud = getXiaomiCloud?.();
-    if (!cloud) { res.status(503).json({ error: "Xiaomi Cloud not available" }); return; }
     const id = parseInt(String(req.params.id), 10);
     if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
 
     const result = await pool.query("SELECT * FROM automations WHERE id = $1", [id]);
     if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
-    const rule = result.rows[0] as { device_ids?: string[]; device_id: string; action_on: { power?: string } };
+    const rule = result.rows[0] as { device_ids?: string[]; device_id: string; device_type?: string; action_on: Record<string, unknown> };
 
     try {
       const ids = rule.device_ids ?? [rule.device_id];
-      for (const did of ids) {
-        await cloud.sendCommand(did, "set_power", ["on"]);
+      if (rule.device_type === "ac") {
+        const tcl = getTclCloud?.();
+        if (!tcl || !tcl.isReady()) { res.status(503).json({ error: "TCL Cloud not available" }); return; }
+        for (const did of ids) {
+          await tcl.executeAcAction(did, rule.action_on as unknown as import("./tcl-cloud.js").AcAction);
+        }
+      } else {
+        const cloud = getXiaomiCloud?.();
+        if (!cloud) { res.status(503).json({ error: "Xiaomi Cloud not available" }); return; }
+        for (const did of ids) {
+          await cloud.sendCommand(did, "set_power", ["on"]);
+        }
       }
       res.json({ ok: true });
     } catch (err) {
@@ -770,6 +865,28 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
+  });
+
+  // ---------- AC Timers ----------
+
+  router.get("/api/ac/timers", requireAuth, (_req: Request, res: Response) => {
+    const timers = Array.from(acTimers.values());
+    res.json({ timers });
+  });
+
+  router.post("/api/ac/timer", requireAuth, (req: Request, res: Response) => {
+    const { deviceId, action, minutes, preset } = req.body as { deviceId: string; action: "on" | "off"; minutes: number; preset?: Record<string, unknown> };
+    if (!deviceId || !action || !minutes) { res.status(400).json({ error: "deviceId, action, minutes required" }); return; }
+    if (action !== "on" && action !== "off") { res.status(400).json({ error: "action must be 'on' or 'off'" }); return; }
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 480) { res.status(400).json({ error: "minutes must be 1–480" }); return; }
+    const fireAt = Date.now() + minutes * 60_000;
+    acTimers.set(deviceId, { deviceId, action, preset: action === "on" ? preset : undefined, fireAt });
+    res.json({ ok: true, fireAt });
+  });
+
+  router.delete("/api/ac/timer/:deviceId", requireAuth, (req: Request, res: Response) => {
+    acTimers.delete(String(req.params.deviceId));
+    res.json({ ok: true });
   });
 
   return router;

@@ -52,6 +52,9 @@ interface IndoorCardProps {
   onControl?: (command: string, params: unknown[]) => Promise<void>;
   acDevice?: AcDevice;
   onAcControl?: (command: string, value: unknown) => Promise<void>;
+  acTimer?: import("@/components/ac-widget").AcTimerData | null;
+  onAcSetTimer?: (action: "on" | "off", minutes: number, preset?: Record<string, unknown>) => Promise<void>;
+  onAcCancelTimer?: () => Promise<void>;
 }
 
 function ExpandedIndoorChart({
@@ -150,6 +153,9 @@ export const IndoorCard = memo(function IndoorCard({
   onControl,
   acDevice,
   onAcControl,
+  acTimer,
+  onAcSetTimer,
+  onAcCancelTimer,
 }: IndoorCardProps) {
   const { fmtTemp, tempLabel, units: { temperature: tempUnit } } = useUnits();
   const { chartsVisible } = useChartsVisible();
@@ -388,7 +394,7 @@ export const IndoorCard = memo(function IndoorCard({
 
         {/* AC widget */}
         {hasAc && (
-          <AcWidget device={acDevice} onControl={onAcControl} />
+          <AcWidget device={acDevice} onControl={onAcControl} timer={acTimer} onSetTimer={onAcSetTimer} onCancelTimer={onAcCancelTimer} />
         )}
       </div>
 

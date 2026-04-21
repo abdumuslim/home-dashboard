@@ -4,6 +4,7 @@ import type { PurifierDevice } from "@/types/automations";
 import type { AcDevice } from "@/types/ac";
 import { IndoorCard } from "@/components/cards/indoor-card";
 import { PowerCard } from "@/components/cards/power-card";
+import { useAcTimers } from "@/components/ac-widget";
 
 interface IndoorSectionProps {
   weather: WeatherReading | null;
@@ -34,6 +35,8 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
   const kitchenFeelsLike = air?.temperature != null && air?.humidity != null
     ? calcFeelsLike(air.temperature, air.humidity) : undefined;
 
+  const { timers, setTimer, cancelTimer } = useAcTimers();
+
   // Match purifier devices to indoor cards by name (case-insensitive)
   const momDevice = devices.find((d) => d.name.toLowerCase() === "mom");
   const abduDevice = devices.find((d) => d.name.toLowerCase() === "abdu");
@@ -58,6 +61,9 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         onControl={momDevice && sendControl ? (cmd, params) => sendControl(momDevice.id, cmd, params) : undefined}
         acDevice={momAc}
         onAcControl={momAc && acSendControl ? (cmd, val) => acSendControl(momAc.id, cmd, val) : undefined}
+        acTimer={momAc ? timers.find(t => t.deviceId === momAc.id) ?? null : null}
+        onAcSetTimer={momAc ? (action, minutes, preset) => setTimer(momAc.id, action, minutes, preset) : undefined}
+        onAcCancelTimer={momAc ? () => cancelTimer(momAc.id) : undefined}
       />
       <IndoorCard
         title="Abdu"
@@ -73,6 +79,9 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         onControl={abduDevice && sendControl ? (cmd, params) => sendControl(abduDevice.id, cmd, params) : undefined}
         acDevice={abduAc}
         onAcControl={abduAc && acSendControl ? (cmd, val) => acSendControl(abduAc.id, cmd, val) : undefined}
+        acTimer={abduAc ? timers.find(t => t.deviceId === abduAc.id) ?? null : null}
+        onAcSetTimer={abduAc ? (action, minutes, preset) => setTimer(abduAc.id, action, minutes, preset) : undefined}
+        onAcCancelTimer={abduAc ? () => cancelTimer(abduAc.id) : undefined}
       />
       <IndoorCard
         title="Kitchen"

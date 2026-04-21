@@ -5,7 +5,8 @@ import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import type { Config } from "./config.js";
 import { getMetricValue, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
-import { TclCloud } from "./tcl-cloud.js";
+import { TclCloud, type AcAction } from "./tcl-cloud.js";
+import { acTimers } from "./routes.js";
 import { childLogger } from "./logger.js";
 
 const log = childLogger("collector");
@@ -116,9 +117,11 @@ interface AutomationRule {
   name: string;
   enabled: boolean;
   automation_type: "metric" | "schedule";
+  device_type: "purifier" | "ac";
   metric: string | null;
   condition: "above" | "below" | null;
   threshold: number | null;
+  threshold_low: number | null;
   time_start: string | null;
   time_end: string | null;
   device_id: string;
@@ -133,8 +136,8 @@ interface AutomationRule {
   end_mode: "exact" | "prayer";
   end_prayer: string | null;
   end_prayer_offset: number | null;
-  action_on: PurifierAction;
-  action_off: PurifierAction | null;
+  action_on: PurifierAction | AcAction;
+  action_off: PurifierAction | AcAction | null;
   cooldown_secs: number;
 }
 
@@ -293,6 +296,12 @@ export class Collector {
       await this.checkAutomations();
     } catch (err) {
       log.error("[collector] Automation check failed:", err);
+    }
+
+    try {
+      await this.checkAcTimers();
+    } catch (err) {
+      log.error("[collector] AC timer check failed:", err);
     }
 
     // Retry TCL Cloud init if it failed previously (every 5 minutes)
@@ -498,12 +507,13 @@ export class Collector {
   }
 
   private async checkAutomations(): Promise<void> {
-    if (!this.xiaomiCloud || !this.xiaomiCloud.isReady()) return;
-
     await this.refreshAutomationRules();
     if (this.automationRules.length === 0) return;
 
     for (const rule of this.automationRules) {
+      if (rule.device_type === "ac" && (!this.tclCloud || !this.tclCloud.isReady())) continue;
+      if (rule.device_type !== "ac" && (!this.xiaomiCloud || !this.xiaomiCloud.isReady())) continue;
+
       if (rule.automation_type === "schedule") {
         await this.checkScheduleAutomation(rule);
       } else {
@@ -512,8 +522,24 @@ export class Collector {
     }
   }
 
+  private async executeAutomationAction(rule: AutomationRule, action: PurifierAction | AcAction, deviceIds: string[]): Promise<void> {
+    for (const did of deviceIds) {
+      if (rule.device_type === "ac") {
+        await this.tclCloud!.executeAcAction(did, action as AcAction);
+      } else {
+        await this.xiaomiCloud!.executeAction(did, action as PurifierAction);
+      }
+    }
+  }
+
   private async checkMetricAutomation(rule: AutomationRule): Promise<void> {
-    if (!rule.metric || !rule.condition || rule.threshold == null) return;
+    if (!rule.metric || rule.threshold == null) return;
+
+    if (rule.device_type === "ac" && rule.threshold_low != null) {
+      return this.checkAcRangeAutomation(rule);
+    }
+
+    if (!rule.condition) return;
 
     const now = Date.now();
     const weatherStale = !this.latestWeatherTs || (now - this.latestWeatherTs.getTime() > 300_000);
@@ -565,9 +591,7 @@ export class Collector {
           `, turning ON [${deviceNames}]`,
         );
         try {
-          for (const did of deviceIds) {
-            await this.xiaomiCloud!.executeAction(did, rule.action_on);
-          }
+          await this.executeAutomationAction(rule, rule.action_on, deviceIds);
           this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null });
         } catch (err) {
           log.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
@@ -576,12 +600,12 @@ export class Collector {
         // Already triggered — re-check device power and re-send turn-on if off
         for (const did of deviceIds) {
           try {
-            const power = await this.getDevicePowerCached(did);
+            const power = await this.getDevicePowerCached(did, rule.device_type);
             if (power === "off" || power === undefined) {
               log.info(
                 `[collector] Automation "${rule.name}": device ${did} is OFF while ${rule.metric}=${value} still ${rule.condition} ${rule.threshold}, re-turning ON [${deviceNames}]`,
               );
-              await this.xiaomiCloud!.executeAction(did, rule.action_on);
+              await this.executeAutomationAction(rule, rule.action_on, [did]);
               this.devicePowerCache.set(did, { power: "on", ts: Date.now() });
             }
           } catch (err) {
@@ -592,9 +616,11 @@ export class Collector {
       }
     } else if (!conditionMet && state.status === "triggered") {
       if (rule.turn_off_at_end) {
+        const defaultOff = rule.device_type === "ac" ? { power: 0 as const } : { power: "off" as const };
+        const offAction = rule.action_off ?? defaultOff;
         for (const did of deviceIds) {
           try {
-            await this.xiaomiCloud!.executeAction(did, rule.action_off ?? { power: "off" });
+            await this.executeAutomationAction(rule, offAction, [did]);
             this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
           } catch (err) {
             log.error(`Automation "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
@@ -606,12 +632,93 @@ export class Collector {
     }
   }
 
-  private async getDevicePowerCached(deviceId: string): Promise<"on" | "off" | undefined> {
+  private async getDevicePowerCached(deviceId: string, deviceType: "purifier" | "ac" = "purifier"): Promise<"on" | "off" | undefined> {
     const cached = this.devicePowerCache.get(deviceId);
     if (cached && Date.now() - cached.ts < this.POWER_CACHE_TTL) return cached.power;
-    const power = await this.xiaomiCloud!.getDevicePower(deviceId);
+    let power: "on" | "off" | undefined;
+    if (deviceType === "ac") {
+      const devs = await this.tclCloud!.fetchDevicesLive();
+      const dev = devs.find(d => d.id === deviceId);
+      power = dev ? (dev.power ? "on" : "off") : undefined;
+    } else {
+      power = await this.xiaomiCloud!.getDevicePower(deviceId);
+    }
     this.devicePowerCache.set(deviceId, { power, ts: Date.now() });
     return power;
+  }
+
+  private async checkAcRangeAutomation(rule: AutomationRule): Promise<void> {
+    const now = Date.now();
+    const weatherStale = !this.latestWeatherTs || (now - this.latestWeatherTs.getTime() > 300_000);
+    const airStale = !this.latestAirTs || (now - this.latestAirTs.getTime() > 300_000);
+    const def = ALERT_METRICS[rule.metric!];
+    if (!def) return;
+    if (def.source === "weather" && weatherStale) return;
+    if (def.source === "air" && airStale) return;
+
+    const value = getMetricValue(rule.metric!, this.latestWeatherRow, this.latestAirRow);
+    if (value == null) return;
+
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null };
+    const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
+    const deviceIds = rule.device_ids ?? [rule.device_id];
+    const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
+
+    const acAction = rule.action_on as Record<string, unknown>;
+    const isCool = acAction.mode === 1;
+
+    const shouldTurnOn = isCool ? value >= rule.threshold! : value <= rule.threshold_low!;
+    const shouldTurnOff = isCool ? value <= rule.threshold_low! : value >= rule.threshold!;
+
+    if (state.status === "idle") {
+      if (shouldTurnOn) {
+        if (state.conditionSince == null) state.conditionSince = now;
+        const sustainedMs = (rule.sustained_minutes ?? 0) * 60_000;
+        const sustained = sustainedMs === 0 || (now - state.conditionSince >= sustainedMs);
+        if (sustained && (now - state.lastToggle >= cooldownMs)) {
+          log.info(
+            `[collector] AC range "${rule.name}": ${rule.metric}=${value}, turning ON [${deviceNames}]`,
+          );
+          try {
+            await this.executeAutomationAction(rule, rule.action_on, deviceIds);
+            this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
+          } catch (err) {
+            log.error(`[collector] AC range "${rule.name}" turn-on failed:`, (err as Error).message);
+          }
+        } else {
+          this.automationState.set(rule.id, state);
+        }
+      } else {
+        state.conditionSince = null;
+        this.automationState.set(rule.id, state);
+      }
+    } else {
+      if (shouldTurnOff) {
+        log.info(`[collector] AC range "${rule.name}": ${rule.metric}=${value}, turning OFF [${deviceNames}]`);
+        try {
+          await this.executeAutomationAction(rule, { power: 0 } as AcAction, deviceIds);
+        } catch (err) {
+          log.error(`[collector] AC range "${rule.name}" turn-off failed:`, (err as Error).message);
+        }
+        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null });
+      } else if (now - state.lastToggle >= cooldownMs) {
+        for (const did of deviceIds) {
+          try {
+            const power = await this.getDevicePowerCached(did, "ac");
+            if (power === "off" || power === undefined) {
+              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, going idle`);
+              this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null });
+              return;
+            }
+            const { power: _p, ...profileOnly } = rule.action_on as AcAction;
+            await this.tclCloud!.executeAcAction(did, profileOnly);
+          } catch (err) {
+            log.error(`[collector] AC range "${rule.name}" re-enforce failed for ${did}:`, (err as Error).message);
+          }
+        }
+        this.automationState.set(rule.id, { ...state, lastToggle: now });
+      }
+    }
   }
 
   private async checkScheduleAutomation(rule: AutomationRule): Promise<void> {
@@ -645,13 +752,12 @@ export class Collector {
 
       for (const did of deviceIds) {
         try {
-          const power = await this.getDevicePowerCached(did);
+          const power = await this.getDevicePowerCached(did, rule.device_type);
           if (power === "off" || power === undefined) {
             log.info(
               `[collector] Schedule "${rule.name}": device ${did} is OFF during active window, turning ON [${deviceNames}]`,
             );
-            await this.xiaomiCloud!.executeAction(did, rule.action_on);
-            // Update cache immediately after turning on
+            await this.executeAutomationAction(rule, rule.action_on, [did]);
             this.devicePowerCache.set(did, { power: "on", ts: Date.now() });
             this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
           }
@@ -666,15 +772,50 @@ export class Collector {
           const deviceIds = rule.device_ids ?? [rule.device_id];
           const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
           log.info(`[collector] Schedule "${rule.name}": window ended, turning OFF [${deviceNames}]`);
+          const offAction = rule.device_type === "ac" ? { power: 0 as const } : { power: "off" as const };
           for (const did of deviceIds) {
             try {
-              await this.xiaomiCloud!.executeAction(did, { power: "off" });
+              await this.executeAutomationAction(rule, rule.action_off ?? offAction, [did]);
             } catch (err) {
               log.error(`[collector] Schedule "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
             }
           }
         }
         this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null });
+      }
+    }
+  }
+
+  private async checkAcTimers(): Promise<void> {
+    if (!this.tclCloud || !this.tclCloud.isReady()) return;
+    const now = Date.now();
+    for (const [deviceId, timer] of acTimers) {
+      if (now < timer.fireAt) continue;
+      acTimers.delete(deviceId);
+      try {
+        if (timer.action === "off") {
+          await this.tclCloud.executeAcAction(deviceId, { power: 0 });
+          log.info(`[collector] AC timer: turned OFF device ${deviceId}`);
+        } else {
+          const preset = timer.preset ?? {};
+          const action: AcAction = {
+            power: 1,
+            ...(preset.mode != null ? { mode: preset.mode as number } : {}),
+            ...(preset.temperature != null ? { temperature: preset.temperature as number } : {}),
+            ...(preset.fan_speed != null ? { fan_speed: preset.fan_speed as number } : {}),
+            ...(preset.eco != null ? { eco: preset.eco as number } : {}),
+            ...(preset.turbo != null ? { turbo: preset.turbo as number } : {}),
+            ...(preset.screen != null ? { screen: preset.screen as number } : {}),
+            ...(preset.vertical_swing != null ? { vertical_swing: preset.vertical_swing as number } : {}),
+            ...(preset.horizontal_swing != null ? { horizontal_swing: preset.horizontal_swing as number } : {}),
+            ...(preset.fresh_air != null ? { fresh_air: preset.fresh_air as number } : {}),
+            ...(preset.generator_mode != null ? { generator_mode: preset.generator_mode as number } : {}),
+          };
+          await this.tclCloud.executeAcAction(deviceId, action);
+          log.info(`[collector] AC timer: turned ON device ${deviceId} with preset`);
+        }
+      } catch (err) {
+        log.error(`[collector] AC timer failed for ${deviceId}:`, (err as Error).message);
       }
     }
   }

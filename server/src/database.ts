@@ -118,6 +118,9 @@ const MIGRATIONS: string[] = [
     power_2     REAL NOT NULL
   )`,
   "CREATE INDEX IF NOT EXISTS idx_power_ts_brin ON power_readings USING BRIN (ts)",
+  // AC automation support
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS device_type TEXT NOT NULL DEFAULT 'purifier'",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS threshold_low REAL",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {
