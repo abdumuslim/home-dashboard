@@ -147,7 +147,7 @@ function parseTimeToMinutes(time: string): number {
 }
 
 interface AutomationState {
-  status: "idle" | "triggered";
+  status: "idle" | "triggered" | "override";
   lastToggle: number;
   conditionSince: number | null;
   conditionLostAt: number | null;
@@ -714,7 +714,7 @@ export class Collector {
         state.conditionSince = null;
         this.automationState.set(rule.id, state);
       }
-    } else {
+    } else if (state.status === "triggered") {
       if (shouldTurnOff) {
         log.info(`[collector] AC range "${rule.name}": ${rule.metric}=${value}, turning OFF [${deviceNames}]`);
         try {
@@ -728,8 +728,8 @@ export class Collector {
           try {
             const power = await this.getDevicePowerCached(did, "ac");
             if (power === "off" || power === undefined) {
-              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, going idle`);
-              this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null });
+              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, entering override (won't auto-turn-on until user restores)`);
+              this.automationState.set(rule.id, { status: "override", lastToggle: now, conditionSince: null, conditionLostAt: null });
               return;
             }
             const { power: _p, ...profileOnly } = rule.action_on as AcAction;
@@ -739,6 +739,26 @@ export class Collector {
           }
         }
         this.automationState.set(rule.id, { ...state, lastToggle: now });
+      }
+    } else if (state.status === "override") {
+      if (shouldTurnOff) {
+        log.info(`[collector] AC range "${rule.name}": temp reached turn-off limit (${rule.metric}=${value}), clearing override`);
+        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null });
+      } else if (now - state.lastToggle >= cooldownMs) {
+        for (const did of deviceIds) {
+          try {
+            const power = await this.getDevicePowerCached(did, "ac");
+            if (power === "on") {
+              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned back ON, resuming automation`);
+              const { power: _p, ...profileOnly } = rule.action_on as AcAction;
+              await this.tclCloud!.executeAcAction(did, profileOnly);
+              this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
+              return;
+            }
+          } catch (err) {
+            log.error(`[collector] AC range "${rule.name}" override check failed for ${did}:`, (err as Error).message);
+          }
+        }
       }
     }
   }
