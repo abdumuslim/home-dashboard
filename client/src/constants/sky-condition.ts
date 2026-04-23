@@ -105,17 +105,17 @@ export function getSkyCondition(
   );
 
   // Classification: medianCSI for level, spread for variability
-  if (medianCSI > 0.7) {
+  if (medianCSI > 0.85) {
     if (spread < 0.2)
       return { label: "Sunny", icon: "/weather-icons/clear-day.svg", color: "#ffc107" };
     return { label: "Partly Cloudy", icon: "/weather-icons/partly-cloudy-day.svg", color: "#fbbf24" };
   }
-  if (medianCSI > 0.4) {
+  if (medianCSI > 0.55) {
     if (spread < 0.15)
       return { label: "Partly Cloudy", icon: "/weather-icons/partly-cloudy-day.svg", color: "#fbbf24" };
     return { label: "Mostly Cloudy", icon: "/weather-icons/overcast-day.svg", color: "#d1d5db" };
   }
-  if (medianCSI > 0.15)
+  if (medianCSI > 0.25)
     return { label: "Mostly Cloudy", icon: "/weather-icons/overcast-day.svg", color: "#d1d5db" };
   return { label: "Cloudy", icon: "/weather-icons/cloudy.svg", color: "#c0c7d0" };
 }

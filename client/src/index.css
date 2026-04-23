@@ -129,3 +129,12 @@
   border-right: 8px solid transparent;
   border-top: 18px solid #ffffff;
 }
+
+/* Hide scrollbar for horizontal scroll containers */
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}

@@ -1,6 +1,7 @@
 import { config } from "./config.js";
 import { createPool, initDb } from "./database.js";
 import { Collector } from "./collector.js";
+import { ForecastService } from "./forecast.js";
 import { createRouter } from "./routes.js";
 import { childLogger } from "./logger.js";
 import express from "express";
@@ -25,6 +26,11 @@ async function main(): Promise<void> {
     log.error("[index] Collector crashed:", err);
   });
 
+  // Start the forecast service
+  const biasPath = path.resolve(__dirname, "..", "bias-data", "bias-table.json");
+  const forecastService = new ForecastService(biasPath);
+  forecastService.init();
+
   // Create Express app
   const app = express();
 
@@ -41,7 +47,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   // Mount API routes
-  app.use(createRouter(pool, config, () => collector.xiaomiCloud, () => collector.tclCloud, () => collector.getLatestAir()));
+  app.use(createRouter(pool, config, () => collector.xiaomiCloud, () => collector.tclCloud, () => collector.getLatestAir(), () => forecastService.getForecast(), (data) => collector.setLatestPower(data)));
 
   // Serve static files from ../static (relative to dist/ or src/)
   const staticDir = path.resolve(__dirname, "..", "static");
@@ -61,6 +67,7 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     log.info("[index] Shutting down...");
     collector.stop();
+    forecastService.stop();
     pool.end().then(() => {
       log.info("[index] Database pool closed");
       process.exit(0);

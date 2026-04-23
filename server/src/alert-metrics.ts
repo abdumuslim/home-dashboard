@@ -2,7 +2,7 @@ export interface MetricDef {
   label: string;
   unit: string;
   group: string;
-  source: "weather" | "air";
+  source: "weather" | "air" | "power";
   min: number;
   max: number;
   dbColumn?: string; // override when metric key differs from DB column
@@ -34,6 +34,14 @@ export const ALERT_METRICS: Record<string, MetricDef> = {
   pm10:             { label: "PM10", unit: "µg/m³", group: "Air Quality", source: "air", min: 0, max: 600 },
   tvoc:             { label: "tVOC", unit: "ppb", group: "Air Quality", source: "air", min: 0, max: 1000 },
   noise:            { label: "Noise", unit: "dB", group: "Air Quality", source: "air", min: 0, max: 130 },
+
+  // Power
+  voltage:          { label: "Voltage", unit: "V", group: "Power", source: "power", min: 0, max: 300 },
+  power_grid:       { label: "Grid Power", unit: "W", group: "Power", source: "power", min: 0, max: 25000, dbColumn: "power_1" },
+  power_gen:        { label: "Generator Power", unit: "W", group: "Power", source: "power", min: 0, max: 25000, dbColumn: "power_2" },
+  power_total:      { label: "Total Power", unit: "W", group: "Power", source: "power", min: 0, max: 50000 },
+  current_grid:     { label: "Grid Current", unit: "A", group: "Power", source: "power", min: 0, max: 100, dbColumn: "current_1" },
+  current_gen:      { label: "Generator Current", unit: "A", group: "Power", source: "power", min: 0, max: 100, dbColumn: "current_2" },
 };
 
 export const VALID_PRAYER_NAMES = ["fajr", "dhuhr", "asr", "maghrib", "isha"] as const;
@@ -46,11 +54,20 @@ export function getMetricValue(
   metric: string,
   weather: Record<string, unknown> | null,
   air: Record<string, unknown> | null,
+  power?: Record<string, unknown> | null,
 ): number | null {
   const def = ALERT_METRICS[metric];
   if (!def) return null;
 
-  const row = def.source === "weather" ? weather : air;
+  if (metric === "power_total") {
+    if (!power) return null;
+    const p1 = power.power_1;
+    const p2 = power.power_2;
+    if (typeof p1 !== "number" || typeof p2 !== "number") return null;
+    return p1 + p2;
+  }
+
+  const row = def.source === "weather" ? weather : def.source === "air" ? air : power ?? null;
   if (!row) return null;
 
   const col = def.dbColumn ?? metric;

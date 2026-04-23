@@ -61,7 +61,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void): Router {
   const router = Router();
 
   // Health check — before auth middleware, no auth required
@@ -256,6 +256,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     const p2 = v * i2;
     const now = new Date();
     latestPower = { ts: now.toISOString(), voltage: v, current_1: i1, current_2: i2, power_1: p1, power_2: p2 };
+    onPowerIngest?.(latestPower);
     powerBuffer.push({ v, i1, i2 });
 
     // Persist median of buffered readings to DB every 60 seconds

@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { WeatherReading, AirReading, PowerReading, OpenOverlayFn } from "@/types/api";
+import type { ForecastResponse } from "@/types/forecast";
 import { useSectionLayout, type SectionId } from "@/hooks/use-section-layout";
 import { useDevices } from "@/hooks/use-devices";
 import { useAcDevices } from "@/hooks/use-ac-devices";
@@ -8,6 +9,7 @@ import { OutdoorSection } from "./sections/outdoor-section";
 import { IndoorSection } from "./sections/indoor-section";
 import { AirQualitySection } from "./sections/air-quality-section";
 import { PrayerSectionHeader, PrayerSectionContent } from "./sections/prayer-section";
+import { ForecastSection } from "./sections/forecast-section";
 import { BatteryIndicator } from "./ui/battery-indicator";
 
 interface DashboardTabProps {
@@ -19,9 +21,10 @@ interface DashboardTabProps {
   power: PowerReading | null;
   powerHistory: PowerReading[];
   isAdmin: boolean;
+  forecast: ForecastResponse | null;
 }
 
-export function DashboardTab({ weather, air, weatherHistory, airHistory, openOverlay, power, powerHistory, isAdmin }: DashboardTabProps) {
+export function DashboardTab({ weather, air, weatherHistory, airHistory, openOverlay, power, powerHistory, isAdmin, forecast }: DashboardTabProps) {
   const { order, collapsed, toggleCollapsed, moveUp, moveDown } = useSectionLayout();
   const { devices, sendControl } = useDevices(isAdmin);
   const { devices: acDevices, sendControl: acSendControl } = useAcDevices(isAdmin);
@@ -69,6 +72,14 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
     prayer: {
       header: <PrayerSectionHeader />,
       content: <PrayerSectionContent />,
+    },
+    forecast: {
+      header: (
+        <h2 className="text-base font-medium tracking-wider text-white inline-flex items-center">
+          FORECAST <span className="text-dim text-sm tracking-normal ml-2">7-Day</span>
+        </h2>
+      ),
+      content: <ForecastSection forecast={forecast} />,
     },
   };
 

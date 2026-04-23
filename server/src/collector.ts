@@ -147,10 +147,11 @@ function parseTimeToMinutes(time: string): number {
 }
 
 interface AutomationState {
-  status: "idle" | "triggered" | "override";
+  status: "idle" | "triggered";
   lastToggle: number;
   conditionSince: number | null;
   conditionLostAt: number | null;
+  canAutoTurnOn: boolean;
 }
 
 export class Collector {
@@ -171,6 +172,8 @@ export class Collector {
   private latestWeatherTs: Date | null = null;
   private latestAirRow: Record<string, unknown> | null = null;
   private latestAirTs: Date | null = null;
+  private latestPowerRow: Record<string, unknown> | null = null;
+  private latestPowerTs: Date | null = null;
   private airBuffer: AirRow[] = [];
   private lastAirSave = 0;
   private readonly AIR_SAVE_INTERVAL = 60_000;
@@ -188,6 +191,11 @@ export class Collector {
 
   getLatestAir(): Record<string, unknown> | null {
     return this.latestAirRow;
+  }
+
+  setLatestPower(data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }): void {
+    this.latestPowerRow = data as unknown as Record<string, unknown>;
+    this.latestPowerTs = new Date(data.ts);
   }
 
   constructor(pool: pg.Pool, config: Config) {
@@ -347,6 +355,7 @@ export class Collector {
     // Check sensor alerts
     const weatherStale = !this.latestWeatherTs || (now.getTime() - this.latestWeatherTs.getTime() > 300_000);
     const airStale = !this.latestAirTs || (now.getTime() - this.latestAirTs.getTime() > 300_000);
+    const powerStale = !this.latestPowerTs || (now.getTime() - this.latestPowerTs.getTime() > 60_000);
 
     for (const rule of this.alertRules) {
       if (rule.alert_type === "sensor") {
@@ -356,11 +365,13 @@ export class Collector {
         // Skip if source data is stale
         if (def.source === "weather" && weatherStale) continue;
         if (def.source === "air" && airStale) continue;
+        if (def.source === "power" && powerStale) continue;
 
         const value = getMetricValue(
           rule.metric!,
           this.latestWeatherRow,
           this.latestAirRow,
+          this.latestPowerRow,
         );
         if (value == null) continue;
 
@@ -544,21 +555,23 @@ export class Collector {
     const now = Date.now();
     const weatherStale = !this.latestWeatherTs || (now - this.latestWeatherTs.getTime() > 300_000);
     const airStale = !this.latestAirTs || (now - this.latestAirTs.getTime() > 300_000);
+    const powerStale = !this.latestPowerTs || (now - this.latestPowerTs.getTime() > 60_000);
 
     const def = ALERT_METRICS[rule.metric];
     if (!def) return;
 
     if (def.source === "weather" && weatherStale) return;
     if (def.source === "air" && airStale) return;
+    if (def.source === "power" && powerStale) return;
 
-    const value = getMetricValue(rule.metric, this.latestWeatherRow, this.latestAirRow);
+    const value = getMetricValue(rule.metric, this.latestWeatherRow, this.latestAirRow, this.latestPowerRow);
     if (value == null) return;
 
     const conditionMet = rule.condition === "above"
       ? value >= rule.threshold
       : value <= rule.threshold;
 
-    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null };
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true };
     const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
 
     const deviceIds = rule.device_ids ?? [rule.device_id];
@@ -592,7 +605,7 @@ export class Collector {
         );
         try {
           await this.executeAutomationAction(rule, rule.action_on, deviceIds);
-          this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null });
+          this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null, canAutoTurnOn: true });
         } catch (err) {
           log.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
         }
@@ -612,7 +625,7 @@ export class Collector {
             log.error(`[collector] Automation "${rule.name}" re-check failed for ${did}:`, (err as Error).message);
           }
         }
-        this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null });
+        this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null, canAutoTurnOn: true });
       }
     } else if (!conditionMet && state.status === "triggered") {
       if (rule.turn_off_at_end) {
@@ -628,7 +641,7 @@ export class Collector {
         }
         log.info(`Automation "${rule.name}" condition cleared → turning OFF devices`);
       }
-      this.automationState.set(rule.id, { status: "idle", lastToggle: state.lastToggle, conditionSince: null, conditionLostAt: null });
+      this.automationState.set(rule.id, { status: "idle", lastToggle: state.lastToggle, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true });
     }
   }
 
@@ -651,15 +664,17 @@ export class Collector {
     const now = Date.now();
     const weatherStale = !this.latestWeatherTs || (now - this.latestWeatherTs.getTime() > 300_000);
     const airStale = !this.latestAirTs || (now - this.latestAirTs.getTime() > 300_000);
+    const powerStale = !this.latestPowerTs || (now - this.latestPowerTs.getTime() > 60_000);
     const def = ALERT_METRICS[rule.metric!];
     if (!def) return;
     if (def.source === "weather" && weatherStale) return;
     if (def.source === "air" && airStale) return;
+    if (def.source === "power" && powerStale) return;
 
-    const value = getMetricValue(rule.metric!, this.latestWeatherRow, this.latestAirRow);
+    const value = getMetricValue(rule.metric!, this.latestWeatherRow, this.latestAirRow, this.latestPowerRow);
     if (value == null) return;
 
-    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null };
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true };
     const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
     const deviceIds = rule.device_ids ?? [rule.device_id];
     const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
@@ -671,7 +686,16 @@ export class Collector {
     const shouldTurnOff = isCool ? value <= rule.threshold_low! : value >= rule.threshold!;
 
     if (state.status === "idle") {
+      if (shouldTurnOff && !state.canAutoTurnOn) {
+        log.info(`[collector] AC range "${rule.name}": turn-off limit reached (${rule.metric}=${value}), unlocking auto-turn-on`);
+        state.canAutoTurnOn = true;
+      }
+
       if (shouldTurnOn) {
+        if (!state.canAutoTurnOn) {
+          this.automationState.set(rule.id, state);
+          return;
+        }
         if (state.conditionSince == null) state.conditionSince = now;
         const sustainedMs = (rule.sustained_minutes ?? 0) * 60_000;
         const sustained = sustainedMs === 0 || (now - state.conditionSince >= sustainedMs);
@@ -681,7 +705,7 @@ export class Collector {
           );
           try {
             await this.executeAutomationAction(rule, rule.action_on, deviceIds);
-            this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
+            this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
           } catch (err) {
             log.error(`[collector] AC range "${rule.name}" turn-on failed:`, (err as Error).message);
           }
@@ -701,7 +725,7 @@ export class Collector {
                 log.info(`[collector] AC range "${rule.name}": device ${did} is ON in dead zone (${rule.metric}=${value}), adopting and re-enforcing profile`);
                 const { power: _p, ...profileOnly } = rule.action_on as AcAction;
                 await this.tclCloud!.executeAcAction(did, profileOnly);
-                this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
+                this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
               }
             }
           } catch (err) {
@@ -714,7 +738,7 @@ export class Collector {
         state.conditionSince = null;
         this.automationState.set(rule.id, state);
       }
-    } else if (state.status === "triggered") {
+    } else {
       if (shouldTurnOff) {
         log.info(`[collector] AC range "${rule.name}": ${rule.metric}=${value}, turning OFF [${deviceNames}]`);
         try {
@@ -722,14 +746,14 @@ export class Collector {
         } catch (err) {
           log.error(`[collector] AC range "${rule.name}" turn-off failed:`, (err as Error).message);
         }
-        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null });
+        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true });
       } else if (now - state.lastToggle >= cooldownMs) {
         for (const did of deviceIds) {
           try {
             const power = await this.getDevicePowerCached(did, "ac");
             if (power === "off" || power === undefined) {
-              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, entering override (won't auto-turn-on until user restores)`);
-              this.automationState.set(rule.id, { status: "override", lastToggle: now, conditionSince: null, conditionLostAt: null });
+              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, blocking auto-turn-on until turn-off limit reached`);
+              this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
               return;
             }
             const { power: _p, ...profileOnly } = rule.action_on as AcAction;
@@ -739,26 +763,6 @@ export class Collector {
           }
         }
         this.automationState.set(rule.id, { ...state, lastToggle: now });
-      }
-    } else if (state.status === "override") {
-      if (shouldTurnOff) {
-        log.info(`[collector] AC range "${rule.name}": temp reached turn-off limit (${rule.metric}=${value}), clearing override`);
-        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null });
-      } else if (now - state.lastToggle >= cooldownMs) {
-        for (const did of deviceIds) {
-          try {
-            const power = await this.getDevicePowerCached(did, "ac");
-            if (power === "on") {
-              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned back ON, resuming automation`);
-              const { power: _p, ...profileOnly } = rule.action_on as AcAction;
-              await this.tclCloud!.executeAcAction(did, profileOnly);
-              this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
-              return;
-            }
-          } catch (err) {
-            log.error(`[collector] AC range "${rule.name}" override check failed for ${did}:`, (err as Error).message);
-          }
-        }
       }
     }
   }
@@ -782,7 +786,7 @@ export class Collector {
       ? (nowMinutes >= startMinutes && nowMinutes < endMinutes)
       : (nowMinutes >= startMinutes || nowMinutes < endMinutes);
 
-    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null };
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true };
     const now = Date.now();
     const cooldownMs = (rule.cooldown_secs ?? 60) * 1000;
 
@@ -801,7 +805,7 @@ export class Collector {
             );
             await this.executeAutomationAction(rule, rule.action_on, [did]);
             this.devicePowerCache.set(did, { power: "on", ts: Date.now() });
-            this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null });
+            this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true });
           }
         } catch (err) {
           log.error(`[collector] Schedule "${rule.name}" check failed for ${did}:`, (err as Error).message);
@@ -823,7 +827,7 @@ export class Collector {
             }
           }
         }
-        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null });
+        this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true });
       }
     }
   }

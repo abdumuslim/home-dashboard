@@ -1,6 +1,7 @@
 import { useState, useCallback, lazy, Suspense, type ReactNode } from "react";
 import { useCurrentData } from "@/hooks/use-current-data";
 import { useHistoryData } from "@/hooks/use-history-data";
+import { useForecast } from "@/hooks/use-forecast";
 import { usePushNotifications } from "@/hooks/use-push-notifications";
 import { AuthProvider, useAuth } from "@/hooks/use-auth";
 import { Header } from "@/components/Header";
@@ -21,6 +22,7 @@ function AppInner() {
   const { isAdmin, logout } = useAuth();
   const { weather, air, power } = useCurrentData();
   const { weatherHistory, airHistory, powerHistory } = useHistoryData("24h", true);
+  const forecast = useForecast();
   const [overlay, setOverlay] = useState<OverlayState | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showAlerts, setShowAlerts] = useState(false);
@@ -60,6 +62,7 @@ function AppInner() {
         power={power ?? null}
         powerHistory={powerHistory}
         isAdmin={isAdmin}
+        forecast={forecast}
       />
 
       <Suspense>

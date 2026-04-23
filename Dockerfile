@@ -21,5 +21,6 @@ COPY --from=server-build /build/server/dist ./dist
 COPY --from=server-build /build/server/node_modules ./node_modules
 COPY --from=server-build /build/server/package.json ./
 COPY --from=client-build /build/client/dist ./static
+COPY server/data/bias-table.json ./bias-data/bias-table.json
 EXPOSE 8000
 CMD ["node", "dist/index.js"]

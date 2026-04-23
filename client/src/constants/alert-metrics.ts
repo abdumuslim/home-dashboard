@@ -26,6 +26,14 @@ export const ALERT_METRICS: Record<string, MetricInfo> = {
   pm10:             { label: "PM10", unit: "µg/m³", group: "Air Quality", min: 0, max: 600 },
   tvoc:             { label: "tVOC", unit: "ppb", group: "Air Quality", min: 0, max: 1000 },
   noise:            { label: "Noise", unit: "dB", group: "Air Quality", min: 0, max: 130 },
+
+  // Power
+  voltage:          { label: "Voltage", unit: "V", group: "Power", min: 0, max: 300 },
+  power_grid:       { label: "Grid Power", unit: "W", group: "Power", min: 0, max: 25000 },
+  power_gen:        { label: "Generator Power", unit: "W", group: "Power", min: 0, max: 25000 },
+  power_total:      { label: "Total Power", unit: "W", group: "Power", min: 0, max: 50000 },
+  current_grid:     { label: "Grid Current", unit: "A", group: "Power", min: 0, max: 100 },
+  current_gen:      { label: "Generator Current", unit: "A", group: "Power", min: 0, max: 100 },
 };
 
 export const PRAYER_NAMES = ["fajr", "dhuhr", "asr", "maghrib", "isha"] as const;
