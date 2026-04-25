@@ -159,12 +159,50 @@ export class TclCloud {
     return devices;
   }
 
+  async ensureDeviceCachePopulated(): Promise<void> {
+    if (this.cachedDevices.length === 0) {
+      await this.fetchDevicesLive();
+    }
+  }
+
+  getDeviceState(deviceId: string): Partial<AcAction> | null {
+    const dev = this.cachedDevices.find(d => d.id === deviceId);
+    if (!dev) return null;
+    return {
+      mode: dev.mode,
+      temperature: dev.targetTemp,
+      fan_speed: dev.fanSpeed,
+      eco: dev.eco ? 1 : 0,
+      turbo: dev.turbo ? 1 : 0,
+      screen: dev.screen ? 1 : 0,
+      vertical_swing: dev.verticalSwing,
+      horizontal_swing: dev.horizontalSwing,
+      fresh_air: dev.freshAir ? 1 : 0,
+      generator_mode: dev.generatorMode,
+    };
+  }
+
+  computeAcDiff(deviceId: string, desired: AcAction): AcAction | null {
+    const current = this.getDeviceState(deviceId);
+    if (!current) {
+      log.warn(`[tcl] computeAcDiff: device ${deviceId} not in cache, sending full profile`);
+      return desired;
+    }
+    const diff: Partial<AcAction> = {};
+    for (const key of ["mode", "temperature", "fan_speed", "eco", "turbo", "screen", "vertical_swing", "horizontal_swing", "fresh_air", "generator_mode"] as const) {
+      if (desired[key] != null && desired[key] !== current[key]) {
+        (diff as Record<string, unknown>)[key] = desired[key];
+      }
+    }
+    return Object.keys(diff).length > 0 ? (diff as AcAction) : null;
+  }
+
   private isNajatModel(deviceId: string): boolean {
     const dev = this.cachedDevices.find(d => d.id === deviceId);
     return dev ? dev.maxGeneratorLevel === 6 : false;
   }
 
-  async sendControl(deviceId: string, command: string, value: unknown): Promise<void> {
+  async sendControl(deviceId: string, command: string, value: unknown, skipRestore = false): Promise<void> {
     await this.ensureValidTokens();
 
     // Handle power-on: restore last saved state
@@ -187,7 +225,9 @@ export class TclCloud {
         }
       }
       log.info(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
-      await this.restoreLastState(deviceId);
+      if (!skipRestore) {
+        await this.restoreLastState(deviceId);
+      }
       return;
     }
 
@@ -789,14 +829,25 @@ export class TclCloud {
     if (action.fresh_air != null) profileCmds.push(["set_fresh_air", action.fresh_air]);
     if (action.generator_mode != null) profileCmds.push(["set_generator_mode", action.generator_mode]);
 
+    const najat = this.isNajatModel(deviceId);
+    const fanSpeed = profileCmds.find(([c]) => c === "set_fan_speed")?.[1];
+    const dropTurbo = !najat && (fanSpeed === 7 || fanSpeed === 1);
+    const filteredCmds = profileCmds.filter(([cmd]) => {
+      if (cmd === "set_fresh_air" && !najat) return false;
+      if (cmd === "set_eco" && najat) return false;
+      if (cmd === "set_turbo" && najat) return false;
+      if (cmd === "set_turbo" && dropTurbo) return false;
+      return true;
+    });
+
     if (action.power === 1) {
-      await this.sendControl(deviceId, "set_power", 1);
-      if (profileCmds.length > 0) {
+      await this.sendControl(deviceId, "set_power", 1, filteredCmds.length > 0);
+      if (filteredCmds.length > 0) {
         await new Promise(r => setTimeout(r, 1000));
       }
     }
 
-    for (const [cmd, val] of profileCmds) {
+    for (const [cmd, val] of filteredCmds) {
       await this.sendControl(deviceId, cmd, val);
     }
   }

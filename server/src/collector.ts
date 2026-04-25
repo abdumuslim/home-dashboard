@@ -704,6 +704,7 @@ export class Collector {
             `[collector] AC range "${rule.name}": ${rule.metric}=${value}, turning ON [${deviceNames}]`,
           );
           try {
+            await this.tclCloud!.ensureDeviceCachePopulated();
             await this.executeAutomationAction(rule, rule.action_on, deviceIds);
             this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
           } catch (err) {
@@ -722,9 +723,12 @@ export class Collector {
                 await this.executeAutomationAction(rule, { power: 0 } as AcAction, [did]);
                 this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
               } else {
-                log.info(`[collector] AC range "${rule.name}": device ${did} is ON in dead zone (${rule.metric}=${value}), adopting and re-enforcing profile`);
                 const { power: _p, ...profileOnly } = rule.action_on as AcAction;
-                await this.tclCloud!.executeAcAction(did, profileOnly);
+                const diff = this.tclCloud!.computeAcDiff(did, profileOnly);
+                if (diff) {
+                  log.info(`[collector] AC range "${rule.name}": device ${did} is ON in dead zone (${rule.metric}=${value}), adopting with diff: ${JSON.stringify(diff)}`);
+                  await this.tclCloud!.executeAcAction(did, diff);
+                }
                 this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
               }
             }
@@ -757,7 +761,11 @@ export class Collector {
               return;
             }
             const { power: _p, ...profileOnly } = rule.action_on as AcAction;
-            await this.tclCloud!.executeAcAction(did, profileOnly);
+            const diff = this.tclCloud!.computeAcDiff(did, profileOnly);
+            if (diff) {
+              log.info(`[collector] AC range "${rule.name}": re-enforcing diff for ${did}: ${JSON.stringify(diff)}`);
+              await this.tclCloud!.executeAcAction(did, diff);
+            }
           } catch (err) {
             log.error(`[collector] AC range "${rule.name}" re-enforce failed for ${did}:`, (err as Error).message);
           }
