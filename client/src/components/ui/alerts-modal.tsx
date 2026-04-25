@@ -43,9 +43,18 @@ const TRIGGER_METRICS: Record<string, MetricInfo> = Object.fromEntries(
   ),
 );
 
+const FEELS_LIKE_MAP: Record<string, string> = {
+  temp_indoor_c: "feels_like_indoor_c",
+  temp_ch8_c: "feels_like_ch8_c",
+};
+const REVERSE_FEELS_LIKE: Record<string, string> = Object.fromEntries(
+  Object.entries(FEELS_LIKE_MAP).map(([k, v]) => [v, k]),
+);
+
 const AC_TRIGGER_METRICS: Record<string, MetricInfo> = Object.fromEntries(
   Object.entries(ALERT_METRICS).filter(
-    ([k, v]) => v.group === "Indoor" || (v.group === "Air Quality" && !["noise", "humidity_air"].includes(k)),
+    ([k, v]) => (v.group === "Indoor" || (v.group === "Air Quality" && !["noise", "humidity_air"].includes(k)))
+      && !(k in REVERSE_FEELS_LIKE),
   ),
 );
 
@@ -89,6 +98,9 @@ function describeTrigger(r: AutomationRule): string {
   const unit = m?.unit ? ` ${m.unit}` : "";
   const dur = r.sustained_minutes > 0 ? ` for ${r.sustained_minutes}min` : "";
   const off = r.turn_off_at_end ? " (off)" : "";
+  if (r.threshold_low != null && r.threshold != null) {
+    return `${label} ${r.threshold_low}–${r.threshold}${unit} → ${names}`;
+  }
   return `${label} ${r.condition} ${r.threshold}${unit}${dur}${off} → ${names}`;
 }
 
@@ -763,7 +775,11 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
   const [deviceType, setDeviceType] = useState<"purifier" | "ac">(editing?.device_type ?? "purifier");
   const [automationType, setAutomationType] = useState<"metric" | "schedule" | "">(editing?.automation_type ?? "");
   // Metric state
-  const [metric, setMetric] = useState(editing?.metric ?? "");
+  const [metric, setMetric] = useState(() => {
+    const raw = editing?.metric ?? "";
+    return REVERSE_FEELS_LIKE[raw] ?? raw;
+  });
+  const [useFeelsLike, setUseFeelsLike] = useState(() => !!(editing?.metric && editing.metric in REVERSE_FEELS_LIKE));
   const [condition, setCondition] = useState<"above" | "below" | "">(editing?.condition ?? "");
   const [threshold, setThreshold] = useState(editing?.threshold != null ? String(editing.threshold) : "");
   const [thresholdLow, setThresholdLow] = useState(editing?.threshold_low != null ? String(editing.threshold_low) : "");
@@ -836,6 +852,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
     setDeviceType(dt);
     setMetric("");
     setThreshold("");
+    setUseFeelsLike(false);
     setSelectedPreset(null);
     setPresetData(null);
     if (dt === "ac") {
@@ -886,7 +903,8 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
     }
     const mins = parseInt(sustainedMinutes, 10);
     if (isAcMetric) {
-      return { ...base, metric, condition: "above", threshold: thresholdNum, threshold_low: thresholdLowNum, sustained_minutes: 0 };
+      const effectiveMetric = useFeelsLike && metric in FEELS_LIKE_MAP ? FEELS_LIKE_MAP[metric] : metric;
+      return { ...base, metric: effectiveMetric, condition: "above", threshold: thresholdNum, threshold_low: thresholdLowNum, sustained_minutes: 0 };
     }
     return { ...base, metric, condition, threshold: thresholdNum, sustained_minutes: isFinite(mins) && mins > 0 ? mins : 0 };
   };
@@ -939,7 +957,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
         <>
           <select
             value={metric}
-            onChange={(e) => { setMetric(e.target.value); setThreshold(""); }}
+            onChange={(e) => { setMetric(e.target.value); setThreshold(""); setThresholdLow(""); setUseFeelsLike(false); }}
             className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50"
           >
             <option value="" className="bg-[#1a1a2e]">Select metric...</option>
@@ -947,6 +965,25 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
               <option key={key} value={key} className="bg-[#1a1a2e]">{info.label}</option>
             ))}
           </select>
+
+          {metric && deviceType === "ac" && metric in FEELS_LIKE_MAP && (
+            <div className="flex gap-2">
+              {([false, true] as const).map((fl) => (
+                <button
+                  key={String(fl)}
+                  onClick={() => setUseFeelsLike(fl)}
+                  className={cn(
+                    "flex-1 px-3 py-1.5 rounded-lg text-xs border transition-colors",
+                    useFeelsLike === fl
+                      ? "border-cyan/50 bg-cyan/10 text-cyan"
+                      : "border-white/10 bg-white/5 text-dim hover:text-text",
+                  )}
+                >
+                  {fl ? "Feels like" : "Real temp"}
+                </button>
+              ))}
+            </div>
+          )}
 
           {metric && deviceType === "ac" && (
             <div className="flex items-center gap-2">

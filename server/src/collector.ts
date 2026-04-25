@@ -572,7 +572,7 @@ export class Collector {
       : value <= rule.threshold;
 
     const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true };
-    const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
+    const cooldownMs = (rule.cooldown_secs ?? 5) * 1000;
 
     const deviceIds = rule.device_ids ?? [rule.device_id];
     const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
@@ -675,7 +675,7 @@ export class Collector {
     if (value == null) return;
 
     const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true };
-    const cooldownMs = (rule.cooldown_secs ?? 300) * 1000;
+    const cooldownMs = (rule.cooldown_secs ?? 5) * 1000;
     const deviceIds = rule.device_ids ?? [rule.device_id];
     const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
 

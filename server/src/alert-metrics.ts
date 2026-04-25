@@ -25,6 +25,8 @@ export const ALERT_METRICS: Record<string, MetricDef> = {
   humidity_indoor:  { label: "Indoor Humidity (Mom)", unit: "%", group: "Indoor", source: "weather", min: 0, max: 100 },
   temp_ch8_c:       { label: "Indoor Temperature (Abdu)", unit: "°C", group: "Indoor", source: "weather", min: -10, max: 60 },
   humidity_ch8:     { label: "Indoor Humidity (Abdu)", unit: "%", group: "Indoor", source: "weather", min: 0, max: 100 },
+  feels_like_indoor_c: { label: "Feels Like (Mom)", unit: "°C", group: "Indoor", source: "weather", min: -10, max: 60 },
+  feels_like_ch8_c:    { label: "Feels Like (Abdu)", unit: "°C", group: "Indoor", source: "weather", min: -10, max: 60 },
 
   // Air Quality (Qingping)
   temperature_air:  { label: "Kitchen Temperature", unit: "°C", group: "Air Quality", source: "air", min: -10, max: 60, dbColumn: "temperature" },

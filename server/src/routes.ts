@@ -689,7 +689,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         : null;
       const result = await pool.query(
         `INSERT INTO automations (name, enabled, automation_type, device_type, metric, condition, threshold, threshold_low, sustained_minutes, turn_off_at_end, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
-         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, 300) RETURNING *`,
+         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, 5) RETURNING *`,
         [name, mb.enabled ?? true, devType, mb.metric, condition, mb.threshold, mb.threshold_low ?? null, mins, turnOff, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, actionOn, actionOff],
       );
       res.json({ automation: result.rows[0] });
