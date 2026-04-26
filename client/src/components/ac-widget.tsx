@@ -221,7 +221,7 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
                   {d.targetTemp}°
                 </span>
                 <span className="text-[0.55rem] text-dim font-medium mt-0.5">
-                  {d.currentTemp > 0 ? `${d.currentTemp}° now` : modeInfo.label}
+                  {d.currentTemp > 0 ? `${d.currentTemp}°` : modeInfo.label}
                 </span>
               </>
             ) : (
