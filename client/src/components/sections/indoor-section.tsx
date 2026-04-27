@@ -86,7 +86,7 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
   ].filter(Boolean) as PurifierEntry[];
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-3">
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
       <DevicesCard acs={acEntries} purifiers={purifierEntries} />
       <IndoorCard
         title="Mom"

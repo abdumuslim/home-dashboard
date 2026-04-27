@@ -27,7 +27,7 @@ interface DevicesCardProps {
 
 export const DevicesCard = memo(function DevicesCard({ acs, purifiers }: DevicesCardProps) {
   return (
-    <MetricCard className="p-3 flex flex-col justify-center gap-2">
+    <MetricCard className="p-3 flex flex-col justify-center gap-2 col-span-2 md:col-span-1">
       {acs.length > 0 && (
         <div className="flex items-start justify-center gap-3">
           {acs.map((ac) => (

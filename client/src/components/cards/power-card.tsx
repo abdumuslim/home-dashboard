@@ -264,10 +264,10 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
               className="text-2xl md:text-3xl font-semibold leading-none tracking-tight"
               style={{ color: heroColor }}
             >
-              {noData ? "0.00" : heroPower != null ? (heroPower / 1000).toFixed(2) : "--"}
-              <span className="text-sm text-dim ml-1">kW</span>
+              {noData ? "0.0" : heroCurrent != null ? fmt(heroCurrent, 1) : "--"}
+              <span className="text-sm text-dim ml-1">A</span>
             </span>
-            <span className="text-[0.75rem] text-text font-medium mt-1">Power</span>
+            <span className="text-[0.75rem] text-text font-medium mt-1">Current</span>
           </div>
 
           <div className="flex flex-col">
@@ -286,10 +286,10 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
               className="text-2xl md:text-3xl font-semibold leading-none tracking-tight"
               style={{ color: heroColor }}
             >
-              {noData ? "0.0" : heroCurrent != null ? fmt(heroCurrent, 1) : "--"}
-              <span className="text-sm text-dim ml-1">A</span>
+              {noData ? "0.00" : heroPower != null ? (heroPower / 1000).toFixed(2) : "--"}
+              <span className="text-sm text-dim ml-1">kW</span>
             </span>
-            <span className="text-[0.75rem] text-text font-medium mt-1">Current</span>
+            <span className="text-[0.75rem] text-text font-medium mt-1">Power</span>
           </div>
         </div>
 
