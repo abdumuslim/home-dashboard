@@ -4,6 +4,7 @@ import type { PurifierDevice } from "@/types/automations";
 import type { AcDevice } from "@/types/ac";
 import { IndoorCard } from "@/components/cards/indoor-card";
 import { PowerCard } from "@/components/cards/power-card";
+import { DevicesCard, type AcEntry, type PurifierEntry } from "@/components/cards/devices-card";
 import { useAcTimers } from "@/components/ac-widget";
 
 interface IndoorSectionProps {
@@ -20,9 +21,7 @@ interface IndoorSectionProps {
   powerHistory?: PowerReading[];
 }
 
-// Steadman approximation for feels-like (indoor, no wind/sun)
 function calcFeelsLike(t: number, rh: number): number {
-  // Simple heat-index for indoor (no wind). Below 20°C just return temp.
   if (t < 20) return t;
   const hi =
     -8.7847 + 1.6114 * t + 2.3385 * rh - 0.14612 * t * rh -
@@ -37,16 +36,58 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
 
   const { timers, setTimer, cancelTimer } = useAcTimers();
 
-  // Match purifier devices to indoor cards by name (case-insensitive)
+  // Purifiers
   const momDevice = devices.find((d) => d.name.toLowerCase() === "mom");
   const abduDevice = devices.find((d) => d.name.toLowerCase() === "abdu");
 
-  // Match AC devices by name: "Najat" → Mom card, "Abdu AC" → Abdu card
+  // ACs — all 3
   const momAc = acDevices.find((d) => d.name.toLowerCase().includes("najat"));
   const abduAc = acDevices.find((d) => d.name.toLowerCase().startsWith("abdu") && !d.name.toLowerCase().includes("abdullah"));
+  const abdullahAc = acDevices.find((d) => d.name.toLowerCase().includes("abdullah"));
+
+  const acEntries: AcEntry[] = [
+    momAc && acSendControl && {
+      device: momAc,
+      label: "Mom",
+      onControl: (cmd: string, val: unknown) => acSendControl(momAc.id, cmd, val),
+      timer: timers.find((t) => t.deviceId === momAc.id) ?? null,
+      onSetTimer: (a: "on" | "off", m: number, p?: Record<string, unknown>) => setTimer(momAc.id, a, m, p),
+      onCancelTimer: () => cancelTimer(momAc.id),
+    },
+    abduAc && acSendControl && {
+      device: abduAc,
+      label: "Abdu",
+      onControl: (cmd: string, val: unknown) => acSendControl(abduAc.id, cmd, val),
+      timer: timers.find((t) => t.deviceId === abduAc.id) ?? null,
+      onSetTimer: (a: "on" | "off", m: number, p?: Record<string, unknown>) => setTimer(abduAc.id, a, m, p),
+      onCancelTimer: () => cancelTimer(abduAc.id),
+    },
+    abdullahAc && acSendControl && {
+      device: abdullahAc,
+      label: "Abdullah",
+      onControl: (cmd: string, val: unknown) => acSendControl(abdullahAc.id, cmd, val),
+      timer: timers.find((t) => t.deviceId === abdullahAc.id) ?? null,
+      onSetTimer: (a: "on" | "off", m: number, p?: Record<string, unknown>) => setTimer(abdullahAc.id, a, m, p),
+      onCancelTimer: () => cancelTimer(abdullahAc.id),
+    },
+  ].filter(Boolean) as AcEntry[];
+
+  const purifierEntries: PurifierEntry[] = [
+    momDevice && sendControl && {
+      device: momDevice,
+      label: "Mom",
+      onControl: (cmd: string, params: unknown[]) => sendControl(momDevice.id, cmd, params),
+    },
+    abduDevice && sendControl && {
+      device: abduDevice,
+      label: "Abdu",
+      onControl: (cmd: string, params: unknown[]) => sendControl(abduDevice.id, cmd, params),
+    },
+  ].filter(Boolean) as PurifierEntry[];
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-[3fr_3fr_2fr_2fr] gap-3">
+    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-3">
+      <DevicesCard acs={acEntries} purifiers={purifierEntries} />
       <IndoorCard
         title="Mom"
         icon={<Home className="w-full h-full" />}
@@ -57,13 +98,6 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         history={weatherHistory}
         metricKey="temp_indoor_c"
         openOverlay={openOverlay}
-        device={momDevice}
-        onControl={momDevice && sendControl ? (cmd, params) => sendControl(momDevice.id, cmd, params) : undefined}
-        acDevice={momAc}
-        onAcControl={momAc && acSendControl ? (cmd, val) => acSendControl(momAc.id, cmd, val) : undefined}
-        acTimer={momAc ? timers.find(t => t.deviceId === momAc.id) ?? null : null}
-        onAcSetTimer={momAc ? (action, minutes, preset) => setTimer(momAc.id, action, minutes, preset) : undefined}
-        onAcCancelTimer={momAc ? () => cancelTimer(momAc.id) : undefined}
       />
       <IndoorCard
         title="Abdu"
@@ -75,13 +109,6 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
         history={weatherHistory}
         metricKey="temp_ch8_c"
         openOverlay={openOverlay}
-        device={abduDevice}
-        onControl={abduDevice && sendControl ? (cmd, params) => sendControl(abduDevice.id, cmd, params) : undefined}
-        acDevice={abduAc}
-        onAcControl={abduAc && acSendControl ? (cmd, val) => acSendControl(abduAc.id, cmd, val) : undefined}
-        acTimer={abduAc ? timers.find(t => t.deviceId === abduAc.id) ?? null : null}
-        onAcSetTimer={abduAc ? (action, minutes, preset) => setTimer(abduAc.id, action, minutes, preset) : undefined}
-        onAcCancelTimer={abduAc ? () => cancelTimer(abduAc.id) : undefined}
       />
       <IndoorCard
         title="Kitchen"

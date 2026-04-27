@@ -146,11 +146,12 @@ interface AcWidgetProps {
   timer?: AcTimerData | null;
   onSetTimer?: (action: "on" | "off", minutes: number, preset?: Record<string, unknown>) => Promise<void>;
   onCancelTimer?: () => Promise<void>;
+  label?: string;
 }
 
 export { useAcTimers, type AcTimerData };
 
-export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTimer }: AcWidgetProps) {
+export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTimer, label }: AcWidgetProps) {
   const [showDetail, setShowDetail] = useState(false);
   const [powerBusy, setPowerBusy] = useState(false);
   const [tick, setTick] = useState(0);
@@ -180,7 +181,7 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
         offline ? "opacity-40" : "hover:border-white/10 hover:bg-[#1a1c23]/95"
       )}>
         {/* Header */}
-        <span className="text-[0.65rem] text-text/70 font-bold uppercase tracking-wider mt-0.5 mb-0.5">AC</span>
+        <span className="text-[0.65rem] text-text/70 font-bold tracking-wider mt-0.5 mb-0.5">{label ?? "AC"}</span>
 
         {/* Row 1: Power + Settings */}
         <div className="flex items-center gap-1">
