@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import pg from "pg";
+import { Coordinates, CalculationMethod, PrayerTimes, Prayer, Rounding } from "adhan";
 import type { Config } from "./config.js";
 import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
@@ -82,6 +83,133 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       return;
     }
     res.json(data);
+  });
+
+  // Prayer times — public, computed server-side via adhan library
+  const BAGHDAD = new Coordinates(33.321502, 44.358335);
+  const PRAYER_CALC = CalculationMethod.Dubai();
+  PRAYER_CALC.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
+  PRAYER_CALC.rounding = Rounding.None;
+
+  const HIJRI_MONTH_DAYS = [30, 29, 30, 29, 30, 29, 30, 29, 30, 29, 30, 29];
+  const HIJRI_YEAR_DAYS = HIJRI_MONTH_DAYS.reduce((a, b) => a + b, 0);
+
+  const ISLAMIC_EVENTS = [
+    { month: 1, day: 1, name: "Islamic New Year" },
+    { month: 1, day: 10, name: "Day of Ashura" },
+    { month: 3, day: 12, name: "Mawlid al-Nabi" },
+    { month: 7, day: 27, name: "Isra & Mi'raj" },
+    { month: 8, day: 15, name: "Change of Qibla" },
+    { month: 9, day: 1, name: "Ramadan" },
+    { month: 9, day: 27, name: "Laylat al-Qadr" },
+    { month: 10, day: 1, name: "Eid al-Fitr" },
+    { month: 12, day: 9, name: "Day of Arafah" },
+    { month: 12, day: 10, name: "Eid al-Adha" },
+  ];
+
+  function roundPrayer(date: Date, prayer: string): Date {
+    const d = new Date(date);
+    const s = d.getSeconds();
+    const ms = d.getMilliseconds();
+    if (prayer === "fajr") {
+      if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
+    } else {
+      if (s >= 30) d.setMinutes(d.getMinutes() + 1);
+    }
+    d.setSeconds(0, 0);
+    return d;
+  }
+
+  function fmtTime(date: Date): string {
+    return date.toLocaleTimeString("en-US", { timeZone: "Asia/Baghdad", hour: "numeric", minute: "2-digit", hour12: true });
+  }
+
+  function fmtCountdown(diffMs: number): string {
+    const totalSec = Math.max(0, Math.floor(diffMs / 1000));
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+
+  router.get("/api/prayer-times", (_req: Request, res: Response) => {
+    const now = new Date();
+    const dateKey = now.toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
+    const [y, m, d] = dateKey.split("-").map(Number);
+    const pt = new PrayerTimes(BAGHDAD, new Date(y, m - 1, d, 12, 0, 0), PRAYER_CALC);
+
+    const tomorrow = new Date(y, m - 1, d + 1, 12, 0, 0);
+    const ptTomorrow = new PrayerTimes(BAGHDAD, tomorrow, PRAYER_CALC);
+
+    const prayerOrder: { key: string; label: string }[] = [
+      { key: "fajr", label: "Fajr" },
+      { key: "sunrise", label: "Sunrise" },
+      { key: "dhuhr", label: "Dhuhr" },
+      { key: "asr", label: "Asr" },
+      { key: "maghrib", label: "Maghrib" },
+      { key: "isha", label: "Isha" },
+    ];
+
+    const nowMs = now.getTime();
+    const nextPrayerEnum = pt.nextPrayer(now);
+    const allPassed = nextPrayerEnum === Prayer.None;
+
+    const prayers = prayerOrder.map(({ key, label }) => {
+      const raw = pt[key as keyof PrayerTimes] as Date;
+      const time = roundPrayer(raw, key);
+      const diffMs = time.getTime() - nowMs;
+      const isPassed = diffMs < 0;
+      const isNext = !allPassed && nextPrayerEnum === key;
+      return {
+        name: key,
+        label,
+        time: fmtTime(time),
+        isPassed,
+        isNext,
+        countdown: isPassed ? null : fmtCountdown(diffMs),
+      };
+    });
+
+    let nextPrayer: { name: string; label: string; time: string; countdown: string } | null = null;
+    if (allPassed) {
+      const fajrTime = roundPrayer(ptTomorrow.fajr, "fajr");
+      const diffMs = fajrTime.getTime() - nowMs;
+      nextPrayer = { name: "fajr", label: "Fajr (tomorrow)", time: fmtTime(fajrTime), countdown: fmtCountdown(diffMs) };
+    } else {
+      const p = prayers.find((p) => p.isNext);
+      if (p) nextPrayer = { name: p.name, label: p.label, time: p.time, countdown: p.countdown! };
+    }
+
+    // Hijri date
+    const hijriDate = new Intl.DateTimeFormat("en-US-u-ca-islamic-umalqura", {
+      day: "numeric", month: "long", year: "numeric", timeZone: "Asia/Baghdad",
+    }).format(now);
+
+    // Next Islamic event
+    const hijriParts = new Intl.DateTimeFormat("en-US-u-ca-islamic-umalqura", {
+      day: "numeric", month: "numeric", timeZone: "Asia/Baghdad",
+    }).formatToParts(now);
+    const hMonth = Number(hijriParts.find((p) => p.type === "month")?.value);
+    const hDay = Number(hijriParts.find((p) => p.type === "day")?.value);
+
+    let nextEvent: { name: string; isToday: boolean; daysLeft: number } | null = null;
+    if (hMonth && hDay) {
+      const todayDoy = HIJRI_MONTH_DAYS.slice(0, hMonth - 1).reduce((a, b) => a + b, 0) + hDay;
+      for (const ev of ISLAMIC_EVENTS) {
+        const evDoy = HIJRI_MONTH_DAYS.slice(0, ev.month - 1).reduce((a, b) => a + b, 0) + ev.day;
+        if (evDoy === todayDoy) { nextEvent = { name: ev.name, isToday: true, daysLeft: 0 }; break; }
+        if (evDoy > todayDoy) { nextEvent = { name: ev.name, isToday: false, daysLeft: evDoy - todayDoy }; break; }
+      }
+      if (!nextEvent) {
+        const first = ISLAMIC_EVENTS[0];
+        const firstDoy = first.day;
+        nextEvent = { name: first.name, isToday: false, daysLeft: HIJRI_YEAR_DAYS - todayDoy + firstDoy };
+      }
+    }
+
+    res.json({ prayers, nextPrayer, hijriDate, nextEvent });
   });
 
   // Auth middleware — sets req.authenticated on every request
