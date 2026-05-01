@@ -521,6 +521,16 @@ export class Collector {
     await this.refreshAutomationRules();
     if (this.automationRules.length === 0) return;
 
+    if (this.tclCloud && !this.tclCloud.isReady() && Date.now() >= this.tclRetryAt) {
+      try {
+        log.warn("[collector] TCL Cloud not ready, attempting re-auth");
+        await this.tclCloud.init();
+      } catch (err) {
+        log.error("[collector] TCL Cloud re-auth failed:", (err as Error).message);
+        this.tclRetryAt = Date.now() + 60_000;
+      }
+    }
+
     for (const rule of this.automationRules) {
       if (rule.device_type === "ac" && (!this.tclCloud || !this.tclCloud.isReady())) continue;
       if (rule.device_type !== "ac" && (!this.xiaomiCloud || !this.xiaomiCloud.isReady())) continue;
@@ -666,13 +676,13 @@ export class Collector {
     const airStale = !this.latestAirTs || (now - this.latestAirTs.getTime() > 300_000);
     const powerStale = !this.latestPowerTs || (now - this.latestPowerTs.getTime() > 60_000);
     const def = ALERT_METRICS[rule.metric!];
-    if (!def) return;
+    if (!def) { log.warn(`[collector] AC range "${rule.name}": unknown metric "${rule.metric}"`); return; }
     if (def.source === "weather" && weatherStale) return;
     if (def.source === "air" && airStale) return;
     if (def.source === "power" && powerStale) return;
 
     const value = getMetricValue(rule.metric!, this.latestWeatherRow, this.latestAirRow, this.latestPowerRow);
-    if (value == null) return;
+    if (value == null) { log.warn(`[collector] AC range "${rule.name}": metric "${rule.metric}" value is null`); return; }
 
     const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true };
     const cooldownMs = (rule.cooldown_secs ?? 5) * 1000;
