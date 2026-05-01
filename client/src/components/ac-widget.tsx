@@ -49,16 +49,20 @@ interface PresetData {
 
 type PresetSlots = Record<number, PresetData | null>;
 
-function loadPresets(deviceId: string): PresetSlots {
+const EMPTY_PRESETS: PresetSlots = { 1: null, 2: null, 3: null, 4: null, 5: null };
+
+async function loadPresetsFromServer(deviceId: string): Promise<PresetSlots> {
   try {
-    const raw = localStorage.getItem(`ac-presets-${deviceId}`);
-    if (raw) return JSON.parse(raw);
+    const resp = await fetch(`/api/ac/presets/${deviceId}`);
+    if (resp.ok) {
+      const json = (await resp.json()) as { presets: PresetSlots };
+      return json.presets;
+    }
   } catch { /* ignore */ }
-  return { 1: null, 2: null, 3: null, 4: null, 5: null };
+  return { ...EMPTY_PRESETS };
 }
 
 function savePresets(deviceId: string, presets: PresetSlots, changedSlot?: number) {
-  localStorage.setItem(`ac-presets-${deviceId}`, JSON.stringify(presets));
   if (changedSlot != null && presets[changedSlot]) {
     fetch("/api/ac/preset-sync", {
       method: "POST",
@@ -66,6 +70,25 @@ function savePresets(deviceId: string, presets: PresetSlots, changedSlot?: numbe
       body: JSON.stringify({ deviceId, slot: changedSlot, presetData: presets[changedSlot] }),
     }).catch(() => {});
   }
+}
+
+function migrateLocalPresets(deviceId: string) {
+  const key = `ac-presets-${deviceId}`;
+  const raw = localStorage.getItem(key);
+  if (!raw) return;
+  try {
+    const local = JSON.parse(raw) as PresetSlots;
+    for (const [slot, data] of Object.entries(local)) {
+      if (data != null) {
+        fetch(`/api/ac/presets/${deviceId}/${slot}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ presetData: data }),
+        }).catch(() => {});
+      }
+    }
+    localStorage.removeItem(key);
+  } catch { /* ignore */ }
 }
 
 function capturePreset(d: AcDevice): PresetData {
@@ -283,7 +306,12 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
   const [saveMode, setSaveMode] = useState(false);
   const [activePreset, setActivePreset] = useState<number | null>(null);
   const [stagedValues, setStagedValues] = useState<PresetData | null>(null);
-  const [presets, setPresets] = useState<PresetSlots>(() => loadPresets(d.id));
+  const [presets, setPresets] = useState<PresetSlots>({ ...EMPTY_PRESETS });
+
+  useEffect(() => {
+    migrateLocalPresets(d.id);
+    loadPresetsFromServer(d.id).then(setPresets);
+  }, [d.id]);
   const [timerOpen, setTimerOpen] = useState(false);
   const [timerMinutes, setTimerMinutes] = useState(60);
   const [timerAction, setTimerAction] = useState<"on" | "off">("off");

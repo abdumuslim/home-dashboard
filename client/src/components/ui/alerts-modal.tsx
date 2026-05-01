@@ -60,10 +60,13 @@ const AC_TRIGGER_METRICS: Record<string, MetricInfo> = Object.fromEntries(
 
 const AC_MODE_NAMES = ["Auto", "Cool", "Dry", "Fan", "Heat"] as const;
 
-function loadAcPresets(deviceId: string): Record<number, Record<string, unknown> | null> {
+async function loadAcPresets(deviceId: string): Promise<Record<number, Record<string, unknown> | null>> {
   try {
-    const raw = localStorage.getItem(`ac-presets-${deviceId}`);
-    if (raw) return JSON.parse(raw);
+    const resp = await fetch(`/api/ac/presets/${deviceId}`);
+    if (resp.ok) {
+      const json = (await resp.json()) as { presets: Record<number, Record<string, unknown> | null> };
+      return json.presets;
+    }
   } catch { /* ignore */ }
   return { 1: null, 2: null, 3: null, 4: null, 5: null };
 }
@@ -802,9 +805,18 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
     () => (editing?.end_prayer_offset ?? 0) < 0 ? "before" : "after",
   );
   const [endOffsetMin, setEndOffsetMin] = useState(() => String(Math.abs(editing?.end_prayer_offset ?? 30)));
-  // AC preset state
-  const [selectedPreset, setSelectedPreset] = useState<number | null>(null);
-  const [presetData, setPresetData] = useState<Record<string, unknown> | null>(null);
+  // AC preset state — restore from editing.action_on when editing
+  const [selectedPreset, setSelectedPreset] = useState<number | null>(() => {
+    if (editing?.device_type === "ac" && editing.action_on?._preset_slot != null) return Number(editing.action_on._preset_slot);
+    return null;
+  });
+  const [presetData, setPresetData] = useState<Record<string, unknown> | null>(() => {
+    if (editing?.device_type === "ac" && editing.action_on?._preset_slot != null) {
+      const a = editing.action_on;
+      return { mode: a.mode, targetTemp: a.temperature, fanSpeed: a.fan_speed, eco: !!a.eco, turbo: !!a.turbo, screen: !!a.screen, verticalSwing: a.vertical_swing, horizontalSwing: a.horizontal_swing, freshAir: !!a.fresh_air, generatorMode: a.generator_mode };
+    }
+    return null;
+  });
   // AC single device selection
   const [selectedAcId, setSelectedAcId] = useState<string>(() => {
     if (editing?.device_type === "ac") return editing.device_ids?.[0] ?? editing.device_id ?? acDevices[0]?.id ?? "";
@@ -817,6 +829,11 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+
+  const [acPresets, setAcPresets] = useState<Record<number, Record<string, unknown> | null>>({ 1: null, 2: null, 3: null, 4: null, 5: null });
+  useEffect(() => {
+    if (deviceType === "ac" && selectedAcId) loadAcPresets(selectedAcId).then(setAcPresets);
+  }, [deviceType, selectedAcId]);
 
   const triggerMetrics = deviceType === "ac" ? AC_TRIGGER_METRICS : TRIGGER_METRICS;
   const metricDef = metric ? triggerMetrics[metric] : null;
@@ -1140,8 +1157,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
       {/* AC Preset selector */}
       {deviceType === "ac" && automationType !== "" && (() => {
         if (!selectedAcId) return null;
-        const presets = loadAcPresets(selectedAcId);
-        const filledSlots = Object.entries(presets).filter(([, v]) => v != null) as [string, Record<string, unknown>][];
+        const filledSlots = Object.entries(acPresets).filter(([, v]) => v != null) as [string, Record<string, unknown>][];
         if (filledSlots.length === 0) return (
           <p className="text-xs text-dim/60 py-1">No presets saved. Save presets in the AC card first.</p>
         );

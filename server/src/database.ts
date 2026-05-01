@@ -123,6 +123,14 @@ const MIGRATIONS: string[] = [
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS threshold_low REAL",
   // Make metric automations re-check every loop tick instead of every 5 min
   "UPDATE automations SET cooldown_secs = 5 WHERE automation_type = 'metric' AND cooldown_secs > 5",
+  // Server-side AC presets
+  `CREATE TABLE IF NOT EXISTS ac_presets (
+    device_id  TEXT NOT NULL,
+    slot       SMALLINT NOT NULL CHECK (slot BETWEEN 1 AND 5),
+    data       JSONB NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (device_id, slot)
+  )`,
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

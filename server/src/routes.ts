@@ -1018,11 +1018,41 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     res.json({ ok: true });
   });
 
+  // ---------- AC Presets (server-side) ----------
+
+  router.get("/api/ac/presets/:deviceId", requireAuth, async (req: Request, res: Response) => {
+    const deviceId = String(req.params.deviceId);
+    const result = await pool.query("SELECT slot, data FROM ac_presets WHERE device_id = $1 ORDER BY slot", [deviceId]);
+    const presets: Record<number, unknown> = { 1: null, 2: null, 3: null, 4: null, 5: null };
+    for (const row of result.rows) presets[row.slot] = row.data;
+    res.json({ presets });
+  });
+
+  router.put("/api/ac/presets/:deviceId/:slot", requireAuth, async (req: Request, res: Response) => {
+    const deviceId = String(req.params.deviceId);
+    const slot = parseInt(String(req.params.slot), 10);
+    if (isNaN(slot) || slot < 1 || slot > 5) { res.status(400).json({ error: "Slot must be 1-5" }); return; }
+    const { presetData } = req.body as { presetData: Record<string, unknown> };
+    if (!presetData || typeof presetData !== "object") { res.status(400).json({ error: "presetData required" }); return; }
+    await pool.query(
+      `INSERT INTO ac_presets (device_id, slot, data, updated_at) VALUES ($1, $2, $3::jsonb, NOW())
+       ON CONFLICT (device_id, slot) DO UPDATE SET data = $3::jsonb, updated_at = NOW()`,
+      [deviceId, slot, JSON.stringify(presetData)],
+    );
+    res.json({ ok: true });
+  });
+
   // ---------- Preset Sync ----------
 
   router.post("/api/ac/preset-sync", requireAuth, async (req: Request, res: Response) => {
     const { deviceId, slot, presetData } = req.body as { deviceId: string; slot: number; presetData: Record<string, unknown> };
     if (!deviceId || !slot || !presetData) { res.status(400).json({ error: "deviceId, slot, presetData required" }); return; }
+
+    await pool.query(
+      `INSERT INTO ac_presets (device_id, slot, data, updated_at) VALUES ($1, $2, $3::jsonb, NOW())
+       ON CONFLICT (device_id, slot) DO UPDATE SET data = $3::jsonb, updated_at = NOW()`,
+      [deviceId, slot, JSON.stringify(presetData)],
+    );
 
     const actionOn = JSON.stringify({
       power: 1,
