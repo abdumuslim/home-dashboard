@@ -183,6 +183,7 @@ export class Collector {
   xiaomiCloud: XiaomiCloud | null = null;
   tclCloud: TclCloud | null = null;
   private tclRetryAt = 0;
+  private xiaomiRetryAt = 0;
   private automationRules: AutomationRule[] = [];
   private automationRulesLastFetch = 0;
   private automationState = new Map<number, AutomationState>();
@@ -218,7 +219,7 @@ export class Collector {
 
   async runForever(): Promise<void> {
     this.startMqtt();
-    await this.initXiaomiCloud();
+    this.initXiaomiCloud().catch((err) => log.error("[collector] Xiaomi Cloud init failed:", (err as Error).message));
     await this.initTclCloud();
 
     // Run backfills in background — don't block the main collection/automation loop
@@ -317,6 +318,13 @@ export class Collector {
       this.tclRetryAt = Date.now() + 5 * 60_000;
       log.info("[collector] Retrying TCL Cloud init...");
       await this.initTclCloud();
+    }
+
+    // Retry Xiaomi Cloud init if it failed previously (every 5 minutes)
+    if (!this.xiaomiCloud && this.config.miEmail && this.config.miPassword && Date.now() >= this.xiaomiRetryAt) {
+      this.xiaomiRetryAt = Date.now() + 5 * 60_000;
+      log.info("[collector] Retrying Xiaomi Cloud init...");
+      await this.initXiaomiCloud();
     }
   }
 
@@ -528,6 +536,21 @@ export class Collector {
       } catch (err) {
         log.error("[collector] TCL Cloud re-auth failed:", (err as Error).message);
         this.tclRetryAt = Date.now() + 60_000;
+      }
+    }
+
+    if (this.xiaomiCloud && !this.xiaomiCloud.isReady()) {
+      const authInfo = this.xiaomiCloud.getAuthStatus();
+      if (authInfo.status !== "needs_2fa" && authInfo.status !== "needs_captcha") {
+        if (Date.now() >= this.xiaomiRetryAt) {
+          try {
+            log.warn("[collector] Xiaomi Cloud not ready, attempting re-auth");
+            await this.xiaomiCloud.init();
+          } catch (err) {
+            log.error("[collector] Xiaomi Cloud re-auth failed:", (err as Error).message);
+            this.xiaomiRetryAt = Date.now() + 60_000;
+          }
+        }
       }
     }
 
@@ -1348,24 +1371,25 @@ export class Collector {
     const buf = this.airBuffer;
     this.airBuffer = [];
 
-    const med = (fn: (r: AirRow) => number | null): number | null => {
+    const med = (fn: (r: AirRow) => number | null, round = false): number | null => {
       const vals = buf.map(fn).filter((v): v is number => v != null);
       if (vals.length === 0) return null;
       vals.sort((a, b) => a - b);
       const mid = Math.floor(vals.length / 2);
-      return vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+      const result = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+      return round ? Math.round(result) : result;
     };
 
     const row: AirRow = {
       ts: new Date(),
       temperature: med(r => r.temperature),
-      humidity: med(r => r.humidity),
-      co2: med(r => r.co2),
-      pm25: med(r => r.pm25),
-      pm10: med(r => r.pm10),
-      tvoc: med(r => r.tvoc),
-      noise: med(r => r.noise),
-      battery: med(r => r.battery),
+      humidity: med(r => r.humidity, true),
+      co2: med(r => r.co2, true),
+      pm25: med(r => r.pm25, true),
+      pm10: med(r => r.pm10, true),
+      tvoc: med(r => r.tvoc, true),
+      noise: med(r => r.noise, true),
+      battery: med(r => r.battery, true),
     };
 
     await this.storeAir(row);

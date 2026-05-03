@@ -1,5 +1,5 @@
 import XiaomiMiHome from "xmihome";
-import { writeFile } from "fs/promises";
+import { writeFile, unlink } from "fs/promises";
 import { childLogger } from "./logger.js";
 
 const log = childLogger("xiaomi");
@@ -355,14 +355,40 @@ export class XiaomiCloud {
     return this.authStatus === "authenticated";
   }
 
+  async invalidateAuth(): Promise<void> {
+    this.authStatus = "error";
+    this.authError = "serviceToken expired (401)";
+    const creds = this.client.config.credentials;
+    if (creds) {
+      delete (creds as Record<string, unknown>).userId;
+      delete (creds as Record<string, unknown>).ssecurity;
+      delete (creds as Record<string, unknown>).serviceToken;
+    }
+    try {
+      await unlink(CREDENTIALS_FILE);
+      log.info("[xiaomi] Deleted stale credentials file");
+    } catch {
+      // File may not exist
+    }
+  }
+
   async sendCommand(deviceId: string, method: string, params: unknown[]): Promise<unknown> {
     if (!this.isReady()) throw new Error("Xiaomi Cloud not authenticated");
-    const { result } = await this.client.miot.request(`/home/rpc/${deviceId}`, {
-      method,
-      params,
-    }) as { result: unknown };
-    log.info(`[xiaomi] Command ${method}(${JSON.stringify(params)}) → device ${deviceId}: OK`);
-    return result;
+    try {
+      const { result } = await this.client.miot.request(`/home/rpc/${deviceId}`, {
+        method,
+        params,
+      }) as { result: unknown };
+      log.info(`[xiaomi] Command ${method}(${JSON.stringify(params)}) → device ${deviceId}: OK`);
+      return result;
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      if (msg.includes("Unauthorized") || msg.includes("401")) {
+        log.warn("[xiaomi] Got 401/Unauthorized, invalidating auth for re-login");
+        await this.invalidateAuth();
+      }
+      throw err;
+    }
   }
 
   async executeAction(deviceId: string, action: PurifierAction): Promise<void> {
