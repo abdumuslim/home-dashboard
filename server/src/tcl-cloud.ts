@@ -817,39 +817,126 @@ export class TclCloud {
       return;
     }
 
-    const profileCmds: Array<[string, unknown]> = [];
-    if (action.mode != null) profileCmds.push(["set_mode", action.mode]);
-    if (action.temperature != null) profileCmds.push(["set_temperature", action.temperature]);
-    if (action.fan_speed != null) profileCmds.push(["set_fan_speed", action.fan_speed]);
-    if (action.eco != null) profileCmds.push(["set_eco", action.eco]);
-    if (action.turbo != null) profileCmds.push(["set_turbo", action.turbo]);
-    if (action.screen != null) profileCmds.push(["set_screen", action.screen]);
-    if (action.vertical_swing != null) profileCmds.push(["set_vertical_swing", action.vertical_swing]);
-    if (action.horizontal_swing != null) profileCmds.push(["set_horizontal_swing", action.horizontal_swing]);
-    if (action.fresh_air != null) profileCmds.push(["set_fresh_air", action.fresh_air]);
-    if (action.generator_mode != null) profileCmds.push(["set_generator_mode", action.generator_mode]);
-
-    const najat = this.isNajatModel(deviceId);
-    const fanSpeed = profileCmds.find(([c]) => c === "set_fan_speed")?.[1];
-    const dropTurbo = !najat && (fanSpeed === 7 || fanSpeed === 1);
-    const filteredCmds = profileCmds.filter(([cmd]) => {
-      if (cmd === "set_fresh_air" && !najat) return false;
-      if (cmd === "set_eco" && najat) return false;
-      if (cmd === "set_turbo" && najat) return false;
-      if (cmd === "set_turbo" && dropTurbo) return false;
-      return true;
-    });
+    const desired = this.buildProfileShadowPayload(deviceId, action);
+    const hasProfile = Object.keys(desired).length > 0;
 
     if (action.power === 1) {
-      await this.sendControl(deviceId, "set_power", 1, filteredCmds.length > 0);
-      if (filteredCmds.length > 0) {
+      await this.sendControl(deviceId, "set_power", 1, hasProfile);
+      if (hasProfile) {
         await new Promise(r => setTimeout(r, 1000));
       }
     }
 
-    for (const [cmd, val] of filteredCmds) {
-      await this.sendControl(deviceId, cmd, val);
+    if (hasProfile) {
+      await this.ensureValidTokens();
+      try {
+        await this.publishShadowUpdate(deviceId, desired);
+      } catch (err) {
+        const msg = (err as Error).message ?? "";
+        const name = (err as { name?: string }).name ?? "";
+        if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
+          log.warn(`[tcl] Batch profile publish failed (${name}), forcing re-auth and retrying`);
+          this.awsCreds = null;
+          this.tokenExpiry = 0;
+          this.tokenData = null;
+          await this.ensureValidTokens();
+          await this.publishShadowUpdate(deviceId, desired);
+        } else {
+          throw err;
+        }
+      }
+      log.info(`[tcl] Batch profile applied to device ${deviceId}: ${JSON.stringify(desired)}`);
     }
+  }
+
+  private buildProfileShadowPayload(deviceId: string, action: AcAction): Record<string, unknown> {
+    const najat = this.isNajatModel(deviceId);
+    const desired: Record<string, unknown> = {};
+
+    if (action.mode != null) {
+      desired.workMode = action.mode;
+    }
+
+    if (action.temperature != null) {
+      desired.targetTemperature = action.temperature;
+    }
+
+    if (action.fan_speed != null) {
+      if (najat) {
+        desired.windSpeed7Gear = action.fan_speed;
+      } else {
+        const v = action.fan_speed;
+        if (v === 1) {
+          desired.windSpeed = 0;
+          desired.silenceSwitch = 1;
+          desired.turbo = 0;
+        } else if (v === 7) {
+          desired.windSpeed = 0;
+          desired.silenceSwitch = 0;
+          desired.turbo = 1;
+        } else {
+          desired.windSpeed = v;
+          desired.silenceSwitch = 0;
+          desired.turbo = 0;
+        }
+      }
+    }
+
+    if (action.eco != null && !najat) {
+      desired.ECO = action.eco;
+    }
+
+    // Turbo: skip if fan_speed already controls it (1=silent, 7=turbo)
+    if (action.turbo != null && !najat) {
+      const dropTurbo = action.fan_speed === 7 || action.fan_speed === 1;
+      if (!dropTurbo) {
+        desired.turbo = action.turbo;
+      }
+    }
+
+    if (action.screen != null) {
+      desired.screen = action.screen;
+    }
+
+    if (action.vertical_swing != null) {
+      const v = action.vertical_swing;
+      const switchProp = najat ? "verticalWind" : "verticalSwitch";
+      if (v === 0) {
+        desired[switchProp] = 0;
+        desired.verticalDirection = 8;
+      } else if (v >= 1 && v <= 4) {
+        desired[switchProp] = 1;
+        desired.verticalDirection = v;
+      } else if (v >= 9 && v <= 13) {
+        desired[switchProp] = 0;
+        desired.verticalDirection = v;
+      }
+    }
+
+    if (action.horizontal_swing != null) {
+      const v = action.horizontal_swing;
+      const switchProp = najat ? "horizontalWind" : "horizontalSwitch";
+      if (v === 0) {
+        desired[switchProp] = 0;
+        desired.horizontalDirection = 8;
+      } else if (v >= 1 && v <= 4) {
+        desired[switchProp] = 1;
+        desired.horizontalDirection = v;
+      } else if (v >= 9 && v <= 13) {
+        desired[switchProp] = 0;
+        desired.horizontalDirection = v;
+      }
+    }
+
+    if (action.fresh_air != null && najat) {
+      desired.newWindSwitch = action.fresh_air;
+    }
+
+    if (action.generator_mode != null) {
+      desired.generatorMode = action.generator_mode;
+    }
+
+    return desired;
   }
 
   private async restoreLastState(deviceId: string): Promise<void> {
