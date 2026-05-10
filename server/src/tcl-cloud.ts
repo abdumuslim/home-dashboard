@@ -821,31 +821,38 @@ export class TclCloud {
     const hasProfile = Object.keys(desired).length > 0;
 
     if (action.power === 1) {
-      await this.sendControl(deviceId, "set_power", 1, hasProfile);
-      if (hasProfile) {
-        await new Promise(r => setTimeout(r, 1000));
+      if (!hasProfile) {
+        await this.sendControl(deviceId, "set_power", 1);
+        return;
       }
+      await this.publishWithRetry(deviceId, { powerSwitch: 1 });
+      log.info(`[tcl] Power ON sent to device ${deviceId}, waiting for boot`);
+      await new Promise(r => setTimeout(r, 3000));
     }
 
     if (hasProfile) {
-      await this.ensureValidTokens();
-      try {
-        await this.publishShadowUpdate(deviceId, desired);
-      } catch (err) {
-        const msg = (err as Error).message ?? "";
-        const name = (err as { name?: string }).name ?? "";
-        if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
-          log.warn(`[tcl] Batch profile publish failed (${name}), forcing re-auth and retrying`);
-          this.awsCreds = null;
-          this.tokenExpiry = 0;
-          this.tokenData = null;
-          await this.ensureValidTokens();
-          await this.publishShadowUpdate(deviceId, desired);
-        } else {
-          throw err;
-        }
+      await this.publishWithRetry(deviceId, desired);
+      log.info(`[tcl] Profile applied to device ${deviceId}: ${JSON.stringify(desired)}`);
+    }
+  }
+
+  private async publishWithRetry(deviceId: string, payload: Record<string, unknown>): Promise<void> {
+    await this.ensureValidTokens();
+    try {
+      await this.publishShadowUpdate(deviceId, payload);
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      const name = (err as { name?: string }).name ?? "";
+      if (msg.includes("403") || msg.includes("Forbidden") || name.includes("Credential") || name.includes("ExpiredToken")) {
+        log.warn(`[tcl] Shadow publish failed (${name}), forcing re-auth and retrying`);
+        this.awsCreds = null;
+        this.tokenExpiry = 0;
+        this.tokenData = null;
+        await this.ensureValidTokens();
+        await this.publishShadowUpdate(deviceId, payload);
+      } else {
+        throw err;
       }
-      log.info(`[tcl] Batch profile applied to device ${deviceId}: ${JSON.stringify(desired)}`);
     }
   }
 

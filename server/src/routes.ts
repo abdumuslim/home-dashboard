@@ -927,6 +927,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       if (rule.device_type === "ac") {
         const tcl = getTclCloud?.();
         if (!tcl || !tcl.isReady()) { res.status(503).json({ error: "TCL Cloud not available" }); return; }
+        await tcl.ensureDeviceCachePopulated();
         for (const did of ids) {
           await tcl.executeAcAction(did, rule.action_on as unknown as import("./tcl-cloud.js").AcAction);
         }

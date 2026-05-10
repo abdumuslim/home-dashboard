@@ -567,6 +567,9 @@ export class Collector {
   }
 
   private async executeAutomationAction(rule: AutomationRule, action: PurifierAction | AcAction, deviceIds: string[]): Promise<void> {
+    if (rule.device_type === "ac") {
+      await this.tclCloud!.ensureDeviceCachePopulated();
+    }
     for (const did of deviceIds) {
       if (rule.device_type === "ac") {
         await this.tclCloud!.executeAcAction(did, action as AcAction);
