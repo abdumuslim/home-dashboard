@@ -674,21 +674,23 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
 
                   {/* Apply button */}
                   <button
-                    onClick={() => {
+                    onClick={async () => {
                       if (!stagedValues) return;
                       const sv = stagedValues;
-                      if (sv.mode !== d.mode) send("set_mode", sv.mode);
-                      if (sv.targetTemp !== d.targetTemp) send("set_temperature", sv.targetTemp);
-                      if (sv.fanSpeed !== d.fanSpeed) send("set_fan_speed", sv.fanSpeed);
-                      if (sv.eco !== d.eco) send("set_eco", sv.eco ? 1 : 0);
-                      if (sv.turbo !== d.turbo) send("set_turbo", sv.turbo ? 1 : 0);
-                      if (sv.screen !== d.screen) send("set_screen", sv.screen ? 1 : 0);
-                      if (sv.verticalSwing !== d.verticalSwing) send("set_vertical_swing", sv.verticalSwing);
-                      if (sv.horizontalSwing !== d.horizontalSwing) send("set_horizontal_swing", sv.horizontalSwing);
-                      if (sv.freshAir !== d.freshAir) send("set_fresh_air", sv.freshAir ? 1 : 0);
-                      if (sv.generatorMode !== d.generatorMode) send("set_generator_mode", sv.generatorMode);
                       setActivePreset(null);
                       setStagedValues(null);
+                      // Mode first — firmware may reset fan speed on mode change
+                      if (sv.mode !== d.mode) try { await onControl("set_mode", sv.mode); } catch {}
+                      if (sv.targetTemp !== d.targetTemp) try { await onControl("set_temperature", sv.targetTemp); } catch {}
+                      if (sv.eco !== d.eco) try { await onControl("set_eco", sv.eco ? 1 : 0); } catch {}
+                      if (sv.screen !== d.screen) try { await onControl("set_screen", sv.screen ? 1 : 0); } catch {}
+                      if (sv.verticalSwing !== d.verticalSwing) try { await onControl("set_vertical_swing", sv.verticalSwing); } catch {}
+                      if (sv.horizontalSwing !== d.horizontalSwing) try { await onControl("set_horizontal_swing", sv.horizontalSwing); } catch {}
+                      if (sv.freshAir !== d.freshAir) try { await onControl("set_fresh_air", sv.freshAir ? 1 : 0); } catch {}
+                      if (sv.generatorMode !== d.generatorMode) try { await onControl("set_generator_mode", sv.generatorMode); } catch {}
+                      // Fan speed last — after mode change processed by firmware
+                      if (sv.fanSpeed !== d.fanSpeed) try { await onControl("set_fan_speed", sv.fanSpeed); } catch {}
+                      if (sv.turbo !== d.turbo) try { await onControl("set_turbo", sv.turbo ? 1 : 0); } catch {}
                     }}
                     disabled={!stagedValues}
                     className={cn(

@@ -613,17 +613,18 @@ export class TclCloud {
         if (!dev.deviceId || seen.has(dev.deviceId)) continue;
         seen.add(dev.deviceId);
 
-        const online = dev.isOnline === "online" || dev.isOnline === "1" || dev.isOnline === true || dev.isOnline === 1;
+        const tclOnline = dev.isOnline === "online" || dev.isOnline === "1" || dev.isOnline === true || dev.isOnline === 1;
 
-        // Read full state from IoT shadow (identifiers only has powerSwitch)
+        // Always attempt shadow fetch — TCL's isOnline flag is unreliable
         let shadow: Record<string, number> = {};
-        if (online && this.awsCreds) {
+        if (this.awsCreds) {
           try {
             shadow = await this.getThingShadow(dev.deviceId);
           } catch (err) {
             log.warn(`[tcl] Shadow read failed for ${dev.deviceId}:`, (err as Error).message);
           }
         }
+        const online = tclOnline || Object.keys(shadow).length > 0;
 
         const powerFromId = (dev.identifiers ?? []).find(i => i.identifier === "powerSwitch");
 
@@ -831,8 +832,25 @@ export class TclCloud {
     }
 
     if (hasProfile) {
-      await this.publishWithRetry(deviceId, desired);
-      log.info(`[tcl] Profile applied to device ${deviceId}: ${JSON.stringify(desired)}`);
+      const najat = this.isNajatModel(deviceId);
+      const fanKeys = ["windSpeed", "silenceSwitch", "turbo"];
+      const hasFan = !najat && fanKeys.some(k => k in desired);
+      const hasMode = "workMode" in desired;
+
+      if (hasFan && hasMode) {
+        const fanPayload: Record<string, unknown> = {};
+        for (const k of fanKeys) {
+          if (k in desired) { fanPayload[k] = desired[k]; delete desired[k]; }
+        }
+        await this.publishWithRetry(deviceId, desired);
+        log.info(`[tcl] Profile (main) applied to ${deviceId}: ${JSON.stringify(desired)}`);
+        await new Promise(r => setTimeout(r, 500));
+        await this.publishWithRetry(deviceId, fanPayload);
+        log.info(`[tcl] Profile (fan) applied to ${deviceId}: ${JSON.stringify(fanPayload)}`);
+      } else {
+        await this.publishWithRetry(deviceId, desired);
+        log.info(`[tcl] Profile applied to device ${deviceId}: ${JSON.stringify(desired)}`);
+      }
     }
   }
 

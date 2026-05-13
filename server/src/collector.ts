@@ -729,6 +729,26 @@ export class Collector {
 
       if (shouldTurnOn) {
         if (!state.canAutoTurnOn) {
+          if (now - state.lastToggle >= cooldownMs) {
+            for (const did of deviceIds) {
+              try {
+                const power = await this.getDevicePowerCached(did, "ac");
+                if (power === "on") {
+                  await this.tclCloud!.ensureDeviceCachePopulated();
+                  const { power: _p, ...profileOnly } = rule.action_on as AcAction;
+                  const diff = this.tclCloud!.computeAcDiff(did, profileOnly);
+                  if (diff) {
+                    log.info(`[collector] AC range "${rule.name}": device ${did} already ON, adopting with diff: ${JSON.stringify(diff)}`);
+                    await this.tclCloud!.executeAcAction(did, diff);
+                  }
+                  this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
+                  return;
+                }
+              } catch (err) {
+                log.error(`[collector] AC range "${rule.name}" adopt-check failed for ${did}:`, (err as Error).message);
+              }
+            }
+          }
           this.automationState.set(rule.id, state);
           return;
         }
