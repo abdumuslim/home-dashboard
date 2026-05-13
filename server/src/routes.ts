@@ -62,7 +62,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void): Router {
   const router = Router();
 
   // Health check — before auth middleware, no auth required
@@ -1076,6 +1076,36 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
        AND (action_on->>'_preset_slot')::int = $3`,
       [actionOn, deviceId, slot],
     );
+    res.json({ ok: true, updated: result.rowCount });
+  });
+
+  // ---------- Preset Apply (update active automations) ----------
+
+  router.post("/api/ac/preset-apply", requireAuth, async (req: Request, res: Response) => {
+    const { deviceId, slot, presetData } = req.body as { deviceId: string; slot: number; presetData: Record<string, unknown> };
+    if (!deviceId || !slot || !presetData) { res.status(400).json({ error: "deviceId, slot, presetData required" }); return; }
+
+    const actionOn = JSON.stringify({
+      power: 1,
+      mode: presetData.mode,
+      temperature: presetData.targetTemp,
+      fan_speed: presetData.fanSpeed,
+      eco: presetData.eco ? 1 : 0,
+      turbo: presetData.turbo ? 1 : 0,
+      screen: presetData.screen ? 1 : 0,
+      vertical_swing: presetData.verticalSwing,
+      horizontal_swing: presetData.horizontalSwing,
+      fresh_air: presetData.freshAir ? 1 : 0,
+      generator_mode: presetData.generatorMode,
+      _preset_slot: slot,
+    });
+
+    const result = await pool.query(
+      `UPDATE automations SET action_on = $1::jsonb
+       WHERE device_type = 'ac' AND enabled = true AND $2 = ANY(device_ids)`,
+      [actionOn, deviceId],
+    );
+    onAutomationRulesChanged?.();
     res.json({ ok: true, updated: result.rowCount });
   });
 

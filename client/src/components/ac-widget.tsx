@@ -384,8 +384,8 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
               <ChevronDown className="w-6 h-6" />
             </button>
             <div className="flex flex-col items-center">
-              <span className="text-4xl font-bold tabular-nums leading-none" style={{ color: colors.text }}>
-                {d.targetTemp}°
+              <span className="text-4xl font-bold tabular-nums leading-none" style={{ color: colors.text, opacity: stagedValues && stagedValues.targetTemp !== d.targetTemp ? 0.3 : 1 }}>
+                {stagedValues ? stagedValues.targetTemp : d.targetTemp}°
               </span>
               <span className="text-xs text-dim mt-1">Target</span>
             </div>
@@ -677,6 +677,7 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                     onClick={async () => {
                       if (!stagedValues) return;
                       const sv = stagedValues;
+                      const appliedSlot = activePreset;
                       setActivePreset(null);
                       setStagedValues(null);
                       // Mode first — firmware may reset fan speed on mode change
@@ -691,6 +692,13 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                       // Fan speed last — after mode change processed by firmware
                       if (sv.fanSpeed !== d.fanSpeed) try { await onControl("set_fan_speed", sv.fanSpeed); } catch {}
                       if (sv.turbo !== d.turbo) try { await onControl("set_turbo", sv.turbo ? 1 : 0); } catch {}
+                      if (appliedSlot != null) {
+                        fetch("/api/ac/preset-apply", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ deviceId: d.id, slot: appliedSlot, presetData: sv }),
+                        }).catch(() => {});
+                      }
                     }}
                     disabled={!stagedValues}
                     className={cn(

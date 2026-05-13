@@ -199,6 +199,10 @@ export class Collector {
     this.latestPowerTs = new Date(data.ts);
   }
 
+  invalidateAutomationRules(): void {
+    this.automationRulesLastFetch = 0;
+  }
+
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
     this.config = config;
