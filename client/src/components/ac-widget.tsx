@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
-import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent, Save, Check, Timer, TimerOff, Volume2, EarOff } from "lucide-react";
+import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent, Save, Check, Timer, TimerOff, Volume2, EarOff, Lock } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AcDevice } from "@/types/ac";
 
@@ -249,7 +249,9 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
                 </span>
               </>
             ) : (
-              <Snowflake className="w-4 h-4 text-dim" />
+              d.manualOffLocked
+                ? <Lock className="w-4 h-4 text-dim" />
+                : <Snowflake className="w-4 h-4 text-dim" />
             )}
           </div>
 
@@ -319,6 +321,7 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
   const isOn = d.power;
   const offline = !d.isOnline;
   const colors = getModeColors(d.mode);
+  const turnOnTimerBlocked = timerAction === "on" && d.manualOffLocked;
 
   const handleClose = useCallback(() => {
     setSaveMode(false);
@@ -478,6 +481,7 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                     >Cancel</button>
                     <button
                       onClick={async () => {
+                        if (turnOnTimerBlocked) return;
                         const preset = timerAction === "on" && timerPreset != null && presets[timerPreset]
                           ? {
                               mode: presets[timerPreset]!.mode,
@@ -495,7 +499,12 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                         await onSetTimer?.(timerAction, timerMinutes, preset);
                         setTimerOpen(false);
                       }}
-                      className="flex-1 px-2 py-1 rounded-lg text-xs border transition-colors"
+                      disabled={turnOnTimerBlocked}
+                      title={turnOnTimerBlocked ? "Turn the AC on manually before setting an on timer" : undefined}
+                      className={cn(
+                        "flex-1 px-2 py-1 rounded-lg text-xs border transition-colors",
+                        turnOnTimerBlocked && "opacity-40 cursor-not-allowed",
+                      )}
                       style={{ borderColor: colors.border, backgroundColor: colors.bg, color: colors.text }}
                     >Start</button>
                   </div>

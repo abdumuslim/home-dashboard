@@ -47,7 +47,23 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   // Mount API routes
-  app.use(createRouter(pool, config, () => collector.xiaomiCloud, () => collector.tclCloud, () => collector.getLatestAir(), () => forecastService.getForecast(), (data) => collector.setLatestPower(data), () => collector.invalidateAutomationRules()));
+  app.use(createRouter(
+    pool,
+    config,
+    () => collector.xiaomiCloud,
+    () => collector.tclCloud,
+    () => collector.getLatestAir(),
+    () => forecastService.getForecast(),
+    (data) => collector.setLatestPower(data),
+    () => collector.invalidateAutomationRules(),
+    {
+      record: (deviceId, reason) => collector.recordAcManualOff(deviceId, reason),
+      clear: (deviceId) => collector.clearAcManualOff(deviceId),
+      isLocked: (deviceId) => collector.isAcManualOffLocked(deviceId),
+      getLockedIds: (deviceIds) => collector.getAcManualOffLockedIds(deviceIds),
+      reconcileDevices: (devices) => collector.reconcileAcManualOffLocks(devices),
+    },
+  ));
 
   // Serve static files from ../static (relative to dist/ or src/)
   const staticDir = path.resolve(__dirname, "..", "static");

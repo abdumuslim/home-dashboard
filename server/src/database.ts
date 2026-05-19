@@ -131,6 +131,11 @@ const MIGRATIONS: string[] = [
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (device_id, slot)
   )`,
+  `CREATE TABLE IF NOT EXISTS ac_manual_off_locks (
+    device_id TEXT PRIMARY KEY,
+    locked_at TIMESTAMPTZ DEFAULT NOW(),
+    reason TEXT
+  )`,
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

@@ -3,6 +3,7 @@ export interface AcDevice {
   name: string;
   isOnline: boolean;
   power: boolean;
+  manualOffLocked?: boolean;
   mode: number;
   targetTemp: number;
   currentTemp: number;

@@ -5,7 +5,7 @@ import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import type { Config } from "./config.js";
 import { getMetricValue, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
-import { TclCloud, type AcAction } from "./tcl-cloud.js";
+import { TclCloud, type AcAction, type AcDevice } from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
 import { childLogger } from "./logger.js";
 
@@ -188,7 +188,11 @@ export class Collector {
   private automationRulesLastFetch = 0;
   private automationState = new Map<number, AutomationState>();
   private devicePowerCache = new Map<string, { power: "on" | "off" | undefined; ts: number }>();
+  private acManualOffLocks = new Set<string>();
+  private acManualOffLockTimes = new Map<string, number>();
+  private acManualOffLocksLoaded = false;
   private readonly POWER_CACHE_TTL = 5_000;
+  private readonly AC_MANUAL_OFF_CLEAR_GRACE_MS = 15_000;
 
   getLatestAir(): Record<string, unknown> | null {
     return this.latestAirRow;
@@ -201,6 +205,72 @@ export class Collector {
 
   invalidateAutomationRules(): void {
     this.automationRulesLastFetch = 0;
+  }
+
+  private async ensureAcManualOffLocksLoaded(): Promise<void> {
+    if (this.acManualOffLocksLoaded) return;
+    const result = await this.pool.query("SELECT device_id, locked_at FROM ac_manual_off_locks");
+    this.acManualOffLocks = new Set();
+    this.acManualOffLockTimes = new Map();
+    for (const row of result.rows) {
+      const deviceId = String(row.device_id);
+      const lockedAt = row.locked_at instanceof Date ? row.locked_at.getTime() : Date.now();
+      this.acManualOffLocks.add(deviceId);
+      this.acManualOffLockTimes.set(deviceId, lockedAt);
+    }
+    this.acManualOffLocksLoaded = true;
+  }
+
+  async recordAcManualOff(deviceId: string, reason: string): Promise<void> {
+    await this.ensureAcManualOffLocksLoaded();
+    const wasLocked = this.acManualOffLocks.has(deviceId);
+    this.acManualOffLocks.add(deviceId);
+    this.acManualOffLockTimes.set(deviceId, Date.now());
+    await this.pool.query(
+      `INSERT INTO ac_manual_off_locks (device_id, locked_at, reason)
+       VALUES ($1, NOW(), $2)
+       ON CONFLICT (device_id) DO UPDATE SET locked_at = NOW(), reason = EXCLUDED.reason`,
+      [deviceId, reason],
+    );
+    this.devicePowerCache.set(deviceId, { power: "off", ts: Date.now() });
+    if (!wasLocked) log.info(`[collector] AC ${deviceId}: manual-off lock recorded (${reason})`);
+  }
+
+  async clearAcManualOff(deviceId: string): Promise<void> {
+    await this.ensureAcManualOffLocksLoaded();
+    const wasLocked = this.acManualOffLocks.delete(deviceId);
+    this.acManualOffLockTimes.delete(deviceId);
+    if (wasLocked) {
+      await this.pool.query("DELETE FROM ac_manual_off_locks WHERE device_id = $1", [deviceId]);
+    }
+    this.devicePowerCache.set(deviceId, { power: "on", ts: Date.now() });
+    if (wasLocked) log.info(`[collector] AC ${deviceId}: manual-off lock cleared`);
+  }
+
+  async isAcManualOffLocked(deviceId: string): Promise<boolean> {
+    await this.ensureAcManualOffLocksLoaded();
+    return this.acManualOffLocks.has(deviceId);
+  }
+
+  async getAcManualOffLockedIds(deviceIds?: string[]): Promise<Set<string>> {
+    await this.ensureAcManualOffLocksLoaded();
+    if (!deviceIds) return new Set(this.acManualOffLocks);
+    return new Set(deviceIds.filter((deviceId) => this.acManualOffLocks.has(deviceId)));
+  }
+
+  private canClearAcManualOff(deviceId: string): boolean {
+    const lockedAt = this.acManualOffLockTimes.get(deviceId);
+    return lockedAt == null || Date.now() - lockedAt >= this.AC_MANUAL_OFF_CLEAR_GRACE_MS;
+  }
+
+  async reconcileAcManualOffLocks(devices: Pick<AcDevice, "id" | "power">[]): Promise<Set<string>> {
+    await this.ensureAcManualOffLocksLoaded();
+    for (const dev of devices) {
+      if (dev.power && this.acManualOffLocks.has(dev.id) && this.canClearAcManualOff(dev.id)) {
+        await this.clearAcManualOff(dev.id);
+      }
+    }
+    return this.getAcManualOffLockedIds(devices.map((dev) => dev.id));
   }
 
   constructor(pool: pg.Pool, config: Config) {
@@ -637,6 +707,20 @@ export class Collector {
 
     if (conditionMet && sustainedEnough && (now - state.lastToggle >= cooldownMs)) {
       if (state.status === "idle") {
+        let targetDeviceIds = deviceIds;
+        if (rule.device_type === "ac") {
+          const lockedIds = await this.getAcManualOffLockedIds(deviceIds);
+          if (lockedIds.size > 0) {
+            for (const did of lockedIds) {
+              const power = await this.getDevicePowerCached(did, "ac", true);
+              if (power !== "on" && await this.isAcManualOffLocked(did)) {
+                log.info(`[collector] Automation "${rule.name}": device ${did} is manual-off locked, skipping auto-on`);
+              }
+            }
+            targetDeviceIds = deviceIds.filter((did) => !this.acManualOffLocks.has(did));
+            if (targetDeviceIds.length === 0) return;
+          }
+        }
         // First trigger — turn on all devices
         log.info(
           `[collector] Automation "${rule.name}": ${rule.metric}=${value} ${rule.condition} ${rule.threshold}` +
@@ -644,7 +728,7 @@ export class Collector {
           `, turning ON [${deviceNames}]`,
         );
         try {
-          await this.executeAutomationAction(rule, rule.action_on, deviceIds);
+          await this.executeAutomationAction(rule, rule.action_on, targetDeviceIds);
           this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: state.conditionSince, conditionLostAt: null, canAutoTurnOn: true });
         } catch (err) {
           log.error(`[collector] Automation "${rule.name}" action_on failed:`, (err as Error).message);
@@ -655,6 +739,12 @@ export class Collector {
           try {
             const power = await this.getDevicePowerCached(did, rule.device_type);
             if (power === "off" || power === undefined) {
+              if (rule.device_type === "ac") {
+                log.info(`[collector] Automation "${rule.name}": device ${did} manually turned OFF, recording manual-off lock`);
+                await this.recordAcManualOff(did, "observed_off");
+                this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
+                continue;
+              }
               log.info(
                 `[collector] Automation "${rule.name}": device ${did} is OFF while ${rule.metric}=${value} still ${rule.condition} ${rule.threshold}, re-turning ON [${deviceNames}]`,
               );
@@ -685,14 +775,17 @@ export class Collector {
     }
   }
 
-  private async getDevicePowerCached(deviceId: string, deviceType: "purifier" | "ac" = "purifier"): Promise<"on" | "off" | undefined> {
+  private async getDevicePowerCached(deviceId: string, deviceType: "purifier" | "ac" = "purifier", forceRefresh = false): Promise<"on" | "off" | undefined> {
     const cached = this.devicePowerCache.get(deviceId);
-    if (cached && Date.now() - cached.ts < this.POWER_CACHE_TTL) return cached.power;
+    if (!forceRefresh && cached && Date.now() - cached.ts < this.POWER_CACHE_TTL) return cached.power;
     let power: "on" | "off" | undefined;
     if (deviceType === "ac") {
       const devs = await this.tclCloud!.fetchDevicesLive();
       const dev = devs.find(d => d.id === deviceId);
       power = dev ? (dev.power ? "on" : "off") : undefined;
+      if (power === "on" && this.canClearAcManualOff(deviceId)) {
+        await this.clearAcManualOff(deviceId);
+      }
     } else {
       power = await this.xiaomiCloud!.getDevicePower(deviceId);
     }
@@ -726,34 +819,34 @@ export class Collector {
     const shouldTurnOff = isCool ? value <= rule.threshold_low! : value >= rule.threshold!;
 
     if (state.status === "idle") {
-      if (shouldTurnOff && !state.canAutoTurnOn) {
-        log.info(`[collector] AC range "${rule.name}": turn-off limit reached (${rule.metric}=${value}), unlocking auto-turn-on`);
-        state.canAutoTurnOn = true;
-      }
-
       if (shouldTurnOn) {
-        if (!state.canAutoTurnOn) {
-          if (now - state.lastToggle >= cooldownMs) {
-            for (const did of deviceIds) {
-              try {
-                const power = await this.getDevicePowerCached(did, "ac");
-                if (power === "on") {
-                  await this.tclCloud!.ensureDeviceCachePopulated();
-                  const { power: _p, ...profileOnly } = rule.action_on as AcAction;
-                  const diff = this.tclCloud!.computeAcDiff(did, profileOnly);
-                  if (diff) {
-                    log.info(`[collector] AC range "${rule.name}": device ${did} already ON, adopting with diff: ${JSON.stringify(diff)}`);
-                    await this.tclCloud!.executeAcAction(did, diff);
-                  }
-                  this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
-                  return;
+        const lockedIds = await this.getAcManualOffLockedIds(deviceIds);
+        let unlockedDeviceIds = deviceIds.filter((did) => !lockedIds.has(did));
+        if (lockedIds.size > 0 && now - state.lastToggle >= cooldownMs) {
+          for (const did of deviceIds) {
+            if (!lockedIds.has(did)) continue;
+            try {
+              const power = await this.getDevicePowerCached(did, "ac", true);
+              if (power === "on" && !(await this.isAcManualOffLocked(did))) {
+                await this.tclCloud!.ensureDeviceCachePopulated();
+                const { power: _p, ...profileOnly } = rule.action_on as AcAction;
+                const diff = this.tclCloud!.computeAcDiff(did, profileOnly);
+                if (diff) {
+                  log.info(`[collector] AC range "${rule.name}": device ${did} is ON while locked, adopting with diff: ${JSON.stringify(diff)}`);
+                  await this.tclCloud!.executeAcAction(did, diff);
                 }
-              } catch (err) {
-                log.error(`[collector] AC range "${rule.name}" adopt-check failed for ${did}:`, (err as Error).message);
+                this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
+                return;
               }
+              log.info(`[collector] AC range "${rule.name}": device ${did} is manual-off locked, skipping auto-on`);
+            } catch (err) {
+              log.error(`[collector] AC range "${rule.name}" lock-check failed for ${did}:`, (err as Error).message);
             }
           }
-          this.automationState.set(rule.id, state);
+          unlockedDeviceIds = deviceIds.filter((did) => !this.acManualOffLocks.has(did));
+        }
+        if (unlockedDeviceIds.length === 0) {
+          this.automationState.set(rule.id, { ...state, conditionSince: null });
           return;
         }
         if (state.conditionSince == null) state.conditionSince = now;
@@ -765,7 +858,7 @@ export class Collector {
           );
           try {
             await this.tclCloud!.ensureDeviceCachePopulated();
-            await this.executeAutomationAction(rule, rule.action_on, deviceIds);
+            await this.executeAutomationAction(rule, rule.action_on, unlockedDeviceIds);
             this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
           } catch (err) {
             log.error(`[collector] AC range "${rule.name}" turn-on failed:`, (err as Error).message);
@@ -816,7 +909,8 @@ export class Collector {
           try {
             const power = await this.getDevicePowerCached(did, "ac");
             if (power === "off" || power === undefined) {
-              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, blocking auto-turn-on until turn-off limit reached`);
+              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, recording manual-off lock`);
+              await this.recordAcManualOff(did, "observed_off");
               this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
               return;
             }
@@ -866,8 +960,19 @@ export class Collector {
 
       for (const did of deviceIds) {
         try {
-          const power = await this.getDevicePowerCached(did, rule.device_type);
+          const locked = rule.device_type === "ac" && await this.isAcManualOffLocked(did);
+          const power = await this.getDevicePowerCached(did, rule.device_type, locked);
           if (power === "off" || power === undefined) {
+            if (rule.device_type === "ac" && state.status === "triggered") {
+              log.info(`[collector] Schedule "${rule.name}": device ${did} manually turned OFF during active window, recording manual-off lock`);
+              await this.recordAcManualOff(did, "observed_off");
+              this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
+              continue;
+            }
+            if (locked && await this.isAcManualOffLocked(did)) {
+              log.info(`[collector] Schedule "${rule.name}": device ${did} is manual-off locked, skipping auto-on`);
+              continue;
+            }
             log.info(
               `[collector] Schedule "${rule.name}": device ${did} is OFF during active window, turning ON [${deviceNames}]`,
             );
@@ -909,8 +1014,16 @@ export class Collector {
       try {
         if (timer.action === "off") {
           await this.tclCloud.executeAcAction(deviceId, { power: 0 });
+          await this.recordAcManualOff(deviceId, "timer_off");
           log.info(`[collector] AC timer: turned OFF device ${deviceId}`);
         } else {
+          if (await this.isAcManualOffLocked(deviceId)) {
+            await this.getDevicePowerCached(deviceId, "ac", true);
+            if (await this.isAcManualOffLocked(deviceId)) {
+              log.info(`[collector] AC timer: device ${deviceId} is manual-off locked, skipping turn-on timer`);
+              continue;
+            }
+          }
           const preset = timer.preset ?? {};
           const action: AcAction = {
             power: 1,

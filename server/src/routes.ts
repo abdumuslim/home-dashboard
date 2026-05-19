@@ -17,6 +17,14 @@ export interface AcTimer {
 
 export const acTimers = new Map<string, AcTimer>();
 
+export interface AcManualOffLockHandlers {
+  record(deviceId: string, reason: string): Promise<void>;
+  clear(deviceId: string): Promise<void>;
+  isLocked(deviceId: string): Promise<boolean>;
+  getLockedIds(deviceIds?: string[]): Promise<Set<string>>;
+  reconcileDevices(devices: Array<{ id: string; power: boolean }>): Promise<Set<string>>;
+}
+
 export function median(arr: number[]): number {
   const sorted = [...arr].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
@@ -62,7 +70,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers): Router {
   const router = Router();
 
   // Health check — before auth middleware, no auth required
@@ -969,9 +977,12 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
     try {
       const devices = await cloud.fetchDevicesLive();
-      res.json({ devices, available: true });
+      const lockedIds = await acManualOffLocks?.reconcileDevices(devices) ?? new Set<string>();
+      res.json({ devices: devices.map((device) => ({ ...device, manualOffLocked: lockedIds.has(device.id) })), available: true });
     } catch (err) {
-      res.json({ devices: cloud.getDevices(), available: true, error: (err as Error).message });
+      const devices = cloud.getDevices();
+      const lockedIds = await acManualOffLocks?.getLockedIds(devices.map((device) => device.id)) ?? new Set<string>();
+      res.json({ devices: devices.map((device) => ({ ...device, manualOffLocked: lockedIds.has(device.id) })), available: true, error: (err as Error).message });
     }
   });
 
@@ -991,6 +1002,13 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
     try {
       await cloud.sendControl(id, command, value);
+      if (command === "set_power") {
+        if (value === 0) {
+          await acManualOffLocks?.record(id, "ui");
+        } else if (value === 1) {
+          await acManualOffLocks?.clear(id);
+        }
+      }
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
@@ -1004,11 +1022,15 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     res.json({ timers });
   });
 
-  router.post("/api/ac/timer", requireAuth, (req: Request, res: Response) => {
+  router.post("/api/ac/timer", requireAuth, async (req: Request, res: Response) => {
     const { deviceId, action, minutes, preset } = req.body as { deviceId: string; action: "on" | "off"; minutes: number; preset?: Record<string, unknown> };
     if (!deviceId || !action || !minutes) { res.status(400).json({ error: "deviceId, action, minutes required" }); return; }
     if (action !== "on" && action !== "off") { res.status(400).json({ error: "action must be 'on' or 'off'" }); return; }
     if (!Number.isInteger(minutes) || minutes < 1 || minutes > 480) { res.status(400).json({ error: "minutes must be 1–480" }); return; }
+    if (action === "on" && await acManualOffLocks?.isLocked(deviceId)) {
+      res.status(409).json({ error: "AC is manually off. Turn it on manually before setting an on timer." });
+      return;
+    }
     const fireAt = Date.now() + minutes * 60_000;
     acTimers.set(deviceId, { deviceId, action, preset: action === "on" ? preset : undefined, fireAt });
     res.json({ ok: true, fireAt });
