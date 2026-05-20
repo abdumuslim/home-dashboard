@@ -22,6 +22,22 @@ export interface AcProfile {
   fan_speed: number;
 }
 
+export interface AutomationRangeSlot {
+  id: string;
+  label?: string;
+  type: "all_day" | "window";
+  start_mode?: "exact" | "prayer";
+  start_time?: string;
+  start_prayer?: string;
+  start_prayer_offset?: number;
+  end_mode?: "exact" | "prayer";
+  end_time?: string;
+  end_prayer?: string;
+  end_prayer_offset?: number;
+  threshold_low: number;
+  threshold: number;
+}
+
 export interface AutomationRule {
   id: number;
   name: string;
@@ -33,6 +49,7 @@ export interface AutomationRule {
   condition: "above" | "below" | null;
   threshold: number | null;
   threshold_low: number | null;
+  range_slots: AutomationRangeSlot[] | null;
   time_start: string | null;
   time_end: string | null;
   start_mode: "exact" | "prayer";

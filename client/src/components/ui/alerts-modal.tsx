@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { X, Trash2, Pencil, Bell, BellOff, Plus, Loader2, Clock, Activity, Snowflake } from "lucide-react";
+import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import { cn } from "@/lib/utils";
 import { usePushNotifications } from "@/hooks/use-push-notifications";
 import { useAlerts } from "@/hooks/use-alerts";
@@ -9,7 +10,7 @@ import { useDevices } from "@/hooks/use-devices";
 import { useAcDevices } from "@/hooks/use-ac-devices";
 import { ALERT_METRICS, PRAYER_NAMES, PRAYER_LABELS } from "@/constants/alert-metrics";
 import type { AlertCondition, PrayerTiming, AlertRule, MetricInfo } from "@/types/alerts";
-import type { PurifierDevice, AutomationRule } from "@/types/automations";
+import type { PurifierDevice, AutomationRule, AutomationRangeSlot } from "@/types/automations";
 import type { AcDevice } from "@/types/ac";
 
 function Spinner({ className }: { className?: string }) {
@@ -59,6 +60,132 @@ const AC_TRIGGER_METRICS: Record<string, MetricInfo> = Object.fromEntries(
 );
 
 const AC_MODE_NAMES = ["Auto", "Cool", "Dry", "Fan", "Heat"] as const;
+const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const MINUTES_PER_DAY = 1440;
+const BAGHDAD = new Coordinates(33.321502, 44.358335);
+const PRAYER_PARAMS = CalculationMethod.Dubai();
+PRAYER_PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
+PRAYER_PARAMS.rounding = Rounding.None;
+
+function createRangeSlot(overrides: Partial<AutomationRangeSlot> = {}): AutomationRangeSlot {
+  return {
+    id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `slot-${Date.now()}`,
+    type: "window",
+    start_mode: "exact",
+    start_time: "08:00",
+    end_mode: "exact",
+    end_time: "12:00",
+    threshold_low: 22,
+    threshold: 26,
+    ...overrides,
+  };
+}
+
+function rangeSlotsFromRule(rule: AutomationRule | null): AutomationRangeSlot[] {
+  if (rule?.device_type === "ac" && rule.automation_type === "metric") {
+    if (rule.range_slots?.length) return rule.range_slots;
+    if (rule.threshold_low != null && rule.threshold != null) {
+      return [createRangeSlot({ id: "default", type: "all_day", threshold_low: rule.threshold_low, threshold: rule.threshold })];
+    }
+  }
+  return [createRangeSlot({ id: "default", type: "all_day" })];
+}
+
+function parseTimeToMinutes(time: string): number {
+  const [h, m] = time.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function roundPrayerTime(date: Date, prayer: string): Date {
+  const d = new Date(date);
+  const s = d.getSeconds();
+  const ms = d.getMilliseconds();
+  if (prayer === "fajr") {
+    if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
+  } else if (s >= 30) {
+    d.setMinutes(d.getMinutes() + 1);
+  }
+  d.setSeconds(0, 0);
+  return d;
+}
+
+function resolvePrayerMinutes(prayer: string, offset: number): number | null {
+  if (!PRAYER_NAMES.includes(prayer as (typeof PRAYER_NAMES)[number])) return null;
+  const dateKey = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const prayerTimes = new PrayerTimes(BAGHDAD, new Date(y, m - 1, d, 12, 0, 0), PRAYER_PARAMS);
+  const raw = prayerTimes[prayer as keyof PrayerTimes] as Date | undefined;
+  if (!(raw instanceof Date)) return null;
+  const rounded = roundPrayerTime(raw, prayer);
+  const bd = new Date(rounded.toLocaleString("en-US", { timeZone: "Asia/Baghdad" }));
+  return ((bd.getHours() * 60 + bd.getMinutes() + offset) % MINUTES_PER_DAY + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+}
+
+function resolveSlotEndpoint(slot: AutomationRangeSlot, prefix: "start" | "end"): number | null {
+  const mode = slot[`${prefix}_mode`] ?? "exact";
+  if (mode === "prayer") {
+    const prayer = slot[`${prefix}_prayer`];
+    const offset = slot[`${prefix}_prayer_offset`] ?? 0;
+    if (!prayer || !Number.isInteger(offset) || offset < -120 || offset > 120) return null;
+    return resolvePrayerMinutes(prayer, offset);
+  }
+  const time = slot[`${prefix}_time`];
+  return time && TIME_RE.test(time) ? parseTimeToMinutes(time) : null;
+}
+
+function slotIntervals(slot: AutomationRangeSlot): Array<{ start: number; end: number }> | null {
+  if (slot.type === "all_day") return [];
+  const start = resolveSlotEndpoint(slot, "start");
+  const end = resolveSlotEndpoint(slot, "end");
+  if (start == null || end == null || start === end) return null;
+  return start < end ? [{ start, end }] : [{ start, end: MINUTES_PER_DAY }, { start: 0, end }];
+}
+
+function validateRangeSlotsForForm(slots: AutomationRangeSlot[], metricDef: MetricInfo | null): { valid: boolean; error: string; conflicts: Set<string> } {
+  const conflicts = new Set<string>();
+  if (!metricDef) return { valid: false, error: "", conflicts };
+  if (slots.length < 1 || slots.length > 24) return { valid: false, error: "Use 1-24 range slots.", conflicts };
+
+  let allDayCount = 0;
+  const windows: Array<{ slot: AutomationRangeSlot; intervals: Array<{ start: number; end: number }> }> = [];
+
+  for (const slot of slots) {
+    if (!Number.isFinite(slot.threshold_low) || !Number.isFinite(slot.threshold)) {
+      return { valid: false, error: "Every slot needs low and high thresholds.", conflicts };
+    }
+    if (slot.threshold_low < metricDef.min || slot.threshold > metricDef.max || slot.threshold_low >= slot.threshold) {
+      return { valid: false, error: `Ranges must stay within ${metricDef.min}-${metricDef.max}${metricDef.unit} and low must be below high.`, conflicts };
+    }
+    if (slot.type === "all_day") {
+      allDayCount += 1;
+      if (allDayCount > 1) return { valid: false, error: "Only one all-day slot is allowed.", conflicts };
+      continue;
+    }
+    const intervals = slotIntervals(slot);
+    if (!intervals) return { valid: false, error: "Window slots need valid, different start and end times.", conflicts };
+    windows.push({ slot, intervals });
+  }
+
+  for (let i = 0; i < windows.length; i += 1) {
+    for (let j = i + 1; j < windows.length; j += 1) {
+      const overlaps = windows[i].intervals.some((a) => windows[j].intervals.some((b) => a.start < b.end && b.start < a.end));
+      if (overlaps) {
+        conflicts.add(windows[i].slot.id);
+        conflicts.add(windows[j].slot.id);
+      }
+    }
+  }
+
+  return {
+    valid: conflicts.size === 0,
+    error: conflicts.size > 0 ? "Timed range slots cannot overlap." : "",
+    conflicts,
+  };
+}
+
+function primaryRangeSlot(slots: AutomationRangeSlot[]): AutomationRangeSlot {
+  return slots.find((s) => s.type === "all_day") ?? slots[0];
+}
 
 async function loadAcPresets(deviceId: string): Promise<Record<number, Record<string, unknown> | null>> {
   try {
@@ -101,6 +228,15 @@ function describeTrigger(r: AutomationRule): string {
   const unit = m?.unit ? ` ${m.unit}` : "";
   const dur = r.sustained_minutes > 0 ? ` for ${r.sustained_minutes}min` : "";
   const off = r.turn_off_at_end ? " (off)" : "";
+  if (r.device_type === "ac" && r.range_slots?.length) {
+    const fallback = r.range_slots.find((s) => s.type === "all_day");
+    const summary = r.range_slots.length === 1
+      ? `${r.range_slots[0].threshold_low}–${r.range_slots[0].threshold}${unit}`
+      : fallback
+        ? `${r.range_slots.length} ranges, default ${fallback.threshold_low}–${fallback.threshold}${unit}`
+        : `${r.range_slots.length} ranges`;
+    return `${label} ${summary} → ${names}`;
+  }
   if (r.threshold_low != null && r.threshold != null) {
     return `${label} ${r.threshold_low}–${r.threshold}${unit} → ${names}`;
   }
@@ -768,6 +904,165 @@ function DeviceCheckboxes({ devices, selectedDevices, setSelectedDevices }: {
   );
 }
 
+function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
+  slots: AutomationRangeSlot[];
+  metricDef: MetricInfo | null;
+  conflicts: Set<string>;
+  onChange: (slots: AutomationRangeSlot[]) => void;
+}) {
+  const updateSlot = (id: string, patch: Partial<AutomationRangeSlot>) => {
+    onChange(slots.map((slot) => slot.id === id ? { ...slot, ...patch } : slot));
+  };
+  const moveSlot = (index: number, dir: -1 | 1) => {
+    const next = [...slots];
+    const target = index + dir;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    onChange(next);
+  };
+
+  return (
+    <div className="flex flex-col gap-2 p-2.5 rounded-lg bg-sky-400/5 border border-sky-400/20">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] text-sky-400/70 uppercase tracking-wider">Ranges</span>
+        <button
+          onClick={() => onChange([...slots, createRangeSlot({ id: `slot-${Date.now()}`, type: "window" })])}
+          disabled={slots.length >= 24}
+          className="flex items-center gap-1 px-2 py-1 rounded border border-white/10 bg-white/5 text-[10px] text-dim hover:text-text disabled:opacity-30"
+        >
+          <Plus className="w-3 h-3" /> Add
+        </button>
+      </div>
+
+      {slots.map((slot, index) => {
+        const conflicted = conflicts.has(slot.id);
+        return (
+          <div key={slot.id} className={cn("flex flex-col gap-2 p-2 rounded-lg border bg-black/10", conflicted ? "border-red-400/50" : "border-white/10")}>
+            <div className="flex items-center gap-1.5">
+              <input
+                value={slot.label ?? ""}
+                onChange={(e) => updateSlot(slot.id, { label: e.target.value })}
+                placeholder={`Slot ${index + 1}`}
+                className="min-w-0 flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-text outline-none focus:border-cyan/50"
+              />
+              <button onClick={() => moveSlot(index, -1)} disabled={index === 0} className="px-1.5 py-1 rounded text-[10px] text-dim border border-white/10 disabled:opacity-30">Up</button>
+              <button onClick={() => moveSlot(index, 1)} disabled={index === slots.length - 1} className="px-1.5 py-1 rounded text-[10px] text-dim border border-white/10 disabled:opacity-30">Down</button>
+              <button
+                onClick={() => onChange([...slots.slice(0, index + 1), { ...slot, id: `slot-${Date.now()}` }, ...slots.slice(index + 1)])}
+                disabled={slots.length >= 24}
+                className="px-1.5 py-1 rounded text-[10px] text-dim border border-white/10 disabled:opacity-30"
+              >
+                Copy
+              </button>
+              <button
+                onClick={() => onChange(slots.filter((s) => s.id !== slot.id))}
+                disabled={slots.length <= 1}
+                className="p-1 rounded text-dim hover:text-red-400 border border-white/10 disabled:opacity-30"
+              >
+                <Trash2 className="w-3 h-3" />
+              </button>
+            </div>
+
+            <div className="flex gap-1.5">
+              {(["all_day", "window"] as const).map((type) => (
+                <button
+                  key={type}
+                  onClick={() => updateSlot(slot.id, { type })}
+                  className={cn(
+                    "flex-1 px-2 py-1 rounded text-[10px] border transition-colors",
+                    slot.type === type ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                  )}
+                >
+                  {type === "all_day" ? "All day" : "Window"}
+                </button>
+              ))}
+            </div>
+
+            {slot.type === "window" && (
+              <div className="grid grid-cols-2 gap-2">
+                {(["start", "end"] as const).map((prefix) => {
+                  const mode = slot[`${prefix}_mode`] ?? "exact";
+                  const prayer = slot[`${prefix}_prayer`] ?? (prefix === "start" ? "isha" : "fajr");
+                  const offset = slot[`${prefix}_prayer_offset`] ?? 0;
+                  return (
+                    <div key={prefix} className="flex flex-col gap-1">
+                      <span className="text-[10px] text-dim">{prefix === "start" ? "From" : "To"}</span>
+                      <div className="flex gap-1">
+                        {(["exact", "prayer"] as const).map((m) => (
+                          <button
+                            key={m}
+                            onClick={() => updateSlot(slot.id, { [`${prefix}_mode`]: m })}
+                            className={cn("flex-1 px-1.5 py-0.5 rounded text-[10px] border", mode === m ? "border-cyan/50 bg-cyan/10 text-cyan" : "border-white/10 bg-white/5 text-dim")}
+                          >
+                            {m === "exact" ? "Time" : "Prayer"}
+                          </button>
+                        ))}
+                      </div>
+                      {mode === "exact" ? (
+                        <input
+                          type="time"
+                          step={60}
+                          value={slot[`${prefix}_time`] ?? (prefix === "start" ? "08:00" : "12:00")}
+                          onChange={(e) => updateSlot(slot.id, { [`${prefix}_time`]: e.target.value })}
+                          className="w-full bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
+                        />
+                      ) : (
+                        <div className="flex gap-1">
+                          <select
+                            value={prayer}
+                            onChange={(e) => updateSlot(slot.id, { [`${prefix}_prayer`]: e.target.value })}
+                            className="min-w-0 flex-1 bg-white/5 border border-white/10 rounded px-1 py-1 text-xs text-text outline-none focus:border-cyan/50"
+                          >
+                            {PRAYER_NAMES.map((p) => <option key={p} value={p} className="bg-[#1a1a2e]">{PRAYER_LABELS[p]}</option>)}
+                          </select>
+                          <input
+                            type="number"
+                            min={-120}
+                            max={120}
+                            value={offset}
+                            onChange={(e) => updateSlot(slot.id, { [`${prefix}_prayer_offset`]: parseInt(e.target.value, 10) })}
+                            className="w-14 bg-white/5 border border-white/10 rounded px-1 py-1 text-xs text-text outline-none focus:border-cyan/50 text-center"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="flex items-center gap-2">
+              <div className="flex-1 flex flex-col gap-0.5">
+                <span className="text-[10px] text-dim">Low</span>
+                <input
+                  type="number"
+                  value={Number.isFinite(slot.threshold_low) ? slot.threshold_low : ""}
+                  onChange={(e) => updateSlot(slot.id, { threshold_low: e.target.value === "" ? Number.NaN : parseFloat(e.target.value) })}
+                  placeholder={metricDef ? `${metricDef.min}` : ""}
+                  step="any"
+                  className="w-full bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-text outline-none focus:border-cyan/50"
+                />
+              </div>
+              <span className="text-dim text-sm mt-4">-</span>
+              <div className="flex-1 flex flex-col gap-0.5">
+                <span className="text-[10px] text-dim">High</span>
+                <input
+                  type="number"
+                  value={Number.isFinite(slot.threshold) ? slot.threshold : ""}
+                  onChange={(e) => updateSlot(slot.id, { threshold: e.target.value === "" ? Number.NaN : parseFloat(e.target.value) })}
+                  placeholder={metricDef ? `${metricDef.max}` : ""}
+                  step="any"
+                  className="w-full bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-text outline-none focus:border-cyan/50"
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }: {
   devices: PurifierDevice[];
   acDevices: AcDevice[];
@@ -785,7 +1080,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
   const [useFeelsLike, setUseFeelsLike] = useState(() => !!(editing?.metric && editing.metric in REVERSE_FEELS_LIKE));
   const [condition, setCondition] = useState<"above" | "below" | "">(editing?.condition ?? "");
   const [threshold, setThreshold] = useState(editing?.threshold != null ? String(editing.threshold) : "");
-  const [thresholdLow, setThresholdLow] = useState(editing?.threshold_low != null ? String(editing.threshold_low) : "");
+  const [rangeSlots, setRangeSlots] = useState<AutomationRangeSlot[]>(() => rangeSlotsFromRule(editing));
   const [sustainedMinutes, setSustainedMinutes] = useState(String(editing?.sustained_minutes ?? 0));
   // Schedule state
   const [timeStart, setTimeStart] = useState(editing?.time_start ?? "22:00");
@@ -838,10 +1133,10 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
   const triggerMetrics = deviceType === "ac" ? AC_TRIGGER_METRICS : TRIGGER_METRICS;
   const metricDef = metric ? triggerMetrics[metric] : null;
   const thresholdNum = parseFloat(threshold);
-  const thresholdLowNum = parseFloat(thresholdLow);
   const thresholdValid = metricDef && threshold !== "" && isFinite(thresholdNum) && thresholdNum >= metricDef.min && thresholdNum <= metricDef.max;
-  const thresholdLowValid = metricDef && thresholdLow !== "" && isFinite(thresholdLowNum) && thresholdLowNum >= metricDef.min && thresholdLowNum <= metricDef.max;
-  const rangeValid = thresholdValid && thresholdLowValid && thresholdLowNum < thresholdNum;
+  const slotValidation = deviceType === "ac" && automationType === "metric"
+    ? validateRangeSlotsForForm(rangeSlots, metricDef)
+    : { valid: false, error: "", conflicts: new Set<string>() };
 
   const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
   const prayerNames = PRAYER_NAMES as readonly string[];
@@ -855,10 +1150,11 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
     && !(startMode === "exact" && endMode === "exact" && timeStart === timeEnd);
 
   const hasDeviceSelected = deviceType === "ac" ? selectedAcId !== "" : selectedDevices.size > 0;
+  const hasAcProfile = deviceType !== "ac" || presetData != null;
   const canSaveMetricPurifier = deviceType !== "ac" && automationType === "metric" && metric !== "" && condition !== "" && thresholdValid && hasDeviceSelected;
-  const canSaveMetricAc = deviceType === "ac" && automationType === "metric" && metric !== "" && rangeValid && hasDeviceSelected;
+  const canSaveMetricAc = deviceType === "ac" && automationType === "metric" && metric !== "" && slotValidation.valid && hasDeviceSelected && hasAcProfile;
   const canSaveMetric = canSaveMetricPurifier || canSaveMetricAc;
-  const canSaveSchedule = automationType === "schedule" && timeValid && hasDeviceSelected;
+  const canSaveSchedule = automationType === "schedule" && timeValid && hasDeviceSelected && hasAcProfile;
   const canSave = canSaveMetric || canSaveSchedule;
 
   const showDevices = deviceType === "ac"
@@ -869,6 +1165,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
     setDeviceType(dt);
     setMetric("");
     setThreshold("");
+    setRangeSlots([createRangeSlot({ id: "default", type: "all_day" })]);
     setUseFeelsLike(false);
     setSelectedPreset(null);
     setPresetData(null);
@@ -921,7 +1218,16 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
     const mins = parseInt(sustainedMinutes, 10);
     if (isAcMetric) {
       const effectiveMetric = useFeelsLike && metric in FEELS_LIKE_MAP ? FEELS_LIKE_MAP[metric] : metric;
-      return { ...base, metric: effectiveMetric, condition: "above", threshold: thresholdNum, threshold_low: thresholdLowNum, sustained_minutes: 0 };
+      const primary = primaryRangeSlot(rangeSlots);
+      return {
+        ...base,
+        metric: effectiveMetric,
+        condition: "above",
+        threshold: primary.threshold,
+        threshold_low: primary.threshold_low,
+        range_slots: rangeSlots,
+        sustained_minutes: 0,
+      };
     }
     return { ...base, metric, condition, threshold: thresholdNum, sustained_minutes: isFinite(mins) && mins > 0 ? mins : 0 };
   };
@@ -974,7 +1280,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
         <>
           <select
             value={metric}
-            onChange={(e) => { setMetric(e.target.value); setThreshold(""); setThresholdLow(""); setUseFeelsLike(false); }}
+            onChange={(e) => { setMetric(e.target.value); setThreshold(""); setRangeSlots([createRangeSlot({ id: "default", type: "all_day" })]); setUseFeelsLike(false); }}
             className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50"
           >
             <option value="" className="bg-[#1a1a2e]">Select metric...</option>
@@ -1003,25 +1309,15 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
           )}
 
           {metric && deviceType === "ac" && (
-            <div className="flex items-center gap-2">
-              <div className="flex-1 flex flex-col gap-0.5">
-                <span className="text-[10px] text-dim">Low (off/on)</span>
-                <input
-                  type="number" value={thresholdLow} onChange={(e) => setThresholdLow(e.target.value)}
-                  placeholder={metricDef ? `${metricDef.min}` : ""} step="any"
-                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50"
-                />
-              </div>
-              <span className="text-dim text-sm mt-4">—</span>
-              <div className="flex-1 flex flex-col gap-0.5">
-                <span className="text-[10px] text-dim">High (on/off)</span>
-                <input
-                  type="number" value={threshold} onChange={(e) => setThreshold(e.target.value)}
-                  placeholder={metricDef ? `${metricDef.max}` : ""} step="any"
-                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-cyan/50"
-                />
-              </div>
-            </div>
+            <>
+              <RangeSlotsEditor
+                slots={rangeSlots}
+                metricDef={metricDef}
+                conflicts={slotValidation.conflicts}
+                onChange={setRangeSlots}
+              />
+              {slotValidation.error && <p className="text-xs text-red-400">{slotValidation.error}</p>}
+            </>
           )}
 
           {metric && deviceType !== "ac" && (

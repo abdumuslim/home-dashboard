@@ -1,0 +1,246 @@
+import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
+
+const MINUTES_PER_DAY = 1440;
+const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const VALID_PRAYERS = new Set(["fajr", "dhuhr", "asr", "maghrib", "isha"]);
+
+const BAGHDAD_COORDS = new Coordinates(33.321502, 44.358335);
+const PRAYER_PARAMS = CalculationMethod.Dubai();
+PRAYER_PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
+PRAYER_PARAMS.rounding = Rounding.None;
+
+export type RangeSlotType = "all_day" | "window";
+export type RangeSlotTimeMode = "exact" | "prayer";
+export type PrayerResolver = (prayer: string, offset: number) => number | null;
+
+export interface AutomationRangeSlot {
+  id: string;
+  label?: string;
+  type: RangeSlotType;
+  start_mode?: RangeSlotTimeMode;
+  start_time?: string;
+  start_prayer?: string;
+  start_prayer_offset?: number;
+  end_mode?: RangeSlotTimeMode;
+  end_time?: string;
+  end_prayer?: string;
+  end_prayer_offset?: number;
+  threshold_low: number;
+  threshold: number;
+}
+
+interface ResolvedWindow {
+  slot: AutomationRangeSlot;
+  start: number;
+  end: number;
+  intervals: Array<{ start: number; end: number }>;
+}
+
+export interface RangeSlotValidationResult {
+  ok: boolean;
+  error?: string;
+  slots?: AutomationRangeSlot[];
+}
+
+export function parseTimeToMinutes(time: string): number {
+  const [h, m] = time.split(":").map(Number);
+  return h * 60 + m;
+}
+
+export function getBaghdadMinutes(date = new Date()): number {
+  const baghdadNow = new Date(date.toLocaleString("en-US", { timeZone: "Asia/Baghdad" }));
+  return baghdadNow.getHours() * 60 + baghdadNow.getMinutes();
+}
+
+export function roundPrayerTime(date: Date, prayer: string): Date {
+  const d = new Date(date);
+  const s = d.getSeconds();
+  const ms = d.getMilliseconds();
+  if (prayer === "fajr") {
+    if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
+  } else {
+    if (s >= 30) d.setMinutes(d.getMinutes() + 1);
+  }
+  d.setSeconds(0, 0);
+  return d;
+}
+
+export function createBaghdadPrayerResolver(date = new Date()): PrayerResolver {
+  const dateKey = date.toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const prayerTimes = new PrayerTimes(BAGHDAD_COORDS, new Date(y, m - 1, d, 12, 0, 0), PRAYER_PARAMS);
+
+  return (prayer: string, offset: number): number | null => {
+    const raw = prayerTimes[prayer as keyof PrayerTimes] as Date | undefined;
+    if (!(raw instanceof Date)) return null;
+    const rounded = roundPrayerTime(raw, prayer);
+    const bd = new Date(rounded.toLocaleString("en-US", { timeZone: "Asia/Baghdad" }));
+    return normalizeMinute(bd.getHours() * 60 + bd.getMinutes() + offset);
+  };
+}
+
+export function normalizeRangeSlots(value: unknown): AutomationRangeSlot[] | null {
+  if (!Array.isArray(value)) return null;
+  return value.map((raw, idx) => {
+    const item = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+    return {
+      id: typeof item.id === "string" && item.id.trim() ? item.id.trim() : `slot-${idx + 1}`,
+      ...(typeof item.label === "string" && item.label.trim() ? { label: item.label.trim() } : {}),
+      type: item.type === "all_day" ? "all_day" : "window",
+      start_mode: item.start_mode === "prayer" ? "prayer" : "exact",
+      ...(typeof item.start_time === "string" ? { start_time: item.start_time } : {}),
+      ...(typeof item.start_prayer === "string" ? { start_prayer: item.start_prayer } : {}),
+      ...(typeof item.start_prayer_offset === "number" ? { start_prayer_offset: item.start_prayer_offset } : {}),
+      end_mode: item.end_mode === "prayer" ? "prayer" : "exact",
+      ...(typeof item.end_time === "string" ? { end_time: item.end_time } : {}),
+      ...(typeof item.end_prayer === "string" ? { end_prayer: item.end_prayer } : {}),
+      ...(typeof item.end_prayer_offset === "number" ? { end_prayer_offset: item.end_prayer_offset } : {}),
+      threshold_low: typeof item.threshold_low === "number" ? item.threshold_low : Number.NaN,
+      threshold: typeof item.threshold === "number" ? item.threshold : Number.NaN,
+    };
+  });
+}
+
+export function getLegacyRangeSlots(thresholdLow: number | null, threshold: number | null): AutomationRangeSlot[] {
+  if (thresholdLow == null || threshold == null) return [];
+  return [{
+    id: "default",
+    type: "all_day",
+    threshold_low: thresholdLow,
+    threshold,
+  }];
+}
+
+export function findActiveRangeSlot(
+  slots: AutomationRangeSlot[],
+  nowMinutes: number,
+  resolvePrayerMinutes: PrayerResolver,
+): AutomationRangeSlot | null {
+  let fallback: AutomationRangeSlot | null = null;
+  const activeWindows: Array<{ slot: AutomationRangeSlot; sortKey: number }> = [];
+
+  for (const slot of slots) {
+    if (slot.type === "all_day") {
+      fallback ??= slot;
+      continue;
+    }
+    const window = resolveWindow(slot, resolvePrayerMinutes);
+    if (!window) continue;
+    const active = window.start <= window.end
+      ? nowMinutes >= window.start && nowMinutes < window.end
+      : nowMinutes >= window.start || nowMinutes < window.end;
+    if (active) {
+      activeWindows.push({
+        slot,
+        sortKey: window.start <= nowMinutes ? window.start : window.start - MINUTES_PER_DAY,
+      });
+    }
+  }
+
+  activeWindows.sort((a, b) => b.sortKey - a.sortKey);
+  return activeWindows[0]?.slot ?? fallback;
+}
+
+export function validateRangeSlots(
+  rawSlots: unknown,
+  bounds: { min: number; max: number },
+  resolvePrayerMinutes: PrayerResolver,
+): RangeSlotValidationResult {
+  const slots = normalizeRangeSlots(rawSlots);
+  if (!slots) return { ok: false, error: "Range slots are required for AC automations" };
+  if (slots.length < 1 || slots.length > 24) return { ok: false, error: "Range slots must contain 1–24 entries" };
+
+  const seenIds = new Set<string>();
+  let allDayCount = 0;
+  const windows: ResolvedWindow[] = [];
+
+  for (let i = 0; i < slots.length; i += 1) {
+    const slot = slots[i];
+    const label = slotLabel(slot, i);
+    if (seenIds.has(slot.id)) return { ok: false, error: `Duplicate range slot id "${slot.id}"` };
+    seenIds.add(slot.id);
+
+    if (!Number.isFinite(slot.threshold_low) || !Number.isFinite(slot.threshold)) {
+      return { ok: false, error: `${label}: thresholds must be finite numbers` };
+    }
+    if (slot.threshold_low < bounds.min || slot.threshold_low > bounds.max) {
+      return { ok: false, error: `${label}: low threshold must be between ${bounds.min} and ${bounds.max}` };
+    }
+    if (slot.threshold < bounds.min || slot.threshold > bounds.max) {
+      return { ok: false, error: `${label}: high threshold must be between ${bounds.min} and ${bounds.max}` };
+    }
+    if (slot.threshold_low >= slot.threshold) {
+      return { ok: false, error: `${label}: low threshold must be less than high threshold` };
+    }
+
+    if (slot.type === "all_day") {
+      allDayCount += 1;
+      if (allDayCount > 1) return { ok: false, error: "Only one all-day range slot is allowed" };
+      continue;
+    }
+
+    const window = resolveWindow(slot, resolvePrayerMinutes);
+    if (!window) return { ok: false, error: `${label}: invalid start or end time` };
+    if (window.start === window.end) return { ok: false, error: `${label}: start and end time cannot be the same` };
+    windows.push(window);
+  }
+
+  for (let i = 0; i < windows.length; i += 1) {
+    for (let j = i + 1; j < windows.length; j += 1) {
+      if (windowsOverlap(windows[i], windows[j])) {
+        return {
+          ok: false,
+          error: `Range slots overlap: ${slotLabel(windows[i].slot, i)} and ${slotLabel(windows[j].slot, j)}`,
+        };
+      }
+    }
+  }
+
+  return { ok: true, slots };
+}
+
+function normalizeMinute(value: number): number {
+  return ((value % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+}
+
+function resolveEndpoint(
+  slot: AutomationRangeSlot,
+  prefix: "start" | "end",
+  resolvePrayerMinutes: PrayerResolver,
+): number | null {
+  const mode = slot[`${prefix}_mode`] ?? "exact";
+  if (mode === "prayer") {
+    const prayer = slot[`${prefix}_prayer`];
+    const offset = slot[`${prefix}_prayer_offset`] ?? 0;
+    if (!prayer || !VALID_PRAYERS.has(prayer)) return null;
+    if (!Number.isInteger(offset) || offset < -120 || offset > 120) return null;
+    return resolvePrayerMinutes(prayer, offset);
+  }
+
+  const time = slot[`${prefix}_time`];
+  if (!time || !TIME_RE.test(time)) return null;
+  return parseTimeToMinutes(time);
+}
+
+function resolveWindow(slot: AutomationRangeSlot, resolvePrayerMinutes: PrayerResolver): ResolvedWindow | null {
+  const start = resolveEndpoint(slot, "start", resolvePrayerMinutes);
+  const end = resolveEndpoint(slot, "end", resolvePrayerMinutes);
+  if (start == null || end == null) return null;
+  if (start === end) return null;
+  return {
+    slot,
+    start,
+    end,
+    intervals: start < end
+      ? [{ start, end }]
+      : [{ start, end: MINUTES_PER_DAY }, { start: 0, end }],
+  };
+}
+
+function windowsOverlap(a: ResolvedWindow, b: ResolvedWindow): boolean {
+  return a.intervals.some((ai) => b.intervals.some((bi) => ai.start < bi.end && bi.start < ai.end));
+}
+
+function slotLabel(slot: AutomationRangeSlot, index: number): string {
+  return slot.label || slot.id || `Slot ${index + 1}`;
+}

@@ -7,6 +7,12 @@ import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import type { ForecastResponse } from "./forecast.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus } from "./auth.js";
+import {
+  createBaghdadPrayerResolver,
+  getLegacyRangeSlots,
+  validateRangeSlots,
+  type AutomationRangeSlot,
+} from "./automation-slots.js";
 
 export interface AcTimer {
   deviceId: string;
@@ -656,6 +662,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     threshold_low?: number;
     sustained_minutes?: number;
     turn_off_at_end?: boolean;
+    range_slots?: AutomationRangeSlot[];
     device_ids: string[];
     device_names: string[];
     enabled?: boolean;
@@ -691,20 +698,45 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     return null;
   }
 
+  function validateAcRangeSlots(body: MetricAutomationBody): ReturnType<typeof validateRangeSlots> {
+    const def = ALERT_METRICS[body.metric];
+    const slotsInput = body.range_slots ?? (
+      typeof body.threshold_low === "number" && typeof body.threshold === "number"
+        ? getLegacyRangeSlots(body.threshold_low, body.threshold)
+        : null
+    );
+    return validateRangeSlots(slotsInput, { min: def.min, max: def.max }, createBaghdadPrayerResolver());
+  }
+
+  function primaryRangeSlot(slots: AutomationRangeSlot[]): AutomationRangeSlot {
+    return slots.find((s) => s.type === "all_day") ?? slots[0];
+  }
+
+  function formatRangeSummary(metric: string, slots: AutomationRangeSlot[]): string {
+    const unit = ALERT_METRICS[metric].unit ?? "";
+    if (slots.length === 1) {
+      const only = slots[0];
+      return `${only.threshold_low}–${only.threshold}${unit}`;
+    }
+    const fallback = slots.find((s) => s.type === "all_day");
+    return fallback
+      ? `${slots.length} ranges, default ${fallback.threshold_low}–${fallback.threshold}${unit}`
+      : `${slots.length} ranges`;
+  }
+
   function validateMetricAutomation(body: MetricAutomationBody): string | null {
     if (!body.metric || !(body.metric in ALERT_METRICS)) return "Invalid metric";
     if (body.device_type !== "ac" && ALERT_METRICS[body.metric].source !== "air") return "Only air quality metrics allowed for purifiers";
     const def = ALERT_METRICS[body.metric];
-    if (typeof body.threshold !== "number" || !isFinite(body.threshold)) return "Threshold must be a finite number";
-    if (body.threshold < def.min || body.threshold > def.max) return `Threshold must be between ${def.min} and ${def.max}`;
 
     if (body.device_type === "ac") {
-      if (typeof body.threshold_low !== "number" || !isFinite(body.threshold_low)) return "Low threshold required for AC range";
-      if (body.threshold_low < def.min || body.threshold_low > def.max) return `Low threshold must be between ${def.min} and ${def.max}`;
-      if (body.threshold_low >= body.threshold) return "Low threshold must be less than high threshold";
+      const slotsResult = validateAcRangeSlots(body);
+      if (!slotsResult.ok) return slotsResult.error ?? "Invalid range slots";
       const profileErr = validateAcProfile(body.ac_profile);
       if (profileErr) return profileErr;
     } else {
+      if (typeof body.threshold !== "number" || !isFinite(body.threshold)) return "Threshold must be a finite number";
+      if (body.threshold < def.min || body.threshold > def.max) return `Threshold must be between ${def.min} and ${def.max}`;
       if (body.condition !== "above" && body.condition !== "below") return "Condition must be 'above' or 'below'";
     }
 
@@ -803,14 +835,16 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
       const mins = mb.sustained_minutes ?? 0;
       const devType = mb.device_type ?? "purifier";
-      const isAcRange = devType === "ac" && mb.threshold_low != null;
+      const rangeSlots = devType === "ac" ? validateAcRangeSlots(mb).slots ?? [] : [];
+      const primarySlot = devType === "ac" ? primaryRangeSlot(rangeSlots) : null;
+      const isAcRange = devType === "ac";
       const turnOff = isAcRange ? true : (mb.turn_off_at_end ?? false);
       const condition = isAcRange ? "above" : mb.condition;
 
       let name: string;
       if (isAcRange && mb.ac_profile) {
         const modeName = AC_MODE_NAMES[mb.ac_profile.mode as number] ?? "?";
-        name = `${ALERT_METRICS[mb.metric].label} ${mb.threshold_low}°–${mb.threshold}° → ${modeName} ${mb.ac_profile.temperature}°`;
+        name = `${ALERT_METRICS[mb.metric].label} ${formatRangeSummary(mb.metric, rangeSlots)} → ${modeName} ${mb.ac_profile.temperature}°`;
       } else {
         const offSuffix = turnOff ? " (off)" : "";
         const acLabel = devType === "ac" && mb.ac_profile ? ` → ${AC_MODE_NAMES[mb.ac_profile.mode as number] ?? "?"} ${mb.ac_profile.temperature}°` : "";
@@ -824,9 +858,26 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         ? (devType === "ac" ? '{"power":0}' : '{"power":"off"}')
         : null;
       const result = await pool.query(
-        `INSERT INTO automations (name, enabled, automation_type, device_type, metric, condition, threshold, threshold_low, sustained_minutes, turn_off_at_end, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
-         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, 5) RETURNING *`,
-        [name, mb.enabled ?? true, devType, mb.metric, condition, mb.threshold, mb.threshold_low ?? null, mins, turnOff, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, actionOn, actionOff],
+        `INSERT INTO automations (name, enabled, automation_type, device_type, metric, condition, threshold, threshold_low, sustained_minutes, turn_off_at_end, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs, range_slots)
+         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, 5, $16::jsonb) RETURNING *`,
+        [
+          name,
+          mb.enabled ?? true,
+          devType,
+          mb.metric,
+          condition,
+          primarySlot ? primarySlot.threshold : mb.threshold,
+          primarySlot ? primarySlot.threshold_low : mb.threshold_low ?? null,
+          mins,
+          turnOff,
+          mb.device_ids[0],
+          mb.device_names[0] ?? mb.device_ids[0],
+          mb.device_ids,
+          mb.device_names,
+          actionOn,
+          actionOff,
+          devType === "ac" ? JSON.stringify(rangeSlots) : null,
+        ],
       );
       res.json({ automation: result.rows[0] });
     }
@@ -863,8 +914,9 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
          time_start=$4, time_end=$5, turn_off_at_end=$6,
          start_mode=$7, start_prayer=$8, start_prayer_offset=$9,
          end_mode=$10, end_prayer=$11, end_prayer_offset=$12,
-         metric=NULL, condition=NULL, threshold=NULL, sustained_minutes=0,
+         metric=NULL, condition=NULL, threshold=NULL, threshold_low=NULL, sustained_minutes=0,
          action_on=$13::jsonb, action_off=$14::jsonb, device_id=$15, device_name=$16, device_ids=$17, device_names=$18
+         , range_slots=NULL
          WHERE id=$19 RETURNING *`,
         [name, sb.enabled ?? true, devType,
          startMode === "exact" ? sb.time_start : null, endMode === "exact" ? sb.time_end : null, turnOff,
@@ -881,14 +933,16 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
       const mins = mb.sustained_minutes ?? 0;
       const devType = mb.device_type ?? "purifier";
-      const isAcRange = devType === "ac" && mb.threshold_low != null;
+      const rangeSlots = devType === "ac" ? validateAcRangeSlots(mb).slots ?? [] : [];
+      const primarySlot = devType === "ac" ? primaryRangeSlot(rangeSlots) : null;
+      const isAcRange = devType === "ac";
       const turnOff = isAcRange ? true : (mb.turn_off_at_end ?? false);
       const condition = isAcRange ? "above" : mb.condition;
 
       let name: string;
       if (isAcRange && mb.ac_profile) {
         const modeName = AC_MODE_NAMES[mb.ac_profile.mode as number] ?? "?";
-        name = `${ALERT_METRICS[mb.metric].label} ${mb.threshold_low}°–${mb.threshold}° → ${modeName} ${mb.ac_profile.temperature}°`;
+        name = `${ALERT_METRICS[mb.metric].label} ${formatRangeSummary(mb.metric, rangeSlots)} → ${modeName} ${mb.ac_profile.temperature}°`;
       } else {
         const offSuffix = turnOff ? " (off)" : "";
         const acLabel = devType === "ac" && mb.ac_profile ? ` → ${AC_MODE_NAMES[mb.ac_profile.mode as number] ?? "?"} ${mb.ac_profile.temperature}°` : "";
@@ -906,9 +960,27 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
          time_start=NULL, time_end=NULL, turn_off_at_end=$9, action_on=$10::jsonb, action_off=$11::jsonb,
          start_mode='exact', start_prayer=NULL, start_prayer_offset=NULL,
          end_mode='exact', end_prayer=NULL, end_prayer_offset=NULL,
-         device_id=$12, device_name=$13, device_ids=$14, device_names=$15
-         WHERE id=$16 RETURNING *`,
-        [name, mb.enabled ?? true, devType, mb.metric, condition, mb.threshold, mb.threshold_low ?? null, mins, turnOff, actionOn, actionOff, mb.device_ids[0], mb.device_names[0] ?? mb.device_ids[0], mb.device_ids, mb.device_names, id],
+         device_id=$12, device_name=$13, device_ids=$14, device_names=$15, range_slots=$16::jsonb
+         WHERE id=$17 RETURNING *`,
+        [
+          name,
+          mb.enabled ?? true,
+          devType,
+          mb.metric,
+          condition,
+          primarySlot ? primarySlot.threshold : mb.threshold,
+          primarySlot ? primarySlot.threshold_low : mb.threshold_low ?? null,
+          mins,
+          turnOff,
+          actionOn,
+          actionOff,
+          mb.device_ids[0],
+          mb.device_names[0] ?? mb.device_ids[0],
+          mb.device_ids,
+          mb.device_names,
+          devType === "ac" ? JSON.stringify(rangeSlots) : null,
+          id,
+        ],
       );
       if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
       res.json({ automation: result.rows[0] });

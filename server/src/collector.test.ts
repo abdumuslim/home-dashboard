@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, vi } from "vitest";
 import type { Config } from "./config.js";
 import { Collector } from "./collector.js";
 import { acTimers } from "./routes.js";
+import type { AutomationRangeSlot } from "./automation-slots.js";
 
 const config: Config = {
   qpAppKey: "",
@@ -96,6 +97,17 @@ function acRangeRule() {
     action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3 },
     action_off: { power: 0 },
     cooldown_secs: 0,
+    range_slots: null as AutomationRangeSlot[] | null,
+  };
+}
+
+function acRangeRuleWithSlots() {
+  return {
+    ...acRangeRule(),
+    range_slots: [
+      { id: "default", type: "all_day", threshold_low: 20, threshold: 28 },
+      { id: "morning", type: "window", start_mode: "exact", start_time: "06:00", end_mode: "exact", end_time: "10:00", threshold_low: 22, threshold: 25 },
+    ] satisfies AutomationRangeSlot[],
   };
 }
 
@@ -210,5 +222,59 @@ describe("AC manual-off locks", () => {
 
     expect(actions).toEqual([{ deviceId: "ac1", action: { power: 0 } }]);
     await expect((collector as never as { isAcManualOffLocked: (id: string) => Promise<boolean> }).isAcManualOffLocked("ac1")).resolves.toBe(true);
+  });
+
+  it("uses the active range slot thresholds for AC hysteresis", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T04:30:00.000Z")); // 07:30 Baghdad
+    try {
+      const { collector, actions } = createCollector();
+
+      await setWeatherValue(collector, 25.5);
+      await checkAcRangeAutomation(collector, acRangeRuleWithSlots());
+
+      expect(actions).toEqual([{ deviceId: "ac1", action: { power: 1, mode: 1, temperature: 23, fan_speed: 3 } }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("turns an AC off when no range slot is active", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T09:00:00.000Z")); // 12:00 Baghdad
+    try {
+      const { collector, tclCloud, actions } = createCollector();
+      tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+      await setWeatherValue(collector, 25.5);
+      await checkAcRangeAutomation(collector, {
+        ...acRangeRule(),
+        range_slots: [
+          { id: "morning", type: "window", start_mode: "exact", start_time: "06:00", end_mode: "exact", end_time: "10:00", threshold_low: 22, threshold: 25 },
+        ] satisfies AutomationRangeSlot[],
+      });
+
+      expect(actions).toEqual([{ deviceId: "ac1", action: { power: 0 } }]);
+      await expect((collector as never as { isAcManualOffLocked: (id: string) => Promise<boolean> }).isAcManualOffLocked("ac1")).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a manual-off lock across later range slots", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T04:30:00.000Z")); // 07:30 Baghdad
+    try {
+      const { collector, actions } = createCollector();
+      await (collector as never as { recordAcManualOff: (id: string, reason: string) => Promise<void> }).recordAcManualOff("ac1", "test");
+
+      await setWeatherValue(collector, 25.5);
+      await checkAcRangeAutomation(collector, acRangeRuleWithSlots());
+
+      expect(actions).toEqual([]);
+      await expect((collector as never as { isAcManualOffLocked: (id: string) => Promise<boolean> }).isAcManualOffLocked("ac1")).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

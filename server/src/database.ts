@@ -121,6 +121,7 @@ const MIGRATIONS: string[] = [
   // AC automation support
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS device_type TEXT NOT NULL DEFAULT 'purifier'",
   "ALTER TABLE automations ADD COLUMN IF NOT EXISTS threshold_low REAL",
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS range_slots JSONB",
   // Make metric automations re-check every loop tick instead of every 5 min
   "UPDATE automations SET cooldown_secs = 5 WHERE automation_type = 'metric' AND cooldown_secs > 5",
   // Server-side AC presets

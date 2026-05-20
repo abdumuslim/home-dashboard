@@ -8,6 +8,12 @@ import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
 import { TclCloud, type AcAction, type AcDevice } from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
 import { childLogger } from "./logger.js";
+import {
+  findActiveRangeSlot,
+  getBaghdadMinutes,
+  getLegacyRangeSlots,
+  type AutomationRangeSlot,
+} from "./automation-slots.js";
 
 const log = childLogger("collector");
 
@@ -139,6 +145,7 @@ interface AutomationRule {
   action_on: PurifierAction | AcAction;
   action_off: PurifierAction | AcAction | null;
   cooldown_secs: number;
+  range_slots: AutomationRangeSlot[] | null;
 }
 
 function parseTimeToMinutes(time: string): number {
@@ -795,11 +802,27 @@ export class Collector {
 
   private async checkAcRangeAutomation(rule: AutomationRule): Promise<void> {
     const now = Date.now();
+    const def = ALERT_METRICS[rule.metric!];
+    if (!def) { log.warn(`[collector] AC range "${rule.name}": unknown metric "${rule.metric}"`); return; }
+
+    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true };
+    const cooldownMs = (rule.cooldown_secs ?? 5) * 1000;
+    const deviceIds = rule.device_ids ?? [rule.device_id];
+    const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
+    const activeSlot = findActiveRangeSlot(
+      rule.range_slots ?? getLegacyRangeSlots(rule.threshold_low, rule.threshold),
+      getBaghdadMinutes(),
+      (prayer, offset) => this.resolvePrayerMinutes(prayer, offset),
+    );
+
+    if (!activeSlot) {
+      await this.turnOffAcOutsideRange(rule, state, now, cooldownMs, deviceIds, deviceNames);
+      return;
+    }
+
     const weatherStale = !this.latestWeatherTs || (now - this.latestWeatherTs.getTime() > 300_000);
     const airStale = !this.latestAirTs || (now - this.latestAirTs.getTime() > 300_000);
     const powerStale = !this.latestPowerTs || (now - this.latestPowerTs.getTime() > 60_000);
-    const def = ALERT_METRICS[rule.metric!];
-    if (!def) { log.warn(`[collector] AC range "${rule.name}": unknown metric "${rule.metric}"`); return; }
     if (def.source === "weather" && weatherStale) return;
     if (def.source === "air" && airStale) return;
     if (def.source === "power" && powerStale) return;
@@ -807,16 +830,11 @@ export class Collector {
     const value = getMetricValue(rule.metric!, this.latestWeatherRow, this.latestAirRow, this.latestPowerRow);
     if (value == null) { log.warn(`[collector] AC range "${rule.name}": metric "${rule.metric}" value is null`); return; }
 
-    const state = this.automationState.get(rule.id) ?? { status: "idle", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true };
-    const cooldownMs = (rule.cooldown_secs ?? 5) * 1000;
-    const deviceIds = rule.device_ids ?? [rule.device_id];
-    const deviceNames = (rule.device_names ?? [rule.device_name]).join(", ");
-
     const acAction = rule.action_on as Record<string, unknown>;
     const isCool = acAction.mode === 1;
 
-    const shouldTurnOn = isCool ? value >= rule.threshold! : value <= rule.threshold_low!;
-    const shouldTurnOff = isCool ? value <= rule.threshold_low! : value >= rule.threshold!;
+    const shouldTurnOn = isCool ? value >= activeSlot.threshold : value <= activeSlot.threshold_low;
+    const shouldTurnOff = isCool ? value <= activeSlot.threshold_low : value >= activeSlot.threshold;
 
     if (state.status === "idle") {
       if (shouldTurnOn) {
@@ -927,6 +945,40 @@ export class Collector {
         this.automationState.set(rule.id, { ...state, lastToggle: now });
       }
     }
+  }
+
+  private async turnOffAcOutsideRange(
+    rule: AutomationRule,
+    state: AutomationState,
+    now: number,
+    cooldownMs: number,
+    deviceIds: string[],
+    deviceNames: string,
+  ): Promise<void> {
+    if (now - state.lastToggle < cooldownMs) return;
+
+    let sentOff = false;
+    for (const did of deviceIds) {
+      try {
+        const power = await this.getDevicePowerCached(did, "ac");
+        if (power !== "off") {
+          log.info(`[collector] AC range "${rule.name}": no active range slot, turning OFF ${did} [${deviceNames}]`);
+          await this.executeAutomationAction(rule, { power: 0 } as AcAction, [did]);
+          this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
+          sentOff = true;
+        }
+      } catch (err) {
+        log.error(`[collector] AC range "${rule.name}" outside-range off failed for ${did}:`, (err as Error).message);
+      }
+    }
+
+    this.automationState.set(rule.id, {
+      status: "idle",
+      lastToggle: sentOff ? now : state.lastToggle,
+      conditionSince: null,
+      conditionLostAt: null,
+      canAutoTurnOn: state.canAutoTurnOn,
+    });
   }
 
   private async checkScheduleAutomation(rule: AutomationRule): Promise<void> {
