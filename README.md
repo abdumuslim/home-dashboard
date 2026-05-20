@@ -18,6 +18,7 @@
 - Air quality metrics — CO2, PM2.5, PM10, tVOC, noise levels with color-coded severity
 - Xiaomi air purifier control with auto/manual modes, fan levels, and filter status
 - TCL split AC control — temperature, mode, fan speed, swing, eco/turbo toggles
+- AC manual-off protection — automations, schedules, and timers do not turn an AC back on after manual off until manual on
 - Metric-based & scheduled automations (e.g., PM2.5 > 50 → turn on purifier)
 - ESP power monitoring with grid/generator source detection and usage charts
 - Push notifications with configurable alerts (sensor thresholds + prayer times)
@@ -64,14 +65,15 @@ Browser → Cloudflare → Traefik (VPS) → Dashboard Container (port 8000)
 │   ├── index.ts            # Express app, static serving, collector startup
 │   ├── routes.ts           # REST API endpoints + /api/health
 │   ├── auth.ts             # JWT auth (HMAC-SHA256), rate limiting (5/15min per IP)
-│   ├── collector.ts        # Sensor polling, MQTT, automation loop, background backfill
+│   ├── collector.ts        # Sensor polling, MQTT, automation loop, AC manual-off locks, background backfill
 │   ├── database.ts         # PostgreSQL pool, schema, migrations
 │   ├── logger.ts           # Structured logging (pino) with console-compatible API
 │   ├── xiaomi-cloud.ts     # Xiaomi device discovery & control
 │   ├── tcl-cloud.ts        # TCL AC cloud API (auth, shadow, control)
 │   ├── alert-metrics.ts    # Metrics catalog, prayer time labels
 │   ├── auth.test.ts        # JWT auth tests (vitest)
-│   └── routes.test.ts      # Utility function tests (vitest)
+│   ├── routes.test.ts      # Utility function tests (vitest)
+│   └── collector.test.ts   # Automation/manual-off lock tests (vitest)
 ├── client/src/
 │   ├── App.tsx             # Root component, lazy-loaded modals
 │   ├── components/         # Cards (React.memo), charts (useMemo), modals, widgets
@@ -162,8 +164,11 @@ The multi-stage Dockerfile builds the client (Vite), compiles the server (tsc), 
 | `GET/POST` | `/api/automations` | Automation rules CRUD |
 | `PUT/PATCH/DELETE` | `/api/automations/:id` | Update / toggle / delete automation |
 | `POST` | `/api/automations/:id/test` | Test automation action |
-| `GET` | `/api/ac/devices` | TCL AC devices & state |
+| `GET` | `/api/ac/devices` | TCL AC devices & state, including `manualOffLocked` |
 | `POST` | `/api/ac/devices/:id/control` | AC control commands |
+| `GET` | `/api/ac/timers` | Active AC countdown timers |
+| `POST` | `/api/ac/timer` | Create AC countdown timer; turn-on timers are rejected while `manualOffLocked` |
+| `DELETE` | `/api/ac/timer/:deviceId` | Cancel AC countdown timer |
 | `POST` | `/api/push/subscribe` | Register push subscription |
 
 ## Deployment
@@ -184,3 +189,5 @@ ssh user@your-vps "cd /opt/home-dashboard && \
 ```
 
 Vite adds content hashes to built assets — no manual cache busting needed.
+
+After deploying to the VPS, regenerate the Mosquitto password file because extracting the tarball overwrites `mosquitto/config`, then verify `GET /api/health` and `docker compose ps`.
