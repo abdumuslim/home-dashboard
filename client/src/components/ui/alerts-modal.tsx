@@ -910,8 +910,14 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
   conflicts: Set<string>;
   onChange: (slots: AutomationRangeSlot[]) => void;
 }) {
+  const [prayerOffsetDirs, setPrayerOffsetDirs] = useState<Record<string, "before" | "after">>({});
   const updateSlot = (id: string, patch: Partial<AutomationRangeSlot>) => {
     onChange(slots.map((slot) => slot.id === id ? { ...slot, ...patch } : slot));
+  };
+  const updatePrayerOffset = (slotId: string, prefix: "start" | "end", dir: "before" | "after", minutes: number) => {
+    const safeMinutes = Number.isFinite(minutes) ? Math.max(0, Math.min(120, Math.trunc(minutes))) : 0;
+    setPrayerOffsetDirs((prev) => ({ ...prev, [`${slotId}:${prefix}`]: dir }));
+    updateSlot(slotId, { [`${prefix}_prayer_offset`]: dir === "before" ? -safeMinutes : safeMinutes });
   };
   const moveSlot = (index: number, dir: -1 | 1) => {
     const next = [...slots];
@@ -985,11 +991,9 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
                   const prayer = slot[`${prefix}_prayer`] ?? (prefix === "start" ? "isha" : "fajr");
                   const rawOffset = slot[`${prefix}_prayer_offset`] ?? 0;
                   const offset = Number.isFinite(rawOffset) ? rawOffset : Number.NaN;
-                  const offsetDir = offset < 0 ? "before" : "after";
+                  const offsetKey = `${slot.id}:${prefix}`;
+                  const offsetDir = prayerOffsetDirs[offsetKey] ?? (offset < 0 ? "before" : "after");
                   const offsetMin = Number.isFinite(offset) ? Math.abs(offset) : "";
-                  const setPrayerOffset = (dir: "before" | "after", minutes: number) => {
-                    updateSlot(slot.id, { [`${prefix}_prayer_offset`]: dir === "before" ? -minutes : minutes });
-                  };
                   return (
                     <div key={prefix} className="flex flex-col gap-1">
                       <span className="text-[10px] text-dim">{prefix === "start" ? "From" : "To"}</span>
@@ -1027,7 +1031,7 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
                             {(["before", "after"] as const).map((dir) => (
                               <button
                                 key={dir}
-                                onClick={() => setPrayerOffset(dir, typeof offsetMin === "number" ? offsetMin : 0)}
+                                onClick={() => updatePrayerOffset(slot.id, prefix, dir, typeof offsetMin === "number" ? offsetMin : 0)}
                                 className={cn(
                                   "px-1.5 py-0.5 rounded text-[10px] border transition-colors",
                                   offsetDir === dir
@@ -1044,8 +1048,8 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
                               max={120}
                               value={offsetMin}
                               onChange={(e) => {
-                                const minutes = e.target.value === "" ? Number.NaN : parseInt(e.target.value, 10);
-                                setPrayerOffset(offsetDir, minutes);
+                                const minutes = e.target.value === "" ? 0 : parseInt(e.target.value, 10);
+                                updatePrayerOffset(slot.id, prefix, offsetDir, minutes);
                               }}
                               className="w-14 bg-white/5 border border-white/10 rounded px-1 py-1 text-xs text-text outline-none focus:border-cyan/50 text-center"
                             />
