@@ -983,7 +983,13 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
                 {(["start", "end"] as const).map((prefix) => {
                   const mode = slot[`${prefix}_mode`] ?? "exact";
                   const prayer = slot[`${prefix}_prayer`] ?? (prefix === "start" ? "isha" : "fajr");
-                  const offset = slot[`${prefix}_prayer_offset`] ?? 0;
+                  const rawOffset = slot[`${prefix}_prayer_offset`] ?? 0;
+                  const offset = Number.isFinite(rawOffset) ? rawOffset : Number.NaN;
+                  const offsetDir = offset < 0 ? "before" : "after";
+                  const offsetMin = Number.isFinite(offset) ? Math.abs(offset) : "";
+                  const setPrayerOffset = (dir: "before" | "after", minutes: number) => {
+                    updateSlot(slot.id, { [`${prefix}_prayer_offset`]: dir === "before" ? -minutes : minutes });
+                  };
                   return (
                     <div key={prefix} className="flex flex-col gap-1">
                       <span className="text-[10px] text-dim">{prefix === "start" ? "From" : "To"}</span>
@@ -1007,23 +1013,45 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
                           className="w-full bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
                         />
                       ) : (
-                        <div className="flex gap-1">
-                          <select
-                            value={prayer}
-                            onChange={(e) => updateSlot(slot.id, { [`${prefix}_prayer`]: e.target.value })}
-                            className="min-w-0 flex-1 bg-white/5 border border-white/10 rounded px-1 py-1 text-xs text-text outline-none focus:border-cyan/50"
-                          >
-                            {PRAYER_NAMES.map((p) => <option key={p} value={p} className="bg-[#1a1a2e]">{PRAYER_LABELS[p]}</option>)}
-                          </select>
-                          <input
-                            type="number"
-                            min={-120}
-                            max={120}
-                            value={offset}
-                            onChange={(e) => updateSlot(slot.id, { [`${prefix}_prayer_offset`]: parseInt(e.target.value, 10) })}
-                            className="w-14 bg-white/5 border border-white/10 rounded px-1 py-1 text-xs text-text outline-none focus:border-cyan/50 text-center"
-                          />
-                        </div>
+                        <>
+                          <div className="flex gap-1">
+                            <select
+                              value={prayer}
+                              onChange={(e) => updateSlot(slot.id, { [`${prefix}_prayer`]: e.target.value })}
+                              className="min-w-0 flex-1 bg-white/5 border border-white/10 rounded px-1 py-1 text-xs text-text outline-none focus:border-cyan/50"
+                            >
+                              {PRAYER_NAMES.map((p) => <option key={p} value={p} className="bg-[#1a1a2e]">{PRAYER_LABELS[p]}</option>)}
+                            </select>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            {(["before", "after"] as const).map((dir) => (
+                              <button
+                                key={dir}
+                                onClick={() => setPrayerOffset(dir, typeof offsetMin === "number" ? offsetMin : 0)}
+                                className={cn(
+                                  "px-1.5 py-0.5 rounded text-[10px] border transition-colors",
+                                  offsetDir === dir
+                                    ? "border-cyan/50 bg-cyan/10 text-cyan"
+                                    : "border-white/10 bg-white/5 text-dim hover:text-text",
+                                )}
+                              >
+                                {dir}
+                              </button>
+                            ))}
+                            <input
+                              type="number"
+                              min={0}
+                              max={120}
+                              value={offsetMin}
+                              onChange={(e) => {
+                                const minutes = e.target.value === "" ? Number.NaN : parseInt(e.target.value, 10);
+                                setPrayerOffset(offsetDir, minutes);
+                              }}
+                              className="w-14 bg-white/5 border border-white/10 rounded px-1 py-1 text-xs text-text outline-none focus:border-cyan/50 text-center"
+                            />
+                            <span className="text-[10px] text-dim">min</span>
+                          </div>
+                        </>
                       )}
                     </div>
                   );
