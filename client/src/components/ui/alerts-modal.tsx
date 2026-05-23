@@ -60,6 +60,8 @@ const AC_TRIGGER_METRICS: Record<string, MetricInfo> = Object.fromEntries(
 );
 
 const AC_MODE_NAMES = ["Auto", "Cool", "Dry", "Fan", "Heat"] as const;
+const DEFAULT_RANGE_SLOT_PRAYERS = { start: "isha", end: "fajr" } as const;
+const DEFAULT_RANGE_SLOT_TIMES = { start: "08:00", end: "12:00" } as const;
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const MINUTES_PER_DAY = 1440;
 const BAGHDAD = new Coordinates(33.321502, 44.358335);
@@ -919,6 +921,16 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
     setPrayerOffsetDirs((prev) => ({ ...prev, [`${slotId}:${prefix}`]: dir }));
     updateSlot(slotId, { [`${prefix}_prayer_offset`]: dir === "before" ? -safeMinutes : safeMinutes });
   };
+  const updateEndpointMode = (slot: AutomationRangeSlot, prefix: "start" | "end", mode: "exact" | "prayer") => {
+    const patch: Partial<AutomationRangeSlot> = { [`${prefix}_mode`]: mode };
+    if (mode === "prayer") {
+      if (!slot[`${prefix}_prayer`]) patch[`${prefix}_prayer`] = DEFAULT_RANGE_SLOT_PRAYERS[prefix];
+      if (!Number.isInteger(slot[`${prefix}_prayer_offset`])) patch[`${prefix}_prayer_offset`] = 0;
+    } else if (!slot[`${prefix}_time`]) {
+      patch[`${prefix}_time`] = DEFAULT_RANGE_SLOT_TIMES[prefix];
+    }
+    updateSlot(slot.id, patch);
+  };
   const moveSlot = (index: number, dir: -1 | 1) => {
     const next = [...slots];
     const target = index + dir;
@@ -988,7 +1000,7 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
               <div className="grid grid-cols-2 gap-2">
                 {(["start", "end"] as const).map((prefix) => {
                   const mode = slot[`${prefix}_mode`] ?? "exact";
-                  const prayer = slot[`${prefix}_prayer`] ?? (prefix === "start" ? "isha" : "fajr");
+                  const prayer = slot[`${prefix}_prayer`] ?? DEFAULT_RANGE_SLOT_PRAYERS[prefix];
                   const rawOffset = slot[`${prefix}_prayer_offset`] ?? 0;
                   const offset = Number.isFinite(rawOffset) ? rawOffset : Number.NaN;
                   const offsetKey = `${slot.id}:${prefix}`;
@@ -1001,7 +1013,7 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
                         {(["exact", "prayer"] as const).map((m) => (
                           <button
                             key={m}
-                            onClick={() => updateSlot(slot.id, { [`${prefix}_mode`]: m })}
+                            onClick={() => updateEndpointMode(slot, prefix, m)}
                             className={cn("flex-1 px-1.5 py-0.5 rounded text-[10px] border", mode === m ? "border-cyan/50 bg-cyan/10 text-cyan" : "border-white/10 bg-white/5 text-dim")}
                           >
                             {m === "exact" ? "Time" : "Prayer"}
@@ -1012,7 +1024,7 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
                         <input
                           type="time"
                           step={60}
-                          value={slot[`${prefix}_time`] ?? (prefix === "start" ? "08:00" : "12:00")}
+                          value={slot[`${prefix}_time`] ?? DEFAULT_RANGE_SLOT_TIMES[prefix]}
                           onChange={(e) => updateSlot(slot.id, { [`${prefix}_time`]: e.target.value })}
                           className="w-full bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-text outline-none focus:border-cyan/50 [color-scheme:dark]"
                         />
