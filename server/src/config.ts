@@ -21,6 +21,7 @@ export interface Config {
   authSecret: string;
   adminUser: string;
   adminPassword: string;
+  hermesApiToken: string;
 }
 
 export const config: Config = {
@@ -44,4 +45,5 @@ export const config: Config = {
   authSecret: process.env.AUTH_SECRET ?? "",
   adminUser: process.env.ADMIN_USER ?? "",
   adminPassword: process.env.ADMIN_PASSWORD ?? "",
+  hermesApiToken: process.env.HERMES_API_TOKEN ?? "",
 };

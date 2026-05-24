@@ -39,6 +39,10 @@ export function verifyToken(token: string, secret: string): Record<string, unkno
   }
 }
 
+function safeCompare(a: string, b: string): boolean {
+  return a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
 function parseCookies(header: string | undefined): Record<string, string> {
   const cookies: Record<string, string> = {};
   if (!header) return cookies;
@@ -52,10 +56,25 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return cookies;
 }
 
+function parseBearerToken(header: string | string[] | undefined): string | null {
+  if (Array.isArray(header)) return null;
+  const match = header?.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+}
+
+export function isHermesBearerRequest(req: Request, config: Config): boolean {
+  if (!config.hermesApiToken) return false;
+  const token = parseBearerToken(req.headers.authorization);
+  return !!token && safeCompare(token, config.hermesApiToken);
+}
+
 export function createAuthMiddleware(config: Config) {
   return (req: Request, _res: Response, next: NextFunction) => {
     req.authenticated = false;
     if (!config.authSecret) {
+      if (isHermesBearerRequest(req, config)) {
+        req.authenticated = true;
+      }
       next();
       return;
     }
@@ -66,6 +85,9 @@ export function createAuthMiddleware(config: Config) {
       if (payload && payload.user === config.adminUser) {
         req.authenticated = true;
       }
+    }
+    if (!req.authenticated && isHermesBearerRequest(req, config)) {
+      req.authenticated = true;
     }
     next();
   };
@@ -117,15 +139,36 @@ export function handleLogin(config: Config) {
       return;
     }
 
-    const userMatch =
-      username.length === config.adminUser.length &&
-      timingSafeEqual(Buffer.from(username), Buffer.from(config.adminUser));
-    const passMatch =
-      password.length === config.adminPassword.length &&
-      timingSafeEqual(Buffer.from(password), Buffer.from(config.adminPassword));
+    const userMatch = safeCompare(username, config.adminUser);
+    const passMatch = safeCompare(password, config.adminPassword);
 
     if (!userMatch || !passMatch) {
       res.status(401).json({ error: "Invalid credentials" });
+      return;
+    }
+
+    const token = signToken(
+      { user: config.adminUser, exp: Date.now() + 30 * 24 * 60 * 60 * 1000 },
+      config.authSecret,
+    );
+
+    const isProduction = !!process.env.DATABASE_URL;
+    res.setHeader(
+      "Set-Cookie",
+      `auth=${token}; HttpOnly; Path=/; Max-Age=${30 * 24 * 60 * 60}; SameSite=Strict${isProduction ? "; Secure" : ""}`,
+    );
+    res.json({ ok: true });
+  };
+}
+
+export function handleAgentSession(config: Config) {
+  return (req: Request, res: Response) => {
+    if (!isHermesBearerRequest(req, config)) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    if (!config.authSecret || !config.adminUser) {
+      res.status(503).json({ error: "Dashboard auth is not configured" });
       return;
     }
 

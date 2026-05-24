@@ -25,6 +25,7 @@ const config: Config = {
   authSecret: "",
   adminUser: "",
   adminPassword: "",
+  hermesApiToken: "",
 };
 
 function createPool() {

@@ -6,7 +6,7 @@ import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metric
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import type { ForecastResponse } from "./forecast.js";
-import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus } from "./auth.js";
+import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession } from "./auth.js";
 import {
   createBaghdadPrayerResolver,
   getLegacyRangeSlots,
@@ -148,7 +148,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     return `${s}s`;
   }
 
-  router.get("/api/prayer-times", (_req: Request, res: Response) => {
+  function getPrayerTimesPayload() {
     const now = new Date();
     const dateKey = now.toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
     const [y, m, d] = dateKey.split("-").map(Number);
@@ -223,7 +223,11 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       }
     }
 
-    res.json({ prayers, nextPrayer, hijriDate, nextEvent });
+    return { prayers, nextPrayer, hijriDate, nextEvent };
+  }
+
+  router.get("/api/prayer-times", (_req: Request, res: Response) => {
+    res.json(getPrayerTimesPayload());
   });
 
   // Auth middleware — sets req.authenticated on every request
@@ -236,13 +240,73 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   router.post("/api/auth/logout", handleLogout);
   router.get("/api/auth/me", handleAuthStatus);
 
+  // Agent access for Hermes and other trusted local automations.
+  router.post("/api/agent/session", handleAgentSession(config!));
+
+  router.get("/api/agent/snapshot", requireAuth, async (_req: Request, res: Response) => {
+    const [current, automationsResult] = await Promise.all([
+      getCurrentPayload(),
+      pool.query("SELECT * FROM automations ORDER BY created_at ASC"),
+    ]);
+
+    const xiaomi = getXiaomiCloud?.();
+    const purifiers = await (async () => {
+      if (!xiaomi) return { devices: [], available: false };
+      try {
+        return {
+          devices: await xiaomi.fetchDevicesLive(),
+          available: true,
+          region: xiaomi.getRegion(),
+        };
+      } catch (err) {
+        return {
+          devices: xiaomi.getDevices(),
+          available: true,
+          region: xiaomi.getRegion(),
+          error: (err as Error).message,
+        };
+      }
+    })();
+
+    const tcl = getTclCloud?.();
+    const ac = await (async () => {
+      if (!tcl || !tcl.isReady()) return { devices: [], available: false };
+      try {
+        const devices = await tcl.fetchDevicesLive();
+        const lockedIds = await acManualOffLocks?.reconcileDevices(devices) ?? new Set<string>();
+        return {
+          devices: devices.map((device) => ({ ...device, manualOffLocked: lockedIds.has(device.id) })),
+          available: true,
+        };
+      } catch (err) {
+        const devices = tcl.getDevices();
+        const lockedIds = await acManualOffLocks?.getLockedIds(devices.map((device) => device.id)) ?? new Set<string>();
+        return {
+          devices: devices.map((device) => ({ ...device, manualOffLocked: lockedIds.has(device.id) })),
+          available: true,
+          error: (err as Error).message,
+        };
+      }
+    })();
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      current,
+      forecast: getForecast?.() ?? null,
+      prayerTimes: getPrayerTimesPayload(),
+      devices: { purifiers, ac },
+      acTimers: Array.from(acTimers.values()),
+      automations: automationsResult.rows,
+    });
+  });
+
   // In-memory latest power reading (updated every ingest ~1s), saved to DB every 60s
   let latestPower: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number } | null = null;
   let lastPowerSave = 0;
   const POWER_SAVE_INTERVAL = 60_000;
   const powerBuffer: { v: number; i1: number; i2: number }[] = [];
 
-  router.get("/api/current", async (_req: Request, res: Response) => {
+  async function getCurrentPayload() {
     // Use in-memory caches where available, fall back to DB in parallel
     const air: Record<string, unknown> | null = getLatestAir?.() ?? null;
     const power = latestPower;
@@ -259,11 +323,15 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       weatherRow.max_daily_gust_kmh = maxGustResult.rows[0]?.max_gust ?? null;
     }
 
-    res.json({
+    return {
       weather: weatherRow,
       air: air ?? (airResult?.rows[0] ? rowToDict(airResult.rows[0]) : null),
       power: power ?? (powerResult?.rows[0] ? rowToDict(powerResult.rows[0]) as any : null),
-    });
+    };
+  }
+
+  router.get("/api/current", async (_req: Request, res: Response) => {
+    res.json(await getCurrentPayload());
   });
 
   // Lightweight power-only endpoint for 1s polling
