@@ -49,7 +49,9 @@ interface PresetData {
 
 type PresetSlots = Record<number, PresetData | null>;
 
-const EMPTY_PRESETS: PresetSlots = { 1: null, 2: null, 3: null, 4: null, 5: null };
+const PRESET_COUNT = 10;
+const PRESET_SLOTS = Array.from({ length: PRESET_COUNT }, (_, i) => i + 1);
+const EMPTY_PRESETS: PresetSlots = Object.fromEntries(PRESET_SLOTS.map((s) => [s, null])) as PresetSlots;
 
 async function loadPresetsFromServer(deviceId: string): Promise<PresetSlots> {
   try {
@@ -104,6 +106,23 @@ function capturePreset(d: AcDevice): PresetData {
     freshAir: d.freshAir,
     generatorMode: d.generatorMode,
   };
+}
+
+function fanLabel(fanSpeed: number): string {
+  return FAN_LABELS[fanSpeed] ?? String(fanSpeed);
+}
+
+// A profile is "active" when its visible summary (mode, temp, fan, generator)
+// matches the AC's current applied state. Hidden props (eco/turbo/swings) are ignored.
+function presetMatchesCurrent(p: PresetData, d: AcDevice): boolean {
+  if (!d.power) return false;
+  const round = (n: number) => Math.round(n * 2) / 2; // 0.5°C steps
+  return (
+    p.mode === d.mode &&
+    round(p.targetTemp) === round(d.targetTemp) &&
+    p.fanSpeed === d.fanSpeed &&
+    p.generatorMode === d.generatorMode
+  );
 }
 
 // ---------- Timer helpers ----------
@@ -466,7 +485,7 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                         "px-2 py-0.5 rounded text-[10px] border transition-colors",
                         timerPreset == null ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim",
                       )}>None</button>
-                      {[1, 2, 3, 4, 5].filter(s => presets[s] != null).map(s => (
+                      {PRESET_SLOTS.filter(s => presets[s] != null).map(s => (
                         <button key={s} onClick={() => setTimerPreset(s)} className={cn(
                           "px-2 py-0.5 rounded text-[10px] border transition-colors",
                           timerPreset === s ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim",
@@ -634,25 +653,72 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
 
               {/* Presets */}
               <div>
-                <span className="text-[0.65rem] text-dim uppercase tracking-wider mb-1.5 block">Presets</span>
-                <div className="flex items-center gap-1.5">
-                  {/* Save button */}
-                  <button
-                    onClick={() => setSaveMode((v) => !v)}
-                    className={cn(
-                      "flex items-center justify-center w-8 h-8 rounded-lg border text-xs transition-colors",
-                      !saveMode && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
-                    )}
-                    style={saveMode ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
-                    title={saveMode ? "Cancel save" : "Save to preset"}
-                  >
-                    <Save className="w-3.5 h-3.5" />
-                  </button>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-[0.65rem] text-dim uppercase tracking-wider">Presets</span>
+                  <div className="flex items-center gap-1.5">
+                    {/* Save button */}
+                    <button
+                      onClick={() => setSaveMode((v) => !v)}
+                      className={cn(
+                        "flex items-center justify-center w-8 h-8 rounded-lg border text-xs transition-colors",
+                        !saveMode && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+                      )}
+                      style={saveMode ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
+                      title={saveMode ? "Cancel save" : "Save to preset"}
+                    >
+                      <Save className="w-3.5 h-3.5" />
+                    </button>
 
-                  {/* Preset slots 1-5 */}
-                  {[1, 2, 3, 4, 5].map((slot) => {
-                    const filled = presets[slot] != null;
+                    {/* Apply button */}
+                    <button
+                      onClick={async () => {
+                        if (!stagedValues) return;
+                        const sv = stagedValues;
+                        const appliedSlot = activePreset;
+                        setActivePreset(null);
+                        setStagedValues(null);
+                        // Mode first — firmware may reset fan speed on mode change
+                        if (sv.mode !== d.mode) try { await onControl("set_mode", sv.mode); } catch {}
+                        if (sv.targetTemp !== d.targetTemp) try { await onControl("set_temperature", sv.targetTemp); } catch {}
+                        if (sv.eco !== d.eco) try { await onControl("set_eco", sv.eco ? 1 : 0); } catch {}
+                        if (sv.screen !== d.screen) try { await onControl("set_screen", sv.screen ? 1 : 0); } catch {}
+                        if (sv.verticalSwing !== d.verticalSwing) try { await onControl("set_vertical_swing", sv.verticalSwing); } catch {}
+                        if (sv.horizontalSwing !== d.horizontalSwing) try { await onControl("set_horizontal_swing", sv.horizontalSwing); } catch {}
+                        if (sv.freshAir !== d.freshAir) try { await onControl("set_fresh_air", sv.freshAir ? 1 : 0); } catch {}
+                        if (sv.generatorMode !== d.generatorMode) try { await onControl("set_generator_mode", sv.generatorMode); } catch {}
+                        // Fan speed last — after mode change processed by firmware
+                        if (sv.fanSpeed !== d.fanSpeed) try { await onControl("set_fan_speed", sv.fanSpeed); } catch {}
+                        if (sv.turbo !== d.turbo) try { await onControl("set_turbo", sv.turbo ? 1 : 0); } catch {}
+                        if (appliedSlot != null) {
+                          fetch("/api/ac/preset-apply", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ deviceId: d.id, slot: appliedSlot, presetData: sv }),
+                          }).catch(() => {});
+                        }
+                      }}
+                      disabled={!stagedValues}
+                      className={cn(
+                        "flex items-center justify-center w-8 h-8 rounded-lg border text-xs transition-colors",
+                        !stagedValues && "border-white/[0.06] bg-white/[0.02] text-dim/40 cursor-not-allowed",
+                      )}
+                      style={stagedValues ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
+                      title="Apply preset"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Preset slots 1-10 (5x2 grid) */}
+                <div className="grid grid-cols-5 gap-1.5">
+                  {PRESET_SLOTS.map((slot) => {
+                    const p = presets[slot];
+                    const filled = p != null;
                     const isActive = activePreset === slot;
+                    const isCurrent = filled && !isActive && presetMatchesCurrent(p, d);
+                    const pColors = filled ? getModeColors(p.mode) : colors;
+                    const ModeIcon = filled ? MODE_LABELS[p.mode]?.icon : undefined;
                     return (
                       <button
                         key={slot}
@@ -668,59 +734,51 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                           }
                         }}
                         className={cn(
-                          "flex items-center justify-center w-8 h-8 rounded-lg border text-xs font-medium transition-colors",
+                          "relative flex flex-col items-center justify-center gap-0.5 h-14 rounded-lg border px-1 py-1 text-xs font-medium transition-colors",
                           saveMode && "animate-preset-blink",
                           !isActive && !saveMode && !filled && "border-white/[0.06] bg-white/[0.02] text-dim/50",
                           !isActive && !saveMode && filled && "border-white/15 bg-white/5 text-dim hover:text-text hover:border-white/25",
                         )}
-                        style={isActive ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text, boxShadow: `0 0 8px ${colors.glow}` } : undefined}
+                        style={
+                          isActive
+                            ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text, boxShadow: `0 0 8px ${colors.glow}` }
+                            : isCurrent
+                              ? { borderColor: pColors.border, boxShadow: `inset 0 0 0 1px ${pColors.border}` }
+                              : undefined
+                        }
                         title={filled ? `Preset ${slot}` : `Empty slot ${slot}`}
                       >
-                        {slot}
+                        {isCurrent && (
+                          <span
+                            className="absolute top-0.5 right-0.5 flex items-center justify-center w-3.5 h-3.5 rounded-full"
+                            style={{ backgroundColor: pColors.accent }}
+                          >
+                            <Check className="w-2.5 h-2.5 text-black" />
+                          </span>
+                        )}
+                        <span className="leading-none">{slot}</span>
+                        {filled ? (
+                          <>
+                            <span className="flex items-center gap-0.5 leading-none">
+                              {ModeIcon && <ModeIcon className="w-2.5 h-2.5" style={{ color: pColors.accent }} />}
+                              <span className="text-[0.55rem] tabular-nums text-text">{p.targetTemp}°</span>
+                            </span>
+                            <span className="flex items-center gap-1 text-[0.5rem] tabular-nums text-dim leading-none">
+                              <span className="flex items-center gap-0.5"><Wind className="w-2 h-2" />{fanLabel(p.fanSpeed)}</span>
+                              {p.generatorMode > 0 && (
+                                <span className="flex items-center gap-0.5" style={{ color: pColors.accent }}>
+                                  <Zap className="w-2 h-2" />{p.generatorMode}
+                                </span>
+                              )}
+                            </span>
+                          </>
+                        ) : (
+                          <span className="text-[0.6rem] text-dim/40 leading-none">—</span>
+                        )}
                       </button>
                     );
                   })}
-
-                  {/* Apply button */}
-                  <button
-                    onClick={async () => {
-                      if (!stagedValues) return;
-                      const sv = stagedValues;
-                      const appliedSlot = activePreset;
-                      setActivePreset(null);
-                      setStagedValues(null);
-                      // Mode first — firmware may reset fan speed on mode change
-                      if (sv.mode !== d.mode) try { await onControl("set_mode", sv.mode); } catch {}
-                      if (sv.targetTemp !== d.targetTemp) try { await onControl("set_temperature", sv.targetTemp); } catch {}
-                      if (sv.eco !== d.eco) try { await onControl("set_eco", sv.eco ? 1 : 0); } catch {}
-                      if (sv.screen !== d.screen) try { await onControl("set_screen", sv.screen ? 1 : 0); } catch {}
-                      if (sv.verticalSwing !== d.verticalSwing) try { await onControl("set_vertical_swing", sv.verticalSwing); } catch {}
-                      if (sv.horizontalSwing !== d.horizontalSwing) try { await onControl("set_horizontal_swing", sv.horizontalSwing); } catch {}
-                      if (sv.freshAir !== d.freshAir) try { await onControl("set_fresh_air", sv.freshAir ? 1 : 0); } catch {}
-                      if (sv.generatorMode !== d.generatorMode) try { await onControl("set_generator_mode", sv.generatorMode); } catch {}
-                      // Fan speed last — after mode change processed by firmware
-                      if (sv.fanSpeed !== d.fanSpeed) try { await onControl("set_fan_speed", sv.fanSpeed); } catch {}
-                      if (sv.turbo !== d.turbo) try { await onControl("set_turbo", sv.turbo ? 1 : 0); } catch {}
-                      if (appliedSlot != null) {
-                        fetch("/api/ac/preset-apply", {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({ deviceId: d.id, slot: appliedSlot, presetData: sv }),
-                        }).catch(() => {});
-                      }
-                    }}
-                    disabled={!stagedValues}
-                    className={cn(
-                      "flex items-center justify-center w-8 h-8 rounded-lg border text-xs transition-colors",
-                      !stagedValues && "border-white/[0.06] bg-white/[0.02] text-dim/40 cursor-not-allowed",
-                    )}
-                    style={stagedValues ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
-                    title="Apply preset"
-                  >
-                    <Check className="w-3.5 h-3.5" />
-                  </button>
                 </div>
-
               </div>
             </>
           )}

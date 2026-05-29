@@ -1186,7 +1186,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   router.get("/api/ac/presets/:deviceId", requireAuth, async (req: Request, res: Response) => {
     const deviceId = String(req.params.deviceId);
     const result = await pool.query("SELECT slot, data FROM ac_presets WHERE device_id = $1 ORDER BY slot", [deviceId]);
-    const presets: Record<number, unknown> = { 1: null, 2: null, 3: null, 4: null, 5: null };
+    const presets: Record<number, unknown> = { 1: null, 2: null, 3: null, 4: null, 5: null, 6: null, 7: null, 8: null, 9: null, 10: null };
     for (const row of result.rows) presets[row.slot] = row.data;
     res.json({ presets });
   });
@@ -1194,7 +1194,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   router.put("/api/ac/presets/:deviceId/:slot", requireAuth, async (req: Request, res: Response) => {
     const deviceId = String(req.params.deviceId);
     const slot = parseInt(String(req.params.slot), 10);
-    if (isNaN(slot) || slot < 1 || slot > 5) { res.status(400).json({ error: "Slot must be 1-5" }); return; }
+    if (isNaN(slot) || slot < 1 || slot > 10) { res.status(400).json({ error: "Slot must be 1-10" }); return; }
     const { presetData } = req.body as { presetData: Record<string, unknown> };
     if (!presetData || typeof presetData !== "object") { res.status(400).json({ error: "presetData required" }); return; }
     await pool.query(

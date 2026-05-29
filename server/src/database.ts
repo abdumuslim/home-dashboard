@@ -127,11 +127,14 @@ const MIGRATIONS: string[] = [
   // Server-side AC presets
   `CREATE TABLE IF NOT EXISTS ac_presets (
     device_id  TEXT NOT NULL,
-    slot       SMALLINT NOT NULL CHECK (slot BETWEEN 1 AND 5),
+    slot       SMALLINT NOT NULL CHECK (slot BETWEEN 1 AND 10),
     data       JSONB NOT NULL,
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (device_id, slot)
   )`,
+  // Widen AC preset slots from 5 to 10 on tables created before the bump
+  "ALTER TABLE ac_presets DROP CONSTRAINT IF EXISTS ac_presets_slot_check",
+  "ALTER TABLE ac_presets ADD CONSTRAINT ac_presets_slot_check CHECK (slot BETWEEN 1 AND 10)",
   `CREATE TABLE IF NOT EXISTS ac_manual_off_locks (
     device_id TEXT PRIMARY KEY,
     locked_at TIMESTAMPTZ DEFAULT NOW(),
