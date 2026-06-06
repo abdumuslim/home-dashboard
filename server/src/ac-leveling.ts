@@ -112,6 +112,13 @@ export const STALE_POWER_MS = 15_000;
 export const NOISE_THRESHOLD = 0.1;
 /** Pause after sending commands so compressors and measurements settle. */
 export const SETTLE_MS = 30_000;
+/**
+ * Compressor ramp-up window after an AC turns ON. While ramping, the AC's
+ * estimated draw is NOT subtracted from measured current when deriving the
+ * non-AC load — otherwise the load briefly looks smaller than it is and a
+ * near-limit turn-on wouldn't trigger the instant proactive reduction.
+ */
+export const AC_RAMP_MS = 30_000;
 /** Grace before an observed-ON clears a shed flag (shadow lags the off command). */
 export const SHED_CLEAR_GRACE_MS = 15_000;
 

@@ -8,6 +8,7 @@ import {
   determineSource,
   estimateAcDraw,
   needCap,
+  AC_RAMP_MS,
   RAISE_STREAK,
   SETTLE_MS,
   SHED_CLEAR_GRACE_MS,
@@ -107,6 +108,7 @@ export class AcLeveler {
   private fanHold = new Map<string, { originalFan: number; lastSetFan: number }>();
   private fanExempt = new Set<string>();
   private prevPowerStates = new Map<string, boolean>();
+  private rampUntil = new Map<string, number>();
   private boostActive = new Map<string, boolean>();
   private deviceNames = new Map<string, string>();
   private settleUntil = 0;
@@ -324,6 +326,8 @@ export class AcLeveler {
   async onUserPowerOn(deviceId: string): Promise<void> {
     await this.ensureLoaded();
     await this.clearShed(deviceId, "user_power_on");
+    // Compressor ramp window — see the nonAcLoad derivation in tick()
+    this.rampUntil.set(deviceId, Date.now() + AC_RAMP_MS);
     this.forceEvaluate = true;
   }
 
@@ -427,6 +431,11 @@ export class AcLeveler {
       const prev = this.prevPowerStates.get(device.id);
       if (prev != null && prev !== device.power) {
         this.forceEvaluate = true;
+        if (device.power) {
+          // Fresh turn-on: compressor hasn't ramped — keep its estimated draw
+          // out of the non-AC load math so a near-limit turn-on reduces instantly.
+          this.rampUntil.set(device.id, Date.now() + AC_RAMP_MS);
+        }
         log.info(`[leveler] ${device.name}: power ${prev ? "ON" : "OFF"} → ${device.power ? "ON" : "OFF"} (re-evaluating)`);
       }
       this.prevPowerStates.set(device.id, device.power);
@@ -438,6 +447,7 @@ export class AcLeveler {
         this.manualCap.delete(device.id);
         this.manualTarget.delete(device.id);
         this.lastSetLevel.delete(device.id);
+        this.rampUntil.delete(device.id);
         await this.clearFanHold(device.id, "power_off");
         this.fanExempt.delete(device.id);
       }
@@ -533,10 +543,15 @@ export class AcLeveler {
 
     const measured = this.smoothedMeasured();
     const ampModels = Object.fromEntries(snapshots.map((s) => [s.deviceId, this.ampModel(s.deviceId)]));
-    const onDraw = snapshots
-      .filter((s) => s.on)
+    // Non-AC load = measured minus the draw of ESTABLISHED ACs only. A freshly
+    // turned-on AC isn't pulling its estimated amps yet (measured is still
+    // pre-turn-on), so subtracting it would understate the household load and
+    // hide an imminent overload when running close to the limit.
+    const now = Date.now();
+    const establishedDraw = snapshots
+      .filter((s) => s.on && (this.rampUntil.get(s.deviceId) ?? 0) <= now)
       .reduce((sum, s) => sum + estimateAcDraw(s.currentLevel, s.maxLevel, this.ampModel(s.deviceId)), 0);
-    const nonAcLoad = Math.max(0, measured - onDraw);
+    const nonAcLoad = Math.max(0, measured - establishedDraw);
     this.lastNonAcLoad = nonAcLoad;
 
     const input: AllocatorInput = {
@@ -649,6 +664,7 @@ export class AcLeveler {
         await this.clearShed(deviceId, "restored");
         this.lastSetLevel.set(deviceId, restoreLevel);
         this.prevPowerStates.set(deviceId, true);
+        this.rampUntil.set(deviceId, Date.now() + AC_RAMP_MS);
         this.deps.setDevicePowerCache(deviceId, "on");
         sentAny = true;
         void this.deps.broadcast({

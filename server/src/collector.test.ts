@@ -633,6 +633,40 @@ describe("Smart AC leveling", () => {
     expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
   });
 
+  it("reduces levels instantly when an AC turns on near the limit", async () => {
+    const { collector, tclCloud, shed, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+
+    // Tick 1: only Najat running at L4 (est 5A), generator at 12A — under the
+    // 15A limit but close to it. Nothing to do.
+    const before = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 4, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: false, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(before);
+    tclCloud.fetchDevicesLive.mockResolvedValue(before as never);
+    // 3 readings at 12A — headroom streak 3 (< 6, raise gating NOT met)
+    for (let i = 0; i < 3; i++) {
+      collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 12, power_1: 0, power_2: 2640 });
+    }
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).not.toHaveBeenCalled();
+
+    // Tick 2: Abdu turns ON (est 4A at L1) while measured is still 12A — the
+    // compressor hasn't ramped, so there are ZERO over-limit readings. The
+    // leveler must NOT subtract Abdu's estimated draw from the measured load
+    // (nonAcLoad stays 12−5=7 → budget 7) and must reduce Najat immediately.
+    const after = [{ ...before[0] }, { ...before[1], power: true }];
+    tclCloud.getDevices.mockReturnValue(after);
+    tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
+    await checkAcLeveling(collector);
+
+    // floors 2+4=6 ≤ 7, one raise step fits → ideal { ac1: 2, ac2: 1 } → Najat L4→L2 now
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+    expect(shed.size).toBe(0);
+  });
+
   it("restores a shed AC when headroom returns", async () => {
     const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
