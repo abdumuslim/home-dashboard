@@ -140,6 +140,18 @@ const MIGRATIONS: string[] = [
     locked_at TIMESTAMPTZ DEFAULT NOW(),
     reason TEXT
   )`,
+  // Smart AC leveling
+  "ALTER TABLE automations ADD COLUMN IF NOT EXISTS smart_leveling BOOLEAN NOT NULL DEFAULT true",
+  `CREATE TABLE IF NOT EXISTS ac_leveling_config (
+    id         SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    config     JSONB NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`,
+  `CREATE TABLE IF NOT EXISTS ac_leveling_shed (
+    device_id TEXT PRIMARY KEY,
+    shed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reason    TEXT
+  )`,
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

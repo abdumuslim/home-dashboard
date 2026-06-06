@@ -7,6 +7,8 @@ import { getMetricValue, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
 import { TclCloud, type AcAction, type AcDevice } from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
+import { AcLeveler, type LevelerDeviceContext } from "./ac-leveler.js";
+import { computeNeedTier, type NeedTier } from "./ac-leveling.js";
 import { childLogger } from "./logger.js";
 import {
   findActiveRangeSlot,
@@ -146,6 +148,7 @@ interface AutomationRule {
   action_off: PurifierAction | AcAction | null;
   cooldown_secs: number;
   range_slots: AutomationRangeSlot[] | null;
+  smart_leveling: boolean;
 }
 
 function parseTimeToMinutes(time: string): number {
@@ -189,6 +192,8 @@ export class Collector {
   // Automation system
   xiaomiCloud: XiaomiCloud | null = null;
   tclCloud: TclCloud | null = null;
+  acLeveler: AcLeveler;
+  private lastLevelerDevicesFetch = 0;
   private tclRetryAt = 0;
   private xiaomiRetryAt = 0;
   private automationRules: AutomationRule[] = [];
@@ -208,6 +213,8 @@ export class Collector {
   setLatestPower(data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }): void {
     this.latestPowerRow = data as unknown as Record<string, unknown>;
     this.latestPowerTs = new Date(data.ts);
+    // Streaks are counted per ESP reading, not per collector tick
+    this.acLeveler.onPowerReading(data);
   }
 
   invalidateAutomationRules(): void {
@@ -283,6 +290,14 @@ export class Collector {
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
     this.config = config;
+    this.acLeveler = new AcLeveler(pool, {
+      getTclCloud: () => this.tclCloud,
+      broadcast: (payload) => this.broadcastPush(payload),
+      setDevicePowerCache: (deviceId, power) => {
+        this.devicePowerCache.set(deviceId, { power, ts: Date.now() });
+      },
+      isManualOffLocked: (deviceId) => this.isAcManualOffLocked(deviceId),
+    });
 
     if (config.vapidPublicKey && config.vapidPrivateKey) {
       webpush.setVapidDetails(config.vapidSubject, config.vapidPublicKey, config.vapidPrivateKey);
@@ -392,6 +407,12 @@ export class Collector {
       await this.checkAcTimers();
     } catch (err) {
       log.error("[collector] AC timer check failed:", err);
+    }
+
+    try {
+      await this.checkAcLeveling();
+    } catch (err) {
+      log.error("[collector] AC leveling check failed:", err);
     }
 
     // Retry TCL Cloud init if it failed previously (every 5 minutes)
@@ -543,6 +564,18 @@ export class Collector {
     });
   }
 
+  /** Send a push notification to every subscription (leveling shed/restore events). */
+  private async broadcastPush(payload: Record<string, unknown>): Promise<void> {
+    try {
+      const result = await this.pool.query("SELECT subscription FROM push_subscriptions");
+      for (const row of result.rows) {
+        await this.sendPush(row.subscription, payload);
+      }
+    } catch (err) {
+      log.error("[collector] Broadcast push failed:", (err as Error).message);
+    }
+  }
+
   private async sendPush(subscription: unknown, payload: Record<string, unknown>): Promise<void> {
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -608,6 +641,8 @@ export class Collector {
 
   private async checkAutomations(): Promise<void> {
     await this.refreshAutomationRules();
+    // Load leveler state early so shed guards and gen-strip checks see DB state
+    await this.acLeveler.ensureLoaded();
     if (this.automationRules.length === 0) return;
 
     if (this.tclCloud && !this.tclCloud.isReady() && Date.now() >= this.tclRetryAt) {
@@ -651,11 +686,12 @@ export class Collector {
     if (rule.device_type === "ac") {
       await this.tclCloud!.ensureDeviceCachePopulated();
     }
+    const effectiveAction = this.stripGenIfLeveled(rule, action);
     for (const did of deviceIds) {
       if (rule.device_type === "ac") {
-        await this.tclCloud!.executeAcAction(did, action as AcAction);
+        await this.tclCloud!.executeAcAction(did, effectiveAction as AcAction);
       } else {
-        await this.xiaomiCloud!.executeAction(did, action as PurifierAction);
+        await this.xiaomiCloud!.executeAction(did, effectiveAction as PurifierAction);
       }
     }
   }
@@ -725,8 +761,10 @@ export class Collector {
               }
             }
             targetDeviceIds = deviceIds.filter((did) => !this.acManualOffLocks.has(did));
-            if (targetDeviceIds.length === 0) return;
           }
+          // Shed devices are leveler-owned — only the leveler restores them
+          targetDeviceIds = targetDeviceIds.filter((did) => !this.acLeveler.isShed(did));
+          if (targetDeviceIds.length === 0) return;
         }
         // First trigger — turn on all devices
         log.info(
@@ -747,6 +785,7 @@ export class Collector {
             const power = await this.getDevicePowerCached(did, rule.device_type);
             if (power === "off" || power === undefined) {
               if (rule.device_type === "ac") {
+                if (this.acLeveler.isShed(did)) continue; // leveler shed it — not a manual off
                 log.info(`[collector] Automation "${rule.name}": device ${did} manually turned OFF, recording manual-off lock`);
                 await this.recordAcManualOff(did, "observed_off");
                 this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
@@ -772,6 +811,7 @@ export class Collector {
           try {
             await this.executeAutomationAction(rule, offAction, [did]);
             this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
+            if (rule.device_type === "ac") await this.acLeveler.clearShed(did, "metric_turn_off");
           } catch (err) {
             log.error(`Automation "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
           }
@@ -790,8 +830,11 @@ export class Collector {
       const devs = await this.tclCloud!.fetchDevicesLive();
       const dev = devs.find(d => d.id === deviceId);
       power = dev ? (dev.power ? "on" : "off") : undefined;
-      if (power === "on" && this.canClearAcManualOff(deviceId)) {
-        await this.clearAcManualOff(deviceId);
+      if (power === "on") {
+        if (this.canClearAcManualOff(deviceId)) {
+          await this.clearAcManualOff(deviceId);
+        }
+        await this.acLeveler.reconcileObservedOn(deviceId);
       }
     } else {
       power = await this.xiaomiCloud!.getDevicePower(deviceId);
@@ -839,7 +882,7 @@ export class Collector {
     if (state.status === "idle") {
       if (shouldTurnOn) {
         const lockedIds = await this.getAcManualOffLockedIds(deviceIds);
-        let unlockedDeviceIds = deviceIds.filter((did) => !lockedIds.has(did));
+        let unlockedDeviceIds = deviceIds.filter((did) => !lockedIds.has(did) && !this.acLeveler.isShed(did));
         if (lockedIds.size > 0 && now - state.lastToggle >= cooldownMs) {
           for (const did of deviceIds) {
             if (!lockedIds.has(did)) continue;
@@ -848,7 +891,7 @@ export class Collector {
               if (power === "on" && !(await this.isAcManualOffLocked(did))) {
                 await this.tclCloud!.ensureDeviceCachePopulated();
                 const { power: _p, ...profileOnly } = rule.action_on as AcAction;
-                const diff = this.tclCloud!.computeAcDiff(did, profileOnly);
+                const diff = this.tclCloud!.computeAcDiff(did, this.stripGenIfLeveled(rule, profileOnly));
                 if (diff) {
                   log.info(`[collector] AC range "${rule.name}": device ${did} is ON while locked, adopting with diff: ${JSON.stringify(diff)}`);
                   await this.tclCloud!.executeAcAction(did, diff);
@@ -861,7 +904,7 @@ export class Collector {
               log.error(`[collector] AC range "${rule.name}" lock-check failed for ${did}:`, (err as Error).message);
             }
           }
-          unlockedDeviceIds = deviceIds.filter((did) => !this.acManualOffLocks.has(did));
+          unlockedDeviceIds = deviceIds.filter((did) => !this.acManualOffLocks.has(did) && !this.acLeveler.isShed(did));
         }
         if (unlockedDeviceIds.length === 0) {
           this.automationState.set(rule.id, { ...state, conditionSince: null });
@@ -895,7 +938,7 @@ export class Collector {
                 this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
               } else {
                 const { power: _p, ...profileOnly } = rule.action_on as AcAction;
-                const diff = this.tclCloud!.computeAcDiff(did, profileOnly);
+                const diff = this.tclCloud!.computeAcDiff(did, this.stripGenIfLeveled(rule, profileOnly));
                 if (diff) {
                   log.info(`[collector] AC range "${rule.name}": device ${did} is ON in dead zone (${rule.metric}=${value}), adopting with diff: ${JSON.stringify(diff)}`);
                   await this.tclCloud!.executeAcAction(did, diff);
@@ -918,6 +961,10 @@ export class Collector {
         log.info(`[collector] AC range "${rule.name}": ${rule.metric}=${value}, turning OFF [${deviceNames}]`);
         try {
           await this.executeAutomationAction(rule, { power: 0 } as AcAction, deviceIds);
+          // The automation owns the OFF now — a leveler shed must not restore it
+          for (const did of deviceIds) {
+            await this.acLeveler.clearShed(did, "range_turn_off");
+          }
         } catch (err) {
           log.error(`[collector] AC range "${rule.name}" turn-off failed:`, (err as Error).message);
         }
@@ -927,13 +974,14 @@ export class Collector {
           try {
             const power = await this.getDevicePowerCached(did, "ac");
             if (power === "off" || power === undefined) {
+              if (this.acLeveler.isShed(did)) continue; // leveler shed it — not a manual off
               log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, recording manual-off lock`);
               await this.recordAcManualOff(did, "observed_off");
               this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
               return;
             }
             const { power: _p, ...profileOnly } = rule.action_on as AcAction;
-            const diff = this.tclCloud!.computeAcDiff(did, profileOnly);
+            const diff = this.tclCloud!.computeAcDiff(did, this.stripGenIfLeveled(rule, profileOnly));
             if (diff) {
               log.info(`[collector] AC range "${rule.name}": re-enforcing diff for ${did}: ${JSON.stringify(diff)}`);
               await this.tclCloud!.executeAcAction(did, diff);
@@ -967,6 +1015,8 @@ export class Collector {
           this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
           sentOff = true;
         }
+        // Outside the window the automation owns the OFF — drop any leveler shed
+        await this.acLeveler.clearShed(did, "outside_range_off");
       } catch (err) {
         log.error(`[collector] AC range "${rule.name}" outside-range off failed for ${did}:`, (err as Error).message);
       }
@@ -1015,6 +1065,7 @@ export class Collector {
           const locked = rule.device_type === "ac" && await this.isAcManualOffLocked(did);
           const power = await this.getDevicePowerCached(did, rule.device_type, locked);
           if (power === "off" || power === undefined) {
+            if (rule.device_type === "ac" && this.acLeveler.isShed(did)) continue; // leveler shed it
             if (rule.device_type === "ac" && state.status === "triggered") {
               log.info(`[collector] Schedule "${rule.name}": device ${did} manually turned OFF during active window, recording manual-off lock`);
               await this.recordAcManualOff(did, "observed_off");
@@ -1047,6 +1098,7 @@ export class Collector {
           for (const did of deviceIds) {
             try {
               await this.executeAutomationAction(rule, rule.action_off ?? offAction, [did]);
+              if (rule.device_type === "ac") await this.acLeveler.clearShed(did, "schedule_turn_off");
             } catch (err) {
               log.error(`[collector] Schedule "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
             }
@@ -1067,8 +1119,13 @@ export class Collector {
         if (timer.action === "off") {
           await this.tclCloud.executeAcAction(deviceId, { power: 0 });
           await this.recordAcManualOff(deviceId, "timer_off");
+          await this.acLeveler.clearShed(deviceId, "timer_off");
           log.info(`[collector] AC timer: turned OFF device ${deviceId}`);
         } else {
+          if (this.acLeveler.isShed(deviceId)) {
+            log.info(`[collector] AC timer: device ${deviceId} is shed by the leveler, skipping turn-on timer`);
+            continue;
+          }
           if (await this.isAcManualOffLocked(deviceId)) {
             await this.getDevicePowerCached(deviceId, "ac", true);
             if (await this.isAcManualOffLocked(deviceId)) {
@@ -1088,7 +1145,10 @@ export class Collector {
             ...(preset.vertical_swing != null ? { vertical_swing: preset.vertical_swing as number } : {}),
             ...(preset.horizontal_swing != null ? { horizontal_swing: preset.horizontal_swing as number } : {}),
             ...(preset.fresh_air != null ? { fresh_air: preset.fresh_air as number } : {}),
-            ...(preset.generator_mode != null ? { generator_mode: preset.generator_mode as number } : {}),
+            // The leveler owns the generator level for managed devices
+            ...(preset.generator_mode != null && !this.isAcLevelingManaged(deviceId)
+              ? { generator_mode: preset.generator_mode as number }
+              : {}),
           };
           await this.tclCloud.executeAcAction(deviceId, action);
           log.info(`[collector] AC timer: turned ON device ${deviceId} with preset`);
@@ -1097,6 +1157,94 @@ export class Collector {
         log.error(`[collector] AC timer failed for ${deviceId}:`, (err as Error).message);
       }
     }
+  }
+
+  // ---------- Smart AC Leveling ----------
+
+  /** True when the leveler controls this device's generator level. */
+  private isAcLevelingManaged(deviceId: string): boolean {
+    return this.acLeveler.isEnabled() && !this.acRuleOptsOutOfLeveling(deviceId);
+  }
+
+  /** An enabled AC automation with smart_leveling=false opts its devices out. */
+  private acRuleOptsOutOfLeveling(deviceId: string): boolean {
+    return this.automationRules.some(
+      (r) =>
+        r.device_type === "ac" &&
+        r.smart_leveling === false &&
+        (r.device_ids ?? [r.device_id]).includes(deviceId),
+    );
+  }
+
+  /** Removes generator_mode from rule actions when the leveler owns the level. */
+  private stripGenIfLeveled<T extends PurifierAction | AcAction>(rule: AutomationRule, action: T): T {
+    if (rule.device_type !== "ac" || rule.smart_leveling === false || !this.acLeveler.isEnabled()) {
+      return action;
+    }
+    const acAction = action as AcAction;
+    if (acAction.generator_mode == null) return action;
+    const { generator_mode: _g, ...rest } = acAction;
+    return rest as T;
+  }
+
+  /**
+   * Need tier for the leveler: ACs with an active range automation use the same
+   * room metric vs the active slot; others use the AC's internal sensor vs the
+   * comfort target (heat mode inverts the comparison).
+   */
+  private computeAcNeedTier(deviceId: string, device: AcDevice): NeedTier {
+    for (const rule of this.automationRules) {
+      if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
+      if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
+      if (!rule.metric) continue;
+      const slot = findActiveRangeSlot(
+        rule.range_slots ?? getLegacyRangeSlots(rule.threshold_low, rule.threshold),
+        getBaghdadMinutes(),
+        (prayer, offset) => this.resolvePrayerMinutes(prayer, offset),
+      );
+      if (!slot) continue;
+      const value = getMetricValue(rule.metric, this.latestWeatherRow, this.latestAirRow, this.latestPowerRow);
+      if (value == null) continue;
+      const isCool = (rule.action_on as Record<string, unknown>).mode === 1;
+      if (isCool) {
+        return computeNeedTier({ kind: "range", value, slotLow: slot.threshold_low, slotHigh: slot.threshold });
+      }
+      // Heat: need grows as the value drops below the low limit — negate to reuse the cool mapping
+      return computeNeedTier({ kind: "range", value: -value, slotLow: -slot.threshold, slotHigh: -slot.threshold_low });
+    }
+    if (!device.currentTemp || device.currentTemp <= 0) return "mild";
+    const target = this.acLeveler.getComfortTarget();
+    if (device.mode === 4) {
+      // Heat mode: deviation is how far the room is below the comfort target
+      return computeNeedTier({ kind: "comfort", currentTemp: 2 * target - device.currentTemp, target });
+    }
+    return computeNeedTier({ kind: "comfort", currentTemp: device.currentTemp, target });
+  }
+
+  private async checkAcLeveling(): Promise<void> {
+    await this.acLeveler.ensureLoaded();
+    if (!this.acLeveler.isEnabled()) return;
+    if (!this.tclCloud || !this.tclCloud.isReady()) return;
+
+    // Keep device state reasonably fresh without hammering TCL: at most one
+    // live fetch per 10s (automations refresh the shared cache most ticks too).
+    let devices = this.tclCloud.getDevices();
+    if (devices.length === 0 || Date.now() - this.lastLevelerDevicesFetch > 10_000) {
+      try {
+        devices = await this.tclCloud.fetchDevicesLive();
+        this.lastLevelerDevicesFetch = Date.now();
+      } catch (err) {
+        log.warn(`[collector] Leveler device refresh failed, using cache: ${(err as Error).message}`);
+      }
+    }
+    if (devices.length === 0) return;
+
+    const ctx: LevelerDeviceContext[] = devices.map((device) => ({
+      device,
+      managed: !this.acRuleOptsOutOfLeveling(device.id),
+      needTier: this.computeAcNeedTier(device.id, device),
+    }));
+    await this.acLeveler.tick(ctx);
   }
 
   // ---------- Ambient Weather ----------

@@ -6,6 +6,8 @@ import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metric
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import type { ForecastResponse } from "./forecast.js";
+import type { AcLevelingConfig, AcAmpModel } from "./ac-leveling.js";
+import type { AcLevelingStatus } from "./ac-leveler.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession } from "./auth.js";
 import {
   createBaghdadPrayerResolver,
@@ -29,6 +31,15 @@ export interface AcManualOffLockHandlers {
   isLocked(deviceId: string): Promise<boolean>;
   getLockedIds(deviceIds?: string[]): Promise<Set<string>>;
   reconcileDevices(devices: Array<{ id: string; power: boolean }>): Promise<Set<string>>;
+}
+
+export interface AcLevelingHandlers {
+  getConfig(): Promise<AcLevelingConfig>;
+  updateConfig(cfg: AcLevelingConfig): Promise<AcLevelingConfig>;
+  getStatus(): AcLevelingStatus;
+  onUserPowerOff(deviceId: string): Promise<void>;
+  onUserPowerOn(deviceId: string): Promise<void>;
+  onUserGenLevel(deviceId: string, level: number): Promise<{ reverted: boolean; level: number }>;
 }
 
 export function median(arr: number[]): number {
@@ -76,7 +87,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers): Router {
   const router = Router();
 
   // Health check — before auth middleware, no auth required
@@ -735,6 +746,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     device_names: string[];
     enabled?: boolean;
     ac_profile?: Record<string, unknown>;
+    smart_leveling?: boolean;
   }
 
   interface ScheduleAutomationBody {
@@ -753,6 +765,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     device_names: string[];
     enabled?: boolean;
     ac_profile?: { mode: number; temperature: number; fan_speed: number };
+    smart_leveling?: boolean;
   }
 
   type AutomationBody = MetricAutomationBody | ScheduleAutomationBody;
@@ -887,13 +900,14 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const result = await pool.query(
         `INSERT INTO automations (name, enabled, automation_type, device_type, time_start, time_end, turn_off_at_end,
          start_mode, start_prayer, start_prayer_offset, end_mode, end_prayer, end_prayer_offset,
-         device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs)
-         VALUES ($1, $2, 'schedule', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, 60) RETURNING *`,
+         device_id, device_name, device_ids, device_names, action_on, action_off, smart_leveling, cooldown_secs)
+         VALUES ($1, $2, 'schedule', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, 60) RETURNING *`,
         [name, sb.enabled ?? true, devType,
          startMode === "exact" ? sb.time_start : null, endMode === "exact" ? sb.time_end : null, turnOff,
          startMode, startMode === "prayer" ? sb.start_prayer : null, startMode === "prayer" ? sb.start_prayer_offset : null,
          endMode, endMode === "prayer" ? sb.end_prayer : null, endMode === "prayer" ? sb.end_prayer_offset : null,
-         sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, actionOn, actionOff],
+         sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, actionOn, actionOff,
+         devType === "ac" ? (sb.smart_leveling ?? true) : true],
       );
       res.json({ automation: result.rows[0] });
     } else {
@@ -926,8 +940,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         ? (devType === "ac" ? '{"power":0}' : '{"power":"off"}')
         : null;
       const result = await pool.query(
-        `INSERT INTO automations (name, enabled, automation_type, device_type, metric, condition, threshold, threshold_low, sustained_minutes, turn_off_at_end, device_id, device_name, device_ids, device_names, action_on, action_off, cooldown_secs, range_slots)
-         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, 5, $16::jsonb) RETURNING *`,
+        `INSERT INTO automations (name, enabled, automation_type, device_type, metric, condition, threshold, threshold_low, sustained_minutes, turn_off_at_end, device_id, device_name, device_ids, device_names, action_on, action_off, smart_leveling, cooldown_secs, range_slots)
+         VALUES ($1, $2, 'metric', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, $16, 5, $17::jsonb) RETURNING *`,
         [
           name,
           mb.enabled ?? true,
@@ -944,6 +958,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
           mb.device_names,
           actionOn,
           actionOff,
+          devType === "ac" ? (mb.smart_leveling ?? true) : true,
           devType === "ac" ? JSON.stringify(rangeSlots) : null,
         ],
       );
@@ -984,13 +999,14 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
          end_mode=$10, end_prayer=$11, end_prayer_offset=$12,
          metric=NULL, condition=NULL, threshold=NULL, threshold_low=NULL, sustained_minutes=0,
          action_on=$13::jsonb, action_off=$14::jsonb, device_id=$15, device_name=$16, device_ids=$17, device_names=$18
-         , range_slots=NULL
-         WHERE id=$19 RETURNING *`,
+         , range_slots=NULL, smart_leveling=$19
+         WHERE id=$20 RETURNING *`,
         [name, sb.enabled ?? true, devType,
          startMode === "exact" ? sb.time_start : null, endMode === "exact" ? sb.time_end : null, turnOff,
          startMode, startMode === "prayer" ? sb.start_prayer : null, startMode === "prayer" ? sb.start_prayer_offset : null,
          endMode, endMode === "prayer" ? sb.end_prayer : null, endMode === "prayer" ? sb.end_prayer_offset : null,
-         actionOn, actionOff, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, id],
+         actionOn, actionOff, sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names,
+         devType === "ac" ? (sb.smart_leveling ?? true) : true, id],
       );
       if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
       res.json({ automation: result.rows[0] });
@@ -1028,8 +1044,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
          time_start=NULL, time_end=NULL, turn_off_at_end=$9, action_on=$10::jsonb, action_off=$11::jsonb,
          start_mode='exact', start_prayer=NULL, start_prayer_offset=NULL,
          end_mode='exact', end_prayer=NULL, end_prayer_offset=NULL,
-         device_id=$12, device_name=$13, device_ids=$14, device_names=$15, range_slots=$16::jsonb
-         WHERE id=$17 RETURNING *`,
+         device_id=$12, device_name=$13, device_ids=$14, device_names=$15, range_slots=$16::jsonb, smart_leveling=$17
+         WHERE id=$18 RETURNING *`,
         [
           name,
           mb.enabled ?? true,
@@ -1047,6 +1063,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
           mb.device_ids,
           mb.device_names,
           devType === "ac" ? JSON.stringify(rangeSlots) : null,
+          devType === "ac" ? (mb.smart_leveling ?? true) : true,
           id,
         ],
       );
@@ -1144,10 +1161,17 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       await cloud.sendControl(id, command, value);
       if (command === "set_power") {
         if (value === 0) {
+          // Record the lock first so a leveler restore can never slip in between
           await acManualOffLocks?.record(id, "ui");
+          await acLeveling?.onUserPowerOff(id);
         } else if (value === 1) {
           await acManualOffLocks?.clear(id);
+          await acLeveling?.onUserPowerOn(id);
         }
+      } else if (command === "set_generator_mode" && typeof value === "number") {
+        const result = await acLeveling?.onUserGenLevel(id, value);
+        res.json({ ok: true, ...(result?.reverted ? { reverted: true, level: result.level } : {}) });
+        return;
       }
       res.json({ ok: true });
     } catch (err) {
@@ -1179,6 +1203,55 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   router.delete("/api/ac/timer/:deviceId", requireAuth, (req: Request, res: Response) => {
     acTimers.delete(String(req.params.deviceId));
     res.json({ ok: true });
+  });
+
+  // ---------- Smart AC Leveling ----------
+
+  function validateLevelingConfig(b: Partial<AcLevelingConfig>): string | null {
+    const num = (v: unknown): v is number => typeof v === "number" && isFinite(v);
+    if (typeof b.enabled !== "boolean") return "enabled must be boolean";
+    if (!num(b.gridLimitAmps) || b.gridLimitAmps < 1 || b.gridLimitAmps > 100) return "gridLimitAmps must be 1–100";
+    if (!num(b.genLimitAmps) || b.genLimitAmps < 1 || b.genLimitAmps > 100) return "genLimitAmps must be 1–100";
+    if (!num(b.marginAmps) || b.marginAmps < 0 || b.marginAmps > 10) return "marginAmps must be 0–10";
+    if (!num(b.comfortTargetC) || b.comfortTargetC < 16 || b.comfortTargetC > 32) return "comfortTargetC must be 16–32";
+    if (!Array.isArray(b.priority) || b.priority.some((p) => typeof p !== "string")) return "priority must be a string array";
+    if (!b.ampModels || typeof b.ampModels !== "object") return "ampModels required";
+    for (const model of Object.values(b.ampModels as Record<string, AcAmpModel>)) {
+      if (!model || !num(model.baseAmps) || model.baseAmps < 0.5 || model.baseAmps > 20) return "baseAmps must be 0.5–20";
+      if (!num(model.stepAmps) || model.stepAmps < 0 || model.stepAmps > 10) return "stepAmps must be 0–10";
+    }
+    return null;
+  }
+
+  router.get("/api/ac/leveling", requireAuth, async (_req: Request, res: Response) => {
+    if (!acLeveling) { res.status(503).json({ error: "Smart AC leveling not available" }); return; }
+    try {
+      const config = await acLeveling.getConfig();
+      res.json({ config, status: acLeveling.getStatus() });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  router.put("/api/ac/leveling", requireAuth, async (req: Request, res: Response) => {
+    if (!acLeveling) { res.status(503).json({ error: "Smart AC leveling not available" }); return; }
+    const body = req.body as Partial<AcLevelingConfig>;
+    const validationError = validateLevelingConfig(body);
+    if (validationError) { res.status(400).json({ error: validationError }); return; }
+    try {
+      const config = await acLeveling.updateConfig({
+        enabled: body.enabled === true,
+        gridLimitAmps: body.gridLimitAmps as number,
+        genLimitAmps: body.genLimitAmps as number,
+        marginAmps: body.marginAmps as number,
+        comfortTargetC: body.comfortTargetC as number,
+        priority: body.priority as string[],
+        ampModels: body.ampModels as Record<string, AcAmpModel>,
+      });
+      res.json({ config });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
   });
 
   // ---------- AC Presets (server-side) ----------

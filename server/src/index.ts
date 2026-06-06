@@ -63,6 +63,14 @@ async function main(): Promise<void> {
       getLockedIds: (deviceIds) => collector.getAcManualOffLockedIds(deviceIds),
       reconcileDevices: (devices) => collector.reconcileAcManualOffLocks(devices),
     },
+    {
+      getConfig: () => collector.acLeveler.getConfig(),
+      updateConfig: (cfg) => collector.acLeveler.updateConfig(cfg),
+      getStatus: () => collector.acLeveler.getStatus(),
+      onUserPowerOff: (deviceId) => collector.acLeveler.onUserPowerOff(deviceId),
+      onUserPowerOn: (deviceId) => collector.acLeveler.onUserPowerOn(deviceId),
+      onUserGenLevel: (deviceId, level) => collector.acLeveler.onUserGenLevel(deviceId, level),
+    },
   ));
 
   // Serve static files from ../static (relative to dist/ or src/)

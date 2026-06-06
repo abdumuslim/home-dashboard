@@ -30,6 +30,8 @@ const config: Config = {
 
 function createPool() {
   const locks = new Set<string>();
+  const shed = new Set<string>();
+  let levelingConfig: Record<string, unknown> | null = null;
   const query = vi.fn(async (sql: string, params: unknown[] = []) => {
     if (sql.includes("SELECT") && sql.includes("FROM ac_manual_off_locks")) {
       return { rows: Array.from(locks).map((device_id) => ({ device_id, locked_at: new Date(Date.now() - 20_000) })), rowCount: locks.size };
@@ -42,22 +44,57 @@ function createPool() {
       locks.delete(String(params[0]));
       return { rows: [], rowCount: 1 };
     }
+    if (sql.includes("FROM ac_leveling_config")) {
+      return { rows: levelingConfig ? [{ config: levelingConfig }] : [], rowCount: levelingConfig ? 1 : 0 };
+    }
+    if (sql.includes("INSERT INTO ac_leveling_config")) {
+      levelingConfig = JSON.parse(String(params[0]));
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("SELECT") && sql.includes("FROM ac_leveling_shed")) {
+      return { rows: Array.from(shed).map((device_id) => ({ device_id, shed_at: new Date(Date.now() - 60_000) })), rowCount: shed.size };
+    }
+    if (sql.includes("INSERT INTO ac_leveling_shed")) {
+      shed.add(String(params[0]));
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("DELETE FROM ac_leveling_shed")) {
+      shed.delete(String(params[0]));
+      return { rows: [], rowCount: 1 };
+    }
     return { rows: [], rowCount: 0 };
   });
-  return { pool: { query }, locks };
+  return {
+    pool: { query },
+    locks,
+    shed,
+    setLevelingConfig: (c: Record<string, unknown>) => { levelingConfig = c; },
+  };
 }
 
+const LEVELING_CONFIG = {
+  enabled: true,
+  gridLimitAmps: 30,
+  genLimitAmps: 15,
+  marginAmps: 1,
+  comfortTargetC: 26,
+  priority: ["ac1", "ac2"],
+  ampModels: { ac1: { baseAmps: 2, stepAmps: 1 }, ac2: { baseAmps: 4, stepAmps: 2 } },
+};
+
 function createCollector() {
-  const { pool, locks } = createPool();
+  const { pool, locks, shed, setLevelingConfig } = createPool();
   const collector = new Collector(pool as never, config);
   const actions: Array<{ deviceId: string; action: Record<string, unknown> }> = [];
   const tclCloud = {
     isReady: vi.fn(() => true),
     ensureDeviceCachePopulated: vi.fn(async () => undefined),
+    getDevices: vi.fn(() => [] as Record<string, unknown>[]),
     fetchDevicesLive: vi.fn(async () => [{ id: "ac1", power: false }]),
     executeAcAction: vi.fn(async (deviceId: string, action: Record<string, unknown>) => {
       actions.push({ deviceId, action });
     }),
+    sendControl: vi.fn(async () => undefined),
     computeAcDiff: vi.fn(() => null as Record<string, unknown> | null),
   };
 
@@ -67,7 +104,7 @@ function createCollector() {
     temp_indoor_c: 23,
   };
 
-  return { collector, tclCloud, actions, locks };
+  return { collector, tclCloud, actions, locks, shed, setLevelingConfig };
 }
 
 function acRangeRule() {
@@ -277,5 +314,138 @@ describe("AC manual-off locks", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+function setTriggered(collector: Collector, ruleId: number) {
+  (collector as never as { automationState: Map<number, unknown> }).automationState.set(ruleId, {
+    status: "triggered", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true,
+  });
+}
+
+async function checkAcLeveling(collector: Collector) {
+  await (collector as never as { checkAcLeveling: () => Promise<void> }).checkAcLeveling();
+}
+
+describe("Smart AC leveling", () => {
+  beforeEach(() => {
+    acTimers.clear();
+  });
+
+  it("does not record a manual-off lock or auto-on a leveler-shed AC", async () => {
+    const { collector, actions, locks, shed, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    shed.add("ac1");
+    await collector.acLeveler.ensureLoaded();
+
+    // Triggered + device off in the dead zone → observed-off path must skip the lock
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, acRangeRule());
+    expect(locks.size).toBe(0);
+    expect(actions).toEqual([]);
+
+    // Idle + above the high limit → auto-on must skip the shed device
+    (collector as never as { automationState: Map<number, unknown> }).automationState.delete(1);
+    await setWeatherValue(collector, 27);
+    await checkAcRangeAutomation(collector, acRangeRule());
+    expect(actions).toEqual([]);
+  });
+
+  it("strips generator_mode from re-enforcement when smart leveling owns the device", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    const rule = { ...acRangeRule(), action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 } };
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
+  });
+
+  it("keeps generator_mode in re-enforcement when the automation opts out", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    const rule = { ...acRangeRule(), smart_leveling: false, action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 } };
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 });
+  });
+
+  it("strips generator_mode from turn-on timer presets for managed devices", async () => {
+    const { collector, actions, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    acTimers.set("ac1", { deviceId: "ac1", action: "on", fireAt: Date.now() - 1, preset: { mode: 1, generator_mode: 2 } });
+
+    await checkAcTimers(collector);
+
+    expect(actions).toEqual([{ deviceId: "ac1", action: { power: 1, mode: 1 } }]);
+  });
+
+  it("drops a due turn-on timer for a shed AC without sending a command", async () => {
+    const { collector, actions, shed, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    shed.add("ac1");
+    await collector.acLeveler.ensureLoaded();
+    acTimers.set("ac1", { deviceId: "ac1", action: "on", fireAt: Date.now() - 1 });
+
+    await checkAcTimers(collector);
+
+    expect(acTimers.has("ac1")).toBe(false);
+    expect(actions).toEqual([]);
+  });
+
+  it("sheds the lowest-priority AC after a sustained over-limit on the generator", async () => {
+    const { collector, tclCloud, actions, shed, locks, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // 4 consecutive generator readings over the 15A limit
+    for (let i = 0; i < 4; i++) {
+      collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 16, power_1: 0, power_2: 3520 });
+    }
+    await checkAcLeveling(collector);
+
+    // budget = 15 − 1 − nonAcLoad(16 − 6) = 4 < L1 sum 6 → shed ac2 (lowest priority)
+    expect(actions).toEqual([{ deviceId: "ac2", action: { power: 0 } }]);
+    expect(shed.has("ac2")).toBe(true);
+    expect(locks.size).toBe(0); // shed is not a manual-off lock
+  });
+
+  it("restores a shed AC when headroom returns", async () => {
+    const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    shed.add("ac2");
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 26, mode: 1 },
+      { id: "ac2", name: "Abdu", power: false, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // 6 consecutive readings with comfortable headroom on the generator
+    for (let i = 0; i < 6; i++) {
+      collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 4, power_1: 0, power_2: 880 });
+    }
+    await checkAcLeveling(collector);
+
+    expect(actions).toEqual([{ deviceId: "ac2", action: { power: 1, generator_mode: 1 } }]);
+    expect(shed.has("ac2")).toBe(false);
   });
 });

@@ -8,6 +8,9 @@ import { useAlerts } from "@/hooks/use-alerts";
 import { useAutomations } from "@/hooks/use-automations";
 import { useDevices } from "@/hooks/use-devices";
 import { useAcDevices } from "@/hooks/use-ac-devices";
+import { useModalSections } from "@/hooks/use-modal-sections";
+import { CollapsibleModalSection } from "@/components/ui/collapsible-modal-section";
+import { AcLevelingSection } from "@/components/ui/ac-leveling-section";
 import { ALERT_METRICS, PRAYER_NAMES, PRAYER_LABELS } from "@/constants/alert-metrics";
 import type { AlertCondition, PrayerTiming, AlertRule, MetricInfo } from "@/types/alerts";
 import type { PurifierDevice, AutomationRule, AutomationRangeSlot } from "@/types/automations";
@@ -253,6 +256,7 @@ export function AlertsModal({ onClose, isAdmin }: AlertsModalProps) {
   const { devices: acDevices } = useAcDevices(isAdmin ?? false);
   const metrics = ALERT_METRICS;
   const prayerNames = [...PRAYER_NAMES];
+  const { collapsed, toggle } = useModalSections();
   const [phase, setPhase] = useState<"in" | "out">("in");
   const [showForm, setShowForm] = useState(false);
   const [editingAlert, setEditingAlert] = useState<AlertRule | null>(null);
@@ -351,20 +355,22 @@ export function AlertsModal({ onClose, isAdmin }: AlertsModalProps) {
           {isSupported && isSubscribed && (
             <div className="flex flex-col">
               {/* Alert list */}
-              <div className="px-5 py-4 flex flex-col gap-2">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-xs font-medium tracking-wider text-dim uppercase">Your Alerts</h3>
-                  {!showForm && !editingAlert && (
-                    <button
-                      onClick={() => setShowForm(true)}
-                      className="flex items-center gap-1 text-xs text-cyan hover:text-cyan/80 transition-colors"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      Add
-                    </button>
-                  )}
-                </div>
-
+              <CollapsibleModalSection
+                id="alerts"
+                title="Your Alerts"
+                collapsed={collapsed.alerts}
+                onToggle={() => toggle("alerts")}
+                headerRight={!showForm && !editingAlert ? (
+                  <button
+                    onClick={() => setShowForm(true)}
+                    className="flex items-center gap-1 text-xs text-cyan hover:text-cyan/80 transition-colors"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    Add
+                  </button>
+                ) : undefined}
+              >
+              <div className="px-5 pb-4 flex flex-col gap-2">
                 {loading ? (
                   <div className="flex items-center gap-2 py-3 text-sm text-dim">
                     <Spinner className="w-4 h-4" />
@@ -435,6 +441,7 @@ export function AlertsModal({ onClose, isAdmin }: AlertsModalProps) {
                   onCancel={() => { setShowForm(false); setEditingAlert(null); }}
                 />
               )}
+              </CollapsibleModalSection>
 
               {/* Unsubscribe */}
               <div className="px-5 py-3 border-t border-white/10">
@@ -460,7 +467,22 @@ export function AlertsModal({ onClose, isAdmin }: AlertsModalProps) {
               onUpdate={updateAutomation}
               onDelete={deleteAutomation}
               onToggle={toggleAutomation}
+              sectionCollapsed={collapsed.automations}
+              onToggleSection={() => toggle("automations")}
             />
+          )}
+
+          {/* Smart AC Leveling — admin only */}
+          {isAdmin && (
+            <CollapsibleModalSection
+              id="leveling"
+              title="Smart AC Leveling"
+              collapsed={collapsed.leveling}
+              onToggle={() => toggle("leveling")}
+              className="border-t border-white/10"
+            >
+              <AcLevelingSection active={!collapsed.leveling} acDevices={acDevices} />
+            </CollapsibleModalSection>
           )}
         </div>
       </div>
@@ -791,7 +813,7 @@ function AlertForm({ metrics, prayerNames, editing, onSave, onCancel }: AlertFor
 
 // ---------- Automations Panel ----------
 
-function AutomationsPanel({ automations, devices, acDevices, onCreate, onUpdate, onDelete, onToggle }: {
+function AutomationsPanel({ automations, devices, acDevices, onCreate, onUpdate, onDelete, onToggle, sectionCollapsed, onToggleSection }: {
   automations: AutomationRule[];
   devices: PurifierDevice[];
   acDevices: AcDevice[];
@@ -799,22 +821,27 @@ function AutomationsPanel({ automations, devices, acDevices, onCreate, onUpdate,
   onUpdate: (id: number, body: Record<string, unknown>) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
   onToggle: (id: number, enabled: boolean) => Promise<void>;
+  sectionCollapsed: boolean;
+  onToggleSection: () => void;
 }) {
   const [showForm, setShowForm] = useState(false);
   const [editingRule, setEditingRule] = useState<AutomationRule | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
   return (
-    <div className="px-5 py-4 flex flex-col gap-2 border-t border-white/10">
-      <div className="flex items-center justify-between">
-        <h3 className="text-xs font-medium tracking-wider text-dim uppercase">Auto Triggers</h3>
-        {!showForm && !editingRule && (
-          <button onClick={() => setShowForm(true)} className="flex items-center gap-1 text-xs text-cyan hover:text-cyan/80 transition-colors">
-            <Plus className="w-3.5 h-3.5" /> Add
-          </button>
-        )}
-      </div>
-
+    <CollapsibleModalSection
+      id="automations"
+      title="Auto Triggers"
+      collapsed={sectionCollapsed}
+      onToggle={onToggleSection}
+      className="border-t border-white/10"
+      headerRight={!showForm && !editingRule ? (
+        <button onClick={() => setShowForm(true)} className="flex items-center gap-1 text-xs text-cyan hover:text-cyan/80 transition-colors">
+          <Plus className="w-3.5 h-3.5" /> Add
+        </button>
+      ) : undefined}
+    >
+    <div className="px-5 pb-4 flex flex-col gap-2">
       {automations.length === 0 && !showForm && !editingRule && (
         <p className="text-sm text-dim py-1">No triggers configured.</p>
       )}
@@ -871,6 +898,7 @@ function AutomationsPanel({ automations, devices, acDevices, onCreate, onUpdate,
         />
       )}
     </div>
+    </CollapsibleModalSection>
   );
 }
 
@@ -1130,6 +1158,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
   const [timeStart, setTimeStart] = useState(editing?.time_start ?? "22:00");
   const [timeEnd, setTimeEnd] = useState(editing?.time_end ?? "07:00");
   const [turnOffAtEnd, setTurnOffAtEnd] = useState(editing?.turn_off_at_end ?? false);
+  const [smartLeveling, setSmartLeveling] = useState(editing?.smart_leveling ?? true);
   // Start prayer-relative
   const [startMode, setStartMode] = useState<"exact" | "prayer">(editing?.start_mode ?? "exact");
   const [startPrayer, setStartPrayer] = useState(editing?.start_prayer ?? "isha");
@@ -1239,7 +1268,14 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
     } : undefined;
     const isAcMetric = deviceType === "ac" && automationType === "metric";
     const effectiveTurnOff = isAcMetric ? true : turnOffAtEnd;
-    const base = { device_type: deviceType, device_ids: ids, device_names: names, turn_off_at_end: effectiveTurnOff, ...(acProfile ? { ac_profile: acProfile } : {}) };
+    const base = {
+      device_type: deviceType,
+      device_ids: ids,
+      device_names: names,
+      turn_off_at_end: effectiveTurnOff,
+      ...(deviceType === "ac" ? { smart_leveling: smartLeveling } : {}),
+      ...(acProfile ? { ac_profile: acProfile } : {}),
+    };
 
     if (automationType === "schedule") {
       return {
@@ -1545,6 +1581,16 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
           </span>
           <input type="checkbox" checked={turnOffAtEnd} onChange={(e) => setTurnOffAtEnd(e.target.checked)} className="sr-only" />
           <span className={turnOffAtEnd ? "text-text" : ""}>{automationType === "schedule" ? "Turn off at end" : "Turn off when resolved"}</span>
+        </label>
+      )}
+
+      {deviceType === "ac" && automationType !== "" && (
+        <label className="flex items-center gap-1.5 cursor-pointer text-xs text-dim">
+          <span className={cn("w-3.5 h-3.5 rounded border flex items-center justify-center", smartLeveling ? "border-emerald-400 bg-emerald-400/20" : "border-dim")}>
+            {smartLeveling && <span className="text-emerald-400 text-[10px]">&#10003;</span>}
+          </span>
+          <input type="checkbox" checked={smartLeveling} onChange={(e) => setSmartLeveling(e.target.checked)} className="sr-only" />
+          <span className={smartLeveling ? "text-text" : ""}>Smart leveling controls generator level</span>
         </label>
       )}
 

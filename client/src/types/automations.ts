@@ -62,6 +62,7 @@ export interface AutomationRule {
   device_names: string[] | null;
   turn_off_at_end: boolean;
   sustained_minutes: number;
+  smart_leveling: boolean; // AC only — leveler owns the generator level (default true)
   device_id: string;
   device_name: string;
   created_at: string;
