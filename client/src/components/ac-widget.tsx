@@ -325,9 +325,33 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
 }) {
   const [phase, setPhase] = useState<"in" | "out">("in");
   const [saveMode, setSaveMode] = useState(false);
-  const [activePreset, setActivePreset] = useState<number | null>(null);
-  const [stagedValues, setStagedValues] = useState<PresetData | null>(null);
+  const [applyingPreset, setApplyingPreset] = useState<number | null>(null);
   const [presets, setPresets] = useState<PresetSlots>({ ...EMPTY_PRESETS });
+
+  const applyPreset = async (slot: number, sv: PresetData) => {
+    setApplyingPreset(slot);
+    try {
+      // Mode first — firmware may reset fan speed on mode change
+      if (sv.mode !== d.mode) try { await onControl("set_mode", sv.mode); } catch {}
+      if (sv.targetTemp !== d.targetTemp) try { await onControl("set_temperature", sv.targetTemp); } catch {}
+      if (sv.eco !== d.eco) try { await onControl("set_eco", sv.eco ? 1 : 0); } catch {}
+      if (sv.screen !== d.screen) try { await onControl("set_screen", sv.screen ? 1 : 0); } catch {}
+      if (sv.verticalSwing !== d.verticalSwing) try { await onControl("set_vertical_swing", sv.verticalSwing); } catch {}
+      if (sv.horizontalSwing !== d.horizontalSwing) try { await onControl("set_horizontal_swing", sv.horizontalSwing); } catch {}
+      if (sv.freshAir !== d.freshAir) try { await onControl("set_fresh_air", sv.freshAir ? 1 : 0); } catch {}
+      if (sv.generatorMode !== d.generatorMode) try { await onControl("set_generator_mode", sv.generatorMode); } catch {}
+      // Fan speed last — after mode change processed by firmware
+      if (sv.fanSpeed !== d.fanSpeed) try { await onControl("set_fan_speed", sv.fanSpeed); } catch {}
+      if (sv.turbo !== d.turbo) try { await onControl("set_turbo", sv.turbo ? 1 : 0); } catch {}
+      fetch("/api/ac/preset-apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deviceId: d.id, slot, presetData: sv }),
+      }).catch(() => {});
+    } finally {
+      setApplyingPreset(null);
+    }
+  };
 
   useEffect(() => {
     migrateLocalPresets(d.id);
@@ -344,8 +368,6 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
 
   const handleClose = useCallback(() => {
     setSaveMode(false);
-    setActivePreset(null);
-    setStagedValues(null);
     setPhase("out");
     setTimeout(onClose, 150);
   }, [onClose]);
@@ -406,8 +428,8 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
               <ChevronDown className="w-6 h-6" />
             </button>
             <div className="flex flex-col items-center">
-              <span className="text-4xl font-bold tabular-nums leading-none" style={{ color: colors.text, opacity: stagedValues && stagedValues.targetTemp !== d.targetTemp ? 0.3 : 1 }}>
-                {stagedValues ? stagedValues.targetTemp : d.targetTemp}°
+              <span className="text-4xl font-bold tabular-nums leading-none" style={{ color: colors.text }}>
+                {d.targetTemp}°
               </span>
               <span className="text-xs text-dim mt-1">Target</span>
             </div>
@@ -542,19 +564,15 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                     const info = MODE_LABELS[m] ?? MODE_LABELS[0];
                     const Icon = info.icon;
                     const mc = getModeColors(m);
-                    const isStaged = stagedValues != null && stagedValues.mode === m && d.mode !== m;
                     return (
                       <button
                         key={m}
                         onClick={() => send("set_mode", m)}
                         className={cn(
                           "flex flex-col items-center gap-1 px-2 py-2 rounded-lg text-xs border transition-colors",
-                          d.mode !== m && !isStaged && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+                          d.mode !== m && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
                         )}
-                        style={{
-                          ...(d.mode === m ? { borderColor: mc.border, backgroundColor: mc.bg, color: mc.text } : undefined),
-                          ...(isStaged ? { outline: `2px dashed ${mc.accent}`, outlineOffset: "-2px", color: mc.text, borderColor: "transparent", backgroundColor: `${mc.accent}08` } : undefined),
-                        }}
+                        style={d.mode === m ? { borderColor: mc.border, backgroundColor: mc.bg, color: mc.text } : undefined}
                       >
                         <Icon className="w-4 h-4" />
                         <span className="text-[0.65rem]">{info.label}</span>
@@ -569,19 +587,15 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                 <span className="text-xs text-dim mb-1.5 block">Fan Speed</span>
                 <div className="flex gap-1.5">
                   {[0, ...Array.from({ length: (d.maxFanSpeed || 7) - (d.minFanSpeed || 1) + 1 }, (_, i) => i + (d.minFanSpeed || 1))].map((s) => {
-                    const isStaged = stagedValues != null && stagedValues.fanSpeed === s && d.fanSpeed !== s;
                     return (
                       <button
                         key={s}
                         onClick={() => send("set_fan_speed", s)}
                         className={cn(
                           "flex-1 py-1.5 rounded-lg text-xs border transition-colors",
-                          d.fanSpeed !== s && !isStaged && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+                          d.fanSpeed !== s && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
                         )}
-                        style={{
-                          ...(d.fanSpeed === s ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined),
-                          ...(isStaged ? { outline: `2px dashed ${colors.accent}`, outlineOffset: "-2px", color: colors.text, borderColor: "transparent", backgroundColor: `${colors.accent}08` } : undefined),
-                        }}
+                        style={d.fanSpeed === s ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
                       >
                         {d.maxGeneratorLevel !== 6 && s === 1
                           ? <EarOff className="w-3 h-3 mx-auto" />
@@ -598,7 +612,6 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
               <SwingSelector
                 label="Vertical"
                 value={d.verticalSwing}
-                stagedValue={stagedValues?.verticalSwing}
                 onChange={(v) => send("set_vertical_swing", v)}
                 axis="vertical"
                 colors={colors}
@@ -608,7 +621,6 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
               <SwingSelector
                 label="Horizontal"
                 value={d.horizontalSwing}
-                stagedValue={stagedValues?.horizontalSwing}
                 onChange={(v) => send("set_horizontal_swing", v)}
                 axis="horizontal"
                 colors={colors}
@@ -630,19 +642,15 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                 <span className="text-[0.65rem] text-dim uppercase tracking-wider mb-1.5 block">Generator</span>
                 <div className="flex gap-1.5 flex-wrap">
                   {[0, ...Array.from({ length: d.maxGeneratorLevel }, (_, i) => i + 1)].map((lvl) => {
-                    const isStaged = stagedValues != null && stagedValues.generatorMode === lvl && d.generatorMode !== lvl;
                     return (
                       <button
                         key={lvl}
                         onClick={() => send("set_generator_mode", lvl)}
                         className={cn(
                           "px-2.5 py-1.5 rounded-lg text-xs border transition-colors",
-                          d.generatorMode !== lvl && !isStaged && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+                          d.generatorMode !== lvl && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
                         )}
-                        style={{
-                          ...(d.generatorMode === lvl ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined),
-                          ...(isStaged ? { outline: `2px dashed ${colors.accent}`, outlineOffset: "-2px", color: colors.text, borderColor: "transparent", backgroundColor: `${colors.accent}08` } : undefined),
-                        }}
+                        style={d.generatorMode === lvl ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
                       >
                         {lvl === 0 ? "OFF" : lvl}
                       </button>
@@ -655,59 +663,18 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
               <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-[0.65rem] text-dim uppercase tracking-wider">Presets</span>
-                  <div className="flex items-center gap-1.5">
-                    {/* Save button */}
-                    <button
-                      onClick={() => setSaveMode((v) => !v)}
-                      className={cn(
-                        "flex items-center justify-center w-8 h-8 rounded-lg border text-xs transition-colors",
-                        !saveMode && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
-                      )}
-                      style={saveMode ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
-                      title={saveMode ? "Cancel save" : "Save to preset"}
-                    >
-                      <Save className="w-3.5 h-3.5" />
-                    </button>
-
-                    {/* Apply button */}
-                    <button
-                      onClick={async () => {
-                        if (!stagedValues) return;
-                        const sv = stagedValues;
-                        const appliedSlot = activePreset;
-                        setActivePreset(null);
-                        setStagedValues(null);
-                        // Mode first — firmware may reset fan speed on mode change
-                        if (sv.mode !== d.mode) try { await onControl("set_mode", sv.mode); } catch {}
-                        if (sv.targetTemp !== d.targetTemp) try { await onControl("set_temperature", sv.targetTemp); } catch {}
-                        if (sv.eco !== d.eco) try { await onControl("set_eco", sv.eco ? 1 : 0); } catch {}
-                        if (sv.screen !== d.screen) try { await onControl("set_screen", sv.screen ? 1 : 0); } catch {}
-                        if (sv.verticalSwing !== d.verticalSwing) try { await onControl("set_vertical_swing", sv.verticalSwing); } catch {}
-                        if (sv.horizontalSwing !== d.horizontalSwing) try { await onControl("set_horizontal_swing", sv.horizontalSwing); } catch {}
-                        if (sv.freshAir !== d.freshAir) try { await onControl("set_fresh_air", sv.freshAir ? 1 : 0); } catch {}
-                        if (sv.generatorMode !== d.generatorMode) try { await onControl("set_generator_mode", sv.generatorMode); } catch {}
-                        // Fan speed last — after mode change processed by firmware
-                        if (sv.fanSpeed !== d.fanSpeed) try { await onControl("set_fan_speed", sv.fanSpeed); } catch {}
-                        if (sv.turbo !== d.turbo) try { await onControl("set_turbo", sv.turbo ? 1 : 0); } catch {}
-                        if (appliedSlot != null) {
-                          fetch("/api/ac/preset-apply", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ deviceId: d.id, slot: appliedSlot, presetData: sv }),
-                          }).catch(() => {});
-                        }
-                      }}
-                      disabled={!stagedValues}
-                      className={cn(
-                        "flex items-center justify-center w-8 h-8 rounded-lg border text-xs transition-colors",
-                        !stagedValues && "border-white/[0.06] bg-white/[0.02] text-dim/40 cursor-not-allowed",
-                      )}
-                      style={stagedValues ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
-                      title="Apply preset"
-                    >
-                      <Check className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
+                  {/* Save button */}
+                  <button
+                    onClick={() => setSaveMode((v) => !v)}
+                    className={cn(
+                      "flex items-center justify-center w-8 h-8 rounded-lg border text-xs transition-colors",
+                      !saveMode && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+                    )}
+                    style={saveMode ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
+                    title={saveMode ? "Cancel save" : "Save to preset"}
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                  </button>
                 </div>
 
                 {/* Preset slots 1-10 (5x2 grid) */}
@@ -715,8 +682,8 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                   {PRESET_SLOTS.map((slot) => {
                     const p = presets[slot];
                     const filled = p != null;
-                    const isActive = activePreset === slot;
-                    const isCurrent = filled && !isActive && presetMatchesCurrent(p, d);
+                    const isApplying = applyingPreset === slot;
+                    const isCurrent = filled && presetMatchesCurrent(p, d);
                     const pColors = filled ? getModeColors(p.mode) : colors;
                     const ModeIcon = filled ? MODE_LABELS[p.mode]?.icon : undefined;
                     return (
@@ -728,25 +695,25 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                             setPresets(next);
                             savePresets(d.id, next, slot);
                             setSaveMode(false);
-                          } else if (filled) {
-                            setActivePreset(slot);
-                            setStagedValues(presets[slot]);
+                          } else if (filled && applyingPreset == null) {
+                            void applyPreset(slot, p);
                           }
                         }}
+                        disabled={!saveMode && applyingPreset != null}
                         className={cn(
                           "relative flex flex-col items-center justify-center gap-0.5 h-14 rounded-lg border px-1 py-1 text-xs font-medium transition-colors",
                           saveMode && "animate-preset-blink",
-                          !isActive && !saveMode && !filled && "border-white/[0.06] bg-white/[0.02] text-dim/50",
-                          !isActive && !saveMode && filled && "border-white/15 bg-white/5 text-dim hover:text-text hover:border-white/25",
+                          !isApplying && !saveMode && !filled && "border-white/[0.06] bg-white/[0.02] text-dim/50",
+                          !isApplying && !saveMode && filled && "border-white/15 bg-white/5 text-dim hover:text-text hover:border-white/25",
                         )}
                         style={
-                          isActive
-                            ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text, boxShadow: `0 0 8px ${colors.glow}` }
+                          isApplying
+                            ? { borderColor: pColors.border, backgroundColor: pColors.bg, color: pColors.text, boxShadow: `0 0 8px ${pColors.glow}` }
                             : isCurrent
                               ? { borderColor: pColors.border, boxShadow: `inset 0 0 0 1px ${pColors.border}` }
                               : undefined
                         }
-                        title={filled ? `Preset ${slot}` : `Empty slot ${slot}`}
+                        title={filled ? `Apply preset ${slot}` : `Empty slot ${slot}`}
                       >
                         {isCurrent && (
                           <span
@@ -859,10 +826,9 @@ function FixedPositionDot({ axis, position }: { axis: "vertical" | "horizontal";
   );
 }
 
-function SwingSelector({ label, value, stagedValue, onChange, axis, colors }: {
+function SwingSelector({ label, value, onChange, axis, colors }: {
   label: string;
   value: number;
-  stagedValue?: number;
   onChange: (v: number) => void;
   axis: "vertical" | "horizontal";
   colors: { accent: string; border: string; bg: string; text: string };
@@ -873,19 +839,15 @@ function SwingSelector({ label, value, stagedValue, onChange, axis, colors }: {
   const IconComponent = axis === "vertical" ? VerticalIcon : HorizontalIcon;
 
   const renderBtn = (o: typeof options[number]) => {
-    const isStaged = stagedValue != null && stagedValue === o.value && value !== o.value;
     return (
       <button
         key={o.value}
         onClick={() => onChange(o.value)}
         className={cn(
           "flex items-center justify-center w-8 h-8 rounded-lg border transition-colors",
-          value !== o.value && !isStaged && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
+          value !== o.value && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
         )}
-        style={{
-          ...(value === o.value ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined),
-          ...(isStaged ? { outline: `2px dashed ${colors.accent}`, outlineOffset: "-2px", color: colors.text, borderColor: "transparent", backgroundColor: `${colors.accent}08` } : undefined),
-        }}
+        style={value === o.value ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
         title={o.label}
       >
         <IconComponent value={o.value} />
