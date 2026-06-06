@@ -76,6 +76,25 @@ describe("AC automation range slots", () => {
     expect(result.error).toContain("morning");
   });
 
+  it("accepts and preserves a valid per-slot fan speed", () => {
+    const result = validateRangeSlots([
+      slot({ id: "auto", fan_speed: 0 }),
+      slot({ id: "max", start_time: "13:00", end_time: "15:00", fan_speed: 7 }),
+      slot({ id: "preset", start_time: "16:00", end_time: "18:00" }),
+    ], metricBounds, () => null);
+
+    expect(result.ok).toBe(true);
+    expect(result.slots?.[0].fan_speed).toBe(0);
+    expect(result.slots?.[1].fan_speed).toBe(7);
+    expect(result.slots?.[2].fan_speed).toBeUndefined();
+  });
+
+  it("rejects out-of-range or non-integer fan speeds", () => {
+    expect(validateRangeSlots([slot({ fan_speed: 8 })], metricBounds, () => null).ok).toBe(false);
+    expect(validateRangeSlots([slot({ fan_speed: -1 })], metricBounds, () => null).ok).toBe(false);
+    expect(validateRangeSlots([slot({ fan_speed: 2.5 })], metricBounds, () => null).ok).toBe(false);
+  });
+
   it("validates slot count and threshold bounds", () => {
     expect(validateRangeSlots([], metricBounds, () => null).ok).toBe(false);
     expect(validateRangeSlots(

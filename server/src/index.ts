@@ -62,6 +62,7 @@ async function main(): Promise<void> {
       isLocked: (deviceId) => collector.isAcManualOffLocked(deviceId),
       getLockedIds: (deviceIds) => collector.getAcManualOffLockedIds(deviceIds),
       reconcileDevices: (devices) => collector.reconcileAcManualOffLocks(devices),
+      onUserFanChange: (deviceId) => collector.noteUserAcFanChange(deviceId),
     },
     {
       getConfig: () => collector.acLeveler.getConfig(),

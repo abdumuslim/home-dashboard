@@ -31,6 +31,8 @@ export interface AcManualOffLockHandlers {
   isLocked(deviceId: string): Promise<boolean>;
   getLockedIds(deviceIds?: string[]): Promise<Set<string>>;
   reconcileDevices(devices: Array<{ id: string; power: boolean }>): Promise<Set<string>>;
+  /** UI fan/turbo change — range automations suspend fan enforcement for this device. */
+  onUserFanChange?(deviceId: string): void;
 }
 
 export interface AcLevelingHandlers {
@@ -1172,6 +1174,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         const result = await acLeveling?.onUserGenLevel(id, value);
         res.json({ ok: true, ...(result?.reverted ? { reverted: true, level: result.level } : {}) });
         return;
+      } else if (command === "set_fan_speed" || command === "set_turbo") {
+        acManualOffLocks?.onUserFanChange?.(id);
       }
       res.json({ ok: true });
     } catch (err) {

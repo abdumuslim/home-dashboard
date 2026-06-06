@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import type { Config } from "./config.js";
 import { Collector } from "./collector.js";
 import { acTimers } from "./routes.js";
@@ -96,6 +96,7 @@ function createCollector() {
     }),
     sendControl: vi.fn(async () => undefined),
     computeAcDiff: vi.fn(() => null as Record<string, unknown> | null),
+    getDeviceState: vi.fn(() => null as Record<string, unknown> | null),
   };
 
   (collector as never as { tclCloud: typeof tclCloud }).tclCloud = tclCloud;
@@ -322,6 +323,169 @@ function setTriggered(collector: Collector, ruleId: number) {
     status: "triggered", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true,
   });
 }
+
+function acFanRule(slotFan?: number, presetFan = 3) {
+  return {
+    ...acRangeRule(),
+    action_on: { power: 1, mode: 1, temperature: 23, fan_speed: presetFan },
+    range_slots: [
+      { id: "morning", type: "window", start_mode: "exact", start_time: "06:00", end_mode: "exact", end_time: "10:00", threshold_low: 22, threshold: 25, ...(slotFan != null ? { fan_speed: slotFan } : {}) },
+      { id: "default", type: "all_day", threshold_low: 20, threshold: 28 },
+    ] satisfies AutomationRangeSlot[],
+  };
+}
+
+function getFanEnforcement(collector: Collector) {
+  return (collector as never as { acFanEnforcement: Map<string, { manual: boolean }> }).acFanEnforcement;
+}
+
+describe("AC range fan enforcement", () => {
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T04:30:00.000Z")); // 07:30 Baghdad — morning slot active
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("applies the slot fan speed on turn-on instead of the preset fan", async () => {
+    const { collector, actions } = createCollector();
+
+    await setWeatherValue(collector, 25.5);
+    await checkAcRangeAutomation(collector, acFanRule(2));
+
+    expect(actions).toEqual([{ deviceId: "ac1", action: { power: 1, mode: 1, temperature: 23, fan_speed: 2 } }]);
+  });
+
+  it("applies the slot fan speed in triggered re-enforcement", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, acFanRule(2));
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 2 });
+  });
+
+  it("falls back to the preset fan when the slot has no override", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, acFanRule());
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
+  });
+
+  it("resolves slot Auto to the delta-based level and follows the delta", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 2 });
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 22.7); // delta 0.7 past the low limit → L2
+    await checkAcRangeAutomation(collector, acFanRule(0));
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 2 });
+
+    vi.setSystemTime(new Date("2026-05-20T04:31:00.000Z"));
+    await setWeatherValue(collector, 25.0); // delta 3.0 → L7
+    await checkAcRangeAutomation(collector, acFanRule(0));
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 7 });
+  });
+
+  it("resolves a preset Auto fan to the delta-based level (never sends 0)", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 22.7);
+    await checkAcRangeAutomation(collector, acFanRule(undefined, 0));
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 2 });
+  });
+
+  it("detects a manual fan change and stops enforcing fan and turbo", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 2 });
+    const rule = { ...acFanRule(2), action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, turbo: 0 } };
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule); // baseline adopted (observed == desired)
+
+    vi.setSystemTime(new Date("2026-05-20T04:30:20.000Z")); // +20s — past the settle window
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 5 });
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23 });
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+  });
+
+  it("keeps enforcing fan when drift is within the settle window", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 2 });
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, acFanRule(2)); // baseline adopted
+
+    vi.setSystemTime(new Date("2026-05-20T04:30:05.000Z")); // +5s — inside the settle window
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 5 });
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, acFanRule(2));
+
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 2 });
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(false);
+  });
+
+  it("resumes fan enforcement when the active slot changes", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    getFanEnforcement(collector).set("1:ac1", { slotId: "morning", lastCommandedFan: 5, lastFanCommandAt: 0, manual: true } as never);
+
+    vi.setSystemTime(new Date("2026-05-20T09:00:00.000Z")); // 12:00 Baghdad — all-day slot active
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, acFanRule(2));
+
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
+  });
+
+  it("drops the manual override when the AC is observed off (power cycle)", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }]);
+    getFanEnforcement(collector).set("1:ac1", { slotId: "morning", lastCommandedFan: 5, lastFanCommandAt: 0, manual: true } as never);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, acFanRule(2));
+
+    expect(getFanEnforcement(collector).has("1:ac1")).toBe(false);
+  });
+
+  it("suspends fan enforcement immediately on a UI fan change", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    const rule = acFanRule(2);
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+
+    collector.noteUserAcFanChange("ac1");
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23 });
+  });
+});
 
 async function checkAcLeveling(collector: Collector) {
   await (collector as never as { checkAcLeveling: () => Promise<void> }).checkAcLeveling();

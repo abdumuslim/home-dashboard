@@ -27,6 +27,8 @@ export interface AutomationRangeSlot {
   end_prayer_offset?: number;
   threshold_low: number;
   threshold: number;
+  /** 0 = smart auto (delta-based), 1–7 fixed level, absent = preset profile fan. */
+  fan_speed?: number;
 }
 
 interface ResolvedWindow {
@@ -97,6 +99,7 @@ export function normalizeRangeSlots(value: unknown): AutomationRangeSlot[] | nul
       ...(typeof item.end_prayer_offset === "number" ? { end_prayer_offset: item.end_prayer_offset } : {}),
       threshold_low: typeof item.threshold_low === "number" ? item.threshold_low : Number.NaN,
       threshold: typeof item.threshold === "number" ? item.threshold : Number.NaN,
+      ...(typeof item.fan_speed === "number" ? { fan_speed: item.fan_speed } : {}),
     };
   });
 }
@@ -171,6 +174,9 @@ export function validateRangeSlots(
     }
     if (slot.threshold_low >= slot.threshold) {
       return { ok: false, error: `${label}: low threshold must be less than high threshold` };
+    }
+    if (slot.fan_speed != null && (!Number.isInteger(slot.fan_speed) || slot.fan_speed < 0 || slot.fan_speed > 7)) {
+      return { ok: false, error: `${label}: fan speed must be an integer 0–7` };
     }
 
     if (slot.type === "all_day") {

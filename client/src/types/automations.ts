@@ -36,6 +36,8 @@ export interface AutomationRangeSlot {
   end_prayer_offset?: number;
   threshold_low: number;
   threshold: number;
+  /** 0 = smart auto (delta-based), 1–7 fixed level, absent = preset profile fan. */
+  fan_speed?: number;
 }
 
 export interface AutomationRule {

@@ -9,6 +9,7 @@ import { TclCloud, type AcAction, type AcDevice } from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
 import { AcLeveler, type LevelerDeviceContext } from "./ac-leveler.js";
 import { computeNeedTier, type NeedTier } from "./ac-leveling.js";
+import { computeAutoFanLevel } from "./ac-auto-fan.js";
 import { childLogger } from "./logger.js";
 import {
   findActiveRangeSlot,
@@ -164,6 +165,14 @@ interface AutomationState {
   canAutoTurnOn: boolean;
 }
 
+/** Per rule+device fan enforcement bookkeeping for AC range automations. */
+interface AcFanEnforcement {
+  slotId: string;                 // range slot under which the baseline was set
+  lastCommandedFan: number | null; // fan level we last sent (smart-auto hysteresis basis)
+  lastFanCommandAt: number;       // ts of our last fan send / baseline adoption
+  manual: boolean;                // user changed fan — stop enforcing until slot change or power cycle
+}
+
 export class Collector {
   private pool: pg.Pool;
   private config: Config;
@@ -205,6 +214,8 @@ export class Collector {
   private acManualOffLocksLoaded = false;
   private readonly POWER_CACHE_TTL = 5_000;
   private readonly AC_MANUAL_OFF_CLEAR_GRACE_MS = 15_000;
+  private acFanEnforcement = new Map<string, AcFanEnforcement>(); // key `${rule.id}:${deviceId}`
+  private readonly AC_FAN_SETTLE_MS = 15_000;
 
   getLatestAir(): Record<string, unknown> | null {
     return this.latestAirRow;
@@ -843,6 +854,110 @@ export class Collector {
     return power;
   }
 
+  private acFanKey(ruleId: number, deviceId: string): string {
+    return `${ruleId}:${deviceId}`;
+  }
+
+  /** Drops fan bookkeeping (incl. a manual override) — call on any AC power cycle the rule owns. */
+  private clearAcFanEnforcement(ruleId: number, deviceId: string): void {
+    this.acFanEnforcement.delete(this.acFanKey(ruleId, deviceId));
+  }
+
+  /**
+   * Slot fan override → preset fan; Auto (0) resolves to the delta-based smart
+   * level (the AC's built-in auto is never enforced by range automations).
+   */
+  private resolveRangeFan(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, value: number): number | null {
+    const resolved = slot.fan_speed ?? (rule.action_on as AcAction).fan_speed;
+    if (resolved == null) return null;
+    if (resolved !== 0) return resolved;
+    const isCool = (rule.action_on as Record<string, unknown>).mode === 1;
+    const delta = isCool ? value - slot.threshold_low : slot.threshold - value;
+    const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, deviceId));
+    return computeAutoFanLevel(delta, entry?.lastCommandedFan);
+  }
+
+  /** rule.action_on with the resolved per-slot fan; fan + turbo dropped while a manual fan override is active. */
+  private effectiveAcRangeProfile(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, value: number): AcAction {
+    const profile = { ...(rule.action_on as AcAction) };
+    const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, deviceId));
+    if (entry?.manual) {
+      // Non-Najat fan 7 == turbo — enforcing turbo would clobber a manual fan choice
+      delete profile.fan_speed;
+      delete profile.turbo;
+      return profile;
+    }
+    const fan = this.resolveRangeFan(rule, slot, deviceId, value);
+    if (fan != null) profile.fan_speed = fan;
+    return profile;
+  }
+
+  /**
+   * Detects manual fan changes (shadow drift vs the fan we last commanded) and
+   * resets the bookkeeping when the active range slot changes. Call before
+   * computing the enforcement diff.
+   */
+  private updateAcFanTracking(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, value: number, now: number): void {
+    const key = this.acFanKey(rule.id, deviceId);
+    let entry = this.acFanEnforcement.get(key);
+    if (entry && entry.slotId !== slot.id) {
+      // New active range = new fan intent — drop any manual override and baseline
+      this.acFanEnforcement.delete(key);
+      entry = undefined;
+    }
+    if (entry?.manual) return;
+    const desiredFan = this.resolveRangeFan(rule, slot, deviceId, value);
+    if (desiredFan == null) return;
+    const observed = this.tclCloud?.getDeviceState(deviceId)?.fan_speed;
+    if (observed == null) return; // device not in cache yet — skip this tick
+    if (!entry) {
+      if (observed === desiredFan) {
+        // Device already matches — adopt a baseline so a later user change is detected
+        this.acFanEnforcement.set(key, { slotId: slot.id, lastCommandedFan: desiredFan, lastFanCommandAt: now, manual: false });
+      }
+      // else: this tick's diff will command the fan and noteAcFanCommanded creates the baseline
+      return;
+    }
+    if (observed === entry.lastCommandedFan) return;
+    // Our own just-sent command may not be reflected in the shadow yet
+    if (now - entry.lastFanCommandAt < this.AC_FAN_SETTLE_MS) return;
+    this.acFanEnforcement.set(key, { ...entry, manual: true });
+    log.info(`[collector] AC range "${rule.name}": manual fan change on ${deviceId} (fan=${observed}), suspending fan enforcement until slot change or power cycle`);
+  }
+
+  /** Records the fan we just sent so drift detection has a baseline. */
+  private noteAcFanCommanded(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, sent: AcAction): void {
+    if (sent.fan_speed == null) return;
+    this.acFanEnforcement.set(this.acFanKey(rule.id, deviceId), {
+      slotId: slot.id,
+      lastCommandedFan: sent.fan_speed,
+      lastFanCommandAt: Date.now(),
+      manual: false,
+    });
+  }
+
+  /** UI fan/turbo change — suspend fan enforcement immediately (no settle-window race). */
+  noteUserAcFanChange(deviceId: string): void {
+    for (const rule of this.automationRules) {
+      if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
+      if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
+      const slot = findActiveRangeSlot(
+        rule.range_slots ?? getLegacyRangeSlots(rule.threshold_low, rule.threshold),
+        getBaghdadMinutes(),
+        (prayer, offset) => this.resolvePrayerMinutes(prayer, offset),
+      );
+      if (!slot) continue;
+      const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, deviceId));
+      this.acFanEnforcement.set(this.acFanKey(rule.id, deviceId), {
+        slotId: slot.id,
+        lastCommandedFan: entry?.lastCommandedFan ?? null,
+        lastFanCommandAt: entry?.lastFanCommandAt ?? 0,
+        manual: true,
+      });
+      log.info(`[collector] AC ${deviceId}: user fan change — suspending fan enforcement for rule "${rule.name}"`);
+    }
+  }
+
   private async checkAcRangeAutomation(rule: AutomationRule): Promise<void> {
     const now = Date.now();
     const def = ALERT_METRICS[rule.metric!];
@@ -890,11 +1005,13 @@ export class Collector {
               const power = await this.getDevicePowerCached(did, "ac", true);
               if (power === "on" && !(await this.isAcManualOffLocked(did))) {
                 await this.tclCloud!.ensureDeviceCachePopulated();
-                const { power: _p, ...profileOnly } = rule.action_on as AcAction;
+                this.clearAcFanEnforcement(rule.id, did); // user power-cycled — fan intent resets
+                const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
                 const diff = this.tclCloud!.computeAcDiff(did, this.stripGenIfLeveled(rule, profileOnly));
                 if (diff) {
                   log.info(`[collector] AC range "${rule.name}": device ${did} is ON while locked, adopting with diff: ${JSON.stringify(diff)}`);
                   await this.tclCloud!.executeAcAction(did, diff);
+                  this.noteAcFanCommanded(rule, activeSlot, did, diff);
                 }
                 this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
                 return;
@@ -919,7 +1036,12 @@ export class Collector {
           );
           try {
             await this.tclCloud!.ensureDeviceCachePopulated();
-            await this.executeAutomationAction(rule, rule.action_on, unlockedDeviceIds);
+            // Automation power-on = power cycle: drop manual fan overrides, apply the slot fan
+            for (const did of unlockedDeviceIds) this.clearAcFanEnforcement(rule.id, did);
+            const fan = this.resolveRangeFan(rule, activeSlot, unlockedDeviceIds[0], value);
+            const onAction = fan != null ? { ...(rule.action_on as AcAction), fan_speed: fan } : rule.action_on;
+            await this.executeAutomationAction(rule, onAction, unlockedDeviceIds);
+            for (const did of unlockedDeviceIds) this.noteAcFanCommanded(rule, activeSlot, did, onAction as AcAction);
             this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
           } catch (err) {
             log.error(`[collector] AC range "${rule.name}" turn-on failed:`, (err as Error).message);
@@ -937,11 +1059,13 @@ export class Collector {
                 await this.executeAutomationAction(rule, { power: 0 } as AcAction, [did]);
                 this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
               } else {
-                const { power: _p, ...profileOnly } = rule.action_on as AcAction;
+                this.updateAcFanTracking(rule, activeSlot, did, value, now);
+                const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
                 const diff = this.tclCloud!.computeAcDiff(did, this.stripGenIfLeveled(rule, profileOnly));
                 if (diff) {
                   log.info(`[collector] AC range "${rule.name}": device ${did} is ON in dead zone (${rule.metric}=${value}), adopting with diff: ${JSON.stringify(diff)}`);
                   await this.tclCloud!.executeAcAction(did, diff);
+                  this.noteAcFanCommanded(rule, activeSlot, did, diff);
                 }
                 this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
               }
@@ -964,6 +1088,7 @@ export class Collector {
           // The automation owns the OFF now — a leveler shed must not restore it
           for (const did of deviceIds) {
             await this.acLeveler.clearShed(did, "range_turn_off");
+            this.clearAcFanEnforcement(rule.id, did);
           }
         } catch (err) {
           log.error(`[collector] AC range "${rule.name}" turn-off failed:`, (err as Error).message);
@@ -977,14 +1102,17 @@ export class Collector {
               if (this.acLeveler.isShed(did)) continue; // leveler shed it — not a manual off
               log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, recording manual-off lock`);
               await this.recordAcManualOff(did, "observed_off");
+              this.clearAcFanEnforcement(rule.id, did); // power cycle — fan intent resets
               this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
               return;
             }
-            const { power: _p, ...profileOnly } = rule.action_on as AcAction;
+            this.updateAcFanTracking(rule, activeSlot, did, value, now);
+            const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
             const diff = this.tclCloud!.computeAcDiff(did, this.stripGenIfLeveled(rule, profileOnly));
             if (diff) {
               log.info(`[collector] AC range "${rule.name}": re-enforcing diff for ${did}: ${JSON.stringify(diff)}`);
               await this.tclCloud!.executeAcAction(did, diff);
+              this.noteAcFanCommanded(rule, activeSlot, did, diff);
             }
           } catch (err) {
             log.error(`[collector] AC range "${rule.name}" re-enforce failed for ${did}:`, (err as Error).message);
@@ -1017,6 +1145,7 @@ export class Collector {
         }
         // Outside the window the automation owns the OFF — drop any leveler shed
         await this.acLeveler.clearShed(did, "outside_range_off");
+        this.clearAcFanEnforcement(rule.id, did);
       } catch (err) {
         log.error(`[collector] AC range "${rule.name}" outside-range off failed for ${did}:`, (err as Error).message);
       }

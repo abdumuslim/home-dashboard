@@ -1128,6 +1128,33 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
                 />
               </div>
             </div>
+
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] text-dim shrink-0">Fan</span>
+              <button
+                onClick={() => updateSlot(slot.id, { fan_speed: undefined })}
+                title="Use the preset profile's fan speed"
+                className={cn(
+                  "px-1.5 py-0.5 rounded text-[10px] border transition-colors",
+                  slot.fan_speed == null ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                )}
+              >
+                Preset
+              </button>
+              {[0, 1, 2, 3, 4, 5, 6, 7].map((s) => (
+                <button
+                  key={s}
+                  onClick={() => updateSlot(slot.id, { fan_speed: s })}
+                  title={s === 0 ? "Smart auto — fan level follows how far the temp is past the limit" : `Fan speed ${s}`}
+                  className={cn(
+                    "flex-1 min-w-0 py-0.5 rounded text-[10px] border transition-colors",
+                    slot.fan_speed === s ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                  )}
+                >
+                  {s === 0 ? "A" : s}
+                </button>
+              ))}
+            </div>
           </div>
         );
       })}
