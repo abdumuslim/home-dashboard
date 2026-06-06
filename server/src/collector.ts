@@ -308,6 +308,7 @@ export class Collector {
         this.devicePowerCache.set(deviceId, { power, ts: Date.now() });
       },
       isManualOffLocked: (deviceId) => this.isAcManualOffLocked(deviceId),
+      onLevelerFanCommand: (deviceId, fan) => this.refreshAcFanBaseline(deviceId, fan),
     });
 
     if (config.vapidPublicKey && config.vapidPrivateKey) {
@@ -697,8 +698,8 @@ export class Collector {
     if (rule.device_type === "ac") {
       await this.tclCloud!.ensureDeviceCachePopulated();
     }
-    const effectiveAction = this.stripGenIfLeveled(rule, action);
     for (const did of deviceIds) {
+      const effectiveAction = this.stripLeveledControls(rule, action, did);
       if (rule.device_type === "ac") {
         await this.tclCloud!.executeAcAction(did, effectiveAction as AcAction);
       } else {
@@ -898,6 +899,9 @@ export class Collector {
    * computing the enforcement diff.
    */
   private updateAcFanTracking(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, value: number, now: number): void {
+    // While the leveler holds the fan down (last try before a shed), the drift
+    // is ours — don't misread it as a manual change.
+    if (this.acLeveler.hasFanHold(deviceId)) return;
     const key = this.acFanKey(rule.id, deviceId);
     let entry = this.acFanEnforcement.get(key);
     if (entry && entry.slotId !== slot.id) {
@@ -936,8 +940,24 @@ export class Collector {
     });
   }
 
+  /**
+   * Leveler fan command — re-baseline enforcement entries so the hold (and its
+   * release) is never misdetected as a manual change. Preserves manual/slotId.
+   */
+  private refreshAcFanBaseline(deviceId: string, fan: number): void {
+    for (const rule of this.automationRules) {
+      if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
+      if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
+      const key = this.acFanKey(rule.id, deviceId);
+      const entry = this.acFanEnforcement.get(key);
+      if (!entry) continue;
+      this.acFanEnforcement.set(key, { ...entry, lastCommandedFan: fan, lastFanCommandAt: Date.now() });
+    }
+  }
+
   /** UI fan/turbo change — suspend fan enforcement immediately (no settle-window race). */
   noteUserAcFanChange(deviceId: string): void {
+    void this.acLeveler.onUserFanChange(deviceId);
     for (const rule of this.automationRules) {
       if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
       if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
@@ -1007,7 +1027,7 @@ export class Collector {
                 await this.tclCloud!.ensureDeviceCachePopulated();
                 this.clearAcFanEnforcement(rule.id, did); // user power-cycled — fan intent resets
                 const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
-                const diff = this.tclCloud!.computeAcDiff(did, this.stripGenIfLeveled(rule, profileOnly));
+                const diff = this.tclCloud!.computeAcDiff(did, this.stripLeveledControls(rule, profileOnly, did));
                 if (diff) {
                   log.info(`[collector] AC range "${rule.name}": device ${did} is ON while locked, adopting with diff: ${JSON.stringify(diff)}`);
                   await this.tclCloud!.executeAcAction(did, diff);
@@ -1061,7 +1081,7 @@ export class Collector {
               } else {
                 this.updateAcFanTracking(rule, activeSlot, did, value, now);
                 const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
-                const diff = this.tclCloud!.computeAcDiff(did, this.stripGenIfLeveled(rule, profileOnly));
+                const diff = this.tclCloud!.computeAcDiff(did, this.stripLeveledControls(rule, profileOnly, did));
                 if (diff) {
                   log.info(`[collector] AC range "${rule.name}": device ${did} is ON in dead zone (${rule.metric}=${value}), adopting with diff: ${JSON.stringify(diff)}`);
                   await this.tclCloud!.executeAcAction(did, diff);
@@ -1108,7 +1128,7 @@ export class Collector {
             }
             this.updateAcFanTracking(rule, activeSlot, did, value, now);
             const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
-            const diff = this.tclCloud!.computeAcDiff(did, this.stripGenIfLeveled(rule, profileOnly));
+            const diff = this.tclCloud!.computeAcDiff(did, this.stripLeveledControls(rule, profileOnly, did));
             if (diff) {
               log.info(`[collector] AC range "${rule.name}": re-enforcing diff for ${did}: ${JSON.stringify(diff)}`);
               await this.tclCloud!.executeAcAction(did, diff);
@@ -1313,6 +1333,18 @@ export class Collector {
     const acAction = action as AcAction;
     if (acAction.generator_mode == null) return action;
     const { generator_mode: _g, ...rest } = acAction;
+    return rest as T;
+  }
+
+  /**
+   * Per-device strip of leveler-owned controls: generator_mode when leveled,
+   * plus fan_speed AND turbo while a leveler fan hold is active (non-Najat
+   * fan 7 == turbo — re-arming turbo would clobber the held fan).
+   */
+  private stripLeveledControls<T extends PurifierAction | AcAction>(rule: AutomationRule, action: T, deviceId: string): T {
+    const stripped = this.stripGenIfLeveled(rule, action);
+    if (rule.device_type !== "ac" || !this.acLeveler.hasFanHold(deviceId)) return stripped;
+    const { fan_speed: _f, turbo: _t, ...rest } = stripped as AcAction;
     return rest as T;
   }
 

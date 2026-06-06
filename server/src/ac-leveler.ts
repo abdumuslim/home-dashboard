@@ -8,6 +8,7 @@ import {
   determineSource,
   estimateAcDraw,
   needCap,
+  RAISE_STREAK,
   SETTLE_MS,
   SHED_CLEAR_GRACE_MS,
   STALE_POWER_MS,
@@ -30,6 +31,8 @@ export interface AcLevelerDeps {
   broadcast: (payload: Record<string, unknown>) => Promise<void>;
   setDevicePowerCache: (deviceId: string, power: "on" | "off") => void;
   isManualOffLocked: (deviceId: string) => Promise<boolean>;
+  /** Fired on every leveler fan command so range-automation fan enforcement re-baselines. */
+  onLevelerFanCommand: (deviceId: string, fan: number) => void;
 }
 
 export interface LevelerDeviceContext {
@@ -57,6 +60,10 @@ export interface AcLevelingAcStatus {
   manualCap: number | null;
   manualTarget: number | null;
   idealLevel: number | null;
+  /** Fan the leveler is currently holding the AC at (null = no hold). */
+  heldFan: number | null;
+  /** Original fan the hold will restore to (0 = built-in auto). */
+  fanOriginal: number | null;
 }
 
 export interface AcLevelingStatus {
@@ -96,6 +103,9 @@ export class AcLeveler {
   private lastSetLevel = new Map<string, number>();
   private manualCap = new Map<string, number>();
   private manualTarget = new Map<string, number>();
+  // Fan holds: fans reduced to minimum as the last try before a shed (persisted)
+  private fanHold = new Map<string, { originalFan: number; lastSetFan: number }>();
+  private fanExempt = new Set<string>();
   private prevPowerStates = new Map<string, boolean>();
   private boostActive = new Map<string, boolean>();
   private deviceNames = new Map<string, string>();
@@ -123,9 +133,21 @@ export class AcLeveler {
       this.shedIds.add(deviceId);
       this.shedTimes.set(deviceId, row.shed_at instanceof Date ? row.shed_at.getTime() : Date.now());
     }
+    const holdRes = await this.pool.query(
+      "SELECT device_id, original_fan, last_set_fan FROM ac_leveling_fan_hold",
+    );
+    for (const row of holdRes.rows) {
+      this.fanHold.set(String(row.device_id), {
+        originalFan: Number(row.original_fan),
+        lastSetFan: Number(row.last_set_fan),
+      });
+    }
     this.loaded = true;
     if (this.shedIds.size > 0) {
       log.info(`[leveler] Loaded ${this.shedIds.size} shed device(s) from DB`);
+    }
+    if (this.fanHold.size > 0) {
+      log.info(`[leveler] Loaded ${this.fanHold.size} fan hold(s) from DB`);
     }
   }
 
@@ -143,6 +165,20 @@ export class AcLeveler {
     );
     this.config = cfg;
     this.forceEvaluate = true;
+    if (!cfg.enabled && this.fanHold.size > 0) {
+      // Leveler switched off mid-hold — leave the house physically right.
+      const tcl = this.deps.getTclCloud();
+      for (const [deviceId, hold] of [...this.fanHold]) {
+        try {
+          await tcl?.sendControl(deviceId, "set_fan_speed", hold.originalFan);
+          this.deps.onLevelerFanCommand(deviceId, hold.originalFan);
+        } catch (err) {
+          log.error(`[leveler] Fan restore on disable failed for ${deviceId}:`, (err as Error).message);
+        }
+        await this.clearFanHold(deviceId, "leveler_disabled");
+      }
+      this.fanExempt.clear();
+    }
     log.info(`[leveler] Config updated (enabled=${cfg.enabled}, grid=${cfg.gridLimitAmps}A, gen=${cfg.genLimitAmps}A)`);
     return cfg;
   }
@@ -176,6 +212,36 @@ export class AcLeveler {
     this.shedTimes.delete(deviceId);
     await this.pool.query("DELETE FROM ac_leveling_shed WHERE device_id = $1", [deviceId]);
     log.info(`[leveler] Cleared shed for AC ${deviceId} (${reason})`);
+  }
+
+  hasFanHold(deviceId: string): boolean {
+    return this.fanHold.has(deviceId);
+  }
+
+  private async recordFanHold(deviceId: string, originalFan: number): Promise<void> {
+    this.fanHold.set(deviceId, { originalFan, lastSetFan: originalFan });
+    await this.pool.query(
+      `INSERT INTO ac_leveling_fan_hold (device_id, original_fan, last_set_fan, held_at)
+       VALUES ($1, $2, $2, NOW())
+       ON CONFLICT (device_id) DO NOTHING`,
+      [deviceId, originalFan],
+    );
+  }
+
+  private async setFanHoldLastSet(deviceId: string, fan: number): Promise<void> {
+    const hold = this.fanHold.get(deviceId);
+    if (!hold) return;
+    this.fanHold.set(deviceId, { ...hold, lastSetFan: fan });
+    await this.pool.query(
+      "UPDATE ac_leveling_fan_hold SET last_set_fan = $2 WHERE device_id = $1",
+      [deviceId, fan],
+    );
+  }
+
+  private async clearFanHold(deviceId: string, reason: string): Promise<void> {
+    if (!this.fanHold.delete(deviceId)) return;
+    await this.pool.query("DELETE FROM ac_leveling_fan_hold WHERE device_id = $1", [deviceId]);
+    log.info(`[leveler] Released fan hold for AC ${deviceId} (${reason})`);
   }
 
   /** Observed ON out-of-band — clear shed after the shadow-lag grace period. */
@@ -243,7 +309,16 @@ export class AcLeveler {
     this.manualCap.delete(deviceId);
     this.manualTarget.delete(deviceId);
     this.lastSetLevel.delete(deviceId);
+    await this.clearFanHold(deviceId, "user_power_off");
+    this.fanExempt.delete(deviceId);
     this.forceEvaluate = true;
+  }
+
+  /** User changed the fan (UI or detected) — their fan is the new truth; never re-reduce this episode. */
+  async onUserFanChange(deviceId: string): Promise<void> {
+    await this.ensureLoaded();
+    await this.clearFanHold(deviceId, "user_fan_change");
+    this.fanExempt.add(deviceId);
   }
 
   async onUserPowerOn(deviceId: string): Promise<void> {
@@ -359,14 +434,33 @@ export class AcLeveler {
         await this.reconcileObservedOn(device.id);
       }
       if (!device.power) {
-        // Power-off clears manual gen intents and drift tracking.
+        // Power-off clears manual gen intents, drift tracking, and fan holds.
         this.manualCap.delete(device.id);
         this.manualTarget.delete(device.id);
         this.lastSetLevel.delete(device.id);
+        await this.clearFanHold(device.id, "power_off");
+        this.fanExempt.delete(device.id);
       }
     }
 
     const inSettle = Date.now() < this.settleUntil;
+
+    // Fan-drift detection: a fan we did not set while holding means a remote/
+    // manual change — the user's fan wins; never re-reduce this episode.
+    for (const { device } of ctx) {
+      const hold = this.fanHold.get(device.id);
+      if (!hold || !device.power || inSettle || typeof device.fanSpeed !== "number") continue;
+      if (device.fanSpeed !== hold.lastSetFan) {
+        log.info(`[leveler] ${device.name}: external fan change observed (fan=${device.fanSpeed}) — releasing hold`);
+        await this.clearFanHold(device.id, "external_fan_change");
+        this.fanExempt.add(device.id);
+      }
+    }
+
+    // Sustained headroom ends the over-limit episode — user fan exemptions reset.
+    if (this.headroomStreak >= RAISE_STREAK && this.fanExempt.size > 0) {
+      this.fanExempt.clear();
+    }
 
     // Shadow-drift detection: a gen level we did not set means a manual/remote change.
     for (const { device, managed } of ctx) {
@@ -421,6 +515,11 @@ export class AcLeveler {
         needDelta,
         manualCap: this.manualCap.get(device.id) ?? null,
         manualTarget: this.manualTarget.get(device.id) ?? null,
+        fanSpeed: (inSettle
+          ? this.fanHold.get(device.id)?.lastSetFan ?? device.fanSpeed
+          : device.fanSpeed) ?? null,
+        fanRestoreTarget: this.fanHold.get(device.id)?.originalFan ?? null,
+        fanExempt: this.fanExempt.has(device.id),
       };
     });
 
@@ -485,10 +584,44 @@ export class AcLeveler {
       }
     }
 
+    // Last try before shedding: drop every reducible fan to minimum in one
+    // batch. didReduce resets the streaks, so the shed only fires if a fresh
+    // 4-reading over-limit window builds with fans already at minimum.
+    if (result.toFanReduce.length > 0) {
+      let fanReduced = false;
+      for (const deviceId of result.toFanReduce) {
+        const snap = snapshots.find((s) => s.deviceId === deviceId);
+        if (snap?.fanSpeed == null) continue;
+        try {
+          if (!this.fanHold.has(deviceId)) {
+            await this.recordFanHold(deviceId, snap.fanSpeed);
+          }
+          await tcl.sendControl(deviceId, "set_fan_speed", 1);
+          await this.setFanHoldLastSet(deviceId, 1);
+          this.deps.onLevelerFanCommand(deviceId, 1);
+          sentAny = true;
+          didReduce = true;
+          fanReduced = true;
+          log.info(`[leveler] ${name(deviceId)}: fan ${snap.fanSpeed === 0 ? "auto" : snap.fanSpeed} → 1 (last try before shed)`);
+        } catch (err) {
+          log.error(`[leveler] Fan reduce failed for ${name(deviceId)}:`, (err as Error).message);
+        }
+      }
+      if (fanReduced) {
+        void this.deps.broadcast({
+          title: "Smart AC Leveling",
+          body: `Fan speeds reduced to minimum to stay under the ${limit}A ${source === "grid" ? "Grid" : "Generator"} limit — they'll be restored when there is room.`,
+          type: "leveling",
+        });
+      }
+    }
+
     for (const deviceId of result.toShed) {
       try {
         await tcl.executeAcAction(deviceId, { power: 0 });
         await this.recordShed(deviceId, `over ${limit}A on ${source}`);
+        await this.clearFanHold(deviceId, "shed");
+        this.fanExempt.delete(deviceId);
         sentAny = true;
         didReduce = true;
         // Fire-and-forget — push HTTP calls must not block the collector loop
@@ -525,6 +658,28 @@ export class AcLeveler {
         });
       } catch (err) {
         log.error(`[leveler] Restore failed for ${name(deviceId)}:`, (err as Error).message);
+      }
+    }
+
+    if (result.toFanRaise) {
+      const { deviceId, fan } = result.toFanRaise;
+      const hold = this.fanHold.get(deviceId);
+      if (hold) {
+        try {
+          await tcl.sendControl(deviceId, "set_fan_speed", fan);
+          this.deps.onLevelerFanCommand(deviceId, fan);
+          if (fan === hold.originalFan) {
+            await this.clearFanHold(deviceId, "restored");
+          } else {
+            await this.setFanHoldLastSet(deviceId, fan);
+          }
+          // Raises must not reset streaks — the settle window paces the steps.
+          sentAny = true;
+          log.info(`[leveler] ${name(deviceId)}: fan restore step → ${fan === 0 ? "auto" : fan}` +
+            (this.fanHold.has(deviceId) ? ` (target ${hold.originalFan === 0 ? "auto" : hold.originalFan})` : " (hold released)"));
+        } catch (err) {
+          log.error(`[leveler] Fan raise failed for ${name(deviceId)}:`, (err as Error).message);
+        }
       }
     }
 
@@ -579,6 +734,8 @@ export class AcLeveler {
           manualCap: this.manualCap.get(device.id) ?? null,
           manualTarget: this.manualTarget.get(device.id) ?? null,
           idealLevel: result?.idealLevels[device.id] ?? null,
+          heldFan: this.fanHold.get(device.id)?.lastSetFan ?? null,
+          fanOriginal: this.fanHold.get(device.id)?.originalFan ?? null,
         };
       }),
     };

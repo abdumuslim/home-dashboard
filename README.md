@@ -19,7 +19,7 @@
 - Xiaomi air purifier control with auto/manual modes, fan levels, and filter status
 - TCL split AC control — temperature, mode, fan speed, swing, eco/turbo toggles
 - AC manual-off protection — automations, schedules, and timers do not turn an AC back on after manual off until manual on
-- Smart AC Leveling — closed-loop controller keeps total household current within the active source limit (grid/generator) by adjusting AC generator-mode levels: priority-protected minimums, temp-delta-driven allocation, outdoor-heat minimum levels, emergency shed with automatic restore
+- Smart AC Leveling — closed-loop controller keeps total household current within the active source limit (grid/generator) by adjusting AC generator-mode levels: priority-protected minimums, temp-delta-driven allocation with soft need caps (surplus budget raises ACs past their need cap toward max), outdoor-heat minimum levels, fan-speed reduction as the last try before shedding (staged priority-ordered restore when headroom returns), emergency shed with automatic restore
 - AC thermostat ranges with per-range fan speed — multiple time-windowed temperature ranges per automation (exact or prayer-relative windows), each with an optional fixed fan level or a delta-based smart auto fan that ramps with how far the room is past the target; manual fan changes always win until the range changes or the AC power-cycles
 - Metric-based & scheduled automations (e.g., PM2.5 > 50 → turn on purifier)
 - ESP power monitoring with grid/generator source detection and usage charts

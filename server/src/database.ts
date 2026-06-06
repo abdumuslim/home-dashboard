@@ -152,6 +152,13 @@ const MIGRATIONS: string[] = [
     shed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     reason    TEXT
   )`,
+  // Leveler fan holds — fans reduced to minimum as the last try before a shed
+  `CREATE TABLE IF NOT EXISTS ac_leveling_fan_hold (
+    device_id    TEXT PRIMARY KEY,
+    original_fan SMALLINT NOT NULL,
+    last_set_fan SMALLINT NOT NULL,
+    held_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

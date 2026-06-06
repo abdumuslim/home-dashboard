@@ -40,6 +40,10 @@ export interface AcLevelingAcStatus {
   manualCap: number | null;
   manualTarget: number | null;
   idealLevel: number | null;
+  /** Fan the leveler is currently holding the AC at (null = no hold). */
+  heldFan: number | null;
+  /** Original fan the hold will restore to (0 = built-in auto). */
+  fanOriginal: number | null;
 }
 
 export interface AcLevelingStatus {

@@ -31,6 +31,7 @@ const config: Config = {
 function createPool() {
   const locks = new Set<string>();
   const shed = new Set<string>();
+  const fanHolds = new Map<string, { original_fan: number; last_set_fan: number }>();
   let levelingConfig: Record<string, unknown> | null = null;
   const query = vi.fn(async (sql: string, params: unknown[] = []) => {
     if (sql.includes("SELECT") && sql.includes("FROM ac_manual_off_locks")) {
@@ -62,12 +63,34 @@ function createPool() {
       shed.delete(String(params[0]));
       return { rows: [], rowCount: 1 };
     }
+    if (sql.includes("SELECT") && sql.includes("FROM ac_leveling_fan_hold")) {
+      return {
+        rows: Array.from(fanHolds, ([device_id, h]) => ({ device_id, ...h })),
+        rowCount: fanHolds.size,
+      };
+    }
+    if (sql.includes("INSERT INTO ac_leveling_fan_hold")) {
+      if (!fanHolds.has(String(params[0]))) {
+        fanHolds.set(String(params[0]), { original_fan: Number(params[1]), last_set_fan: Number(params[1]) });
+      }
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("UPDATE ac_leveling_fan_hold")) {
+      const hold = fanHolds.get(String(params[0]));
+      if (hold) fanHolds.set(String(params[0]), { ...hold, last_set_fan: Number(params[1]) });
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("DELETE FROM ac_leveling_fan_hold")) {
+      fanHolds.delete(String(params[0]));
+      return { rows: [], rowCount: 1 };
+    }
     return { rows: [], rowCount: 0 };
   });
   return {
     pool: { query },
     locks,
     shed,
+    fanHolds,
     setLevelingConfig: (c: Record<string, unknown>) => { levelingConfig = c; },
   };
 }
@@ -83,7 +106,7 @@ const LEVELING_CONFIG = {
 };
 
 function createCollector() {
-  const { pool, locks, shed, setLevelingConfig } = createPool();
+  const { pool, locks, shed, fanHolds, setLevelingConfig } = createPool();
   const collector = new Collector(pool as never, config);
   const actions: Array<{ deviceId: string; action: Record<string, unknown> }> = [];
   const tclCloud = {
@@ -105,7 +128,7 @@ function createCollector() {
     temp_indoor_c: 23,
   };
 
-  return { collector, tclCloud, actions, locks, shed, setLevelingConfig };
+  return { collector, tclCloud, actions, locks, shed, fanHolds, setLevelingConfig };
 }
 
 function acRangeRule() {
@@ -630,5 +653,196 @@ describe("Smart AC leveling", () => {
 
     expect(actions).toEqual([{ deviceId: "ac2", action: { power: 1, generator_mode: 1 } }]);
     expect(shed.has("ac2")).toBe(false);
+  });
+});
+
+function overLimitReadings(collector: Collector, count: number) {
+  for (let i = 0; i < count; i++) {
+    collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 16, power_1: 0, power_2: 3520 });
+  }
+}
+
+function headroomReadings(collector: Collector, count: number) {
+  for (let i = 0; i < count; i++) {
+    collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 4, power_1: 0, power_2: 880 });
+  }
+}
+
+describe("Smart AC leveling — fan reduction before shed", () => {
+  beforeEach(() => {
+    acTimers.clear();
+  });
+
+  it("reduces all reducible fans to 1 instead of shedding on a sustained over-limit", async () => {
+    const { collector, tclCloud, actions, shed, fanHolds, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1, fanSpeed: 3 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1, fanSpeed: 5 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    overLimitReadings(collector, 4);
+    await checkAcLeveling(collector);
+
+    // budget 4 < L1 floors 6 → fans drop first; nobody is powered off
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_fan_speed", 1);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_fan_speed", 1);
+    expect(actions).toEqual([]);
+    expect(shed.size).toBe(0);
+    expect(fanHolds.get("ac1")).toEqual({ original_fan: 3, last_set_fan: 1 });
+    expect(fanHolds.get("ac2")).toEqual({ original_fan: 5, last_set_fan: 1 });
+
+    // Status (next tick) exposes the hold
+    await checkAcLeveling(collector);
+    const status = collector.acLeveler.getStatus().acs.find((a) => a.deviceId === "ac1");
+    expect(status?.heldFan).toBe(1);
+    expect(status?.fanOriginal).toBe(3);
+  });
+
+  it("sheds only after a fresh over-limit window builds with fans already at minimum", async () => {
+    const { collector, tclCloud, actions, shed, fanHolds, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1, fanSpeed: 3 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1, fanSpeed: 5 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    overLimitReadings(collector, 4);
+    await checkAcLeveling(collector); // fan reduce + streak reset
+
+    overLimitReadings(collector, 3);
+    await checkAcLeveling(collector);
+    expect(actions).toEqual([]); // 3 < 4 — fresh window not complete
+
+    overLimitReadings(collector, 1);
+    await checkAcLeveling(collector);
+
+    expect(actions).toEqual([{ deviceId: "ac2", action: { power: 0 } }]);
+    expect(shed.has("ac2")).toBe(true);
+    expect(fanHolds.has("ac2")).toBe(false); // shed releases the hold
+    expect(fanHolds.has("ac1")).toBe(true);
+  });
+
+  it("restores held fans one gated step at a time and suppresses gen raises meanwhile", async () => {
+    const { collector, tclCloud, fanHolds, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    fanHolds.set("ac1", { original_fan: 3, last_set_fan: 1 });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1, fanSpeed: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    headroomReadings(collector, 6);
+    await checkAcLeveling(collector);
+
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_fan_speed", 2);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac1", "set_generator_mode", expect.anything());
+    expect(fanHolds.get("ac1")).toEqual({ original_fan: 3, last_set_fan: 2 });
+  });
+
+  it("releases the hold and re-baselines fan enforcement when the restore completes", async () => {
+    const { collector, tclCloud, fanHolds, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    fanHolds.set("ac1", { original_fan: 2, last_set_fan: 1 });
+    await collector.acLeveler.ensureLoaded();
+    const rule = acFanRule(2);
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    getFanEnforcement(collector).set("1:ac1", { slotId: "morning", lastCommandedFan: 5, lastFanCommandAt: 0, manual: false } as never);
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1, fanSpeed: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    headroomReadings(collector, 6);
+    await checkAcLeveling(collector);
+
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_fan_speed", 2);
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(false);
+    expect(fanHolds.size).toBe(0);
+    const entry = getFanEnforcement(collector).get("1:ac1") as never as { lastCommandedFan: number; manual: boolean };
+    expect(entry.lastCommandedFan).toBe(2); // re-baselined — no false manual detection later
+    expect(entry.manual).toBe(false);
+  });
+
+  it("treats a user fan change as the new truth: hold released, no re-reduce, shed proceeds", async () => {
+    const { collector, tclCloud, actions, fanHolds, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    fanHolds.set("ac1", { original_fan: 3, last_set_fan: 1 });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1, fanSpeed: 5 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    collector.noteUserAcFanChange("ac1");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(false);
+
+    // Over limit with only this AC: its fan is exempt → shed instead of re-reduce
+    overLimitReadings(collector, 4);
+    await checkAcLeveling(collector);
+
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac1", "set_fan_speed", expect.anything());
+    expect(actions).toEqual([{ deviceId: "ac1", action: { power: 0 } }]);
+  });
+
+  it("releases the hold when an external fan change is observed outside settle", async () => {
+    const { collector, tclCloud, fanHolds, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    fanHolds.set("ac1", { original_fan: 3, last_set_fan: 1 });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1, fanSpeed: 4 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    headroomReadings(collector, 1);
+    await checkAcLeveling(collector);
+
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(false);
+    expect(fanHolds.size).toBe(0);
+    expect(tclCloud.sendControl).not.toHaveBeenCalled();
+  });
+});
+
+describe("Smart AC leveling — range enforcement during a fan hold", () => {
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T04:30:00.000Z")); // 07:30 Baghdad — morning slot active
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("strips fan_speed and turbo from re-enforcement while the leveler holds the fan", async () => {
+    const { collector, tclCloud, fanHolds, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    fanHolds.set("ac1", { original_fan: 3, last_set_fan: 1 });
+    await collector.acLeveler.ensureLoaded();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 1 });
+    tclCloud.computeAcDiff.mockReturnValue({ temperature: 23 });
+    const rule = { ...acFanRule(2), action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, turbo: 1 } };
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23 });
+    // Fan tracking is a no-op during the hold — no baseline, no manual flag
+    expect(getFanEnforcement(collector).has("1:ac1")).toBe(false);
   });
 });

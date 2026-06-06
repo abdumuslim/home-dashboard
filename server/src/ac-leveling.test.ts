@@ -34,6 +34,9 @@ function ac(id: string, over: Partial<LevelerAcSnapshot> = {}): LevelerAcSnapsho
     needDelta: 0,
     manualCap: null,
     manualTarget: null,
+    fanSpeed: 1,
+    fanRestoreTarget: null,
+    fanExempt: false,
     ...over,
   };
   if (over.needDelta === undefined) snapshot.needDelta = TIER_DELTAS[snapshot.needTier];
@@ -172,7 +175,7 @@ describe("computeAllocation — priority fill", () => {
 });
 
 describe("computeAllocation — need and manual caps", () => {
-  it("caps satisfied rooms at L1 and mild rooms at half max", () => {
+  it("caps satisfied at L1 but soft-fills mild rooms when budget allows", () => {
     const r = computeAllocation(input({
       acs: [
         ac("najat", { needTier: "mild" }),
@@ -180,7 +183,21 @@ describe("computeAllocation — need and manual caps", () => {
         ac("abdullah", { needTier: "full" }),
       ],
     }));
-    expect(r.idealLevels).toEqual({ najat: 3, abdu: 1, abdullah: 3 });
+    // budget 29: surplus lets mild najat soft-fill past its need cap (3) to max
+    expect(r.idealLevels).toEqual({ najat: 6, abdu: 1, abdullah: 3 });
+  });
+
+  it("keeps the mild cap when the budget is tight", () => {
+    const r = computeAllocation(input({
+      nonAcLoadAmps: 13,
+      acs: [
+        ac("najat", { needTier: "mild" }),
+        ac("abdu", { needTier: "full" }),
+        ac("abdullah", { needTier: "full" }),
+      ],
+    }));
+    // budget 16: need caps {najat 3, abdu 3, abdullah 3} cost exactly 4+8+4 — no surplus
+    expect(r.idealLevels).toEqual({ najat: 3, abdu: 3, abdullah: 3 });
   });
 
   it("never raises above a manual cap (user reduction)", () => {
@@ -463,5 +480,194 @@ describe("computeAllocation — status fields", () => {
     // 5 + najat L3 (4) + abdu L2 (6) = 15
     expect(r.projectedAmps).toBe(15);
     expect(r.nonAcLoadAmps).toBe(5);
+  });
+});
+
+describe("computeAllocation — soft need caps", () => {
+  it("spreads surplus budget across mild rooms level-by-level", () => {
+    const r = computeAllocation(input({
+      acs: [
+        ac("najat", { needTier: "mild" }),
+        ac("abdu", { needTier: "mild" }),
+        ac("abdullah", { needTier: "mild" }),
+      ],
+    }));
+    // budget 29: need caps {3,2,2} cost 4+6+3=13, surplus soft-fills all to max
+    expect(r.idealLevels).toEqual({ najat: 6, abdu: 3, abdullah: 3 });
+  });
+
+  it("never soft-fills past a manual target", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { needTier: "mild", manualTarget: 4 }), ac("abdu"), ac("abdullah")],
+    }));
+    // surplus budget, but the user's explicit pick stays the ceiling
+    expect(r.idealLevels.najat).toBe(4);
+  });
+
+  it("never soft-fills past a manual cap", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { needTier: "mild", manualCap: 2 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.idealLevels.najat).toBe(2);
+  });
+});
+
+describe("computeAllocation — fan reduction before shed", () => {
+  // Same over-budget setup as the shedding suite: budget 5, L1 floors cost 8.
+  const overLimit = {
+    limitAmps: 15,
+    nonAcLoadAmps: 9,
+    overLimitStreak: REDUCE_STREAK,
+    headroomStreak: 0,
+  };
+
+  it("reduces all reducible fans instead of shedding", () => {
+    const r = computeAllocation(input({
+      ...overLimit,
+      acs: [
+        ac("najat", { fanSpeed: 3 }),
+        ac("abdu", { fanSpeed: 0 }), // built-in auto counts as reducible
+        ac("abdullah", { fanSpeed: 1 }), // already at minimum
+      ],
+    }));
+    expect(r.toFanReduce).toEqual(["najat", "abdu"]);
+    expect(r.toShed).toEqual([]);
+  });
+
+  it("floors gen levels in the same batch as the fan reduction", () => {
+    const r = computeAllocation(input({
+      ...overLimit,
+      acs: [
+        ac("najat", { fanSpeed: 3, currentLevel: 4 }),
+        ac("abdu", { fanSpeed: 2, currentLevel: 3 }),
+        ac("abdullah", { fanSpeed: 1, currentLevel: 2 }),
+      ],
+    }));
+    expect(r.toFanReduce).toEqual(["najat", "abdu"]);
+    // No one is shed, so everyone reduces to floor — including would-be-shed ACs
+    expect(r.desiredLevels).toEqual({ najat: 1, abdu: 1, abdullah: 1 });
+  });
+
+  it("skips exempt, unknown-fan, and unmanaged ACs", () => {
+    const r = computeAllocation(input({
+      ...overLimit,
+      acs: [
+        ac("najat", { fanSpeed: 3, fanExempt: true }),
+        ac("abdu", { fanSpeed: null }),
+        ac("abdullah", { fanSpeed: 5, managed: false }),
+      ],
+    }));
+    // Nothing reducible → the shed path runs instead
+    expect(r.toFanReduce).toEqual([]);
+    expect(r.toShed.length).toBeGreaterThan(0);
+  });
+
+  it("sheds when every fan is already at minimum", () => {
+    const r = computeAllocation(input(overLimit));
+    // ac() defaults to fanSpeed 1 — not reducible
+    expect(r.toFanReduce).toEqual([]);
+    expect(r.toShed).toEqual(["abdullah", "abdu"]);
+  });
+
+  it("is gated by the over-limit streak", () => {
+    const r = computeAllocation(input({
+      ...overLimit,
+      overLimitStreak: REDUCE_STREAK - 1,
+      acs: [ac("najat", { fanSpeed: 3 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.toFanReduce).toEqual([]);
+    expect(r.toShed).toEqual([]);
+  });
+
+  it("fires immediately on forceEvaluate", () => {
+    const r = computeAllocation(input({
+      ...overLimit,
+      overLimitStreak: 0,
+      forceEvaluate: true,
+      acs: [ac("najat", { fanSpeed: 3 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.toFanReduce).toEqual(["najat"]);
+  });
+});
+
+describe("computeAllocation — staged fan restore", () => {
+  it("raises the highest-priority pending hold one step", () => {
+    const r = computeAllocation(input({
+      acs: [
+        ac("najat", { fanSpeed: 1, fanRestoreTarget: 4 }),
+        ac("abdu", { fanSpeed: 1, fanRestoreTarget: 3 }),
+        ac("abdullah"),
+      ],
+    }));
+    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 2 });
+  });
+
+  it("restores an auto-fan hold straight to 0", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { fanSpeed: 1, fanRestoreTarget: 0 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 0 });
+  });
+
+  it("clamps the final step to the target", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { fanSpeed: 3, fanRestoreTarget: 4 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 4 });
+  });
+
+  it("emits nothing when the hold is already complete", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { fanSpeed: 4, fanRestoreTarget: 4 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.toFanRaise).toBeNull();
+  });
+
+  it("is suppressed without sustained headroom, during settle, or over budget", () => {
+    const held = [ac("najat", { fanSpeed: 1, fanRestoreTarget: 4 }), ac("abdu"), ac("abdullah")];
+    expect(computeAllocation(input({ acs: held, headroomStreak: RAISE_STREAK - 1 })).toFanRaise).toBeNull();
+    expect(computeAllocation(input({ acs: held, inSettle: true })).toFanRaise).toBeNull();
+    expect(computeAllocation(input({
+      acs: held.map((a) => ({ ...a })),
+      limitAmps: 15,
+      nonAcLoadAmps: 9, // budget 5 < floors 8 — over budget
+    })).toFanRaise).toBeNull();
+  });
+
+  it("lets a shed restore take precedence over a fan raise", () => {
+    const r = computeAllocation(input({
+      nonAcLoadAmps: 10,
+      acs: [
+        ac("najat", { fanSpeed: 1, fanRestoreTarget: 4 }),
+        ac("abdu", { on: false, shed: true }),
+        ac("abdullah"),
+      ],
+    }));
+    expect(r.toRestore).toEqual(["abdu"]);
+    expect(r.toFanRaise).toBeNull();
+  });
+
+  it("suppresses gen raises while any hold is pending", () => {
+    const r = computeAllocation(input({
+      acs: [
+        ac("najat", { fanSpeed: 1, fanRestoreTarget: 4, currentLevel: 1 }),
+        ac("abdu", { currentLevel: 1 }),
+        ac("abdullah", { currentLevel: 1 }),
+      ],
+    }));
+    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 2 });
+    expect(r.desiredLevels).toEqual({});
+  });
+
+  it("still corrects a below-floor AC while a hold is pending", () => {
+    const r = computeAllocation(input({
+      headroomStreak: 0,
+      acs: [
+        ac("najat", { fanSpeed: 1, fanRestoreTarget: 4 }),
+        ac("abdu"),
+        ac("abdullah", { minLevel: 2, currentLevel: 1 }),
+      ],
+    }));
+    expect(r.desiredLevels).toEqual({ abdullah: 2 });
   });
 });

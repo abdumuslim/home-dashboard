@@ -58,6 +58,12 @@ export interface LevelerAcSnapshot {
   manualCap: number | null;
   /** User manually raised the level — overrides the need cap as the target. */
   manualTarget: number | null;
+  /** Observed fan (0 = built-in auto); lastSetFan during settle. Null when unknown. */
+  fanSpeed: number | null;
+  /** Original fan to restore while a leveler fan hold is active, else null (0 = auto). */
+  fanRestoreTarget: number | null;
+  /** User changed the fan this over-limit episode — never fan-reduce again until it ends. */
+  fanExempt: boolean;
 }
 
 export interface AllocatorInput {
@@ -85,6 +91,10 @@ export interface AllocationResult {
   toShed: string[];
   /** Power ON at the floor level + clear shed (at most one per call, most-needy first). */
   toRestore: string[];
+  /** Last try before shedding: set ALL these ACs' fans to 1 instead of powering one off. */
+  toFanReduce: string[];
+  /** One staged fan-restore step (highest-priority pending hold first). */
+  toFanRaise: { deviceId: string; fan: number } | null;
   /** Full budget-constrained ideal allocation for status display. */
   idealLevels: Record<string, number>;
   nonAcLoadAmps: number;
@@ -166,6 +176,18 @@ function ceilOf(ac: LevelerAcSnapshot): number {
   return Math.max(floorOf(ac), Math.min(cap, ac.maxLevel));
 }
 
+/**
+ * Soft ceiling: once everyone reaches their need cap, surplus budget keeps
+ * raising toward max — need caps only bite when amps are tight. Satisfied
+ * rooms stay at their cap (the range automation is about to turn them off /
+ * the compressor idles at the setpoint), and manual intents remain hard.
+ */
+function softCeilOf(ac: LevelerAcSnapshot): number {
+  if (ac.needTier === "satisfied") return ceilOf(ac);
+  const cap = Math.min(ac.maxLevel, ac.manualCap ?? ac.maxLevel, ac.manualTarget ?? ac.maxLevel);
+  return Math.max(floorOf(ac), cap);
+}
+
 export function computeAllocation(input: AllocatorInput): AllocationResult {
   const { limitAmps, marginAmps, nonAcLoadAmps, acs, ampModels } = input;
   const model = (id: string): AcAmpModel => ampModels[id] ?? DEFAULT_AMP_MODEL;
@@ -196,7 +218,17 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
     cost += draw(a, floorOf(a));
   }
 
-  if (cost > budgetAmps) {
+  const overBudget = cost > budgetAmps;
+
+  // Last try before shedding: ACs whose fan can still come down to level 1
+  // (built-in auto counts — it may be running the fan high). A fan step saves
+  // fewer amps than a gen level, but it's free comfort-wise compared to a shed.
+  const fanReducible = overBudget
+    ? onManaged.filter((a) =>
+        !a.shed && !a.fanExempt && a.fanSpeed != null && (a.fanSpeed === 0 || a.fanSpeed > 1))
+    : [];
+
+  if (overBudget && fanReducible.length === 0) {
     // Shed the least-needy room first (smallest delta above target); the
     // top-priority AC is protected and only sheds as the last resort.
     const [top, ...rest] = onManaged;
@@ -211,43 +243,70 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       ideal.delete(a.deviceId);
       shedWanted.push(a.deviceId);
     }
-  } else {
+  } else if (!overBudget) {
     // Raise fill: spread level-by-level (everyone reaches L2 before anyone
     // gets L3); within a level the hottest-above-target room goes first;
-    // priority order breaks delta ties.
-    for (;;) {
-      let pick: LevelerAcSnapshot | null = null;
-      for (const a of onManaged) {
-        const level = ideal.get(a.deviceId)!;
-        if (level >= ceilOf(a)) continue;
-        if (cost + model(a.deviceId).stepAmps > budgetAmps) continue;
-        if (!pick) {
-          pick = a;
-          continue;
+    // priority order breaks delta ties. Two passes: need caps first, then
+    // surplus budget soft-fills toward max (need caps only bite when tight).
+    for (const ceiling of [ceilOf, softCeilOf]) {
+      for (;;) {
+        let pick: LevelerAcSnapshot | null = null;
+        for (const a of onManaged) {
+          const level = ideal.get(a.deviceId)!;
+          if (level >= ceiling(a)) continue;
+          if (cost + model(a.deviceId).stepAmps > budgetAmps) continue;
+          if (!pick) {
+            pick = a;
+            continue;
+          }
+          const pickLevel = ideal.get(pick.deviceId)!;
+          if (level < pickLevel || (level === pickLevel && a.needDelta > pick.needDelta)) {
+            pick = a;
+          }
         }
-        const pickLevel = ideal.get(pick.deviceId)!;
-        if (level < pickLevel || (level === pickLevel && a.needDelta > pick.needDelta)) {
-          pick = a;
-        }
+        if (!pick) break;
+        ideal.set(pick.deviceId, ideal.get(pick.deviceId)! + 1);
+        cost += model(pick.deviceId).stepAmps;
       }
-      if (!pick) break;
-      ideal.set(pick.deviceId, ideal.get(pick.deviceId)! + 1);
-      cost += model(pick.deviceId).stepAmps;
     }
   }
+  // else: over budget with reducible fans — everyone stays in `ideal` at floor,
+  // so the desiredLevels loop floors all gen levels in the same batch as the
+  // fan reductions below. The shed is deferred to the next over-limit streak.
 
   const toShed = canReduce ? shedWanted : [];
+  const toFanReduce = canReduce ? fanReducible.map((a) => a.deviceId) : [];
 
   // Restore at most one shed AC (most-needy room first, priority as tiebreak)
-  // — only when nothing wants shedding and headroom is sustained.
+  // — only when nothing is over budget and headroom is sustained.
   const toRestore: string[] = [];
-  if (canRaise && shedWanted.length === 0) {
+  if (canRaise && !overBudget) {
     const restoreOrder = restoreCandidates.slice().sort((a, b) => b.needDelta - a.needDelta);
     for (const a of restoreOrder) {
       if (currentOnCost + draw(a, floorOf(a)) <= budgetAmps) {
         toRestore.push(a.deviceId);
         break;
       }
+    }
+  }
+
+  // Staged fan restore: one step toward the hold's original fan per call,
+  // highest-priority pending hold first. Restoring a shed AC takes precedence;
+  // gen raises wait until every held fan is back (a fan step costs fewer amps).
+  const holdPending = (a: LevelerAcSnapshot): boolean =>
+    a.on && a.managed && a.fanRestoreTarget != null && a.fanSpeed != null &&
+    (a.fanRestoreTarget === 0 ? a.fanSpeed !== 0 : a.fanSpeed < a.fanRestoreTarget);
+  const anyHoldPending = acs.some(holdPending);
+  let toFanRaise: AllocationResult["toFanRaise"] = null;
+  if (canRaise && !overBudget && toRestore.length === 0) {
+    const pick = acs.find(holdPending);
+    if (pick) {
+      toFanRaise = {
+        deviceId: pick.deviceId,
+        // Original fan 0 = built-in auto — restore in one gated step (stepping
+        // up through 7 first would briefly engage turbo on non-Najat units).
+        fan: pick.fanRestoreTarget === 0 ? 0 : Math.min(pick.fanSpeed! + 1, pick.fanRestoreTarget!),
+      };
     }
   }
 
@@ -271,7 +330,7 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       desiredLevels[a.deviceId] = target;
       continue;
     }
-    if (target > a.currentLevel && canRaise && toRestore.length === 0) {
+    if (target > a.currentLevel && canRaise && toRestore.length === 0 && !anyHoldPending) {
       // Jump straight to the budget-fitted ideal — the amp model is the guess,
       // the measurement feedback loop is the adjustment.
       desiredLevels[a.deviceId] = target;
@@ -282,6 +341,8 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
     desiredLevels,
     toShed,
     toRestore,
+    toFanReduce,
+    toFanRaise,
     idealLevels: Object.fromEntries(ideal),
     nonAcLoadAmps,
     budgetAmps,
