@@ -11,6 +11,12 @@ export interface AcAmpModel {
   stepAmps: number;
 }
 
+/** Conditional minimum level — e.g. Abdullah's AC can't cool at L1 when it's 37°C+ outside. */
+export interface AcLevelBoost {
+  minLevel: number;
+  outdoorAtLeastC: number;
+}
+
 export interface AcLevelingConfig {
   enabled: boolean;
   gridLimitAmps: number;
@@ -20,6 +26,7 @@ export interface AcLevelingConfig {
   /** Device ids, highest priority first. */
   priority: string[];
   ampModels: Record<string, AcAmpModel>;
+  levelBoosts: Record<string, AcLevelBoost>;
 }
 
 export const DEFAULT_LEVELING_CONFIG: AcLevelingConfig = {
@@ -30,6 +37,7 @@ export const DEFAULT_LEVELING_CONFIG: AcLevelingConfig = {
   comfortTargetC: 26,
   priority: [],
   ampModels: {},
+  levelBoosts: {},
 };
 
 export interface LevelerAcSnapshot {
@@ -41,7 +49,11 @@ export interface LevelerAcSnapshot {
   maxLevel: number;
   /** generatorMode from the device shadow; 0 = unrestricted. */
   currentLevel: number;
+  /** Hard floor (≥1). Above 1 when an outdoor-temp boost is active (e.g. Abdullah L2 at 37°C+). */
+  minLevel: number;
   needTier: NeedTier;
+  /** °C above the target/satisfied point (≤0 = satisfied). Orders raises (desc) and sheds (asc). */
+  needDelta: number;
   /** User manually reduced the level — never raise above this. */
   manualCap: number | null;
   /** User manually raised the level — overrides the need cap as the target. */
@@ -69,9 +81,9 @@ export interface AllocatorInput {
 export interface AllocationResult {
   /** Level-change commands: deviceId → new generator level (differs from current). */
   desiredLevels: Record<string, number>;
-  /** Power OFF + mark shed, lowest priority first. */
+  /** Power OFF + mark shed — least-needy room first, top-priority AC last. */
   toShed: string[];
-  /** Power ON at L1 + clear shed (at most one per call). */
+  /** Power ON at the floor level + clear shed (at most one per call, most-needy first). */
   toRestore: string[];
   /** Full budget-constrained ideal allocation for status display. */
   idealLevels: Record<string, number>;
@@ -139,11 +151,19 @@ export function needCap(tier: NeedTier, maxLevel: number): number {
   return maxLevel;
 }
 
-function targetCap(ac: LevelerAcSnapshot): number {
+/** Hard floor: the boost minimum, unless the user manually reduced below it. */
+function floorOf(ac: LevelerAcSnapshot): number {
+  let floor = Math.max(1, Math.min(ac.minLevel, ac.maxLevel));
+  if (ac.manualCap != null) floor = Math.min(floor, Math.max(1, ac.manualCap));
+  return floor;
+}
+
+/** Ceiling from need tier / manual intents, never below the floor. */
+function ceilOf(ac: LevelerAcSnapshot): number {
   const cap = ac.manualTarget != null
     ? ac.manualTarget
     : Math.min(needCap(ac.needTier, ac.maxLevel), ac.manualCap ?? ac.maxLevel);
-  return Math.max(1, Math.min(cap, ac.maxLevel));
+  return Math.max(floorOf(ac), Math.min(cap, ac.maxLevel));
 }
 
 export function computeAllocation(input: AllocatorInput): AllocationResult {
@@ -167,43 +187,64 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   const canReduce = input.forceEvaluate || input.overLimitStreak >= REDUCE_STREAK;
   const canRaise = !input.inSettle && input.headroomStreak >= RAISE_STREAK;
 
-  // Greedy ideal allocation: L1 each by priority; shed lowest priority if even
-  // the base does not fit; otherwise raise-fill saturating highest priority first.
+  // Baseline: every ON managed AC at its floor (L1, or the boost minimum).
   const ideal = new Map<string, number>();
   const shedWanted: string[] = [];
   let cost = 0;
   for (const a of onManaged) {
-    ideal.set(a.deviceId, 1);
-    cost += draw(a, 1);
+    ideal.set(a.deviceId, floorOf(a));
+    cost += draw(a, floorOf(a));
   }
+
   if (cost > budgetAmps) {
-    for (let i = onManaged.length - 1; i >= 0 && cost > budgetAmps; i--) {
-      const a = onManaged[i];
-      cost -= draw(a, 1);
+    // Shed the least-needy room first (smallest delta above target); the
+    // top-priority AC is protected and only sheds as the last resort.
+    const [top, ...rest] = onManaged;
+    const shedOrder = [
+      ...rest.slice().sort((a, b) =>
+        a.needDelta - b.needDelta || onManaged.indexOf(b) - onManaged.indexOf(a)),
+      ...(top ? [top] : []),
+    ];
+    for (const a of shedOrder) {
+      if (cost <= budgetAmps) break;
+      cost -= draw(a, ideal.get(a.deviceId)!);
       ideal.delete(a.deviceId);
       shedWanted.push(a.deviceId);
     }
   } else {
-    for (const a of onManaged) {
-      const cap = targetCap(a);
-      const step = model(a.deviceId).stepAmps;
-      let level = 1;
-      while (level < cap && cost + step <= budgetAmps) {
-        level++;
-        cost += step;
+    // Raise fill: spread level-by-level (everyone reaches L2 before anyone
+    // gets L3); within a level the hottest-above-target room goes first;
+    // priority order breaks delta ties.
+    for (;;) {
+      let pick: LevelerAcSnapshot | null = null;
+      for (const a of onManaged) {
+        const level = ideal.get(a.deviceId)!;
+        if (level >= ceilOf(a)) continue;
+        if (cost + model(a.deviceId).stepAmps > budgetAmps) continue;
+        if (!pick) {
+          pick = a;
+          continue;
+        }
+        const pickLevel = ideal.get(pick.deviceId)!;
+        if (level < pickLevel || (level === pickLevel && a.needDelta > pick.needDelta)) {
+          pick = a;
+        }
       }
-      ideal.set(a.deviceId, level);
+      if (!pick) break;
+      ideal.set(pick.deviceId, ideal.get(pick.deviceId)! + 1);
+      cost += model(pick.deviceId).stepAmps;
     }
   }
 
   const toShed = canReduce ? shedWanted : [];
 
-  // Restore at most one shed AC (highest priority first) — only when nothing
-  // wants shedding and headroom is sustained.
+  // Restore at most one shed AC (most-needy room first, priority as tiebreak)
+  // — only when nothing wants shedding and headroom is sustained.
   const toRestore: string[] = [];
   if (canRaise && shedWanted.length === 0) {
-    for (const a of restoreCandidates) {
-      if (currentOnCost + draw(a, 1) <= budgetAmps) {
+    const restoreOrder = restoreCandidates.slice().sort((a, b) => b.needDelta - a.needDelta);
+    for (const a of restoreOrder) {
+      if (currentOnCost + draw(a, floorOf(a)) <= budgetAmps) {
         toRestore.push(a.deviceId);
         break;
       }
@@ -211,7 +252,6 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   }
 
   const desiredLevels: Record<string, number> = {};
-  let raised = false;
   for (const a of onManaged) {
     if (toShed.includes(a.deviceId)) continue;
     const target = ideal.get(a.deviceId);
@@ -221,14 +261,20 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       desiredLevels[a.deviceId] = target;
       continue;
     }
+    if (a.currentLevel < floorOf(a)) {
+      // Below the hard floor (e.g. boost just activated) — fix immediately;
+      // jump to the full ideal only when raise gating allows.
+      desiredLevels[a.deviceId] = canRaise ? target : floorOf(a);
+      continue;
+    }
     if (target < a.currentLevel && canReduce) {
       desiredLevels[a.deviceId] = target;
       continue;
     }
-    if (target > a.currentLevel && canRaise && !raised && toRestore.length === 0) {
-      // One raise step on one AC per call — smooth, measurable ramp-up.
-      desiredLevels[a.deviceId] = a.currentLevel + 1;
-      raised = true;
+    if (target > a.currentLevel && canRaise && toRestore.length === 0) {
+      // Jump straight to the budget-fitted ideal — the amp model is the guess,
+      // the measurement feedback loop is the adjustment.
+      desiredLevels[a.deviceId] = target;
     }
   }
 

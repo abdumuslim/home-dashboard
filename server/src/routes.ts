@@ -6,7 +6,7 @@ import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metric
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import type { ForecastResponse } from "./forecast.js";
-import type { AcLevelingConfig, AcAmpModel } from "./ac-leveling.js";
+import type { AcLevelingConfig, AcAmpModel, AcLevelBoost } from "./ac-leveling.js";
 import type { AcLevelingStatus } from "./ac-leveler.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession } from "./auth.js";
 import {
@@ -1220,6 +1220,13 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       if (!model || !num(model.baseAmps) || model.baseAmps < 0.5 || model.baseAmps > 20) return "baseAmps must be 0.5–20";
       if (!num(model.stepAmps) || model.stepAmps < 0 || model.stepAmps > 10) return "stepAmps must be 0–10";
     }
+    if (b.levelBoosts != null) {
+      if (typeof b.levelBoosts !== "object" || Array.isArray(b.levelBoosts)) return "levelBoosts must be an object";
+      for (const boost of Object.values(b.levelBoosts as Record<string, AcLevelBoost>)) {
+        if (!boost || !Number.isInteger(boost.minLevel) || boost.minLevel < 1 || boost.minLevel > 6) return "boost minLevel must be 1–6";
+        if (!num(boost.outdoorAtLeastC) || boost.outdoorAtLeastC < 25 || boost.outdoorAtLeastC > 55) return "boost outdoor temp must be 25–55";
+      }
+    }
     return null;
   }
 
@@ -1247,6 +1254,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         comfortTargetC: body.comfortTargetC as number,
         priority: body.priority as string[],
         ampModels: body.ampModels as Record<string, AcAmpModel>,
+        levelBoosts: (body.levelBoosts as Record<string, AcLevelBoost>) ?? {},
       });
       res.json({ config });
     } catch (err) {

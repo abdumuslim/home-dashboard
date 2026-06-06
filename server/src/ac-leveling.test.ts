@@ -19,19 +19,25 @@ const MODELS: Record<string, AcAmpModel> = {
   abdullah: { baseAmps: 2, stepAmps: 1 },
 };
 
+const TIER_DELTAS = { satisfied: -0.5, mild: 1, full: 2 } as const;
+
 function ac(id: string, over: Partial<LevelerAcSnapshot> = {}): LevelerAcSnapshot {
-  return {
+  const snapshot: LevelerAcSnapshot = {
     deviceId: id,
     on: true,
     managed: true,
     shed: false,
     maxLevel: id === "najat" ? 6 : 3,
     currentLevel: 1,
+    minLevel: 1,
     needTier: "full",
+    needDelta: 0,
     manualCap: null,
     manualTarget: null,
     ...over,
   };
+  if (over.needDelta === undefined) snapshot.needDelta = TIER_DELTAS[snapshot.needTier];
+  return snapshot;
 }
 
 // acs are pre-sorted by priority (highest first): najat > abdu > abdullah
@@ -120,11 +126,32 @@ describe("computeAllocation — priority fill", () => {
     expect(r.budgetAmps).toBe(29);
   });
 
-  it("raises only one step on one AC per call (highest priority unsaturated)", () => {
+  it("jumps straight to the ideal allocation when headroom is sustained", () => {
     const r = computeAllocation(input());
-    expect(r.desiredLevels).toEqual({ najat: 2 });
+    expect(r.desiredLevels).toEqual({ najat: 6, abdu: 3, abdullah: 3 });
     expect(r.toShed).toEqual([]);
     expect(r.toRestore).toEqual([]);
+  });
+
+  it("spreads levels evenly before saturating anyone when the budget is tight", () => {
+    const r = computeAllocation(input({ nonAcLoadAmps: 16 }));
+    // budget 13: L1 sum 8 → najat L2 (9), abdu L2 (11), abdullah L2 (12), najat L3 (13)
+    expect(r.idealLevels).toEqual({ najat: 3, abdu: 2, abdullah: 2 });
+  });
+
+  it("gives the next level to the hottest-above-target room first", () => {
+    const tight = { nonAcLoadAmps: 20, headroomStreak: 0 }; // budget 9, one step fits
+    const r1 = computeAllocation(input({
+      ...tight,
+      acs: [ac("najat", { needDelta: 3 }), ac("abdu", { needDelta: 1 }), ac("abdullah", { needDelta: 2 })],
+    }));
+    expect(r1.idealLevels).toEqual({ najat: 2, abdu: 1, abdullah: 1 });
+
+    const r2 = computeAllocation(input({
+      ...tight,
+      acs: [ac("najat", { needDelta: 1 }), ac("abdu", { needDelta: 2 }), ac("abdullah", { needDelta: 5 })],
+    }));
+    expect(r2.idealLevels).toEqual({ najat: 1, abdu: 1, abdullah: 2 });
   });
 
   it("stops the ideal fill at the budget", () => {
@@ -227,6 +254,78 @@ describe("computeAllocation — reductions", () => {
   });
 });
 
+describe("computeAllocation — minimum level boost", () => {
+  it("holds a boosted AC at its floor even when the room is satisfied", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat"), ac("abdu"), ac("abdullah", { minLevel: 2, needTier: "satisfied" })],
+    }));
+    expect(r.idealLevels.abdullah).toBe(2);
+  });
+
+  it("corrects a below-floor AC immediately without raise gating", () => {
+    const r = computeAllocation(input({
+      headroomStreak: 0,
+      acs: [ac("najat"), ac("abdu"), ac("abdullah", { minLevel: 2, currentLevel: 1 })],
+    }));
+    // Only the floor correction goes out — other raises stay gated
+    expect(r.desiredLevels).toEqual({ abdullah: 2 });
+  });
+
+  it("jumps a below-floor AC to its full ideal when raise gating allows", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat"), ac("abdu"), ac("abdullah", { minLevel: 2, currentLevel: 1 })],
+    }));
+    expect(r.desiredLevels.abdullah).toBe(3);
+  });
+
+  it("lets a manual reduction below the floor win", () => {
+    const r = computeAllocation(input({
+      headroomStreak: 0,
+      acs: [ac("najat"), ac("abdu"), ac("abdullah", { minLevel: 2, currentLevel: 1, manualCap: 1 })],
+    }));
+    expect(r.desiredLevels).toEqual({});
+    expect(r.idealLevels.abdullah).toBe(1);
+  });
+});
+
+describe("computeAllocation — shed by need", () => {
+  // User scenario: Abdullah (top priority) pinned at L2 by the outdoor boost;
+  // Mom (najat) and Abdu at L1; over the generator limit → shed the room with
+  // the smaller delta between target and actual, NOT strict reverse priority.
+  it("sheds the least-needy non-top AC first", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 7,
+      forceEvaluate: true,
+      headroomStreak: 0,
+      acs: [
+        ac("abdullah", { minLevel: 2, currentLevel: 2, needDelta: 1.5 }),
+        ac("najat", { needDelta: 0.8 }),
+        ac("abdu", { needDelta: 2.5 }),
+      ],
+    }));
+    // budget 7: abdullah L2 (3) + najat L1 (2) + abdu L1 (4) = 9 → shed najat (lowest delta)
+    expect(r.toShed).toEqual(["najat"]);
+    expect(r.idealLevels.abdullah).toBe(2);
+    expect(r.idealLevels.abdu).toBe(1);
+  });
+
+  it("protects the top-priority AC until last", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 13,
+      forceEvaluate: true,
+      headroomStreak: 0,
+      acs: [
+        ac("abdullah", { minLevel: 2, currentLevel: 2, needDelta: 1.5 }),
+        ac("najat", { needDelta: 0.8 }),
+        ac("abdu", { needDelta: 2.5 }),
+      ],
+    }));
+    expect(r.toShed).toEqual(["najat", "abdu", "abdullah"]);
+  });
+});
+
 describe("computeAllocation — shedding", () => {
   it("sheds lowest-priority ACs until the L1 base fits", () => {
     const r = computeAllocation(input({
@@ -292,6 +391,31 @@ describe("computeAllocation — restore", () => {
     };
     expect(computeAllocation(input({ ...base, headroomStreak: RAISE_STREAK - 1 })).toRestore).toEqual([]);
     expect(computeAllocation(input({ ...base, inSettle: true })).toRestore).toEqual([]);
+  });
+
+  it("restores the most-needy shed AC first regardless of priority", () => {
+    const r = computeAllocation(input({
+      nonAcLoadAmps: 10,
+      acs: [
+        ac("najat", { currentLevel: 2 }),
+        ac("abdu", { on: false, shed: true, needDelta: 1 }),
+        ac("abdullah", { on: false, shed: true, needDelta: 3 }),
+      ],
+    }));
+    expect(r.toRestore).toEqual(["abdullah"]);
+  });
+
+  it("budgets a boosted shed AC at its floor level for restore", () => {
+    const base = {
+      limitAmps: 15,
+      acs: [
+        ac("najat", { currentLevel: 1 }),
+        ac("abdullah", { on: false, shed: true, minLevel: 2 }),
+      ],
+    };
+    // najat L1 (2A) + abdullah floor L2 (3A) = 5A
+    expect(computeAllocation(input({ ...base, nonAcLoadAmps: 9 })).toRestore).toEqual(["abdullah"]);
+    expect(computeAllocation(input({ ...base, nonAcLoadAmps: 10 })).toRestore).toEqual([]);
   });
 
   it("blocks restore when the budget cannot fit the L1 draw", () => {

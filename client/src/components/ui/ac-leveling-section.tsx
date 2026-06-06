@@ -28,11 +28,16 @@ function defaultAmpModel(name: string): { baseAmps: number; stepAmps: number } {
 function seedDraft(config: AcLevelingConfig, acDevices: AcDevice[]): AcLevelingConfig {
   const priority = [...config.priority];
   const ampModels = { ...config.ampModels };
+  const levelBoosts = { ...(config.levelBoosts ?? {}) };
   for (const d of acDevices) {
     if (!priority.includes(d.id)) priority.push(d.id);
     if (!ampModels[d.id]) ampModels[d.id] = defaultAmpModel(d.name);
+    // Abdullah's AC can't cool at L1 in extreme heat — seed its boost rule
+    if (!levelBoosts[d.id] && d.name.toLowerCase().includes("abdullah")) {
+      levelBoosts[d.id] = { minLevel: 2, outdoorAtLeastC: 37 };
+    }
   }
-  return { ...config, priority, ampModels };
+  return { ...config, priority, ampModels, levelBoosts };
 }
 
 function NumberField({ label, value, step, onChange }: {
@@ -79,6 +84,11 @@ function AcStatusBadges({ ac }: { ac: AcLevelingAcStatus }) {
       {ac.manualTarget != null && (
         <span className="px-1.5 py-0.5 rounded text-[0.6rem] font-medium bg-sky-400/15 text-sky-400" title="Manual target — overrides the need cap">
           → L{ac.manualTarget}
+        </span>
+      )}
+      {ac.minLevel > 1 && (
+        <span className="px-1.5 py-0.5 rounded text-[0.6rem] font-medium bg-violet-400/15 text-violet-400" title="Outdoor-heat minimum level active">
+          min L{ac.minLevel}
         </span>
       )}
     </span>
@@ -212,62 +222,106 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
         {draft.priority.map((id, idx) => {
           const ac = statusFor(id);
           const model = draft.ampModels[id] ?? { baseAmps: 2, stepAmps: 1 };
+          const boost = draft.levelBoosts[id] ?? { minLevel: 1, outdoorAtLeastC: 37 };
           return (
-            <div key={id} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-white/5">
-              <div className="flex flex-col -my-0.5">
-                <button
-                  onClick={() => movePriority(id, -1)}
-                  disabled={idx === 0}
-                  className="p-0.5 rounded text-dim hover:text-white hover:bg-white/10 disabled:opacity-20"
-                >
-                  <ChevronUp className="w-3 h-3" />
-                </button>
-                <button
-                  onClick={() => movePriority(id, 1)}
-                  disabled={idx === draft.priority.length - 1}
-                  className="p-0.5 rounded text-dim hover:text-white hover:bg-white/10 disabled:opacity-20"
-                >
-                  <ChevronDown className="w-3 h-3" />
-                </button>
+            <div key={id} className="flex flex-col gap-1 px-2.5 py-1.5 rounded-lg bg-white/5">
+              <div className="flex items-center gap-2">
+                <div className="flex flex-col -my-0.5">
+                  <button
+                    onClick={() => movePriority(id, -1)}
+                    disabled={idx === 0}
+                    className="p-0.5 rounded text-dim hover:text-white hover:bg-white/10 disabled:opacity-20"
+                  >
+                    <ChevronUp className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={() => movePriority(id, 1)}
+                    disabled={idx === draft.priority.length - 1}
+                    className="p-0.5 rounded text-dim hover:text-white hover:bg-white/10 disabled:opacity-20"
+                  >
+                    <ChevronDown className="w-3 h-3" />
+                  </button>
+                </div>
+
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-text font-medium truncate">{deviceName(id)}</span>
+                    {ac && <span className={cn("w-1.5 h-1.5 rounded-full shrink-0", ac.on ? NEED_COLORS[ac.needTier] : "bg-white/20")} title={ac.on ? NEED_LABELS[ac.needTier] : "Off"} />}
+                  </div>
+                  <div className="flex items-center gap-1.5 text-[0.65rem] text-dim">
+                    {ac?.on
+                      ? (
+                        <span>
+                          {ac.level > 0 ? `L${ac.level}` : "no cap"} · ~{ac.estAmps.toFixed(1)} A
+                          {" · "}
+                          <span title="Room °C above target">Δ{ac.needDelta >= 0 ? "+" : ""}{ac.needDelta.toFixed(1)}°</span>
+                        </span>
+                      )
+                      : <span>off</span>}
+                    {ac && <AcStatusBadges ac={ac} />}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
+                  <input
+                    type="number"
+                    value={model.baseAmps}
+                    step={0.5}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (isFinite(v)) update({ ampModels: { ...draft.ampModels, [id]: { ...model, baseAmps: v } } });
+                    }}
+                    className="w-11 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
+                    title="Amps at L1"
+                  />
+                  <span className="text-[0.6rem] text-dim">/</span>
+                  <input
+                    type="number"
+                    value={model.stepAmps}
+                    step={0.5}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (isFinite(v)) update({ ampModels: { ...draft.ampModels, [id]: { ...model, stepAmps: v } } });
+                    }}
+                    className="w-11 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
+                    title="Amps added per level"
+                  />
+                </div>
               </div>
 
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-xs text-text font-medium truncate">{deviceName(id)}</span>
-                  {ac && <span className={cn("w-1.5 h-1.5 rounded-full shrink-0", ac.on ? NEED_COLORS[ac.needTier] : "bg-white/20")} title={ac.on ? NEED_LABELS[ac.needTier] : "Off"} />}
-                </div>
-                <div className="flex items-center gap-1.5 text-[0.65rem] text-dim">
-                  {ac?.on
-                    ? <span>{ac.level > 0 ? `L${ac.level}` : "no cap"} · ~{ac.estAmps.toFixed(1)} A</span>
-                    : <span>off</span>}
-                  {ac && <AcStatusBadges ac={ac} />}
-                </div>
-              </div>
-
-              <div className="flex items-center gap-1 shrink-0">
+              {/* Conditional minimum level: AC can't cool at L1 in extreme outdoor heat */}
+              <div className="flex items-center gap-1.5 pl-7 text-[0.65rem] text-dim">
+                <span>Min L</span>
                 <input
                   type="number"
-                  value={model.baseAmps}
-                  step={0.5}
+                  min={1}
+                  max={6}
+                  value={boost.minLevel}
                   onChange={(e) => {
-                    const v = parseFloat(e.target.value);
-                    if (isFinite(v)) update({ ampModels: { ...draft.ampModels, [id]: { ...model, baseAmps: v } } });
+                    const v = parseInt(e.target.value, 10);
+                    if (Number.isInteger(v) && v >= 1 && v <= 6) {
+                      update({ levelBoosts: { ...draft.levelBoosts, [id]: { ...boost, minLevel: v } } });
+                    }
                   }}
-                  className="w-11 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
-                  title="Amps at L1"
+                  className="w-9 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
+                  title="Minimum generator level (1 = no rule)"
                 />
-                <span className="text-[0.6rem] text-dim">/</span>
+                <span>when outdoor ≥</span>
                 <input
                   type="number"
-                  value={model.stepAmps}
-                  step={0.5}
+                  min={25}
+                  max={55}
+                  value={boost.outdoorAtLeastC}
                   onChange={(e) => {
                     const v = parseFloat(e.target.value);
-                    if (isFinite(v)) update({ ampModels: { ...draft.ampModels, [id]: { ...model, stepAmps: v } } });
+                    if (isFinite(v) && v >= 25 && v <= 55) {
+                      update({ levelBoosts: { ...draft.levelBoosts, [id]: { ...boost, outdoorAtLeastC: v } } });
+                    }
                   }}
                   className="w-11 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
-                  title="Amps added per level"
+                  title="Outdoor temperature that activates the minimum"
                 />
+                <span>°C</span>
               </div>
             </div>
           );

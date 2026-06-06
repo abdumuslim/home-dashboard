@@ -427,6 +427,25 @@ describe("Smart AC leveling", () => {
     expect(locks.size).toBe(0); // shed is not a manual-off lock
   });
 
+  it("raises a boosted AC to its minimum level when it's hot outside", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig({ ...LEVELING_CONFIG, levelBoosts: { ac1: { minLevel: 2, outdoorAtLeastC: 37 } } });
+    await collector.acLeveler.ensureLoaded();
+    (collector as never as { latestWeatherRow: Record<string, unknown> }).latestWeatherRow = { temp_c: 38 };
+    (collector as never as { latestWeatherTs: Date }).latestWeatherTs = new Date();
+    const devices = [
+      { id: "ac1", name: "Abdullah", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Single reading with headroom — raise gating NOT met, floor correction must still fire
+    collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 4, power_1: 0, power_2: 880 });
+    await checkAcLeveling(collector);
+
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+  });
+
   it("restores a shed AC when headroom returns", async () => {
     const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);

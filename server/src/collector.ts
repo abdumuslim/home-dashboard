@@ -1188,11 +1188,12 @@ export class Collector {
   }
 
   /**
-   * Need tier for the leveler: ACs with an active range automation use the same
+   * Need for the leveler: ACs with an active range automation use the same
    * room metric vs the active slot; others use the AC's internal sensor vs the
-   * comfort target (heat mode inverts the comparison).
+   * comfort target (heat mode inverts the comparison). The delta (°C past the
+   * satisfied point) orders raises and shed selection.
    */
-  private computeAcNeedTier(deviceId: string, device: AcDevice): NeedTier {
+  private computeAcNeed(deviceId: string, device: AcDevice): { tier: NeedTier; delta: number } {
     for (const rule of this.automationRules) {
       if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
       if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
@@ -1207,18 +1208,30 @@ export class Collector {
       if (value == null) continue;
       const isCool = (rule.action_on as Record<string, unknown>).mode === 1;
       if (isCool) {
-        return computeNeedTier({ kind: "range", value, slotLow: slot.threshold_low, slotHigh: slot.threshold });
+        return {
+          tier: computeNeedTier({ kind: "range", value, slotLow: slot.threshold_low, slotHigh: slot.threshold }),
+          delta: value - slot.threshold_low,
+        };
       }
       // Heat: need grows as the value drops below the low limit — negate to reuse the cool mapping
-      return computeNeedTier({ kind: "range", value: -value, slotLow: -slot.threshold, slotHigh: -slot.threshold_low });
+      return {
+        tier: computeNeedTier({ kind: "range", value: -value, slotLow: -slot.threshold, slotHigh: -slot.threshold_low }),
+        delta: slot.threshold - value,
+      };
     }
-    if (!device.currentTemp || device.currentTemp <= 0) return "mild";
+    if (!device.currentTemp || device.currentTemp <= 0) return { tier: "mild", delta: 1 };
     const target = this.acLeveler.getComfortTarget();
     if (device.mode === 4) {
       // Heat mode: deviation is how far the room is below the comfort target
-      return computeNeedTier({ kind: "comfort", currentTemp: 2 * target - device.currentTemp, target });
+      return {
+        tier: computeNeedTier({ kind: "comfort", currentTemp: 2 * target - device.currentTemp, target }),
+        delta: target - device.currentTemp,
+      };
     }
-    return computeNeedTier({ kind: "comfort", currentTemp: device.currentTemp, target });
+    return {
+      tier: computeNeedTier({ kind: "comfort", currentTemp: device.currentTemp, target }),
+      delta: device.currentTemp - target,
+    };
   }
 
   private async checkAcLeveling(): Promise<void> {
@@ -1239,12 +1252,21 @@ export class Collector {
     }
     if (devices.length === 0) return;
 
-    const ctx: LevelerDeviceContext[] = devices.map((device) => ({
-      device,
-      managed: !this.acRuleOptsOutOfLeveling(device.id),
-      needTier: this.computeAcNeedTier(device.id, device),
-    }));
-    await this.acLeveler.tick(ctx);
+    // Outdoor temp for the conditional min-level boosts (≤10 min old)
+    const weatherFresh = this.latestWeatherTs != null && Date.now() - this.latestWeatherTs.getTime() < 600_000;
+    const outdoorRaw = this.latestWeatherRow?.temp_c;
+    const outdoorTempC = weatherFresh && typeof outdoorRaw === "number" ? outdoorRaw : null;
+
+    const ctx: LevelerDeviceContext[] = devices.map((device) => {
+      const need = this.computeAcNeed(device.id, device);
+      return {
+        device,
+        managed: !this.acRuleOptsOutOfLeveling(device.id),
+        needTier: need.tier,
+        needDelta: need.delta,
+      };
+    });
+    await this.acLeveler.tick(ctx, outdoorTempC);
   }
 
   // ---------- Ambient Weather ----------

@@ -3,6 +3,12 @@ export interface AcAmpModel {
   stepAmps: number;
 }
 
+/** Conditional minimum level — e.g. Abdullah's AC can't cool at L1 when it's 37°C+ outside. */
+export interface AcLevelBoost {
+  minLevel: number;
+  outdoorAtLeastC: number;
+}
+
 export interface AcLevelingConfig {
   enabled: boolean;
   gridLimitAmps: number;
@@ -12,6 +18,7 @@ export interface AcLevelingConfig {
   /** Device ids, highest priority first. */
   priority: string[];
   ampModels: Record<string, AcAmpModel>;
+  levelBoosts: Record<string, AcLevelBoost>;
 }
 
 export type NeedTier = "satisfied" | "mild" | "full";
@@ -25,9 +32,11 @@ export interface AcLevelingAcStatus {
   shed: boolean;
   level: number;
   maxLevel: number;
+  minLevel: number;
   estAmps: number;
   needTier: NeedTier;
   needCap: number;
+  needDelta: number;
   manualCap: number | null;
   manualTarget: number | null;
   idealLevel: number | null;

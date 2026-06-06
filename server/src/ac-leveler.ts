@@ -37,6 +37,8 @@ export interface LevelerDeviceContext {
   /** False when an enabled AC automation covering this device has smart_leveling=false. */
   managed: boolean;
   needTier: NeedTier;
+  /** °C above the target/satisfied point (≤0 = satisfied). */
+  needDelta: number;
 }
 
 export interface AcLevelingAcStatus {
@@ -47,9 +49,11 @@ export interface AcLevelingAcStatus {
   shed: boolean;
   level: number;
   maxLevel: number;
+  minLevel: number;
   estAmps: number;
   needTier: NeedTier;
   needCap: number;
+  needDelta: number;
   manualCap: number | null;
   manualTarget: number | null;
   idealLevel: number | null;
@@ -93,6 +97,7 @@ export class AcLeveler {
   private manualCap = new Map<string, number>();
   private manualTarget = new Map<string, number>();
   private prevPowerStates = new Map<string, boolean>();
+  private boostActive = new Map<string, boolean>();
   private deviceNames = new Map<string, string>();
   private settleUntil = 0;
   private forceEvaluate = false;
@@ -309,7 +314,27 @@ export class AcLeveler {
 
   // ---------- Main tick (called from the collector loop) ----------
 
-  async tick(ctx: LevelerDeviceContext[]): Promise<void> {
+  /**
+   * Conditional minimum level (e.g. Abdullah L2 when outdoor ≥ 37°C) with 1°C
+   * hysteresis so it doesn't flap at the boundary; holds state when outdoor
+   * temp is unknown.
+   */
+  private minLevelFor(deviceId: string, maxLevel: number, outdoorTempC: number | null): number {
+    const boost = this.config.levelBoosts[deviceId];
+    if (!boost || boost.minLevel <= 1) return 1;
+    let active = this.boostActive.get(deviceId) ?? false;
+    if (outdoorTempC != null) {
+      if (outdoorTempC >= boost.outdoorAtLeastC) active = true;
+      else if (outdoorTempC < boost.outdoorAtLeastC - 1) active = false;
+    }
+    if (active !== (this.boostActive.get(deviceId) ?? false)) {
+      log.info(`[leveler] ${this.deviceNames.get(deviceId) ?? deviceId}: outdoor ${outdoorTempC}°C → min level boost ${active ? "ON" : "OFF"} (min L${boost.minLevel})`);
+    }
+    this.boostActive.set(deviceId, active);
+    return active ? Math.min(boost.minLevel, maxLevel) : 1;
+  }
+
+  async tick(ctx: LevelerDeviceContext[], outdoorTempC: number | null): Promise<void> {
     await this.ensureLoaded();
     if (!this.config.enabled) {
       this.lastStatus = null;
@@ -382,17 +407,30 @@ export class AcLeveler {
     const sorted = [...ctx].sort(
       (a, b) => (order.get(a.device.id) ?? 999) - (order.get(b.device.id) ?? 999),
     );
-    const snapshots: LevelerAcSnapshot[] = sorted.map(({ device, managed, needTier }) => ({
-      deviceId: device.id,
-      on: device.power,
-      managed,
-      shed: this.shedIds.has(device.id),
-      maxLevel: device.maxGeneratorLevel || 3,
-      currentLevel: inSettle ? (this.lastSetLevel.get(device.id) ?? device.generatorMode) : device.generatorMode,
-      needTier,
-      manualCap: this.manualCap.get(device.id) ?? null,
-      manualTarget: this.manualTarget.get(device.id) ?? null,
-    }));
+    const snapshots: LevelerAcSnapshot[] = sorted.map(({ device, managed, needTier, needDelta }) => {
+      const maxLevel = device.maxGeneratorLevel || 3;
+      return {
+        deviceId: device.id,
+        on: device.power,
+        managed,
+        shed: this.shedIds.has(device.id),
+        maxLevel,
+        currentLevel: inSettle ? (this.lastSetLevel.get(device.id) ?? device.generatorMode) : device.generatorMode,
+        minLevel: this.minLevelFor(device.id, maxLevel, outdoorTempC),
+        needTier,
+        needDelta,
+        manualCap: this.manualCap.get(device.id) ?? null,
+        manualTarget: this.manualTarget.get(device.id) ?? null,
+      };
+    });
+
+    // A managed AC stuck below its boost floor "can't work" — allow same-tick
+    // reductions elsewhere to make room for the correction.
+    for (const s of snapshots) {
+      if (s.on && s.managed && s.currentLevel >= 1 && s.currentLevel < s.minLevel && s.manualCap == null) {
+        this.forceEvaluate = true;
+      }
+    }
 
     const measured = this.smoothedMeasured();
     const ampModels = Object.fromEntries(snapshots.map((s) => [s.deviceId, this.ampModel(s.deviceId)]));
@@ -471,15 +509,18 @@ export class AcLeveler {
           await this.clearShed(deviceId, "manual_off_lock");
           continue;
         }
-        await tcl.executeAcAction(deviceId, { power: 1, generator_mode: 1 });
+        // Restore at the floor level (boost minimum when active, else L1)
+        const snap = snapshots.find((s) => s.deviceId === deviceId);
+        const restoreLevel = Math.max(1, Math.min(snap?.minLevel ?? 1, snap?.maxLevel ?? 1));
+        await tcl.executeAcAction(deviceId, { power: 1, generator_mode: restoreLevel });
         await this.clearShed(deviceId, "restored");
-        this.lastSetLevel.set(deviceId, 1);
+        this.lastSetLevel.set(deviceId, restoreLevel);
         this.prevPowerStates.set(deviceId, true);
         this.deps.setDevicePowerCache(deviceId, "on");
         sentAny = true;
         void this.deps.broadcast({
           title: "Smart AC Leveling",
-          body: `${name(deviceId)} restored at L1 — current headroom is available again.`,
+          body: `${name(deviceId)} restored at L${restoreLevel} — current headroom is available again.`,
           type: "leveling",
         });
       } catch (err) {
@@ -514,8 +555,12 @@ export class AcLeveler {
       overLimitStreak: this.overLimitStreak,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
-      acs: ctx.map(({ device, managed, needTier }) => {
+      acs: ctx.map(({ device, managed, needTier, needDelta }) => {
         const maxLevel = device.maxGeneratorLevel || 3;
+        const boost = this.config.levelBoosts[device.id];
+        const minLevel = boost && (this.boostActive.get(device.id) ?? false)
+          ? Math.min(boost.minLevel, maxLevel)
+          : 1;
         return {
           deviceId: device.id,
           name: device.name,
@@ -524,11 +569,13 @@ export class AcLeveler {
           shed: this.shedIds.has(device.id),
           level: device.generatorMode,
           maxLevel,
+          minLevel,
           estAmps: device.power
             ? estimateAcDraw(device.generatorMode, maxLevel, this.ampModel(device.id))
             : 0,
           needTier,
           needCap: needCap(needTier, maxLevel),
+          needDelta,
           manualCap: this.manualCap.get(device.id) ?? null,
           manualTarget: this.manualTarget.get(device.id) ?? null,
           idealLevel: result?.idealLevels[device.id] ?? null,
