@@ -34,6 +34,8 @@ export interface AcManualOffLockHandlers {
   reconcileDevices(devices: Array<{ id: string; power: boolean }>): Promise<Set<string>>;
   /** UI fan/turbo change — range automations suspend fan enforcement for this device. */
   onUserFanChange?(deviceId: string): void;
+  /** UI fan set to Auto (0) — range automations resume fan control (delta-based smart auto). */
+  onUserFanAuto?(deviceId: string): void;
 }
 
 export interface AcLevelingHandlers {
@@ -1186,6 +1188,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         const result = await acLeveling?.onUserGenLevel(id, value);
         res.json({ ok: true, ...(result?.reverted ? { reverted: true, level: result.level } : {}) });
         return;
+      } else if (command === "set_fan_speed" && value === 0) {
+        acManualOffLocks?.onUserFanAuto?.(id);
       } else if (command === "set_fan_speed" || command === "set_turbo") {
         acManualOffLocks?.onUserFanChange?.(id);
       }

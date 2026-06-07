@@ -974,6 +974,25 @@ export class Collector {
     }
   }
 
+  /**
+   * UI fan set to Auto (0) — hand fan control back to the range automations:
+   * any manual override is cleared and the resolved fan (smart auto for Auto
+   * slots/presets) re-enforces on the next tick. The AC's built-in auto stays
+   * in effect only for devices no automation owns.
+   */
+  noteUserAcFanAuto(deviceId: string): void {
+    // The physical fan changed — release any leveler fan hold, same as a manual change
+    void this.acLeveler.onUserFanChange(deviceId);
+    let resumed = false;
+    for (const key of this.acFanEnforcement.keys()) {
+      if (key.endsWith(`:${deviceId}`)) {
+        this.acFanEnforcement.delete(key);
+        resumed = true;
+      }
+    }
+    if (resumed) log.info(`[collector] AC ${deviceId}: user fan Auto — resuming automation fan enforcement (smart auto)`);
+  }
+
   /** UI fan/turbo change — suspend fan enforcement immediately (no settle-window race). */
   noteUserAcFanChange(deviceId: string): void {
     void this.acLeveler.onUserFanChange(deviceId);

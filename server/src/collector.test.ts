@@ -508,6 +508,25 @@ describe("AC range fan enforcement", () => {
 
     expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23 });
   });
+
+  it("resumes smart-auto fan enforcement when the user taps fan Auto", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    const rule = acFanRule(0); // slot fan = smart auto
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+
+    collector.noteUserAcFanChange("ac1");
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+
+    collector.noteUserAcFanAuto("ac1");
+    expect(getFanEnforcement(collector).has("1:ac1")).toBe(false);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24); // delta 2.0 past low 22 → L6
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6 });
+  });
 });
 
 async function checkAcLeveling(collector: Collector) {
