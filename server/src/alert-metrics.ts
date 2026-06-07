@@ -52,6 +52,41 @@ export const PRAYER_LABELS: Record<string, string> = {
   fajr: "Fajr", dhuhr: "Dhuhr", asr: "Asr", maghrib: "Maghrib", isha: "Isha",
 };
 
+/** One ESP power reading with its ingest timestamp (ms epoch). */
+export interface PowerReadingEntry {
+  tsMs: number;
+  row: Record<string, unknown>;
+}
+
+/** Consecutive readings required before a power alert fires (~20s at the ESP's 5s cadence). */
+export const POWER_ALERT_READINGS = 4;
+/** A gap larger than this between readings breaks the streak (3 missed readings = no electricity). */
+export const POWER_ALERT_MAX_GAP_MS = 15_000;
+
+/**
+ * Sustained-condition check for fluctuating power metrics: true only when the
+ * last POWER_ALERT_READINGS readings all meet the condition and are consecutive
+ * in time (no gap > POWER_ALERT_MAX_GAP_MS). Pure — no I/O.
+ */
+export function powerConditionSustained(
+  metric: string,
+  condition: "above" | "below",
+  threshold: number,
+  readings: ReadonlyArray<PowerReadingEntry>,
+): boolean {
+  if (readings.length < POWER_ALERT_READINGS) return false;
+  const window = readings.slice(-POWER_ALERT_READINGS);
+
+  for (let i = 0; i < window.length; i++) {
+    if (i > 0 && window[i].tsMs - window[i - 1].tsMs > POWER_ALERT_MAX_GAP_MS) return false;
+    const value = getMetricValue(metric, null, null, window[i].row);
+    if (value == null) return false;
+    const met = condition === "above" ? value > threshold : value < threshold;
+    if (!met) return false;
+  }
+  return true;
+}
+
 export function getMetricValue(
   metric: string,
   weather: Record<string, unknown> | null,

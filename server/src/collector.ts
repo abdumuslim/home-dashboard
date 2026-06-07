@@ -3,7 +3,7 @@ import webpush from "web-push";
 import mqtt from "mqtt";
 import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import type { Config } from "./config.js";
-import { getMetricValue, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
+import { getMetricValue, powerConditionSustained, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS, type PowerReadingEntry } from "./alert-metrics.js";
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
 import { TclCloud, type AcAction, type AcDevice } from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
@@ -194,6 +194,7 @@ export class Collector {
   private latestAirTs: Date | null = null;
   private latestPowerRow: Record<string, unknown> | null = null;
   private latestPowerTs: Date | null = null;
+  private recentPowerReadings: PowerReadingEntry[] = []; // last few ESP readings for sustained power alerts
   private airBuffer: AirRow[] = [];
   private lastAirSave = 0;
   private readonly AIR_SAVE_INTERVAL = 60_000;
@@ -226,6 +227,10 @@ export class Collector {
   setLatestPower(data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }): void {
     this.latestPowerRow = data as unknown as Record<string, unknown>;
     this.latestPowerTs = new Date(data.ts);
+    this.recentPowerReadings = [
+      ...this.recentPowerReadings.slice(-7),
+      { tsMs: this.latestPowerTs.getTime(), row: this.latestPowerRow },
+    ];
     // Streaks are counted per ESP reading, not per collector tick
     this.acLeveler.onPowerReading(data);
     this.acCalibrator.onPowerReading(data);
@@ -513,9 +518,13 @@ export class Collector {
         );
         if (value == null) continue;
 
-        const conditionMet = rule.condition === "above"
-          ? value > rule.threshold
-          : value < rule.threshold;
+        // Power fluctuates (motor/compressor spikes) — require 4 consecutive ESP
+        // readings (~20s) meeting the condition before a power alert fires.
+        const conditionMet = def.source === "power"
+          ? powerConditionSustained(rule.metric!, rule.condition, rule.threshold, this.recentPowerReadings)
+          : rule.condition === "above"
+            ? value > rule.threshold
+            : value < rule.threshold;
 
         const QUIET_PERIOD_MS = 10 * 60 * 1000; // 10 minutes
         const entry = this.sensorAlertState.get(rule.id) ?? { state: "idle" };
