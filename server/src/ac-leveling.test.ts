@@ -450,6 +450,38 @@ describe("computeAllocation — restore", () => {
   });
 });
 
+describe("computeAllocation — raise-miss hold", () => {
+  it("blocks raises while the hold is active", () => {
+    const r = computeAllocation(input({ raiseHold: true }));
+    // budget 29 would normally raise everyone to the ideal — hold gates it
+    expect(r.desiredLevels).toEqual({});
+    expect(r.idealLevels).toEqual({ najat: 6, abdu: 3, abdullah: 3 });
+  });
+
+  it("blocks restores while the hold is active", () => {
+    const r = computeAllocation(input({
+      raiseHold: true,
+      acs: [ac("najat"), ac("abdu"), ac("abdullah", { on: false, shed: true })],
+    }));
+    expect(r.toRestore).toEqual([]);
+  });
+
+  it("never blocks reductions — safety first", () => {
+    const r = computeAllocation(input({
+      raiseHold: true,
+      overLimitStreak: REDUCE_STREAK,
+      nonAcLoadAmps: 18,
+      acs: [ac("najat", { currentLevel: 6 }), ac("abdu", { currentLevel: 3 }), ac("abdullah", { currentLevel: 3 })],
+    }));
+    // budget 11: fitted ideal is below current levels → reductions go out
+    expect(Object.keys(r.desiredLevels).length).toBeGreaterThan(0);
+    for (const [id, level] of Object.entries(r.desiredLevels)) {
+      const current = id === "najat" ? 6 : 3;
+      expect(level).toBeLessThan(current);
+    }
+  });
+});
+
 describe("computeAllocation — restore with reduction", () => {
   // All ACs on at lower levels beats one AC raised high: restore feasibility
   // is judged at FLOORS, and raised ACs are pulled down in the same batch.

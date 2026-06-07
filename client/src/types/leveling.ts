@@ -59,6 +59,8 @@ export interface AcLevelingStatus {
   overLimitStreak: number;
   headroomStreak: number;
   settleRemainingMs: number;
+  /** Raises paused because the last raise's amps never showed up (0 = no hold). */
+  raiseHoldRemainingMs: number;
   /** Predicted steady-state total amps after the last command batch (null once graded). */
   expectedAmps: number | null;
   /** Last completed amp-model accuracy check. */

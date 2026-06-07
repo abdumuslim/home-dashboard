@@ -81,6 +81,8 @@ export interface AllocatorInput {
   headroomStreak: number;
   /** Within the settle window after the last command batch. */
   inSettle: boolean;
+  /** Last raise under-delivered (expected amps missing) — raises wait out the hold. */
+  raiseHold?: boolean;
   /** Structural change (AC on/off, source change, manual change, config change) — allow immediate reductions. */
   forceEvaluate: boolean;
   /** Pre-sorted by priority, highest first. */
@@ -145,6 +147,14 @@ export const SHED_CLEAR_GRACE_MS = 15_000;
 export const NON_AC_FREEZE_MS = 15_000;
 /** Warn when the post-command measured total misses the prediction by more than this. */
 export const PREDICTION_WARN_AMPS = 2;
+/**
+ * Raise-miss hold: a gen level is a CAP, not a draw command — when a raise's
+ * expected amps don't show up (room nearly satisfied, compressor idling), the
+ * measured "headroom" is partly fake. Further raises wait this long so the
+ * leveler ratchets up slowly instead of stacking raises on phantom headroom
+ * that vanishes the moment the compressors do kick in.
+ */
+export const RAISE_MISS_HOLD_MS = 60_000;
 
 const DEFAULT_AMP_MODEL: AcAmpModel = { baseAmps: 2, stepAmps: 1 };
 
@@ -238,7 +248,7 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   // structural change (proactive). They deliberately ignore the settle window —
   // safety first; the caller resets streaks after executing reductions.
   const canReduce = input.forceEvaluate || input.overLimitStreak >= REDUCE_STREAK;
-  const canRaise = !input.inSettle && input.headroomStreak >= RAISE_STREAK;
+  const canRaise = !input.inSettle && !input.raiseHold && input.headroomStreak >= RAISE_STREAK;
 
   // Baseline: every ON managed AC at its floor (L1, or the boost minimum).
   const ideal = new Map<string, number>();

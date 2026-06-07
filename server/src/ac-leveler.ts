@@ -11,6 +11,7 @@ import {
   AC_RAMP_MS,
   NON_AC_FREEZE_MS,
   PREDICTION_WARN_AMPS,
+  RAISE_MISS_HOLD_MS,
   RAISE_STREAK,
   SETTLE_MS,
   SHED_CLEAR_GRACE_MS,
@@ -79,6 +80,8 @@ export interface AcLevelingStatus {
   overLimitStreak: number;
   headroomStreak: number;
   settleRemainingMs: number;
+  /** Raises paused because the last raise's amps never showed up (0 = no hold). */
+  raiseHoldRemainingMs: number;
   /** Predicted steady-state total amps after the last command batch (null once graded/none pending). */
   expectedAmps: number | null;
   /** Last completed amp-model accuracy check (expected vs measured after effects settled). */
@@ -126,8 +129,10 @@ export class AcLeveler {
   // records the steady-state total it expects so the model can be graded.
   private frozenNonAcLoad: number | null = null;
   private freezeUntil = 0;
-  private expected: { amps: number; at: number; compareAfter: number } | null = null;
+  private expected: { amps: number; raisedAmps: number; at: number; compareAfter: number } | null = null;
   private lastPrediction: { expectedAmps: number; actualAmps: number; at: number } | null = null;
+  /** Raises wait until this passes when the last raise under-delivered its amps. */
+  private raiseHoldUntil = 0;
 
   constructor(pool: pg.Pool, deps: AcLevelerDeps) {
     this.pool = pool;
@@ -184,6 +189,7 @@ export class AcLeveler {
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
       this.expected = null;
+      this.raiseHoldUntil = 0;
     }
     if (!cfg.enabled && this.fanHold.size > 0) {
       // Leveler switched off mid-hold — leave the house physically right.
@@ -294,10 +300,11 @@ export class AcLeveler {
       this.headroomStreak = 0;
       this.recentMeasured = [];
       this.forceEvaluate = true;
-      // A frozen load / pending expectation from the other source is meaningless.
+      // A frozen load / pending expectation / raise hold from the other source is meaningless.
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
       this.expected = null;
+      this.raiseHoldUntil = 0;
       log.info(`[leveler] Power source changed → ${source}`);
     }
     if (source === "none") return;
@@ -540,6 +547,7 @@ export class AcLeveler {
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
       this.expected = null;
+      this.raiseHoldUntil = 0;
       this.lastStatus = this.buildStatus(ctx, source, null, null, null);
       return;
     }
@@ -605,6 +613,17 @@ export class AcLeveler {
           `consider tuning ampModels or running calibration`,
         );
       }
+      // A raise whose amps never showed up means the new "headroom" is partly
+      // fake (the cap rose, the compressor draw didn't). Hold further raises
+      // so the leveler ratchets up slowly instead of stacking raises.
+      const shortfall = this.expected.amps - measured;
+      if (this.expected.raisedAmps > 0 && shortfall >= Math.max(1, this.expected.raisedAmps / 2)) {
+        this.raiseHoldUntil = now + RAISE_MISS_HOLD_MS;
+        log.info(
+          `[leveler] Raise under-delivered (+${this.expected.raisedAmps.toFixed(1)}A expected, ` +
+          `${shortfall.toFixed(1)}A missing) — holding raises for ${RAISE_MISS_HOLD_MS / 1000}s`,
+        );
+      }
       this.expected = null;
     }
 
@@ -634,6 +653,7 @@ export class AcLeveler {
       overLimitStreak: this.overLimitStreak,
       headroomStreak: this.headroomStreak,
       inSettle,
+      raiseHold: now < this.raiseHoldUntil,
       forceEvaluate: this.forceEvaluate,
       acs: snapshots,
       ampModels,
@@ -655,6 +675,7 @@ export class AcLeveler {
   ): Promise<void> {
     let sentAny = false;
     let didReduce = false;
+    let raisedAmps = 0;
     const restoredNow = new Set<string>();
     const name = (id: string): string => this.deviceNames.get(id) ?? id;
 
@@ -665,6 +686,12 @@ export class AcLeveler {
         this.lastSetLevel.set(deviceId, level);
         sentAny = true;
         if (snap && (snap.currentLevel === 0 || level < snap.currentLevel)) didReduce = true;
+        if (snap && snap.currentLevel >= 1 && level > snap.currentLevel) {
+          // Predicted extra draw from this raise — graded against measured later
+          const model = this.ampModelFor(deviceId, source);
+          raisedAmps += estimateAcDraw(level, snap.maxLevel, model)
+            - estimateAcDraw(snap.currentLevel, snap.maxLevel, model);
+        }
         log.info(
           `[leveler] ${name(deviceId)}: gen level ${snap?.currentLevel ?? "?"} → L${level} ` +
           `(${source} budget ${result.budgetAmps.toFixed(1)}A)`,
@@ -740,6 +767,8 @@ export class AcLeveler {
         await tcl.executeAcAction(deviceId, { power: 1, generator_mode: restoreLevel });
         await this.clearShed(deviceId, "restored");
         restoredNow.add(deviceId);
+        // A restore adds its whole floor draw to the expectation
+        raisedAmps += estimateAcDraw(restoreLevel, snap?.maxLevel ?? 1, this.ampModelFor(deviceId, source));
         this.lastSetLevel.set(deviceId, restoreLevel);
         this.prevPowerStates.set(deviceId, true);
         this.rampUntil.set(deviceId, Date.now() + AC_RAMP_MS);
@@ -801,7 +830,7 @@ export class AcLeveler {
         expectedDraw += estimateAcDraw(level, s.maxLevel, this.ampModelFor(s.deviceId, source));
         compareAfter = Math.max(compareAfter, this.rampUntil.get(s.deviceId) ?? 0);
       }
-      this.expected = { amps: result.nonAcLoadAmps + expectedDraw, at: now, compareAfter };
+      this.expected = { amps: result.nonAcLoadAmps + expectedDraw, raisedAmps, at: now, compareAfter };
     }
     if (didReduce) {
       // Fresh readings required before the next decision in either direction.
@@ -831,6 +860,7 @@ export class AcLeveler {
       overLimitStreak: this.overLimitStreak,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
+      raiseHoldRemainingMs: Math.max(0, this.raiseHoldUntil - Date.now()),
       expectedAmps: this.expected?.amps ?? null,
       lastPrediction: this.lastPrediction,
       acs: ctx.map(({ device, managed, needTier, needDelta }) => {
@@ -877,6 +907,7 @@ export class AcLeveler {
       overLimitStreak: this.overLimitStreak,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
+      raiseHoldRemainingMs: Math.max(0, this.raiseHoldUntil - Date.now()),
       expectedAmps: this.expected?.amps ?? null,
       lastPrediction: this.lastPrediction,
       acs: [],

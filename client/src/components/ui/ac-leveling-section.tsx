@@ -214,13 +214,26 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
       </div>
 
       {/* Gating hints */}
-      {draft.enabled && status && (status.overLimitStreak > 0 || status.settleRemainingMs > 0 || status.expectedAmps != null) && (
+      {draft.enabled && status && (status.overLimitStreak > 0 || status.settleRemainingMs > 0 || status.raiseHoldRemainingMs > 0 || status.expectedAmps != null) && (
         <div className="text-[0.65rem] text-dim -mt-1.5">
-          {status.overLimitStreak > 0 && <span className="text-amber-400">over-limit {Math.min(status.overLimitStreak, 4)}/4 readings</span>}
-          {status.overLimitStreak > 0 && status.settleRemainingMs > 0 && " · "}
-          {status.settleRemainingMs > 0 && <span>settling {Math.ceil(status.settleRemainingMs / 1000)}s</span>}
-          {(status.overLimitStreak > 0 || status.settleRemainingMs > 0) && status.expectedAmps != null && " · "}
-          {status.expectedAmps != null && <span title="Predicted steady-state total once the last commands take effect">expecting {status.expectedAmps.toFixed(1)} A</span>}
+          {[
+            status.overLimitStreak > 0 && (
+              <span key="over" className="text-amber-400">over-limit {Math.min(status.overLimitStreak, 4)}/4 readings</span>
+            ),
+            status.settleRemainingMs > 0 && <span key="settle">settling {Math.ceil(status.settleRemainingMs / 1000)}s</span>,
+            status.raiseHoldRemainingMs > 0 && (
+              <span key="hold" className="text-amber-400" title="Last raise didn't draw the expected amps — the headroom may be fake, raises wait">
+                raise hold {Math.ceil(status.raiseHoldRemainingMs / 1000)}s
+              </span>
+            ),
+            status.expectedAmps != null && (
+              <span key="expect" title="Predicted steady-state total once the last commands take effect">
+                expecting {status.expectedAmps.toFixed(1)} A
+              </span>
+            ),
+          ].filter(Boolean).map((el, i) => (
+            <span key={i}>{i > 0 && " · "}{el}</span>
+          ))}
         </div>
       )}
 

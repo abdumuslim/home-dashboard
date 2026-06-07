@@ -852,6 +852,42 @@ describe("Smart AC leveling — predictive control", () => {
     expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(5);
   });
 
+  it("holds further raises for 60s when a raise does not draw the expected amps", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // 12A on gen → nonAcLoad 12−6=6, budget 8 → Najat raised L1→L3 (+2A expected)
+    genReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 3);
+
+    // Settle passes but measured never rises — the cap rose, the draw didn't.
+    // The fake headroom would now fit Abdu L2; the raise-miss hold must block it.
+    const after = [{ ...devices[0], generatorMode: 3 }, { ...devices[1] }];
+    tclCloud.getDevices.mockReturnValue(after);
+    tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
+    vi.advanceTimersByTime(31_000);
+    genReadings(collector, 12, 4);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+    expect(collector.acLeveler.getStatus().raiseHoldRemainingMs).toBeGreaterThan(0);
+
+    // After the 60s hold expires the next (single) raise is allowed again
+    vi.advanceTimersByTime(65_000);
+    genReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(2);
+    expect(tclCloud.sendControl).toHaveBeenLastCalledWith("ac2", "set_generator_mode", 2);
+  });
+
   it("suspends AC automations, timers, and the leveler while calibration runs", async () => {
     const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
