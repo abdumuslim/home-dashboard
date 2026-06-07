@@ -11,7 +11,9 @@ import {
   AC_RAMP_MS,
   NON_AC_FREEZE_MS,
   PREDICTION_WARN_AMPS,
-  RAISE_MISS_HOLD_MS,
+  RAISE_HOLD_MS,
+  RAISE_HOLD_CHECK_AFTER_MS,
+  RESTORE_HOLD_MS,
   RAISE_STREAK,
   SETTLE_MS,
   SHED_CLEAR_GRACE_MS,
@@ -131,8 +133,12 @@ export class AcLeveler {
   private freezeUntil = 0;
   private expected: { amps: number; raisedAmps: number; at: number; compareAfter: number } | null = null;
   private lastPrediction: { expectedAmps: number; actualAmps: number; at: number } | null = null;
-  /** Raises wait until this passes when the last raise under-delivered its amps. */
-  private raiseHoldUntil = 0;
+  /**
+   * Armed by every raise batch: the next raise must either see the expected
+   * effect on the total draw (released once measured ≥ expectedAmps − threshold)
+   * or wait until `until` (2 min for fan/level raises, 3 min for turn-ons).
+   */
+  private raiseHold: { until: number; expectedAmps: number; threshold: number; checkAfter: number } | null = null;
 
   constructor(pool: pg.Pool, deps: AcLevelerDeps) {
     this.pool = pool;
@@ -189,7 +195,7 @@ export class AcLeveler {
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
       this.expected = null;
-      this.raiseHoldUntil = 0;
+      this.raiseHold = null;
     }
     if (!cfg.enabled && this.fanHold.size > 0) {
       // Leveler switched off mid-hold — leave the house physically right.
@@ -304,7 +310,7 @@ export class AcLeveler {
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
       this.expected = null;
-      this.raiseHoldUntil = 0;
+      this.raiseHold = null;
       log.info(`[leveler] Power source changed → ${source}`);
     }
     if (source === "none") return;
@@ -547,7 +553,7 @@ export class AcLeveler {
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
       this.expected = null;
-      this.raiseHoldUntil = 0;
+      this.raiseHold = null;
       this.lastStatus = this.buildStatus(ctx, source, null, null, null);
       return;
     }
@@ -613,18 +619,27 @@ export class AcLeveler {
           `consider tuning ampModels or running calibration`,
         );
       }
-      // A raise whose amps never showed up means the new "headroom" is partly
-      // fake (the cap rose, the compressor draw didn't). Hold further raises
-      // so the leveler ratchets up slowly instead of stacking raises.
-      const shortfall = this.expected.amps - measured;
-      if (this.expected.raisedAmps > 0 && shortfall >= Math.max(1, this.expected.raisedAmps / 2)) {
-        this.raiseHoldUntil = now + RAISE_MISS_HOLD_MS;
-        log.info(
-          `[leveler] Raise under-delivered (+${this.expected.raisedAmps.toFixed(1)}A expected, ` +
-          `${shortfall.toFixed(1)}A missing) — holding raises for ${RAISE_MISS_HOLD_MS / 1000}s`,
-        );
-      }
       this.expected = null;
+    }
+
+    // Effect-confirmation hold: armed by every raise batch in execute(). The
+    // next raise needs the last raise's amps to actually show up on the meter
+    // (early release) — or the hold to time out (2 min level/fan, 3 min
+    // turn-on). Reductions are never gated by this.
+    if (this.raiseHold) {
+      if (now >= this.raiseHold.until) {
+        this.raiseHold = null;
+      } else if (
+        now >= this.raiseHold.checkAfter &&
+        this.recentMeasured.length >= 4 &&
+        measured >= this.raiseHold.expectedAmps - this.raiseHold.threshold
+      ) {
+        log.info(
+          `[leveler] Raise effect confirmed (${measured.toFixed(1)}A ≈ ` +
+          `${this.raiseHold.expectedAmps.toFixed(1)}A expected) — raises unlocked`,
+        );
+        this.raiseHold = null;
+      }
     }
 
     const ampModels = Object.fromEntries(
@@ -653,7 +668,7 @@ export class AcLeveler {
       overLimitStreak: this.overLimitStreak,
       headroomStreak: this.headroomStreak,
       inSettle,
-      raiseHold: now < this.raiseHoldUntil,
+      raiseHold: this.raiseHold != null,
       forceEvaluate: this.forceEvaluate,
       acs: snapshots,
       ampModels,
@@ -830,7 +845,26 @@ export class AcLeveler {
         expectedDraw += estimateAcDraw(level, s.maxLevel, this.ampModelFor(s.deviceId, source));
         compareAfter = Math.max(compareAfter, this.rampUntil.get(s.deviceId) ?? 0);
       }
-      this.expected = { amps: result.nonAcLoadAmps + expectedDraw, raisedAmps, at: now, compareAfter };
+      const expectedAmps = result.nonAcLoadAmps + expectedDraw;
+      this.expected = { amps: expectedAmps, raisedAmps, at: now, compareAfter };
+      // Every raise batch arms the effect-confirmation hold: the next raise
+      // must either see this batch's amps arrive (early release in tick) or
+      // wait the hold out. Turn-ons hold longest — compressor ramps are slow.
+      // Pure-reduction batches leave any existing hold untouched.
+      const hasRaise = raisedAmps > 0 || restoredNow.size > 0 || result.toFanRaise != null;
+      if (hasRaise) {
+        const holdMs = restoredNow.size > 0 ? RESTORE_HOLD_MS : RAISE_HOLD_MS;
+        this.raiseHold = {
+          until: now + holdMs,
+          expectedAmps,
+          threshold: Math.max(1, raisedAmps / 2),
+          checkAfter: now + RAISE_HOLD_CHECK_AFTER_MS,
+        };
+        log.info(
+          `[leveler] Raise hold armed for ${holdMs / 1000}s — next raise once ` +
+          `~${expectedAmps.toFixed(1)}A is seen on ${source} or the hold expires`,
+        );
+      }
     }
     if (didReduce) {
       // Fresh readings required before the next decision in either direction.
@@ -860,7 +894,7 @@ export class AcLeveler {
       overLimitStreak: this.overLimitStreak,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
-      raiseHoldRemainingMs: Math.max(0, this.raiseHoldUntil - Date.now()),
+      raiseHoldRemainingMs: Math.max(0, (this.raiseHold?.until ?? 0) - Date.now()),
       expectedAmps: this.expected?.amps ?? null,
       lastPrediction: this.lastPrediction,
       acs: ctx.map(({ device, managed, needTier, needDelta }) => {
@@ -907,7 +941,7 @@ export class AcLeveler {
       overLimitStreak: this.overLimitStreak,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
-      raiseHoldRemainingMs: Math.max(0, this.raiseHoldUntil - Date.now()),
+      raiseHoldRemainingMs: Math.max(0, (this.raiseHold?.until ?? 0) - Date.now()),
       expectedAmps: this.expected?.amps ?? null,
       lastPrediction: this.lastPrediction,
       acs: [],

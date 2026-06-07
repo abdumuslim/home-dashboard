@@ -852,7 +852,7 @@ describe("Smart AC leveling — predictive control", () => {
     expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(5);
   });
 
-  it("holds further raises for 60s when a raise does not draw the expected amps", async () => {
+  it("blocks the next raise for 2 min when a level raise does not draw the expected amps", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
@@ -870,7 +870,7 @@ describe("Smart AC leveling — predictive control", () => {
     expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 3);
 
     // Settle passes but measured never rises — the cap rose, the draw didn't.
-    // The fake headroom would now fit Abdu L2; the raise-miss hold must block it.
+    // The fake headroom would now fit Abdu L2; the armed hold must block it.
     const after = [{ ...devices[0], generatorMode: 3 }, { ...devices[1] }];
     tclCloud.getDevices.mockReturnValue(after);
     tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
@@ -880,12 +880,88 @@ describe("Smart AC leveling — predictive control", () => {
     expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
     expect(collector.acLeveler.getStatus().raiseHoldRemainingMs).toBeGreaterThan(0);
 
-    // After the 60s hold expires the next (single) raise is allowed again
-    vi.advanceTimersByTime(65_000);
+    // Still held at the old 1-min mark...
+    vi.advanceTimersByTime(35_000);
+    genReadings(collector, 12, 4);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+
+    // ...released only after the full 2-min hold expires
+    vi.advanceTimersByTime(60_000);
     genReadings(collector, 12, 6);
     await checkAcLeveling(collector);
     expect(tclCloud.sendControl).toHaveBeenCalledTimes(2);
     expect(tclCloud.sendControl).toHaveBeenLastCalledWith("ac2", "set_generator_mode", 2);
+  });
+
+  it("releases the hold early once the raise's expected amps actually arrive", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Najat raised L1→L3, expectation 14A armed for 2 min
+    genReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+
+    // The compressor responds — measured reaches the expected 14A → hold released
+    const after = [{ ...devices[0], generatorMode: 3 }, { ...devices[1] }];
+    tclCloud.getDevices.mockReturnValue(after);
+    tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
+    vi.advanceTimersByTime(31_000);
+    genReadings(collector, 14, 4);
+    await checkAcLeveling(collector);
+    expect(collector.acLeveler.getStatus().raiseHoldRemainingMs).toBe(0);
+
+    // Other household load drops → budget grows — the next raise fires well
+    // inside what would have been the 2-min hold window.
+    vi.advanceTimersByTime(35_000);
+    genReadings(collector, 10, 6);
+    await checkAcLeveling(collector);
+    // budget 12: ideal najat 3 (already there) + abdu 3 → one raise goes out
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(2);
+    expect(tclCloud.sendControl).toHaveBeenLastCalledWith("ac2", "set_generator_mode", 3);
+  });
+
+  it("holds raises for 3 min after an AC turn-on whose draw never arrives", async () => {
+    const { collector, tclCloud, shed, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    shed.add("ac2");
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 4, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: false, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Restore-with-reduction batch: Najat L4→L3, Abdu restored at L1
+    genReadings(collector, 11, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+
+    // Past the 2-min mark the measured draw never rose (compressor refuses) —
+    // a turn-on holds for 3 min, so the pending raises must stay blocked.
+    const after = [{ ...devices[0], generatorMode: 3 }, { ...devices[1], power: true }];
+    tclCloud.getDevices.mockReturnValue(after);
+    tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
+    vi.advanceTimersByTime(121_000);
+    genReadings(collector, 11, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+    expect(collector.acLeveler.getStatus().raiseHoldRemainingMs).toBeGreaterThan(0);
+
+    // After 3 min the hold expires and raises resume
+    vi.advanceTimersByTime(65_000);
+    genReadings(collector, 11, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl.mock.calls.length).toBeGreaterThan(1);
   });
 
   it("suspends AC automations, timers, and the leveler while calibration runs", async () => {

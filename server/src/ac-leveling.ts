@@ -148,13 +148,17 @@ export const NON_AC_FREEZE_MS = 15_000;
 /** Warn when the post-command measured total misses the prediction by more than this. */
 export const PREDICTION_WARN_AMPS = 2;
 /**
- * Raise-miss hold: a gen level is a CAP, not a draw command — when a raise's
- * expected amps don't show up (room nearly satisfied, compressor idling), the
- * measured "headroom" is partly fake. Further raises wait this long so the
- * leveler ratchets up slowly instead of stacking raises on phantom headroom
- * that vanishes the moment the compressors do kick in.
+ * Effect-confirmation holds: after a raise action the next raise must either
+ * SEE the expected effect on the whole amp draw (early release) or wait the
+ * hold out. A gen level is a CAP, not a draw command — a nearly-satisfied
+ * room's compressor won't draw more when the cap rises, leaving phantom
+ * headroom that would stack raises which overshoot the moment the
+ * compressors do kick in. Turn-ons hold longer (compressor ramp is slow).
  */
-export const RAISE_MISS_HOLD_MS = 60_000;
+export const RAISE_HOLD_MS = 120_000;
+export const RESTORE_HOLD_MS = 180_000;
+/** Fresh readings needed before the effect check can release a hold (~4 × 5s ESP). */
+export const RAISE_HOLD_CHECK_AFTER_MS = 20_000;
 
 const DEFAULT_AMP_MODEL: AcAmpModel = { baseAmps: 2, stepAmps: 1 };
 
