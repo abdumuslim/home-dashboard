@@ -159,6 +159,19 @@ const MIGRATIONS: string[] = [
     last_set_fan SMALLINT NOT NULL,
     held_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`,
+  // Per-AC measured draw at each gen level / fan speed, per source (re-runs overwrite)
+  `CREATE TABLE IF NOT EXISTS ac_calibration_results (
+    device_id   TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    step        SMALLINT NOT NULL,
+    amps        REAL NOT NULL,
+    voltage     REAL,
+    stddev      REAL,
+    samples     SMALLINT NOT NULL,
+    measured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (device_id, source, kind, step)
+  )`,
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

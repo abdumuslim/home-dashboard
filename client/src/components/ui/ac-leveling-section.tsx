@@ -2,8 +2,9 @@ import { useState, useEffect } from "react";
 import { ChevronUp, ChevronDown, Zap, PowerOff, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAcLeveling } from "@/hooks/use-ac-leveling";
+import { AcCalibrationPanel } from "@/components/ui/ac-calibration-panel";
 import type { AcDevice } from "@/types/ac";
-import type { AcLevelingConfig, AcLevelingAcStatus, NeedTier } from "@/types/leveling";
+import type { AcLevelingConfig, AcLevelingAcStatus, CalibrationFit, NeedTier } from "@/types/leveling";
 
 const NEED_COLORS: Record<NeedTier, string> = {
   satisfied: "bg-emerald-400",
@@ -28,16 +29,19 @@ function defaultAmpModel(name: string): { baseAmps: number; stepAmps: number } {
 function seedDraft(config: AcLevelingConfig, acDevices: AcDevice[]): AcLevelingConfig {
   const priority = [...config.priority];
   const ampModels = { ...config.ampModels };
+  const genAmpModels = { ...(config.genAmpModels ?? {}) };
   const levelBoosts = { ...(config.levelBoosts ?? {}) };
   for (const d of acDevices) {
     if (!priority.includes(d.id)) priority.push(d.id);
     if (!ampModels[d.id]) ampModels[d.id] = defaultAmpModel(d.name);
+    // Gen draws more at lower voltage — start from the grid model until calibrated
+    if (!genAmpModels[d.id]) genAmpModels[d.id] = { ...ampModels[d.id] };
     // Abdullah's AC can't cool at L1 in extreme heat — seed its boost rule
     if (!levelBoosts[d.id] && d.name.toLowerCase().includes("abdullah")) {
       levelBoosts[d.id] = { minLevel: 2, outdoorAtLeastC: 37 };
     }
   }
-  return { ...config, priority, ampModels, levelBoosts };
+  return { ...config, priority, ampModels, genAmpModels, levelBoosts };
 }
 
 function NumberField({ label, value, step, onChange }: {
@@ -142,6 +146,16 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
     await save({ enabled });
   };
 
+  /** Calibration "Apply" — write a fitted model into the draft and save right away. */
+  const applyFit = async (deviceId: string, fitSource: "grid" | "gen", fit: CalibrationFit) => {
+    if (!draft) return;
+    const patch: Partial<AcLevelingConfig> = fitSource === "grid"
+      ? { ampModels: { ...draft.ampModels, [deviceId]: { ...fit } } }
+      : { genAmpModels: { ...(draft.genAmpModels ?? {}), [deviceId]: { ...fit } } };
+    setDraft((prev) => (prev ? { ...prev, ...patch } : prev));
+    await save(patch);
+  };
+
   if (loading && !draft) {
     return (
       <div className="px-5 pb-4 flex items-center gap-2 text-sm text-dim">
@@ -200,13 +214,29 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
       </div>
 
       {/* Gating hints */}
-      {draft.enabled && status && (status.overLimitStreak > 0 || status.settleRemainingMs > 0) && (
+      {draft.enabled && status && (status.overLimitStreak > 0 || status.settleRemainingMs > 0 || status.expectedAmps != null) && (
         <div className="text-[0.65rem] text-dim -mt-1.5">
           {status.overLimitStreak > 0 && <span className="text-amber-400">over-limit {Math.min(status.overLimitStreak, 4)}/4 readings</span>}
           {status.overLimitStreak > 0 && status.settleRemainingMs > 0 && " · "}
           {status.settleRemainingMs > 0 && <span>settling {Math.ceil(status.settleRemainingMs / 1000)}s</span>}
+          {(status.overLimitStreak > 0 || status.settleRemainingMs > 0) && status.expectedAmps != null && " · "}
+          {status.expectedAmps != null && <span title="Predicted steady-state total once the last commands take effect">expecting {status.expectedAmps.toFixed(1)} A</span>}
         </div>
       )}
+
+      {/* Amp-model accuracy: expected vs measured after the last command batch settled */}
+      {draft.enabled && status?.lastPrediction && (() => {
+        const p = status.lastPrediction;
+        const delta = p.actualAmps - p.expectedAmps;
+        return (
+          <div className="text-[0.65rem] text-dim -mt-1.5">
+            model check: expected {p.expectedAmps.toFixed(1)} A → measured {p.actualAmps.toFixed(1)} A{" "}
+            <span className={cn(Math.abs(delta) > 2 && "text-amber-400")} title={Math.abs(delta) > 2 ? "Amp model is off — consider running calibration" : "Amp model is accurate"}>
+              ({delta >= 0 ? "+" : ""}{delta.toFixed(1)})
+            </span>
+          </div>
+        );
+      })()}
 
       {/* Limits */}
       <div className="grid grid-cols-4 gap-2">
@@ -222,6 +252,7 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
         {draft.priority.map((id, idx) => {
           const ac = statusFor(id);
           const model = draft.ampModels[id] ?? { baseAmps: 2, stepAmps: 1 };
+          const genModel = draft.genAmpModels?.[id] ?? model;
           const boost = draft.levelBoosts[id] ?? { minLevel: 1, outdoorAtLeastC: 37 };
           return (
             <div key={id} className="flex flex-col gap-1 px-2.5 py-1.5 rounded-lg bg-white/5">
@@ -263,6 +294,7 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
                 </div>
 
                 <div className="flex items-center gap-1 shrink-0">
+                  <span className="text-[0.6rem] text-indigo-300" title="Draw model while on Grid">Grid</span>
                   <input
                     type="number"
                     value={model.baseAmps}
@@ -272,7 +304,7 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
                       if (isFinite(v)) update({ ampModels: { ...draft.ampModels, [id]: { ...model, baseAmps: v } } });
                     }}
                     className="w-11 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
-                    title="Amps at L1"
+                    title="Amps at L1 on Grid"
                   />
                   <span className="text-[0.6rem] text-dim">/</span>
                   <input
@@ -284,7 +316,7 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
                       if (isFinite(v)) update({ ampModels: { ...draft.ampModels, [id]: { ...model, stepAmps: v } } });
                     }}
                     className="w-11 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
-                    title="Amps added per level"
+                    title="Amps added per level on Grid"
                   />
                 </div>
               </div>
@@ -322,6 +354,31 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
                   title="Outdoor temperature that activates the minimum"
                 />
                 <span>°C</span>
+                <span className="mx-0.5">·</span>
+                <span className="text-rose-300" title="Draw model while on Generator (lower voltage → more amps)">Gen</span>
+                <input
+                  type="number"
+                  value={genModel.baseAmps}
+                  step={0.5}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (isFinite(v)) update({ genAmpModels: { ...(draft.genAmpModels ?? {}), [id]: { ...genModel, baseAmps: v } } });
+                  }}
+                  className="w-11 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
+                  title="Amps at L1 on Generator"
+                />
+                <span>/</span>
+                <input
+                  type="number"
+                  value={genModel.stepAmps}
+                  step={0.5}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (isFinite(v)) update({ genAmpModels: { ...(draft.genAmpModels ?? {}), [id]: { ...genModel, stepAmps: v } } });
+                  }}
+                  className="w-11 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
+                  title="Amps added per level on Generator"
+                />
               </div>
             </div>
           );
@@ -340,6 +397,13 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
           {saving ? "Saving..." : "Save Leveling Settings"}
         </button>
       )}
+
+      <AcCalibrationPanel
+        active={active}
+        acDevices={acDevices}
+        source={status?.source}
+        onApplyFit={applyFit}
+      />
     </div>
   );
 }

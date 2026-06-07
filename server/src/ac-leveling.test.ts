@@ -450,6 +450,118 @@ describe("computeAllocation — restore", () => {
   });
 });
 
+describe("computeAllocation — restore with reduction", () => {
+  // All ACs on at lower levels beats one AC raised high: restore feasibility
+  // is judged at FLOORS, and raised ACs are pulled down in the same batch.
+  it("reduces raised ACs to make room and restores in the same call", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 3,
+      acs: [
+        ac("najat", { currentLevel: 6 }),
+        ac("abdu", { currentLevel: 3 }),
+        ac("abdullah", { on: false, shed: true }),
+      ],
+    }));
+    // budget 11; floors najat 2 + abdu 4 = 6, + abdullah floor 2 = 8 fits.
+    // Fill: najat→2 (9), abdu→2 (11). Old code compared against current
+    // levels (7 + 8 = 15) and blocked the restore forever.
+    expect(r.toRestore).toEqual(["abdullah"]);
+    expect(r.desiredLevels).toEqual({ najat: 2, abdu: 2 });
+    expect(r.idealLevels.abdullah).toBe(1);
+  });
+
+  it("emits the accompanying reductions without an over-limit streak", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 3,
+      overLimitStreak: 0,
+      forceEvaluate: false,
+      acs: [
+        ac("najat", { currentLevel: 6 }),
+        ac("abdu", { currentLevel: 3 }),
+        ac("abdullah", { on: false, shed: true }),
+      ],
+    }));
+    // canReduce is false — the reductions ride the restore (raise gate).
+    expect(r.desiredLevels).toEqual({ najat: 2, abdu: 2 });
+  });
+
+  it("does not reduce anyone when even the floors cannot fit the candidate", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 7,
+      acs: [
+        ac("najat", { currentLevel: 6 }),
+        ac("abdu", { currentLevel: 3 }),
+        ac("abdullah", { on: false, shed: true }),
+      ],
+    }));
+    // budget 7; floors 6 + abdullah 2 = 8 > 7 → no restore, and no
+    // reduction may leak through without canReduce.
+    expect(r.toRestore).toEqual([]);
+    expect(r.desiredLevels).toEqual({});
+  });
+
+  it("restores at most one shed AC per call (most-needy first)", () => {
+    const r = computeAllocation(input({
+      acs: [
+        ac("najat", { currentLevel: 1 }),
+        ac("abdu", { on: false, shed: true, needDelta: 1 }),
+        ac("abdullah", { on: false, shed: true, needDelta: 3 }),
+      ],
+    }));
+    expect(r.toRestore).toEqual(["abdullah"]);
+    expect(r.idealLevels.abdu).toBeUndefined();
+  });
+
+  it("falls back to a less-needy candidate whose floor fits", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 9,
+      acs: [
+        ac("najat", { currentLevel: 1 }),
+        ac("abdu", { on: false, shed: true, needDelta: 3 }),
+        ac("abdullah", { on: false, shed: true, needDelta: 1 }),
+      ],
+    }));
+    // budget 5: najat 2 + abdu 4 = 6 won't fit, najat 2 + abdullah 2 = 4 does
+    expect(r.toRestore).toEqual(["abdullah"]);
+  });
+
+  it("reduces a manualTarget AC too — floors ignore manual targets", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 3,
+      acs: [
+        ac("najat", { currentLevel: 6, manualTarget: 6 }),
+        ac("abdu", { currentLevel: 3 }),
+        ac("abdullah", { on: false, shed: true }),
+      ],
+    }));
+    expect(r.toRestore).toEqual(["abdullah"]);
+    expect(r.desiredLevels.najat).toBeLessThan(6);
+  });
+
+  it("gates the restore-reductions with the restore itself", () => {
+    const acs = [
+      ac("najat", { currentLevel: 6 }),
+      ac("abdu", { currentLevel: 3 }),
+      ac("abdullah", { on: false, shed: true }),
+    ];
+    const noHeadroom = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 3, acs, headroomStreak: RAISE_STREAK - 1,
+    }));
+    expect(noHeadroom.toRestore).toEqual([]);
+    expect(noHeadroom.desiredLevels).toEqual({});
+    const settling = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 3, acs, inSettle: true,
+    }));
+    expect(settling.toRestore).toEqual([]);
+    expect(settling.desiredLevels).toEqual({});
+  });
+});
+
 describe("computeAllocation — unmanaged ACs", () => {
   it("counts unmanaged draw against the budget but never touches them", () => {
     const r = computeAllocation(input({

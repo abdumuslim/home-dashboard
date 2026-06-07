@@ -72,6 +72,13 @@ async function main(): Promise<void> {
       onUserPowerOn: (deviceId) => collector.acLeveler.onUserPowerOn(deviceId),
       onUserGenLevel: (deviceId, level) => collector.acLeveler.onUserGenLevel(deviceId, level),
     },
+    {
+      start: (deviceIds, includeFan) => collector.acCalibrator.start(deviceIds, includeFan),
+      abort: (reason) => collector.acCalibrator.abort(reason),
+      getStatus: () => collector.acCalibrator.getStatus(),
+      getResults: () => collector.acCalibrator.getResults(),
+      requestAbort: (reason) => collector.acCalibrator.requestAbort(reason),
+    },
   ));
 
   // Serve static files from ../static (relative to dist/ or src/)

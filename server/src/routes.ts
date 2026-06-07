@@ -8,6 +8,7 @@ import type { TclCloud } from "./tcl-cloud.js";
 import type { ForecastResponse } from "./forecast.js";
 import type { AcLevelingConfig, AcAmpModel, AcLevelBoost } from "./ac-leveling.js";
 import type { AcLevelingStatus } from "./ac-leveler.js";
+import type { AcCalibrationStatus, CalibrationResultRow, CalibrationFit } from "./ac-calibration.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession } from "./auth.js";
 import {
   createBaghdadPrayerResolver,
@@ -42,6 +43,15 @@ export interface AcLevelingHandlers {
   onUserPowerOff(deviceId: string): Promise<void>;
   onUserPowerOn(deviceId: string): Promise<void>;
   onUserGenLevel(deviceId: string, level: number): Promise<{ reverted: boolean; level: number }>;
+}
+
+export interface AcCalibrationHandlers {
+  start(deviceIds: string[], includeFan: boolean): Promise<{ ok: true } | { error: string; status: number }>;
+  abort(reason: string): Promise<void>;
+  getStatus(): AcCalibrationStatus;
+  getResults(): Promise<{ results: CalibrationResultRow[]; suggestedFit: Record<string, { grid?: CalibrationFit; gen?: CalibrationFit }> }>;
+  /** Called on any user AC control — a running calibration aborts (user intent wins). */
+  requestAbort(reason: string): void;
 }
 
 export function median(arr: number[]): number {
@@ -89,7 +99,7 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers, acCalibration?: AcCalibrationHandlers): Router {
   const router = Router();
 
   // Health check — before auth middleware, no auth required
@@ -1160,6 +1170,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       return;
     }
     try {
+      // A user touching any AC mid-calibration aborts the run — their intent wins
+      acCalibration?.requestAbort("user_control");
       await cloud.sendControl(id, command, value);
       if (command === "set_power") {
         if (value === 0) {
@@ -1224,6 +1236,13 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       if (!model || !num(model.baseAmps) || model.baseAmps < 0.5 || model.baseAmps > 20) return "baseAmps must be 0.5–20";
       if (!num(model.stepAmps) || model.stepAmps < 0 || model.stepAmps > 10) return "stepAmps must be 0–10";
     }
+    if (b.genAmpModels != null) {
+      if (typeof b.genAmpModels !== "object" || Array.isArray(b.genAmpModels)) return "genAmpModels must be an object";
+      for (const model of Object.values(b.genAmpModels as Record<string, AcAmpModel>)) {
+        if (!model || !num(model.baseAmps) || model.baseAmps < 0.5 || model.baseAmps > 20) return "gen baseAmps must be 0.5–20";
+        if (!num(model.stepAmps) || model.stepAmps < 0 || model.stepAmps > 10) return "gen stepAmps must be 0–10";
+      }
+    }
     if (b.levelBoosts != null) {
       if (typeof b.levelBoosts !== "object" || Array.isArray(b.levelBoosts)) return "levelBoosts must be an object";
       for (const boost of Object.values(b.levelBoosts as Record<string, AcLevelBoost>)) {
@@ -1258,9 +1277,51 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         comfortTargetC: body.comfortTargetC as number,
         priority: body.priority as string[],
         ampModels: body.ampModels as Record<string, AcAmpModel>,
+        genAmpModels: (body.genAmpModels as Record<string, AcAmpModel>) ?? {},
         levelBoosts: (body.levelBoosts as Record<string, AcLevelBoost>) ?? {},
       });
       res.json({ config });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // ---------- AC Calibration ----------
+
+  router.get("/api/ac/calibration", requireAuth, async (_req: Request, res: Response) => {
+    if (!acCalibration) { res.status(503).json({ error: "Calibration not available" }); return; }
+    try {
+      const { results, suggestedFit } = await acCalibration.getResults();
+      res.json({ status: acCalibration.getStatus(), results, suggestedFit });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  router.post("/api/ac/calibration/start", requireAuth, async (req: Request, res: Response) => {
+    if (!acCalibration) { res.status(503).json({ error: "Calibration not available" }); return; }
+    const { deviceIds, includeFan } = req.body as { deviceIds?: unknown; includeFan?: unknown };
+    if (!Array.isArray(deviceIds) || deviceIds.length === 0 || deviceIds.some((id) => typeof id !== "string")) {
+      res.status(400).json({ error: "deviceIds must be a non-empty string array" });
+      return;
+    }
+    try {
+      const result = await acCalibration.start(deviceIds as string[], includeFan !== false);
+      if ("error" in result) {
+        res.status(result.status).json({ error: result.error });
+        return;
+      }
+      res.status(202).json({ ok: true, status: acCalibration.getStatus() });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  router.post("/api/ac/calibration/abort", requireAuth, async (_req: Request, res: Response) => {
+    if (!acCalibration) { res.status(503).json({ error: "Calibration not available" }); return; }
+    try {
+      await acCalibration.abort("user_abort");
+      res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }

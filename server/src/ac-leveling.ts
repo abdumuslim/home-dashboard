@@ -25,7 +25,10 @@ export interface AcLevelingConfig {
   comfortTargetC: number;
   /** Device ids, highest priority first. */
   priority: string[];
+  /** Per-AC draw model on grid (and the fallback for gen when no gen model is set). */
   ampModels: Record<string, AcAmpModel>;
+  /** Optional per-AC draw model on generator — lower, fluctuating voltage means more amps. */
+  genAmpModels?: Record<string, AcAmpModel>;
   levelBoosts: Record<string, AcLevelBoost>;
 }
 
@@ -37,6 +40,7 @@ export const DEFAULT_LEVELING_CONFIG: AcLevelingConfig = {
   comfortTargetC: 26,
   priority: [],
   ampModels: {},
+  genAmpModels: {},
   levelBoosts: {},
 };
 
@@ -117,10 +121,30 @@ export const SETTLE_MS = 30_000;
  * estimated draw is NOT subtracted from measured current when deriving the
  * non-AC load — otherwise the load briefly looks smaller than it is and a
  * near-limit turn-on wouldn't trigger the instant proactive reduction.
+ *
+ * Deliberately conservative double-count: as the compressor ramps, its real
+ * draw bleeds into the measured-derived non-AC load WHILE its full estimate is
+ * also budgeted — understating the budget during the ramp. That delays raises
+ * instead of letting a not-yet-ramped compressor masquerade as headroom
+ * (raise → over-limit → reduce flap). 90s covers the observed TCL ramp.
  */
-export const AC_RAMP_MS = 30_000;
+export const AC_RAMP_MS = 90_000;
 /** Grace before an observed-ON clears a shed flag (shadow lags the off command). */
 export const SHED_CLEAR_GRACE_MS = 15_000;
+/**
+ * After a command batch, fresh measured readings are contaminated: compressors
+ * haven't responded yet while the snapshot levels are already the new ones, so
+ * `measured − establishedDraw` OVERSTATES the non-AC load and would trigger an
+ * over-reduction spiral. The leveler freezes the non-AC load at its
+ * pre-command value for this window. Shorter than SETTLE_MS because reductions
+ * physically settle within seconds — and unlike raises, the reduce path
+ * ignores the settle window, so this freeze is its only protection. A real
+ * non-AC rise during the window is still caught by the raw over-limit streak
+ * with at most this much extra latency.
+ */
+export const NON_AC_FREEZE_MS = 15_000;
+/** Warn when the post-command measured total misses the prediction by more than this. */
+export const PREDICTION_WARN_AMPS = 2;
 
 const DEFAULT_AMP_MODEL: AcAmpModel = { baseAmps: 2, stepAmps: 1 };
 
@@ -235,6 +259,29 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
         !a.shed && !a.fanExempt && a.fanSpeed != null && (a.fanSpeed === 0 || a.fanSpeed > 1))
     : [];
 
+  // Restore selection happens BEFORE the fill so the candidate's floor cost
+  // shapes the fitted ideal: feasibility is judged at FLOORS, not current
+  // levels — all ACs on at lower levels beats one AC raised high. Raised ACs
+  // are pulled down to the new ideal in the same batch as the power-on (see
+  // desiredLevels below). At most one restore per call, most-needy room first.
+  // Boost floors stay hard: if the ON floors alone exceed the budget
+  // (overBudget), no restore is attempted.
+  let restorePick: string | null = null;
+  if (canRaise && !overBudget) {
+    const restoreOrder = restoreCandidates.slice().sort((a, b) => b.needDelta - a.needDelta);
+    for (const a of restoreOrder) {
+      const floorDraw = draw(a, floorOf(a));
+      if (cost + floorDraw <= budgetAmps) {
+        restorePick = a.deviceId;
+        // Not in onManaged (it's off), so the fill below fits the ON ACs
+        // around its floor draw without ever raising it above the floor.
+        ideal.set(a.deviceId, floorOf(a));
+        cost += floorDraw;
+        break;
+      }
+    }
+  }
+
   if (overBudget && fanReducible.length === 0) {
     // Shed the least-needy room first (smallest delta above target); the
     // top-priority AC is protected and only sheds as the last resort.
@@ -283,19 +330,7 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
 
   const toShed = canReduce ? shedWanted : [];
   const toFanReduce = canReduce ? fanReducible.map((a) => a.deviceId) : [];
-
-  // Restore at most one shed AC (most-needy room first, priority as tiebreak)
-  // — only when nothing is over budget and headroom is sustained.
-  const toRestore: string[] = [];
-  if (canRaise && !overBudget) {
-    const restoreOrder = restoreCandidates.slice().sort((a, b) => b.needDelta - a.needDelta);
-    for (const a of restoreOrder) {
-      if (currentOnCost + draw(a, floorOf(a)) <= budgetAmps) {
-        toRestore.push(a.deviceId);
-        break;
-      }
-    }
-  }
+  const toRestore: string[] = restorePick ? [restorePick] : [];
 
   // Staged fan restore: one step toward the hold's original fan per call,
   // highest-priority pending hold first. Restoring a shed AC takes precedence;
@@ -333,7 +368,9 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       desiredLevels[a.deviceId] = canRaise ? target : floorOf(a);
       continue;
     }
-    if (target < a.currentLevel && canReduce) {
+    if (target < a.currentLevel && (canReduce || toRestore.length > 0)) {
+      // Reductions accompanying a restore ride the raise gate — they only
+      // make room (lower load), so the over-limit streak isn't required.
       desiredLevels[a.deviceId] = target;
       continue;
     }

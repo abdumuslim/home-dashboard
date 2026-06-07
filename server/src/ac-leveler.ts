@@ -9,6 +9,8 @@ import {
   estimateAcDraw,
   needCap,
   AC_RAMP_MS,
+  NON_AC_FREEZE_MS,
+  PREDICTION_WARN_AMPS,
   RAISE_STREAK,
   SETTLE_MS,
   SHED_CLEAR_GRACE_MS,
@@ -77,6 +79,10 @@ export interface AcLevelingStatus {
   overLimitStreak: number;
   headroomStreak: number;
   settleRemainingMs: number;
+  /** Predicted steady-state total amps after the last command batch (null once graded/none pending). */
+  expectedAmps: number | null;
+  /** Last completed amp-model accuracy check (expected vs measured after effects settled). */
+  lastPrediction: { expectedAmps: number; actualAmps: number; at: number } | null;
   acs: AcLevelingAcStatus[];
 }
 
@@ -115,6 +121,13 @@ export class AcLeveler {
   private forceEvaluate = false;
   private lastNonAcLoad = 0;
   private lastStatus: AcLevelingStatus | null = null;
+  // Predictive bookkeeping: the non-AC load is frozen at its pre-command value
+  // while compressors respond (see NON_AC_FREEZE_MS), and every command batch
+  // records the steady-state total it expects so the model can be graded.
+  private frozenNonAcLoad: number | null = null;
+  private freezeUntil = 0;
+  private expected: { amps: number; at: number; compareAfter: number } | null = null;
+  private lastPrediction: { expectedAmps: number; actualAmps: number; at: number } | null = null;
 
   constructor(pool: pg.Pool, deps: AcLevelerDeps) {
     this.pool = pool;
@@ -167,6 +180,11 @@ export class AcLeveler {
     );
     this.config = cfg;
     this.forceEvaluate = true;
+    if (!cfg.enabled) {
+      this.frozenNonAcLoad = null;
+      this.freezeUntil = 0;
+      this.expected = null;
+    }
     if (!cfg.enabled && this.fanHold.size > 0) {
       // Leveler switched off mid-hold — leave the house physically right.
       const tcl = this.deps.getTclCloud();
@@ -191,6 +209,15 @@ export class AcLeveler {
 
   getComfortTarget(): number {
     return this.config.comfortTargetC;
+  }
+
+  /** Source limits for other components (e.g. the calibration safety check). */
+  getLimits(): { gridLimitAmps: number; genLimitAmps: number; marginAmps: number } {
+    return {
+      gridLimitAmps: this.config.gridLimitAmps,
+      genLimitAmps: this.config.genLimitAmps,
+      marginAmps: this.config.marginAmps,
+    };
   }
 
   isShed(deviceId: string): boolean {
@@ -267,6 +294,10 @@ export class AcLeveler {
       this.headroomStreak = 0;
       this.recentMeasured = [];
       this.forceEvaluate = true;
+      // A frozen load / pending expectation from the other source is meaningless.
+      this.frozenNonAcLoad = null;
+      this.freezeUntil = 0;
+      this.expected = null;
       log.info(`[leveler] Power source changed → ${source}`);
     }
     if (source === "none") return;
@@ -298,7 +329,12 @@ export class AcLeveler {
     return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
   }
 
-  private ampModel(deviceId: string): AcAmpModel {
+  /** Source-specific draw model: gen model when on generator (more amps at lower voltage), else grid. */
+  private ampModelFor(deviceId: string, source: PowerSource): AcAmpModel {
+    if (source === "gen") {
+      const gen = this.config.genAmpModels?.[deviceId];
+      if (gen) return gen;
+    }
     return this.config.ampModels[deviceId] ?? { baseAmps: 2, stepAmps: 1 };
   }
 
@@ -365,7 +401,7 @@ export class AcLeveler {
       for (const d of tcl.getDevices()) {
         if (!d.power && d.id !== deviceId) continue;
         const lvl = d.id === deviceId ? level : (this.lastSetLevel.get(d.id) ?? d.generatorMode);
-        projected += estimateAcDraw(lvl, d.maxGeneratorLevel || 3, this.ampModel(d.id));
+        projected += estimateAcDraw(lvl, d.maxGeneratorLevel || 3, this.ampModelFor(d.id, source));
       }
       if (projected > limit - this.config.marginAmps) {
         const revertTo = Math.max(1, rank(previous) > maxLevel ? maxLevel : Math.max(1, previous));
@@ -501,6 +537,9 @@ export class AcLeveler {
       // No electricity / no ESP signal — pause decisions, reset gating.
       this.overLimitStreak = 0;
       this.headroomStreak = 0;
+      this.frozenNonAcLoad = null;
+      this.freezeUntil = 0;
+      this.expected = null;
       this.lastStatus = this.buildStatus(ctx, source, null, null, null);
       return;
     }
@@ -533,6 +572,16 @@ export class AcLeveler {
       };
     });
 
+    // A manual-off-locked shed AC can never be restored — clear the shed now
+    // so the allocator doesn't reduce running ACs to make room for a restore
+    // that execute() would abort anyway.
+    for (const s of snapshots) {
+      if (!s.on && s.shed && s.managed && (await this.deps.isManualOffLocked(s.deviceId))) {
+        await this.clearShed(s.deviceId, "manual_off_lock");
+        s.shed = false;
+      }
+    }
+
     // A managed AC stuck below its boost floor "can't work" — allow same-tick
     // reductions elsewhere to make room for the correction.
     for (const s of snapshots) {
@@ -541,17 +590,41 @@ export class AcLeveler {
       }
     }
 
+    const now = Date.now();
     const measured = this.smoothedMeasured();
-    const ampModels = Object.fromEntries(snapshots.map((s) => [s.deviceId, this.ampModel(s.deviceId)]));
+
+    // Grade the last command batch's prediction once its effects had time to
+    // materialize (settle for level changes, compressor ramp for turn-ons).
+    if (this.expected && now >= this.expected.compareAfter && this.recentMeasured.length >= 4) {
+      const err = measured - this.expected.amps;
+      this.lastPrediction = { expectedAmps: this.expected.amps, actualAmps: measured, at: now };
+      if (Math.abs(err) > PREDICTION_WARN_AMPS) {
+        log.warn(
+          `[leveler] Amp model off by ${err >= 0 ? "+" : ""}${err.toFixed(1)}A ` +
+          `(expected ${this.expected.amps.toFixed(1)}A, measured ${measured.toFixed(1)}A on ${source}) — ` +
+          `consider tuning ampModels or running calibration`,
+        );
+      }
+      this.expected = null;
+    }
+
+    const ampModels = Object.fromEntries(
+      snapshots.map((s) => [s.deviceId, this.ampModelFor(s.deviceId, source)]),
+    );
     // Non-AC load = measured minus the draw of ESTABLISHED ACs only. A freshly
     // turned-on AC isn't pulling its estimated amps yet (measured is still
     // pre-turn-on), so subtracting it would understate the household load and
     // hide an imminent overload when running close to the limit.
-    const now = Date.now();
     const establishedDraw = snapshots
       .filter((s) => s.on && (this.rampUntil.get(s.deviceId) ?? 0) <= now)
-      .reduce((sum, s) => sum + estimateAcDraw(s.currentLevel, s.maxLevel, this.ampModel(s.deviceId)), 0);
-    const nonAcLoad = Math.max(0, measured - establishedDraw);
+      .reduce((sum, s) => sum + estimateAcDraw(s.currentLevel, s.maxLevel, this.ampModelFor(s.deviceId, source)), 0);
+    // While the post-command freeze is active, fresh derivations are
+    // contaminated (measured still shows pre-command draw against post-command
+    // snapshot levels) — use the value the command batch was computed with.
+    const freshNonAcLoad = Math.max(0, measured - establishedDraw);
+    const nonAcLoad = now < this.freezeUntil && this.frozenNonAcLoad != null
+      ? this.frozenNonAcLoad
+      : freshNonAcLoad;
     this.lastNonAcLoad = nonAcLoad;
 
     const input: AllocatorInput = {
@@ -567,9 +640,10 @@ export class AcLeveler {
     };
     const result = computeAllocation(input);
     this.forceEvaluate = false;
-    this.lastStatus = this.buildStatus(ctx, source, measured, limit, result);
-
+    // Execute BEFORE building status so the same tick reports the settle
+    // window it just opened, fresh sheds, reset streaks, and the expectation.
     await this.execute(tcl, snapshots, result, source, limit);
+    this.lastStatus = this.buildStatus(ctx, source, measured, limit, result);
   }
 
   private async execute(
@@ -581,6 +655,7 @@ export class AcLeveler {
   ): Promise<void> {
     let sentAny = false;
     let didReduce = false;
+    const restoredNow = new Set<string>();
     const name = (id: string): string => this.deviceNames.get(id) ?? id;
 
     for (const [deviceId, level] of Object.entries(result.desiredLevels)) {
@@ -650,6 +725,8 @@ export class AcLeveler {
       }
     }
 
+    // Accompanying level reductions above have already gone out — room is
+    // made before the power-on (restore-with-reduction).
     for (const deviceId of result.toRestore) {
       try {
         if (await this.deps.isManualOffLocked(deviceId)) {
@@ -662,6 +739,7 @@ export class AcLeveler {
         const restoreLevel = Math.max(1, Math.min(snap?.minLevel ?? 1, snap?.maxLevel ?? 1));
         await tcl.executeAcAction(deviceId, { power: 1, generator_mode: restoreLevel });
         await this.clearShed(deviceId, "restored");
+        restoredNow.add(deviceId);
         this.lastSetLevel.set(deviceId, restoreLevel);
         this.prevPowerStates.set(deviceId, true);
         this.rampUntil.set(deviceId, Date.now() + AC_RAMP_MS);
@@ -699,9 +777,36 @@ export class AcLeveler {
       }
     }
 
-    if (sentAny) this.settleUntil = Date.now() + SETTLE_MS;
+    if (sentAny) {
+      const now = Date.now();
+      this.settleUntil = now + SETTLE_MS;
+      // Freeze the non-AC load the allocation was computed with — fresh
+      // derivations are contaminated until compressors respond to the
+      // commands just sent (see NON_AC_FREEZE_MS).
+      this.frozenNonAcLoad = result.nonAcLoadAmps;
+      this.freezeUntil = now + NON_AC_FREEZE_MS;
+      // Predict the steady-state total: non-AC load + every AC that will be
+      // ON at its commanded level. Grading waits until the slowest effect has
+      // materialized (settle for level/fan changes, compressor ramp for
+      // turn-ons). Fan-only batches barely move amps — a slightly noisy but
+      // harmless data point for the model check.
+      let expectedDraw = 0;
+      let compareAfter = this.settleUntil;
+      for (const s of snapshots) {
+        const willBeOn = restoredNow.has(s.deviceId) || (s.on && !this.shedIds.has(s.deviceId));
+        if (!willBeOn) continue;
+        const level = s.managed
+          ? (this.lastSetLevel.get(s.deviceId) ?? s.currentLevel)
+          : s.currentLevel;
+        expectedDraw += estimateAcDraw(level, s.maxLevel, this.ampModelFor(s.deviceId, source));
+        compareAfter = Math.max(compareAfter, this.rampUntil.get(s.deviceId) ?? 0);
+      }
+      this.expected = { amps: result.nonAcLoadAmps + expectedDraw, at: now, compareAfter };
+    }
     if (didReduce) {
       // Fresh readings required before the next decision in either direction.
+      // Note: restore-with-reduction batches land here too — the next restore
+      // needs a fresh 6-reading headroom streak, which paces restores out.
       this.overLimitStreak = 0;
       this.headroomStreak = 0;
     }
@@ -726,6 +831,8 @@ export class AcLeveler {
       overLimitStreak: this.overLimitStreak,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
+      expectedAmps: this.expected?.amps ?? null,
+      lastPrediction: this.lastPrediction,
       acs: ctx.map(({ device, managed, needTier, needDelta }) => {
         const maxLevel = device.maxGeneratorLevel || 3;
         const boost = this.config.levelBoosts[device.id];
@@ -742,7 +849,7 @@ export class AcLeveler {
           maxLevel,
           minLevel,
           estAmps: device.power
-            ? estimateAcDraw(device.generatorMode, maxLevel, this.ampModel(device.id))
+            ? estimateAcDraw(device.generatorMode, maxLevel, this.ampModelFor(device.id, source))
             : 0,
           needTier,
           needCap: needCap(needTier, maxLevel),
@@ -770,6 +877,8 @@ export class AcLeveler {
       overLimitStreak: this.overLimitStreak,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
+      expectedAmps: this.expected?.amps ?? null,
+      lastPrediction: this.lastPrediction,
       acs: [],
     };
   }

@@ -8,6 +8,7 @@ import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
 import { TclCloud, type AcAction, type AcDevice } from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
 import { AcLeveler, type LevelerDeviceContext } from "./ac-leveler.js";
+import { AcCalibrator } from "./ac-calibration.js";
 import { computeNeedTier, type NeedTier } from "./ac-leveling.js";
 import { computeAutoFanLevel } from "./ac-auto-fan.js";
 import { childLogger } from "./logger.js";
@@ -202,6 +203,7 @@ export class Collector {
   xiaomiCloud: XiaomiCloud | null = null;
   tclCloud: TclCloud | null = null;
   acLeveler: AcLeveler;
+  acCalibrator: AcCalibrator;
   private lastLevelerDevicesFetch = 0;
   private tclRetryAt = 0;
   private xiaomiRetryAt = 0;
@@ -226,6 +228,7 @@ export class Collector {
     this.latestPowerTs = new Date(data.ts);
     // Streaks are counted per ESP reading, not per collector tick
     this.acLeveler.onPowerReading(data);
+    this.acCalibrator.onPowerReading(data);
   }
 
   invalidateAutomationRules(): void {
@@ -309,6 +312,11 @@ export class Collector {
       },
       isManualOffLocked: (deviceId) => this.isAcManualOffLocked(deviceId),
       onLevelerFanCommand: (deviceId, fan) => this.refreshAcFanBaseline(deviceId, fan),
+    });
+    this.acCalibrator = new AcCalibrator(pool, {
+      getTclCloud: () => this.tclCloud,
+      getLimits: () => this.acLeveler.getLimits(),
+      broadcast: (payload) => this.broadcastPush(payload),
     });
 
     if (config.vapidPublicKey && config.vapidPrivateKey) {
@@ -407,6 +415,14 @@ export class Collector {
       await this.checkAlerts();
     } catch (err) {
       log.error("[collector] Alert check failed:", err);
+    }
+
+    try {
+      // Calibration owns the ACs while active — the AC automation/timer/
+      // leveler checks below all stand down until it finishes.
+      await this.acCalibrator.tick();
+    } catch (err) {
+      log.error("[collector] AC calibration tick failed:", err);
     }
 
     try {
@@ -683,6 +699,9 @@ export class Collector {
     }
 
     for (const rule of this.automationRules) {
+      // Calibration deliberately powers ACs off/on — AC rules must not fight
+      // it (or record manual-off locks for calibration-initiated offs).
+      if (rule.device_type === "ac" && this.acCalibrator.isActive()) continue;
       if (rule.device_type === "ac" && (!this.tclCloud || !this.tclCloud.isReady())) continue;
       if (rule.device_type !== "ac" && (!this.xiaomiCloud || !this.xiaomiCloud.isReady())) continue;
 
@@ -1260,6 +1279,8 @@ export class Collector {
 
   private async checkAcTimers(): Promise<void> {
     if (!this.tclCloud || !this.tclCloud.isReady()) return;
+    // Timers stay pending during a calibration run and fire (late) after it.
+    if (this.acCalibrator.isActive()) return;
     const now = Date.now();
     for (const [deviceId, timer] of acTimers) {
       if (now < timer.fireAt) continue;
@@ -1399,6 +1420,8 @@ export class Collector {
     await this.acLeveler.ensureLoaded();
     if (!this.acLeveler.isEnabled()) return;
     if (!this.tclCloud || !this.tclCloud.isReady()) return;
+    // Calibration drives the ACs single-handedly — don't fight its sweeps.
+    if (this.acCalibrator.isActive()) return;
 
     // Keep device state reasonably fresh without hammering TCL: at most one
     // live fetch per 10s (automations refresh the shared cache most ticks too).
