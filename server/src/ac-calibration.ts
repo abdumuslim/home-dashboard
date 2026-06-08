@@ -13,12 +13,25 @@ import { childLogger } from "./logger.js";
 
 const log = childLogger("ac-calibration");
 
-/** Settle after a generator-level change before sampling starts. */
+/**
+ * Settle floors and ceilings. The change must be given AT LEAST the floor to
+ * take effect (never sample sooner than the proven settle), then sampling
+ * starts as soon as the measured draw plateaus — or at the max cap if it never
+ * stabilizes. Compressors are slow (level/ramp), fans respond fast.
+ */
 export const CAL_LEVEL_SETTLE_MS = 20_000;
-/** Settle after a fan-speed change (fans respond faster than compressors). */
+export const CAL_LEVEL_SETTLE_MAX_MS = 120_000;
 export const CAL_FAN_SETTLE_MS = 15_000;
-/** Settle after powering ACs off before the all-off baseline is sampled. */
+export const CAL_FAN_SETTLE_MAX_MS = 30_000;
+/** Compressor ramp after a turn-on: AC_RAMP_MS floor, this the max cap. */
+export const CAL_RAMP_MAX_MS = 180_000;
+/** Settle after powering ACs off before the all-off baseline is sampled (fixed — quick). */
 export const CAL_OFF_SETTLE_MS = 10_000;
+/** Consecutive settle-phase readings within the band that define a plateau (early release). */
+export const CAL_STABLE_READINGS = 4;
+/** Max−min spread across the plateau window; generator voltage fluctuates more. */
+export const CAL_STABILITY_BAND_GRID = 0.4;
+export const CAL_STABILITY_BAND_GEN = 0.8;
 /** Samples per step on grid (ESP reads every ~5s). */
 export const CAL_SAMPLES_GRID = 6;
 /** Samples per step on generator — fluctuating voltage needs more averaging. */
@@ -171,6 +184,11 @@ export class AcCalibrator {
   private baselineAmps = 0;
   private samples: Sample[] = [];
   private settleUntil = 0;
+  // Early-release plateau detection: when the settle was armed and the readings
+  // observed during it (before sampling). Sampling starts once the draw is
+  // stable past the floor, or at settleUntil (the max cap).
+  private settleStartedAt = 0;
+  private settleReadings: number[] = [];
   private startedAt: number | null = null;
   private finishedAt: number | null = null;
   private abortReason: string | null = null;
@@ -207,9 +225,14 @@ export class AcCalibrator {
       this.requestAbort("over_limit");
       return;
     }
+    const now = Date.now();
     const collecting = this.phase === "baseline" || this.phase === "sample";
-    if (collecting && Date.now() >= this.settleUntil) {
+    if (collecting && now >= this.settleUntil) {
       this.samples.push({ amps: measured, voltage: data.voltage });
+    } else if ((this.phase === "ramp" || this.phase === "sample") && now < this.settleUntil) {
+      // Settle-phase reading — feeds plateau detection for early release.
+      this.settleReadings.push(measured);
+      if (this.settleReadings.length > 6) this.settleReadings.shift();
     }
   }
 
@@ -277,6 +300,20 @@ export class AcCalibrator {
       return;
     }
 
+    // Early release: once the change has had at least its floor to take effect
+    // and the measured draw has plateaued, collapse the remaining wait so
+    // sampling starts now instead of holding out to the max cap.
+    const now = Date.now();
+    if (
+      (this.phase === "ramp" || this.phase === "sample") &&
+      now < this.settleUntil &&
+      now - this.settleStartedAt >= this.settleFloorMs() &&
+      this.isSettleStable()
+    ) {
+      log.info(`[calibration] Draw stabilized after ${Math.round((now - this.settleStartedAt) / 1000)}s — sampling early`);
+      this.settleUntil = now;
+    }
+
     try {
       switch (this.phase) {
         case "prep": {
@@ -298,7 +335,7 @@ export class AcCalibrator {
           // Power on at L1 with the reference fan, then wait out the compressor ramp.
           await tcl.executeAcAction(target, { power: 1, generator_mode: 1, fan_speed: CAL_REFERENCE_FAN });
           this.phase = "ramp";
-          this.settleUntil = Date.now() + AC_RAMP_MS;
+          this.armSettle(CAL_RAMP_MAX_MS);
           break;
         }
         case "ramp": {
@@ -335,6 +372,28 @@ export class AcCalibrator {
     this.settleUntil = Date.now() + CAL_OFF_SETTLE_MS;
   }
 
+  /** Arm a settle with a hard max cap; early release collapses it once stable. */
+  private armSettle(maxMs: number): void {
+    const now = Date.now();
+    this.settleUntil = now + maxMs;
+    this.settleStartedAt = now;
+    this.settleReadings = [];
+  }
+
+  /** Minimum settle before early release — never sample sooner than the proven floor. */
+  private settleFloorMs(): number {
+    if (this.phase === "ramp") return AC_RAMP_MS;
+    return this.steps[this.stepIndex]?.kind === "fan" ? CAL_FAN_SETTLE_MS : CAL_LEVEL_SETTLE_MS;
+  }
+
+  /** Plateau detection: the last few settle readings sit within the source band. */
+  private isSettleStable(): boolean {
+    if (this.settleReadings.length < CAL_STABLE_READINGS) return false;
+    const w = this.settleReadings.slice(-CAL_STABLE_READINGS);
+    const band = this.source === "gen" ? CAL_STABILITY_BAND_GEN : CAL_STABILITY_BAND_GRID;
+    return Math.max(...w) - Math.min(...w) <= band;
+  }
+
   private async recordStep(): Promise<void> {
     const target = this.queue[this.queueIndex];
     const step = this.steps[this.stepIndex];
@@ -365,7 +424,7 @@ export class AcCalibrator {
       const prev = this.steps[this.stepIndex - 1];
       if (next.kind === "level") {
         await tcl.sendControl(target, "set_generator_mode", next.value);
-        this.settleUntil = Date.now() + CAL_LEVEL_SETTLE_MS;
+        this.armSettle(CAL_LEVEL_SETTLE_MAX_MS);
       } else {
         if (prev.kind === "level") {
           // Fan sweep runs at max level — the per-level current cap bites least there.
@@ -373,7 +432,7 @@ export class AcCalibrator {
           if (prev.value !== maxLevel) await tcl.sendControl(target, "set_generator_mode", maxLevel);
         }
         await tcl.sendControl(target, "set_fan_speed", next.value);
-        this.settleUntil = Date.now() + CAL_FAN_SETTLE_MS;
+        this.armSettle(CAL_FAN_SETTLE_MAX_MS);
       }
       this.samples = [];
       return;

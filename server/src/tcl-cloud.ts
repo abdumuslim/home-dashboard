@@ -188,8 +188,13 @@ export class TclCloud {
       log.warn(`[tcl] computeAcDiff: device ${deviceId} not in cache, sending full profile`);
       return desired;
     }
+    // Non-Najat: fan_speed already encodes turbo (1=silence, 7=turbo) — the
+    // derived fan_speed comparison subsumes the turbo flag. Comparing both
+    // alternated {turbo:0}/{fan_speed:7} commands forever (beep loop).
+    const skipTurbo = desired.fan_speed != null && !this.isNajatModel(deviceId);
     const diff: Partial<AcAction> = {};
     for (const key of ["mode", "temperature", "fan_speed", "eco", "turbo", "screen", "vertical_swing", "horizontal_swing", "fresh_air", "generator_mode"] as const) {
+      if (key === "turbo" && skipTurbo) continue;
       if (desired[key] != null && desired[key] !== current[key]) {
         (diff as Record<string, unknown>)[key] = desired[key];
       }
@@ -911,12 +916,10 @@ export class TclCloud {
       desired.ECO = action.eco;
     }
 
-    // Turbo: skip if fan_speed already controls it (1=silent, 7=turbo)
-    if (action.turbo != null && !najat) {
-      const dropTurbo = action.fan_speed === 7 || action.fan_speed === 1;
-      if (!dropTurbo) {
-        desired.turbo = action.turbo;
-      }
+    // Turbo: any fan_speed owns windSpeed/silenceSwitch/turbo atomically —
+    // an explicit turbo must never override the fan block (1=silent, 7=turbo)
+    if (action.turbo != null && !najat && action.fan_speed == null) {
+      desired.turbo = action.turbo;
     }
 
     if (action.screen != null) {

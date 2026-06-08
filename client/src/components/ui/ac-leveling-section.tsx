@@ -95,6 +95,22 @@ function AcStatusBadges({ ac }: { ac: AcLevelingAcStatus }) {
           min L{ac.minLevel}
         </span>
       )}
+      {ac.bounceCap != null && (
+        <span
+          className="px-1.5 py-0.5 rounded text-[0.6rem] font-medium bg-orange-400/15 text-orange-400"
+          title={`Raise bounced over the limit — retries when total load drops below ${ac.bounceRetryBelowAmps?.toFixed(1) ?? "?"}A (consider calibration)`}
+        >
+          bounce L{ac.bounceCap}
+        </span>
+      )}
+      {ac.restoreBlocked && (
+        <span
+          className="px-1.5 py-0.5 rounded text-[0.6rem] font-medium bg-orange-400/15 text-orange-400"
+          title={`Restore bounced (re-shed) — retries when total load drops below ${ac.bounceRetryBelowAmps?.toFixed(1) ?? "?"}A (consider calibration)`}
+        >
+          restore wait
+        </span>
+      )}
     </span>
   );
 }
@@ -218,7 +234,11 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
         <div className="text-[0.65rem] text-dim -mt-1.5">
           {[
             status.overLimitStreak > 0 && (
-              <span key="over" className="text-amber-400">over-limit {Math.min(status.overLimitStreak, 4)}/4 readings</span>
+              status.severeOverLimitStreak > 0 ? (
+                <span key="over" className="text-amber-400">severe over-limit {Math.min(status.severeOverLimitStreak, 2)}/2 readings</span>
+              ) : (
+                <span key="over" className="text-amber-400">over-limit {Math.min(status.overLimitStreak, 5)}/5 readings</span>
+              )
             ),
             status.settleRemainingMs > 0 && <span key="settle">settling {Math.ceil(status.settleRemainingMs / 1000)}s</span>,
             status.raiseHoldRemainingMs > 0 && (

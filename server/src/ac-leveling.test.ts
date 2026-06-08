@@ -6,6 +6,7 @@ import {
   computeNeedTier,
   needCap,
   REDUCE_STREAK,
+  REDUCE_STREAK_SEVERE,
   RAISE_STREAK,
   type AllocatorInput,
   type LevelerAcSnapshot,
@@ -37,6 +38,9 @@ function ac(id: string, over: Partial<LevelerAcSnapshot> = {}): LevelerAcSnapsho
     fanSpeed: 1,
     fanRestoreTarget: null,
     fanExempt: false,
+    bounceCap: null,
+    restoreBlocked: false,
+    warmStartLevel: null,
     ...over,
   };
   if (over.needDelta === undefined) snapshot.needDelta = TIER_DELTAS[snapshot.needTier];
@@ -50,6 +54,7 @@ function input(over: Partial<AllocatorInput> = {}): AllocatorInput {
     marginAmps: 1,
     nonAcLoadAmps: 0,
     overLimitStreak: 0,
+    severeOverLimitStreak: 0,
     headroomStreak: RAISE_STREAK,
     inSettle: false,
     forceEvaluate: false,
@@ -174,6 +179,62 @@ describe("computeAllocation — priority fill", () => {
   });
 });
 
+describe("computeAllocation — warm restore", () => {
+  it("jumps to the remembered level skipping the headroom streak, capped at remembered", () => {
+    const r = computeAllocation(input({
+      headroomStreak: 0,
+      acs: [ac("najat", { currentLevel: 1, warmStartLevel: 4 })],
+    }));
+    // budget fits L6, but the warm restore only goes back to the remembered L4.
+    expect(r.desiredLevels).toEqual({ najat: 4 });
+  });
+
+  it("does not warm-restore above the remembered level", () => {
+    const r = computeAllocation(input({
+      headroomStreak: 0,
+      acs: [ac("najat", { currentLevel: 4, warmStartLevel: 4 })],
+    }));
+    expect(r.desiredLevels).toEqual({});
+  });
+
+  it("budget still clamps the warm restore below the remembered level", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 11, // budget 3 → najat fits only L2 (3A), not L3 (4A)
+      headroomStreak: 0,
+      acs: [ac("najat", { currentLevel: 1, warmStartLevel: 4 })],
+    }));
+    expect(r.desiredLevels).toEqual({ najat: 2 });
+  });
+
+  it("defers the warm restore during settle", () => {
+    const r = computeAllocation(input({
+      headroomStreak: 0,
+      inSettle: true,
+      acs: [ac("najat", { currentLevel: 1, warmStartLevel: 4 })],
+    }));
+    expect(r.desiredLevels).toEqual({});
+  });
+
+  it("defers the warm restore while a raise hold is active", () => {
+    const r = computeAllocation(input({
+      headroomStreak: 0,
+      raiseHold: true,
+      acs: [ac("najat", { currentLevel: 1, warmStartLevel: 4 })],
+    }));
+    expect(r.desiredLevels).toEqual({});
+  });
+
+  it("raises past the remembered level once headroom is sustained", () => {
+    const r = computeAllocation(input({
+      headroomStreak: RAISE_STREAK,
+      acs: [ac("najat", { currentLevel: 1, warmStartLevel: 4 })],
+    }));
+    // canRaise is met → full budget-fitted ideal, not capped at the remembered L4.
+    expect(r.desiredLevels).toEqual({ najat: 6 });
+  });
+});
+
 describe("computeAllocation — need and manual caps", () => {
   it("caps satisfied at L1 but soft-fills mild rooms when budget allows", () => {
     const r = computeAllocation(input({
@@ -260,6 +321,30 @@ describe("computeAllocation — reductions", () => {
       headroomStreak: 0,
     }));
     expect(r.desiredLevels).toEqual({ najat: 2, abdu: 1, abdullah: 1 });
+  });
+
+  it("reduces on the fast severe path before the mild streak is reached", () => {
+    // overLimitStreak short of REDUCE_STREAK, but a severe streak of 2 acts now.
+    const r = computeAllocation(input({
+      acs: highLevels,
+      nonAcLoadAmps: 20,
+      overLimitStreak: REDUCE_STREAK_SEVERE,
+      severeOverLimitStreak: REDUCE_STREAK_SEVERE,
+      headroomStreak: 0,
+    }));
+    expect(r.desiredLevels).toEqual({ najat: 2, abdu: 1, abdullah: 1 });
+  });
+
+  it("does not reduce on a single severe reading (needs the severe streak)", () => {
+    const r = computeAllocation(input({
+      acs: highLevels,
+      nonAcLoadAmps: 20,
+      overLimitStreak: 1,
+      severeOverLimitStreak: REDUCE_STREAK_SEVERE - 1,
+      headroomStreak: 0,
+    }));
+    expect(r.desiredLevels).toEqual({});
+    expect(r.toShed).toEqual([]);
   });
 
   it("always caps a managed ON AC left at level 0 regardless of gating", () => {
@@ -813,5 +898,85 @@ describe("computeAllocation — staged fan restore", () => {
       ],
     }));
     expect(r.desiredLevels).toEqual({ abdullah: 2 });
+  });
+});
+
+describe("computeAllocation — bounce caps", () => {
+  it("never raises above a bounce cap, in either fill pass", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat"), ac("abdu", { bounceCap: 1 }), ac("abdullah")],
+    }));
+    // budget 29: without the cap abdu (full tier) would soft-fill to 3
+    expect(r.idealLevels).toEqual({ najat: 6, abdu: 1, abdullah: 3 });
+  });
+
+  it("gives the budget to the other ACs when the neediest is bounce-capped", () => {
+    const base = {
+      nonAcLoadAmps: 19,
+      acs: [
+        ac("najat", { needDelta: 2 }),
+        ac("abdu", { needDelta: 3 }),
+        ac("abdullah", { needTier: "satisfied" as const }),
+      ],
+    };
+    // budget 10, base cost 8: without a cap the hottest room (abdu, step 2A) wins the surplus
+    expect(computeAllocation(input(base)).idealLevels).toEqual({ najat: 1, abdu: 2, abdullah: 1 });
+    // bounce-capped abdu steps aside — najat absorbs the surplus instead
+    const capped = {
+      ...base,
+      acs: [base.acs[0], ac("abdu", { needDelta: 3, bounceCap: 1 }), base.acs[2]],
+    };
+    expect(computeAllocation(input(capped)).idealLevels).toEqual({ najat: 3, abdu: 1, abdullah: 1 });
+  });
+
+  it("defers a manual target while the bounce cap is active", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat"), ac("abdu", { manualTarget: 3, bounceCap: 1 }), ac("abdullah")],
+    }));
+    expect(r.idealLevels.abdu).toBe(1);
+  });
+
+  it("never lowers the hard boost floor", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat"), ac("abdu"), ac("abdullah", { minLevel: 2, bounceCap: 1 })],
+    }));
+    expect(r.idealLevels.abdullah).toBe(2);
+  });
+
+  it("produces no commands when the only raise candidate is bounce-capped", () => {
+    const r = computeAllocation(input({
+      nonAcLoadAmps: 19,
+      acs: [
+        ac("najat", { needTier: "satisfied" }),
+        ac("abdu", { bounceCap: 1 }),
+        ac("abdullah", { needTier: "satisfied" }),
+      ],
+    }));
+    expect(r.desiredLevels).toEqual({});
+    expect(r.toShed).toEqual([]);
+  });
+
+  it("skips a restore-blocked shed AC and restores the next-most-needy", () => {
+    const r = computeAllocation(input({
+      nonAcLoadAmps: 10,
+      acs: [
+        ac("najat", { currentLevel: 2 }),
+        ac("abdu", { on: false, shed: true, needDelta: 3, restoreBlocked: true }),
+        ac("abdullah", { on: false, shed: true, needDelta: 1 }),
+      ],
+    }));
+    expect(r.toRestore).toEqual(["abdullah"]);
+  });
+
+  it("restores nothing when every shed candidate is restore-blocked", () => {
+    const r = computeAllocation(input({
+      nonAcLoadAmps: 10,
+      acs: [
+        ac("najat", { currentLevel: 2 }),
+        ac("abdu", { on: false, shed: true, restoreBlocked: true }),
+        ac("abdullah", { on: false, shed: true, restoreBlocked: true }),
+      ],
+    }));
+    expect(r.toRestore).toEqual([]);
   });
 });

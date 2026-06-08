@@ -12,6 +12,8 @@ import {
   CAL_REFERENCE_FAN,
   CAL_OFF_SETTLE_MS,
   CAL_LEVEL_SETTLE_MS,
+  CAL_RAMP_MAX_MS,
+  CAL_STABLE_READINGS,
 } from "./ac-calibration.js";
 import { AC_RAMP_MS } from "./ac-leveling.js";
 
@@ -135,6 +137,19 @@ function feedGen(cal: AcCalibrator, amps: number, count: number) {
   }
 }
 
+/**
+ * Pass one settle step: advance to the settle floor, feed a stable plateau so
+ * the calibrator early-releases, collapse the window with a tick, then collect
+ * the measurement samples and record with a second tick.
+ */
+async function settleStep(cal: AcCalibrator, floorMs: number, amps: number, count: number) {
+  vi.advanceTimersByTime(floorMs + 1000);
+  feedGen(cal, amps, CAL_STABLE_READINGS); // plateau → early release
+  await cal.tick(); // collapse the settle window
+  feedGen(cal, amps, count); // measurement samples
+  await cal.tick(); // record the step
+}
+
 describe("AcCalibrator state machine", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -169,9 +184,15 @@ describe("AcCalibrator state machine", () => {
     expect(tcl.executeAcAction).toHaveBeenCalledWith("ac1", { power: 1, generator_mode: 1, fan_speed: CAL_REFERENCE_FAN });
     expect(cal.getStatus().phase).toBe("ramp");
 
-    // Compressor ramp must fully pass before sampling
-    vi.advanceTimersByTime(AC_RAMP_MS + 1000);
-    feedGen(cal, 5, 1); // ESP keeps reporting during the ramp (not sampled)
+    // Compressor ramp: not sampled before the floor, even with a stable draw.
+    vi.advanceTimersByTime(AC_RAMP_MS - 5000);
+    feedGen(cal, 5, CAL_STABLE_READINGS);
+    await cal.tick();
+    expect(cal.getStatus().phase).toBe("ramp"); // floor not reached yet
+
+    // Past the floor + stable draw → early release into sampling.
+    vi.advanceTimersByTime(6000);
+    feedGen(cal, 5, CAL_STABLE_READINGS);
     await cal.tick();
     expect(cal.getStatus().phase).toBe("sample");
     expect(cal.getStatus().step).toEqual({ kind: "level", value: 1 });
@@ -182,10 +203,12 @@ describe("AcCalibrator state machine", () => {
     expect(rows.get("ac1:gen:level:1")).toMatchObject({ amps: 3, samples: CAL_SAMPLES_GEN });
     expect(tcl.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
 
-    // L2 samples only count after the level settle
-    feedGen(cal, 6, CAL_SAMPLES_GEN);
-    expect(cal.getStatus().samplesCollected).toBe(0);
+    // L2: plateau readings during the settle don't count as samples; once stable
+    // past the floor the window collapses and the real samples are collected.
     vi.advanceTimersByTime(CAL_LEVEL_SETTLE_MS + 1000);
+    feedGen(cal, 6, CAL_STABLE_READINGS);
+    expect(cal.getStatus().samplesCollected).toBe(0);
+    await cal.tick(); // early release
     feedGen(cal, 6, CAL_SAMPLES_GEN);
     await cal.tick();
     expect(rows.get("ac1:gen:level:2")).toMatchObject({ amps: 4 });
@@ -211,15 +234,9 @@ describe("AcCalibrator state machine", () => {
     // Device 1 (ac1, maxLevel 2)
     vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
     feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
-    await cal.tick(); // ac1 on
-    vi.advanceTimersByTime(AC_RAMP_MS + 1000);
-    feedGen(cal, 5, 1); // ESP keep-alive during the ramp
-    await cal.tick();
-    feedGen(cal, 5, CAL_SAMPLES_GEN);
-    await cal.tick(); // L1 done → L2
-    vi.advanceTimersByTime(CAL_LEVEL_SETTLE_MS + 1000);
-    feedGen(cal, 6, CAL_SAMPLES_GEN);
-    await cal.tick(); // L2 done → ac1 off, next baseline
+    await cal.tick(); // ac1 on → ramp
+    await settleStep(cal, AC_RAMP_MS, 5, CAL_SAMPLES_GEN); // ramp → L1 recorded → L2 commanded
+    await settleStep(cal, CAL_LEVEL_SETTLE_MS, 6, CAL_SAMPLES_GEN); // L2 recorded → ac1 off, next baseline
 
     expect(tcl.executeAcAction).toHaveBeenLastCalledWith("ac1", { power: 0 });
     expect(cal.getStatus().phase).toBe("baseline");
@@ -256,12 +273,8 @@ describe("AcCalibrator state machine", () => {
     await cal.tick(); // prep
     vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
     feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
-    await cal.tick(); // ac1 on
-    vi.advanceTimersByTime(AC_RAMP_MS + 1000);
-    feedGen(cal, 5, 1); // ESP keep-alive during the ramp
-    await cal.tick();
-    feedGen(cal, 5, CAL_SAMPLES_GEN);
-    await cal.tick(); // L1 recorded
+    await cal.tick(); // ac1 on → ramp
+    await settleStep(cal, AC_RAMP_MS, 5, CAL_SAMPLES_GEN); // ramp → L1 recorded
 
     cal.requestAbort("user_control");
     await cal.tick();
@@ -293,5 +306,27 @@ describe("AcCalibrator state machine", () => {
     const { suggestedFit } = await cal.getResults();
     expect(suggestedFit.ac1.gen).toEqual({ baseAmps: 3, stepAmps: 2 });
     expect(suggestedFit.ac1.grid).toBeUndefined();
+  });
+
+  it("holds the ramp to the max cap when the draw never stabilizes, then samples", async () => {
+    const { cal } = createCalibrator();
+    feedGen(cal, 9, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
+    feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
+    await cal.tick(); // ac1 on → ramp
+
+    // Past the floor but the draw keeps drifting (spread > band) → no early release.
+    vi.advanceTimersByTime(AC_RAMP_MS + 1000);
+    for (const a of [4, 5, 6, 7]) feedGen(cal, a, 1);
+    await cal.tick();
+    expect(cal.getStatus().phase).toBe("ramp"); // not stable → still ramping
+
+    // Reaching the max cap forces the transition regardless of stability.
+    vi.advanceTimersByTime(CAL_RAMP_MAX_MS);
+    feedGen(cal, 6, 1); // keep-alive so the source stays gen
+    await cal.tick();
+    expect(cal.getStatus().phase).toBe("sample");
   });
 });

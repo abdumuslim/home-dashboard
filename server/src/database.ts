@@ -159,6 +159,21 @@ const MIGRATIONS: string[] = [
     last_set_fan SMALLINT NOT NULL,
     held_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`,
+  // Remembered stable gen level captured when an AC is auto-turned-off because
+  // its temperature left the comfort range — warm-restored fast on the next
+  // turn-on instead of re-discovering the level by slow climbing.
+  `CREATE TABLE IF NOT EXISTS ac_leveling_remembered_level (
+    device_id     TEXT PRIMARY KEY,
+    level         SMALLINT NOT NULL,
+    remembered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
+  // Persistent per-AC "beep off" preference — row present = collector re-sends
+  // set_beep 0 whenever the AC is observed on with the beep back on (firmware
+  // resets beepSwitch after a power-loss restart)
+  `CREATE TABLE IF NOT EXISTS ac_beep_off (
+    device_id TEXT PRIMARY KEY,
+    set_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
   // Per-AC measured draw at each gen level / fan speed, per source (re-runs overwrite)
   `CREATE TABLE IF NOT EXISTS ac_calibration_results (
     device_id   TEXT NOT NULL,

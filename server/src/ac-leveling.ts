@@ -68,6 +68,17 @@ export interface LevelerAcSnapshot {
   fanRestoreTarget: number | null;
   /** User changed the fan this over-limit episode — never fan-reduce again until it ends. */
   fanExempt: boolean;
+  /** A recent raise bounced (raise → over-limit → forced back) — never raise above this until it clears. */
+  bounceCap: number | null;
+  /** A recent restore bounced (restore → over-limit → re-shed) — skip in restore selection until it clears. */
+  restoreBlocked: boolean;
+  /**
+   * Remembered stable level from before a temperature-cycling off. When set and
+   * the AC just came back on below it, a raise up to this level may skip the
+   * headroom-streak gate (still budget-clamped, still deferred during
+   * settle/raise-hold) — we already know it was stable. Null = no warm start.
+   */
+  warmStartLevel: number | null;
 }
 
 export interface AllocatorInput {
@@ -77,6 +88,8 @@ export interface AllocatorInput {
   nonAcLoadAmps: number;
   /** Consecutive power readings with measured > limit. */
   overLimitStreak: number;
+  /** Consecutive power readings with measured > limit + OVER_LIMIT_SEVERE_AMPS (badly over → act faster). */
+  severeOverLimitStreak: number;
   /** Consecutive power readings with measured ≤ limit − margin. */
   headroomStreak: number;
   /** Within the settle window after the last command batch. */
@@ -108,8 +121,17 @@ export interface AllocationResult {
   projectedAmps: number;
 }
 
-/** Readings over the limit required before a reactive reduction (gen current fluctuates). */
-export const REDUCE_STREAK = 4;
+/**
+ * Reactive-reduction gate. When measured is only just over the limit (gen
+ * current fluctuates, a single blip is noise) we wait for a longer streak; a
+ * dip back below the limit resets it. When measured is clearly over (> limit +
+ * OVER_LIMIT_SEVERE_AMPS) a short streak acts fast — the overload is real.
+ */
+export const REDUCE_STREAK = 5;
+/** Readings over limit + OVER_LIMIT_SEVERE_AMPS required for a fast reactive reduction. */
+export const REDUCE_STREAK_SEVERE = 2;
+/** Amps above the raw limit that classify a reading as "severely" over (fast path). */
+export const OVER_LIMIT_SEVERE_AMPS = 1;
 /** Readings with headroom required before raising a level or restoring a shed AC. */
 export const RAISE_STREAK = 6;
 /** Power reading older than this means no electricity (matches /api/current/power). */
@@ -159,6 +181,19 @@ export const RAISE_HOLD_MS = 120_000;
 export const RESTORE_HOLD_MS = 180_000;
 /** Fresh readings needed before the effect check can release a hold (~4 × 5s ESP). */
 export const RAISE_HOLD_CHECK_AFTER_MS = 20_000;
+/**
+ * Bounce caps: a raise whose amps arrive but push the total OVER the limit gets
+ * reactively reduced right back — without memory the allocator would pick the
+ * same AC again two minutes later (raise → over-limit → reduce loop). The
+ * bounce records the raise's OBSERVED cost (peak measured − pre-raise measured)
+ * and the device only retries once the total load drops enough to absorb that
+ * observed cost under the limit. The observed cost is clamped to at most the
+ * model step + this slack so a coincident background spike can't lock the cap
+ * at an impossible threshold.
+ */
+export const BOUNCE_MAX_EXTRA_AMPS = 3;
+/** Safety net: a bounce record older than this is dropped regardless (corrupted baseline insurance). */
+export const BOUNCE_SAFETY_EXPIRY_MS = 3_600_000;
 
 const DEFAULT_AMP_MODEL: AcAmpModel = { baseAmps: 2, stepAmps: 1 };
 
@@ -213,12 +248,14 @@ function floorOf(ac: LevelerAcSnapshot): number {
   return floor;
 }
 
-/** Ceiling from need tier / manual intents, never below the floor. */
+/** Ceiling from need tier / manual intents / bounce caps, never below the floor. */
 function ceilOf(ac: LevelerAcSnapshot): number {
   const cap = ac.manualTarget != null
     ? ac.manualTarget
     : Math.min(needCap(ac.needTier, ac.maxLevel), ac.manualCap ?? ac.maxLevel);
-  return Math.max(floorOf(ac), Math.min(cap, ac.maxLevel));
+  // A bounce cap also defers manualTarget-driven raises — the target stays,
+  // the retry waits for the load to drop. Hard boost floors still win (max).
+  return Math.max(floorOf(ac), Math.min(cap, ac.bounceCap ?? ac.maxLevel, ac.maxLevel));
 }
 
 /**
@@ -229,7 +266,12 @@ function ceilOf(ac: LevelerAcSnapshot): number {
  */
 function softCeilOf(ac: LevelerAcSnapshot): number {
   if (ac.needTier === "satisfied") return ceilOf(ac);
-  const cap = Math.min(ac.maxLevel, ac.manualCap ?? ac.maxLevel, ac.manualTarget ?? ac.maxLevel);
+  const cap = Math.min(
+    ac.maxLevel,
+    ac.manualCap ?? ac.maxLevel,
+    ac.manualTarget ?? ac.maxLevel,
+    ac.bounceCap ?? ac.maxLevel,
+  );
   return Math.max(floorOf(ac), cap);
 }
 
@@ -251,7 +293,10 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   // Reductions/sheds need either a sustained over-limit streak (reactive) or a
   // structural change (proactive). They deliberately ignore the settle window —
   // safety first; the caller resets streaks after executing reductions.
-  const canReduce = input.forceEvaluate || input.overLimitStreak >= REDUCE_STREAK;
+  const canReduce =
+    input.forceEvaluate ||
+    input.overLimitStreak >= REDUCE_STREAK ||
+    input.severeOverLimitStreak >= REDUCE_STREAK_SEVERE;
   const canRaise = !input.inSettle && !input.raiseHold && input.headroomStreak >= RAISE_STREAK;
 
   // Baseline: every ON managed AC at its floor (L1, or the boost minimum).
@@ -282,7 +327,11 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   // (overBudget), no restore is attempted.
   let restorePick: string | null = null;
   if (canRaise && !overBudget) {
-    const restoreOrder = restoreCandidates.slice().sort((a, b) => b.needDelta - a.needDelta);
+    // A restore that bounced (over-limit → re-shed) waits for the load to drop
+    // before another attempt — the next-most-needy unblocked room goes first.
+    const restoreOrder = restoreCandidates
+      .filter((a) => !a.restoreBlocked)
+      .sort((a, b) => b.needDelta - a.needDelta);
     for (const a of restoreOrder) {
       const floorDraw = draw(a, floorOf(a));
       if (cost + floorDraw <= budgetAmps) {
@@ -388,10 +437,20 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       desiredLevels[a.deviceId] = target;
       continue;
     }
-    if (target > a.currentLevel && canRaise && toRestore.length === 0 && !anyHoldPending) {
-      // Jump straight to the budget-fitted ideal — the amp model is the guess,
-      // the measurement feedback loop is the adjustment.
-      desiredLevels[a.deviceId] = target;
+    if (target > a.currentLevel && toRestore.length === 0 && !anyHoldPending) {
+      if (canRaise) {
+        // Jump straight to the budget-fitted ideal — the amp model is the guess,
+        // the measurement feedback loop is the adjustment.
+        desiredLevels[a.deviceId] = target;
+      } else if (a.warmStartLevel != null && !input.inSettle && !input.raiseHold) {
+        // Warm restore: the AC just came back from a temperature cycle and we
+        // remember the level it was stable at. Skip the slow headroom-streak
+        // rediscovery and jump straight there — but only up to the remembered
+        // level (going higher still needs a confirmed raise), still capped by
+        // the budget-fitted target, and still deferred during settle/raise-hold.
+        const warm = Math.min(target, a.warmStartLevel);
+        if (warm > a.currentLevel) desiredLevels[a.deviceId] = warm;
+      }
     }
   }
 

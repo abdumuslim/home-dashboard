@@ -47,6 +47,12 @@ export interface AcLevelingAcStatus {
   heldFan: number | null;
   /** Original fan the hold will restore to (0 = built-in auto). */
   fanOriginal: number | null;
+  /** A recent raise bounced over the limit — raises capped here until the load drops (null = no bounce). */
+  bounceCap: number | null;
+  /** Measured total below which the bounced raise/restore is retried. */
+  bounceRetryBelowAmps: number | null;
+  /** A recent restore bounced (re-shed) — restore attempts paused until the load drops. */
+  restoreBlocked: boolean;
 }
 
 export interface AcLevelingStatus {
@@ -57,6 +63,8 @@ export interface AcLevelingStatus {
   budgetAmps: number | null;
   nonAcLoadAmps: number | null;
   overLimitStreak: number;
+  /** Consecutive readings badly over the limit (> limit + 1A) — drives the fast reduce path. */
+  severeOverLimitStreak: number;
   headroomStreak: number;
   settleRemainingMs: number;
   /** Raises paused because the last raise's amps never showed up (0 = no hold). */

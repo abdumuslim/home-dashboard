@@ -64,6 +64,7 @@ async function main(): Promise<void> {
       reconcileDevices: (devices) => collector.reconcileAcManualOffLocks(devices),
       onUserFanChange: (deviceId) => collector.noteUserAcFanChange(deviceId),
       onUserFanAuto: (deviceId) => collector.noteUserAcFanAuto(deviceId),
+      onUserBeep: (deviceId, beepOn) => collector.noteUserAcBeep(deviceId, beepOn),
     },
     {
       getConfig: () => collector.acLeveler.getConfig(),

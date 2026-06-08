@@ -9,12 +9,17 @@ import {
   estimateAcDraw,
   needCap,
   AC_RAMP_MS,
+  BOUNCE_MAX_EXTRA_AMPS,
+  BOUNCE_SAFETY_EXPIRY_MS,
   NON_AC_FREEZE_MS,
+  OVER_LIMIT_SEVERE_AMPS,
   PREDICTION_WARN_AMPS,
   RAISE_HOLD_MS,
   RAISE_HOLD_CHECK_AFTER_MS,
   RESTORE_HOLD_MS,
   RAISE_STREAK,
+  REDUCE_STREAK,
+  REDUCE_STREAK_SEVERE,
   SETTLE_MS,
   SHED_CLEAR_GRACE_MS,
   STALE_POWER_MS,
@@ -70,6 +75,12 @@ export interface AcLevelingAcStatus {
   heldFan: number | null;
   /** Original fan the hold will restore to (0 = built-in auto). */
   fanOriginal: number | null;
+  /** A recent raise bounced over the limit — raises capped here until the load drops (null = no bounce). */
+  bounceCap: number | null;
+  /** Measured total below which the bounced raise/restore is retried. */
+  bounceRetryBelowAmps: number | null;
+  /** A recent restore bounced (re-shed) — restore attempts paused until the load drops. */
+  restoreBlocked: boolean;
 }
 
 export interface AcLevelingStatus {
@@ -80,6 +91,8 @@ export interface AcLevelingStatus {
   budgetAmps: number | null;
   nonAcLoadAmps: number | null;
   overLimitStreak: number;
+  /** Consecutive readings badly over the limit (> limit + 1A) — drives the fast reduce path. */
+  severeOverLimitStreak: number;
   headroomStreak: number;
   settleRemainingMs: number;
   /** Raises paused because the last raise's amps never showed up (0 = no hold). */
@@ -110,6 +123,8 @@ export class AcLeveler {
   private lastSource: PowerSource = "none";
   private recentMeasured: number[] = [];
   private overLimitStreak = 0;
+  /** Consecutive readings measured > limit + OVER_LIMIT_SEVERE_AMPS — the fast reduce path. */
+  private severeOverLimitStreak = 0;
   private headroomStreak = 0;
   // Runtime control state
   private lastSetLevel = new Map<string, number>();
@@ -121,6 +136,10 @@ export class AcLeveler {
   private prevPowerStates = new Map<string, boolean>();
   private rampUntil = new Map<string, number>();
   private boostActive = new Map<string, boolean>();
+  // Stable gen level remembered when an AC is auto-turned-off because its
+  // temperature left the comfort range — warm-restored on the next turn-on
+  // (persisted so a deploy mid-cycle doesn't force a slow re-climb).
+  private rememberedLevel = new Map<string, number>();
   private deviceNames = new Map<string, string>();
   private settleUntil = 0;
   private forceEvaluate = false;
@@ -139,6 +158,27 @@ export class AcLeveler {
    * or wait until `until` (2 min for fan/level raises, 3 min for turn-ons).
    */
   private raiseHold: { until: number; expectedAmps: number; threshold: number; checkAfter: number } | null = null;
+  /**
+   * Last raise batch — the bounce attribution window. A reactive over-limit
+   * reduction that undoes one of these raises (or re-sheds one of these
+   * restores) before `windowUntil` is a BOUNCE: the raise delivered amps but
+   * pushed the total over the limit. `preMeasured` (smoothed measured at
+   * command time) lets the bounce record the raise's OBSERVED cost.
+   */
+  private lastRaiseBatch: {
+    windowUntil: number;
+    preMeasured: number;
+    raised: Map<string, number>;
+    restored: Set<string>;
+  } | null = null;
+  /**
+   * Bounce records (in-memory — lost on restart, accepted like manual gen
+   * intents). The device retries only once the measured total drops below
+   * `limit − margin − requiredAmps` (its observed cost now fits), on a
+   * structural change (power cycle, source change, manual gen change, config
+   * save), or after the safety expiry.
+   */
+  private bounce = new Map<string, { kind: "level" | "restore"; cap: number | null; requiredAmps: number; until: number }>();
 
   constructor(pool: pg.Pool, deps: AcLevelerDeps) {
     this.pool = pool;
@@ -168,6 +208,10 @@ export class AcLeveler {
         lastSetFan: Number(row.last_set_fan),
       });
     }
+    const remRes = await this.pool.query("SELECT device_id, level FROM ac_leveling_remembered_level");
+    for (const row of remRes.rows) {
+      this.rememberedLevel.set(String(row.device_id), Number(row.level));
+    }
     this.loaded = true;
     if (this.shedIds.size > 0) {
       log.info(`[leveler] Loaded ${this.shedIds.size} shed device(s) from DB`);
@@ -191,6 +235,10 @@ export class AcLeveler {
     );
     this.config = cfg;
     this.forceEvaluate = true;
+    // Limits/amp models may have changed (e.g. calibration applied) — old
+    // bounce evidence no longer describes the world.
+    this.bounce.clear();
+    this.lastRaiseBatch = null;
     if (!cfg.enabled) {
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
@@ -239,6 +287,8 @@ export class AcLeveler {
   private async recordShed(deviceId: string, reason: string): Promise<void> {
     this.shedIds.add(deviceId);
     this.shedTimes.set(deviceId, Date.now());
+    // A shed/restore is governed by the floor-based restore path, not warm start.
+    await this.clearRememberedLevel(deviceId, "shed");
     await this.pool.query(
       `INSERT INTO ac_leveling_shed (device_id, shed_at, reason) VALUES ($1, NOW(), $2)
        ON CONFLICT (device_id) DO UPDATE SET shed_at = NOW(), reason = EXCLUDED.reason`,
@@ -285,6 +335,32 @@ export class AcLeveler {
     log.info(`[leveler] Released fan hold for AC ${deviceId} (${reason})`);
   }
 
+  /**
+   * Remember the level this AC was stable at, captured by the collector right
+   * before a temperature-cycling auto-off. On the next turn-on the allocator
+   * warm-restores straight to it (budget permitting) instead of re-climbing.
+   * Only stores levels above the base floor — L1 is the default restore anyway.
+   */
+  async rememberStableLevel(deviceId: string): Promise<void> {
+    await this.ensureLoaded();
+    if (!this.config.enabled) return;
+    const level = this.lastSetLevel.get(deviceId);
+    if (level == null || level < 2) return;
+    this.rememberedLevel.set(deviceId, level);
+    await this.pool.query(
+      `INSERT INTO ac_leveling_remembered_level (device_id, level, remembered_at) VALUES ($1, $2, NOW())
+       ON CONFLICT (device_id) DO UPDATE SET level = EXCLUDED.level, remembered_at = NOW()`,
+      [deviceId, level],
+    );
+    log.info(`[leveler] Remembered stable level L${level} for AC ${this.deviceNames.get(deviceId) ?? deviceId} (temperature cycle)`);
+  }
+
+  private async clearRememberedLevel(deviceId: string, reason: string): Promise<void> {
+    if (!this.rememberedLevel.delete(deviceId)) return;
+    await this.pool.query("DELETE FROM ac_leveling_remembered_level WHERE device_id = $1", [deviceId]);
+    log.info(`[leveler] Cleared remembered level for AC ${this.deviceNames.get(deviceId) ?? deviceId} (${reason})`);
+  }
+
   /** Observed ON out-of-band — clear shed after the shadow-lag grace period. */
   async reconcileObservedOn(deviceId: string): Promise<void> {
     if (!this.shedIds.has(deviceId)) return;
@@ -303,6 +379,7 @@ export class AcLeveler {
     if (source !== this.lastSource) {
       this.lastSource = source;
       this.overLimitStreak = 0;
+      this.severeOverLimitStreak = 0;
       this.headroomStreak = 0;
       this.recentMeasured = [];
       this.forceEvaluate = true;
@@ -311,6 +388,9 @@ export class AcLeveler {
       this.freezeUntil = 0;
       this.expected = null;
       this.raiseHold = null;
+      // Bounce evidence is per-source (different limit + amp models).
+      this.bounce.clear();
+      this.lastRaiseBatch = null;
       log.info(`[leveler] Power source changed → ${source}`);
     }
     if (source === "none") return;
@@ -323,12 +403,17 @@ export class AcLeveler {
     if (measured > limit) {
       this.overLimitStreak++;
       this.headroomStreak = 0;
+      // Badly over → escalate the fast path; a merely-mild reading breaks it.
+      if (measured > limit + OVER_LIMIT_SEVERE_AMPS) this.severeOverLimitStreak++;
+      else this.severeOverLimitStreak = 0;
     } else if (measured <= limit - this.config.marginAmps) {
       this.headroomStreak++;
       this.overLimitStreak = 0;
+      this.severeOverLimitStreak = 0;
     } else {
       // Inside the margin band — neither raise nor reduce.
       this.overLimitStreak = 0;
+      this.severeOverLimitStreak = 0;
       this.headroomStreak = 0;
     }
   }
@@ -357,11 +442,13 @@ export class AcLeveler {
     await this.ensureLoaded();
     // User confirmed OFF — the shed no longer drives this device (manual-off lock takes over).
     await this.clearShed(deviceId, "user_power_off");
+    await this.clearRememberedLevel(deviceId, "user_power_off");
     this.manualCap.delete(deviceId);
     this.manualTarget.delete(deviceId);
     this.lastSetLevel.delete(deviceId);
     await this.clearFanHold(deviceId, "user_power_off");
     this.fanExempt.delete(deviceId);
+    this.bounce.delete(deviceId);
     this.forceEvaluate = true;
   }
 
@@ -377,6 +464,7 @@ export class AcLeveler {
     await this.clearShed(deviceId, "user_power_on");
     // Compressor ramp window — see the nonAcLoad derivation in tick()
     this.rampUntil.set(deviceId, Date.now() + AC_RAMP_MS);
+    this.bounce.delete(deviceId);
     this.forceEvaluate = true;
   }
 
@@ -395,6 +483,10 @@ export class AcLeveler {
     const maxLevel = device.maxGeneratorLevel || 3;
     const previous = this.lastSetLevel.get(deviceId) ?? device.generatorMode;
     const rank = (l: number): number => (l <= 0 ? maxLevel + 1 : Math.min(l, maxLevel));
+    // Manual intent replaces bounce evidence (manualCap/manualTarget take over)
+    // and any warm-restore target — the user owns the level now.
+    this.bounce.delete(deviceId);
+    await this.clearRememberedLevel(deviceId, "manual_gen_change");
 
     if (rank(level) < rank(previous)) {
       // Manual reduction — user override; never raise above it again.
@@ -453,7 +545,8 @@ export class AcLeveler {
     let active = this.boostActive.get(deviceId) ?? false;
     if (outdoorTempC != null) {
       if (outdoorTempC >= boost.outdoorAtLeastC) active = true;
-      else if (outdoorTempC < boost.outdoorAtLeastC - 1) active = false;
+      // Releases AT threshold−1 (e.g. 37° boost releases at exactly 36.0°).
+      else if (outdoorTempC <= boost.outdoorAtLeastC - 1) active = false;
     }
     if (active !== (this.boostActive.get(deviceId) ?? false)) {
       log.info(`[leveler] ${this.deviceNames.get(deviceId) ?? deviceId}: outdoor ${outdoorTempC}°C → min level boost ${active ? "ON" : "OFF"} (min L${boost.minLevel})`);
@@ -499,6 +592,9 @@ export class AcLeveler {
         this.rampUntil.delete(device.id);
         await this.clearFanHold(device.id, "power_off");
         this.fanExempt.delete(device.id);
+        // Level-bounce caps reset on a power cycle. Restore-kind records must
+        // survive here — a restore-bounced shed AC is off every tick.
+        if (this.bounce.get(device.id)?.kind === "level") this.bounce.delete(device.id);
       }
     }
 
@@ -549,6 +645,7 @@ export class AcLeveler {
     if (source === "none") {
       // No electricity / no ESP signal — pause decisions, reset gating.
       this.overLimitStreak = 0;
+      this.severeOverLimitStreak = 0;
       this.headroomStreak = 0;
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
@@ -559,6 +656,31 @@ export class AcLeveler {
     }
     const limit = source === "grid" ? this.config.gridLimitAmps : this.config.genLimitAmps;
 
+    // Bounce retry check: a bounced raise/restore unlocks once the measured
+    // total drops enough to absorb its OBSERVED cost under the limit, or the
+    // safety expiry passes. Settle-window readings are skipped — they still
+    // show the pre-command draw.
+    if (this.bounce.size > 0) {
+      const nowMs = Date.now();
+      const smoothed = this.smoothedMeasured();
+      for (const [deviceId, entry] of [...this.bounce]) {
+        if (nowMs >= entry.until) {
+          this.bounce.delete(deviceId);
+          log.info(`[leveler] ${this.deviceNames.get(deviceId) ?? deviceId}: bounce record expired (safety net)`);
+        } else if (
+          !inSettle &&
+          this.recentMeasured.length >= 4 &&
+          smoothed + entry.requiredAmps <= limit - this.config.marginAmps
+        ) {
+          this.bounce.delete(deviceId);
+          log.info(
+            `[leveler] ${this.deviceNames.get(deviceId) ?? deviceId}: load dropped ` +
+            `(${smoothed.toFixed(1)}A + ${entry.requiredAmps.toFixed(1)}A observed cost fits under ${limit}A) — bounce ${entry.kind === "level" ? `cap L${entry.cap}` : "restore block"} cleared`,
+          );
+        }
+      }
+    }
+
     // Snapshots sorted by configured priority (unknown devices go last).
     const order = new Map(this.config.priority.map((id, i) => [id, i]));
     const sorted = [...ctx].sort(
@@ -566,13 +688,22 @@ export class AcLeveler {
     );
     const snapshots: LevelerAcSnapshot[] = sorted.map(({ device, managed, needTier, needDelta }) => {
       const maxLevel = device.maxGeneratorLevel || 3;
+      const currentLevel = inSettle ? (this.lastSetLevel.get(device.id) ?? device.generatorMode) : device.generatorMode;
+      // Warm restore: a remembered level still above where the AC came back on.
+      // rank() treats 0 (unrestricted) as above the top — that case is capped by
+      // the level-0 rule, not warm start.
+      const rank = (l: number): number => (l <= 0 ? maxLevel + 1 : Math.min(l, maxLevel));
+      const remembered = this.rememberedLevel.get(device.id);
+      const warmStartLevel = managed && device.power && remembered != null && rank(currentLevel) < remembered
+        ? remembered
+        : null;
       return {
         deviceId: device.id,
         on: device.power,
         managed,
         shed: this.shedIds.has(device.id),
         maxLevel,
-        currentLevel: inSettle ? (this.lastSetLevel.get(device.id) ?? device.generatorMode) : device.generatorMode,
+        currentLevel,
         minLevel: this.minLevelFor(device.id, maxLevel, outdoorTempC),
         needTier,
         needDelta,
@@ -583,8 +714,23 @@ export class AcLeveler {
           : device.fanSpeed) ?? null,
         fanRestoreTarget: this.fanHold.get(device.id)?.originalFan ?? null,
         fanExempt: this.fanExempt.has(device.id),
+        bounceCap: (() => {
+          const entry = this.bounce.get(device.id);
+          return entry?.kind === "level" ? entry.cap : null;
+        })(),
+        restoreBlocked: this.bounce.get(device.id)?.kind === "restore",
+        warmStartLevel,
       };
     });
+
+    // Clear remembered levels that have been reached (or whose AC is on at/above
+    // it) — the warm restore is done. Off devices keep their memory for the
+    // next turn-on.
+    for (const s of snapshots) {
+      if (s.warmStartLevel == null && s.on && s.managed && this.rememberedLevel.has(s.deviceId)) {
+        await this.clearRememberedLevel(s.deviceId, "reached");
+      }
+    }
 
     // A manual-off-locked shed AC can never be restored — clear the shed now
     // so the allocator doesn't reduce running ACs to make room for a restore
@@ -666,6 +812,7 @@ export class AcLeveler {
       marginAmps: this.config.marginAmps,
       nonAcLoadAmps: nonAcLoad,
       overLimitStreak: this.overLimitStreak,
+      severeOverLimitStreak: this.severeOverLimitStreak,
       headroomStreak: this.headroomStreak,
       inSettle,
       raiseHold: this.raiseHold != null,
@@ -675,9 +822,14 @@ export class AcLeveler {
     };
     const result = computeAllocation(input);
     this.forceEvaluate = false;
+    // Over-limit-driven reductions in this batch are bounce candidates;
+    // captured here because execute() resets the streaks afterwards.
+    const reactive =
+      this.overLimitStreak >= REDUCE_STREAK ||
+      this.severeOverLimitStreak >= REDUCE_STREAK_SEVERE;
     // Execute BEFORE building status so the same tick reports the settle
     // window it just opened, fresh sheds, reset streaks, and the expectation.
-    await this.execute(tcl, snapshots, result, source, limit);
+    await this.execute(tcl, snapshots, result, source, limit, reactive);
     this.lastStatus = this.buildStatus(ctx, source, measured, limit, result);
   }
 
@@ -687,12 +839,33 @@ export class AcLeveler {
     result: AllocationResult,
     source: PowerSource,
     limit: number,
+    reactive: boolean,
   ): Promise<void> {
     let sentAny = false;
     let didReduce = false;
     let raisedAmps = 0;
+    const raisedNow = new Map<string, number>();
     const restoredNow = new Set<string>();
     const name = (id: string): string => this.deviceNames.get(id) ?? id;
+    const startedAt = Date.now();
+    // Reactive reductions that undo the last raise batch are bounces: the
+    // raise's amps arrived but pushed the total over the limit. Record the
+    // observed cost so the retry waits for the load to actually drop.
+    const batch = reactive && this.lastRaiseBatch && startedAt <= this.lastRaiseBatch.windowUntil
+      ? this.lastRaiseBatch
+      : null;
+    const peakMeasured = batch ? this.smoothedMeasured() : 0;
+    const recordBounce = (deviceId: string, kind: "level" | "restore", cap: number | null, anchorAmps: number): void => {
+      const observed = peakMeasured - batch!.preMeasured;
+      const requiredAmps = Math.min(Math.max(observed, anchorAmps), anchorAmps + BOUNCE_MAX_EXTRA_AMPS);
+      this.bounce.set(deviceId, { kind, cap, requiredAmps, until: startedAt + BOUNCE_SAFETY_EXPIRY_MS });
+      this.lastRaiseBatch = null; // consumed — one bounce attribution per batch
+      log.warn(
+        `[leveler] ${name(deviceId)}: ${kind === "level" ? `raise bounced — capped at L${cap}` : "restore bounced — re-shed"} ` +
+        `(observed cost ${requiredAmps.toFixed(1)}A, retry below ` +
+        `${(limit - this.config.marginAmps - requiredAmps).toFixed(1)}A measured) — consider calibrating the amp model`,
+      );
+    };
 
     for (const [deviceId, level] of Object.entries(result.desiredLevels)) {
       const snap = snapshots.find((s) => s.deviceId === deviceId);
@@ -701,11 +874,20 @@ export class AcLeveler {
         this.lastSetLevel.set(deviceId, level);
         sentAny = true;
         if (snap && (snap.currentLevel === 0 || level < snap.currentLevel)) didReduce = true;
+        const raisedTo = batch?.raised.get(deviceId);
+        if (raisedTo != null && level < raisedTo) {
+          // This reduction undoes a raise from the still-open batch — bounce.
+          const model = this.ampModelFor(deviceId, source);
+          const anchor = estimateAcDraw(raisedTo, snap?.maxLevel ?? 1, model)
+            - estimateAcDraw(level, snap?.maxLevel ?? 1, model);
+          recordBounce(deviceId, "level", level, anchor);
+        }
         if (snap && snap.currentLevel >= 1 && level > snap.currentLevel) {
           // Predicted extra draw from this raise — graded against measured later
           const model = this.ampModelFor(deviceId, source);
           raisedAmps += estimateAcDraw(level, snap.maxLevel, model)
             - estimateAcDraw(snap.currentLevel, snap.maxLevel, model);
+          raisedNow.set(deviceId, level);
         }
         log.info(
           `[leveler] ${name(deviceId)}: gen level ${snap?.currentLevel ?? "?"} → L${level} ` +
@@ -754,6 +936,17 @@ export class AcLeveler {
         await this.recordShed(deviceId, `over ${limit}A on ${source}`);
         await this.clearFanHold(deviceId, "shed");
         this.fanExempt.delete(deviceId);
+        if (batch?.restored.has(deviceId)) {
+          // Re-shed of an AC the batch just restored — restore bounce. Anchor
+          // on its floor draw (what the next restore attempt would add).
+          const snap = snapshots.find((s) => s.deviceId === deviceId);
+          const anchor = estimateAcDraw(
+            Math.max(1, Math.min(snap?.minLevel ?? 1, snap?.maxLevel ?? 1)),
+            snap?.maxLevel ?? 1,
+            this.ampModelFor(deviceId, source),
+          );
+          recordBounce(deviceId, "restore", null, anchor);
+        }
         sentAny = true;
         didReduce = true;
         // Fire-and-forget — push HTTP calls must not block the collector loop
@@ -853,13 +1046,28 @@ export class AcLeveler {
       // Pure-reduction batches leave any existing hold untouched.
       const hasRaise = raisedAmps > 0 || restoredNow.size > 0 || result.toFanRaise != null;
       if (hasRaise) {
-        const holdMs = restoredNow.size > 0 ? RESTORE_HOLD_MS : RAISE_HOLD_MS;
+        // A warm-restore raise targets a still-ramping just-turned-on AC, so it
+        // gets the longer turn-on hold — the compressor ramp is what we wait on.
+        const isTurnOn = restoredNow.size > 0 ||
+          [...raisedNow.keys()].some((id) => (this.rampUntil.get(id) ?? 0) > now);
+        const holdMs = isTurnOn ? RESTORE_HOLD_MS : RAISE_HOLD_MS;
         this.raiseHold = {
           until: now + holdMs,
           expectedAmps,
           threshold: Math.max(1, raisedAmps / 2),
           checkAfter: now + RAISE_HOLD_CHECK_AFTER_MS,
         };
+        if (raisedNow.size > 0 || restoredNow.size > 0) {
+          // Bounce attribution window: a reactive reduction that undoes one of
+          // these raises/restores before the hold would expire is a bounce.
+          // preMeasured = the smoothed total these raises were stacked onto.
+          this.lastRaiseBatch = {
+            windowUntil: now + holdMs,
+            preMeasured: this.smoothedMeasured(),
+            raised: raisedNow,
+            restored: new Set(restoredNow),
+          };
+        }
         log.info(
           `[leveler] Raise hold armed for ${holdMs / 1000}s — next raise once ` +
           `~${expectedAmps.toFixed(1)}A is seen on ${source} or the hold expires`,
@@ -871,6 +1079,7 @@ export class AcLeveler {
       // Note: restore-with-reduction batches land here too — the next restore
       // needs a fresh 6-reading headroom streak, which paces restores out.
       this.overLimitStreak = 0;
+      this.severeOverLimitStreak = 0;
       this.headroomStreak = 0;
     }
   }
@@ -892,6 +1101,7 @@ export class AcLeveler {
       budgetAmps: result?.budgetAmps ?? null,
       nonAcLoadAmps: result?.nonAcLoadAmps ?? null,
       overLimitStreak: this.overLimitStreak,
+      severeOverLimitStreak: this.severeOverLimitStreak,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
       raiseHoldRemainingMs: Math.max(0, (this.raiseHold?.until ?? 0) - Date.now()),
@@ -923,6 +1133,15 @@ export class AcLeveler {
           idealLevel: result?.idealLevels[device.id] ?? null,
           heldFan: this.fanHold.get(device.id)?.lastSetFan ?? null,
           fanOriginal: this.fanHold.get(device.id)?.originalFan ?? null,
+          bounceCap: (() => {
+            const entry = this.bounce.get(device.id);
+            return entry?.kind === "level" ? entry.cap : null;
+          })(),
+          bounceRetryBelowAmps: (() => {
+            const entry = this.bounce.get(device.id);
+            return entry && limit != null ? limit - this.config.marginAmps - entry.requiredAmps : null;
+          })(),
+          restoreBlocked: this.bounce.get(device.id)?.kind === "restore",
         };
       }),
     };
@@ -939,6 +1158,7 @@ export class AcLeveler {
       budgetAmps: null,
       nonAcLoadAmps: null,
       overLimitStreak: this.overLimitStreak,
+      severeOverLimitStreak: this.severeOverLimitStreak,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
       raiseHoldRemainingMs: Math.max(0, (this.raiseHold?.until ?? 0) - Date.now()),

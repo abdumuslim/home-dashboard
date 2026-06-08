@@ -36,6 +36,8 @@ export interface AcManualOffLockHandlers {
   onUserFanChange?(deviceId: string): void;
   /** UI fan set to Auto (0) — range automations resume fan control (delta-based smart auto). */
   onUserFanAuto?(deviceId: string): void;
+  /** UI beep toggle — beep off becomes a persistent enforced preference, beep on releases it. */
+  onUserBeep?(deviceId: string, beepOn: boolean): void;
 }
 
 export interface AcLevelingHandlers {
@@ -1192,6 +1194,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         acManualOffLocks?.onUserFanAuto?.(id);
       } else if (command === "set_fan_speed" || command === "set_turbo") {
         acManualOffLocks?.onUserFanChange?.(id);
+      } else if (command === "set_beep") {
+        acManualOffLocks?.onUserBeep?.(id, value === 1);
       }
       res.json({ ok: true });
     } catch (err) {

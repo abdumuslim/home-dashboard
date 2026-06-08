@@ -219,6 +219,13 @@ export class Collector {
   private readonly AC_MANUAL_OFF_CLEAR_GRACE_MS = 15_000;
   private acFanEnforcement = new Map<string, AcFanEnforcement>(); // key `${rule.id}:${deviceId}`
   private readonly AC_FAN_SETTLE_MS = 15_000;
+  // Persistent per-AC beep-off preference (firmware resets beepSwitch on power-loss restarts)
+  private acBeepOffPrefs = new Set<string>();
+  private acBeepPrefsLoaded = false;
+  private acBeepLastSent = new Map<string, number>();
+  private lastBeepDevicesFetch = 0;
+  private readonly AC_BEEP_RESEND_COOLDOWN_MS = 30_000;
+  private readonly AC_BEEP_FETCH_INTERVAL_MS = 30_000;
 
   getLatestAir(): Record<string, unknown> | null {
     return this.latestAirRow;
@@ -304,6 +311,76 @@ export class Collector {
       }
     }
     return this.getAcManualOffLockedIds(devices.map((dev) => dev.id));
+  }
+
+  private async ensureAcBeepPrefsLoaded(): Promise<void> {
+    if (this.acBeepPrefsLoaded) return;
+    const result = await this.pool.query("SELECT device_id FROM ac_beep_off");
+    this.acBeepOffPrefs = new Set(result.rows.map((row) => String(row.device_id)));
+    this.acBeepPrefsLoaded = true;
+  }
+
+  /** UI beep toggle — beep off becomes a persistent enforced preference, beep on releases it. */
+  noteUserAcBeep(deviceId: string, beepOn: boolean): void {
+    void (beepOn ? this.clearAcBeepOff(deviceId) : this.recordAcBeepOff(deviceId)).catch((err) => {
+      log.error(`[collector] AC ${deviceId}: beep pref update failed:`, err);
+    });
+  }
+
+  private async recordAcBeepOff(deviceId: string): Promise<void> {
+    await this.ensureAcBeepPrefsLoaded();
+    const wasSet = this.acBeepOffPrefs.has(deviceId);
+    this.acBeepOffPrefs.add(deviceId);
+    // The UI just sent set_beep 0 itself — give the shadow time to reflect it
+    this.acBeepLastSent.set(deviceId, Date.now());
+    await this.pool.query(
+      "INSERT INTO ac_beep_off (device_id) VALUES ($1) ON CONFLICT (device_id) DO NOTHING",
+      [deviceId],
+    );
+    if (!wasSet) log.info(`[collector] AC ${deviceId}: beep-off preference recorded`);
+  }
+
+  private async clearAcBeepOff(deviceId: string): Promise<void> {
+    await this.ensureAcBeepPrefsLoaded();
+    const wasSet = this.acBeepOffPrefs.delete(deviceId);
+    this.acBeepLastSent.delete(deviceId);
+    if (wasSet) {
+      await this.pool.query("DELETE FROM ac_beep_off WHERE device_id = $1", [deviceId]);
+      log.info(`[collector] AC ${deviceId}: beep-off preference cleared`);
+    }
+  }
+
+  /** Re-send set_beep 0 to any beep-off AC observed on with the beep back on. */
+  private async checkAcBeepEnforcement(): Promise<void> {
+    if (!this.tclCloud || !this.tclCloud.isReady()) return;
+    if (this.acCalibrator.isActive()) return; // calibration owns the ACs
+    await this.ensureAcBeepPrefsLoaded();
+    if (this.acBeepOffPrefs.size === 0) return;
+
+    // Shared cache is refreshed most ticks by automations/leveler/frontend;
+    // our own gated fetch keeps enforcement alive when nothing else polls.
+    let devices = this.tclCloud.getDevices();
+    if (devices.length === 0 || Date.now() - this.lastBeepDevicesFetch > this.AC_BEEP_FETCH_INTERVAL_MS) {
+      try {
+        devices = await this.tclCloud.fetchDevicesLive();
+      } catch (err) {
+        log.warn(`[collector] Beep enforcement device refresh failed, using cache: ${(err as Error).message}`);
+      }
+      this.lastBeepDevicesFetch = Date.now();
+    }
+
+    for (const dev of devices) {
+      if (!this.acBeepOffPrefs.has(dev.id) || !dev.power || !dev.beep) continue;
+      const lastSent = this.acBeepLastSent.get(dev.id) ?? 0;
+      if (Date.now() - lastSent < this.AC_BEEP_RESEND_COOLDOWN_MS) continue;
+      try {
+        await this.tclCloud.sendControl(dev.id, "set_beep", 0);
+        this.acBeepLastSent.set(dev.id, Date.now());
+        log.info(`[collector] AC ${dev.id}: beep came back on — re-sent beep off`);
+      } catch (err) {
+        log.warn(`[collector] AC ${dev.id}: beep-off re-send failed: ${(err as Error).message}`);
+      }
+    }
   }
 
   constructor(pool: pg.Pool, config: Config) {
@@ -446,6 +523,12 @@ export class Collector {
       await this.checkAcLeveling();
     } catch (err) {
       log.error("[collector] AC leveling check failed:", err);
+    }
+
+    try {
+      await this.checkAcBeepEnforcement();
+    } catch (err) {
+      log.error("[collector] AC beep enforcement failed:", err);
     }
 
     // Retry TCL Cloud init if it failed previously (every 5 minutes)
@@ -1123,6 +1206,8 @@ export class Collector {
             if (power === "on") {
               if (shouldTurnOff) {
                 log.info(`[collector] AC range "${rule.name}": device ${did} is ON past turn-off limit (${rule.metric}=${value}), turning OFF`);
+                // Temperature-cycling off — remember the stable level for warm restore.
+                await this.acLeveler.rememberStableLevel(did);
                 await this.executeAutomationAction(rule, { power: 0 } as AcAction, [did]);
                 this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
               } else {
@@ -1151,6 +1236,9 @@ export class Collector {
       if (shouldTurnOff) {
         log.info(`[collector] AC range "${rule.name}": ${rule.metric}=${value}, turning OFF [${deviceNames}]`);
         try {
+          // Temperature-cycling off: remember each AC's stable level so the next
+          // turn-on warm-restores straight to it instead of slow re-climbing.
+          for (const did of deviceIds) await this.acLeveler.rememberStableLevel(did);
           await this.executeAutomationAction(rule, { power: 0 } as AcAction, deviceIds);
           // The automation owns the OFF now — a leveler shed must not restore it
           for (const did of deviceIds) {
