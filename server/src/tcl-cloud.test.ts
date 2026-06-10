@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { TclCloud, type AcDevice, type AcAction } from "./tcl-cloud.js";
+import { TclCloud, latestReportedAtMs, deviceOnline, SHADOW_STALE_MS, type AcDevice, type AcAction } from "./tcl-cloud.js";
 
 // Regression tests for the fan/turbo coupling on non-Najat models (TAC-12CHSD):
 // fan_speed 7 IS turbo:1/windSpeed:0 and fan_speed 1 IS silenceSwitch:1, so a
@@ -12,6 +12,7 @@ function acDevice(overrides: Partial<AcDevice>): AcDevice {
     id: "ac1",
     name: "Abdu AC",
     isOnline: true,
+    lastSeenAt: null,
     power: true,
     mode: 1,
     targetTemp: 25,
@@ -99,5 +100,44 @@ describe("buildProfileShadowPayload fan/turbo coupling (non-Najat)", () => {
     const tcl = tclWithDevice(acDevice({}));
     const payload = buildPayload(tcl, "ac1", { turbo: 1 });
     expect(payload).toEqual({ turbo: 1 });
+  });
+});
+
+describe("shadow freshness → online flag (blackout detection)", () => {
+  it("latestReportedAtMs takes the newest per-field timestamp and converts seconds→ms", () => {
+    expect(latestReportedAtMs({
+      powerSwitch: { timestamp: 1000 },
+      currentTemperature: { timestamp: 1500 },
+      workMode: { timestamp: 1200 },
+    })).toBe(1500 * 1000);
+  });
+
+  it("latestReportedAtMs returns null when metadata is missing or empty", () => {
+    expect(latestReportedAtMs(undefined)).toBeNull();
+    expect(latestReportedAtMs({})).toBeNull();
+    expect(latestReportedAtMs({ x: {} })).toBeNull();
+  });
+
+  it("trusts TCL's online flag regardless of shadow freshness", () => {
+    const stale = Date.now() - SHADOW_STALE_MS - 60_000;
+    expect(deviceOnline(true, true, stale, Date.now(), SHADOW_STALE_MS)).toBe(true);
+  });
+
+  it("marks a blacked-out AC offline: TCL offline + a stale (persisted) shadow", () => {
+    const now = 10_000_000;
+    const stale = now - SHADOW_STALE_MS - 1;
+    expect(deviceOnline(false, true, stale, now, SHADOW_STALE_MS)).toBe(false);
+  });
+
+  it("keeps a live AC online: TCL offline but the shadow reported recently", () => {
+    const now = 10_000_000;
+    const fresh = now - 30_000;
+    expect(deviceOnline(false, true, fresh, now, SHADOW_STALE_MS)).toBe(true);
+  });
+
+  it("falls back to legacy has-shadow behavior when no freshness metadata exists", () => {
+    const now = 10_000_000;
+    expect(deviceOnline(false, true, null, now, SHADOW_STALE_MS)).toBe(true);
+    expect(deviceOnline(false, false, null, now, SHADOW_STALE_MS)).toBe(false);
   });
 });

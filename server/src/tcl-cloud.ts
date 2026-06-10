@@ -5,6 +5,46 @@ import { childLogger } from "./logger.js";
 
 const log = childLogger("tcl");
 
+/**
+ * An AC counts as online only if its TCL/AWS-IoT shadow was reported within
+ * this window. The persisted shadow never disappears when the AC loses power,
+ * so without a freshness check a blacked-out AC reads "online" forever. Kept
+ * generous because a quietly-running AC reports infrequently — better a late
+ * offline than a flapping one. This only drives the UI indicator; nothing
+ * server-side (leveler, automations, commands) gates on isOnline.
+ */
+export const SHADOW_STALE_MS = 10 * 60_000;
+
+/** Newest per-field reported timestamp from an AWS IoT shadow `metadata.reported`, in ms (null if none). */
+export function latestReportedAtMs(
+  metadataReported: Record<string, { timestamp?: number }> | undefined,
+): number | null {
+  if (!metadataReported) return null;
+  let maxSec = 0;
+  for (const meta of Object.values(metadataReported)) {
+    if (typeof meta?.timestamp === "number" && meta.timestamp > maxSec) maxSec = meta.timestamp;
+  }
+  return maxSec > 0 ? maxSec * 1000 : null; // AWS IoT timestamps are epoch seconds
+}
+
+/**
+ * Online decision: trust TCL's flag when it says online (it only ever gives
+ * false negatives), otherwise require a FRESH shadow. A shadow with no
+ * freshness metadata falls back to the legacy "has shadow = online" behavior.
+ */
+export function deviceOnline(
+  tclOnline: boolean,
+  hasShadow: boolean,
+  reportedAtMs: number | null,
+  nowMs: number,
+  staleMs: number,
+): boolean {
+  if (tclOnline) return true;
+  if (!hasShadow) return false;
+  if (reportedAtMs == null) return true;
+  return nowMs - reportedAtMs <= staleMs;
+}
+
 export interface AcAction {
   power?: 0 | 1;
   mode?: number;
@@ -23,6 +63,8 @@ export interface AcDevice {
   id: string;
   name: string;
   isOnline: boolean;
+  /** Epoch ms of the device's last shadow report (null if unknown) — drives "last seen" + the offline check. */
+  lastSeenAt: number | null;
   power: boolean;
   mode: number;
   targetTemp: number;
@@ -622,14 +664,20 @@ export class TclCloud {
 
         // Always attempt shadow fetch — TCL's isOnline flag is unreliable
         let shadow: Record<string, number> = {};
+        let reportedAt: number | null = null;
         if (this.awsCreds) {
           try {
-            shadow = await this.getThingShadow(dev.deviceId);
+            const result = await this.getThingShadow(dev.deviceId);
+            shadow = result.reported;
+            reportedAt = result.reportedAt;
           } catch (err) {
             log.warn(`[tcl] Shadow read failed for ${dev.deviceId}:`, (err as Error).message);
           }
         }
-        const online = tclOnline || Object.keys(shadow).length > 0;
+        // A persisted shadow alone no longer means "online" — it never clears
+        // when the AC loses power, so a blacked-out AC read online forever.
+        // Require the shadow to be fresh (last report within SHADOW_STALE_MS).
+        const online = deviceOnline(tclOnline, Object.keys(shadow).length > 0, reportedAt, Date.now(), SHADOW_STALE_MS);
 
         const powerFromId = (dev.identifiers ?? []).find(i => i.identifier === "powerSwitch");
 
@@ -642,6 +690,7 @@ export class TclCloud {
           id: dev.deviceId,
           name: dev.nickName || dev.deviceName || dev.deviceId,
           isOnline: online,
+          lastSeenAt: reportedAt,
           power: shadow.powerSwitch != null ? shadow.powerSwitch === 1 : powerFromId?.value === 1,
           mode: shadow.workMode ?? 0,
           targetTemp: shadow.targetTemperature ?? 24,
@@ -679,7 +728,7 @@ export class TclCloud {
     return devices;
   }
 
-  private async getThingShadow(deviceId: string): Promise<Record<string, number>> {
+  private async getThingShadow(deviceId: string): Promise<{ reported: Record<string, number>; reportedAt: number | null }> {
     if (!this.awsCreds) throw new Error("No AWS credentials");
 
     const region = this.awsCreds.region;
@@ -700,9 +749,13 @@ export class TclCloud {
 
     const shadow = await resp.json() as {
       state?: { reported?: Record<string, number> };
+      metadata?: { reported?: Record<string, { timestamp?: number }> };
     };
 
-    return shadow.state?.reported ?? {};
+    return {
+      reported: shadow.state?.reported ?? {},
+      reportedAt: latestReportedAtMs(shadow.metadata?.reported),
+    };
   }
 
   private async publishShadowUpdate(deviceId: string, desired: Record<string, unknown>): Promise<void> {

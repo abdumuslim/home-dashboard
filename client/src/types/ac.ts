@@ -2,6 +2,8 @@ export interface AcDevice {
   id: string;
   name: string;
   isOnline: boolean;
+  /** Epoch ms of the device's last cloud report (null if unknown) — shown as "last seen" when offline. */
+  lastSeenAt?: number | null;
   power: boolean;
   manualOffLocked?: boolean;
   mode: number;

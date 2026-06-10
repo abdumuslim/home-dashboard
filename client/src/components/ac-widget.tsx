@@ -751,7 +751,14 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
           )}
 
           {offline && (
-            <p className="text-sm text-dim text-center py-2">Device is offline</p>
+            <p className="text-sm text-dim text-center py-2">
+              Device is offline
+              {d.lastSeenAt != null && (
+                <span className="block text-xs opacity-70">
+                  last seen {new Date(d.lastSeenAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                </span>
+              )}
+            </p>
           )}
         </div>
       </div>
