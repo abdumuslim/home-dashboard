@@ -7,7 +7,7 @@
 // automations, AC timers, and fan enforcement — and restores every AC to its
 // pre-run state on completion or abort.
 import pg from "pg";
-import { determineSource, AC_RAMP_MS, type PowerSource } from "./ac-leveling.js";
+import { determineSource, type PowerSource } from "./ac-leveling.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import { childLogger } from "./logger.js";
 
@@ -20,11 +20,17 @@ const log = childLogger("ac-calibration");
  * stabilizes. Compressors are slow (level/ramp), fans respond fast.
  */
 export const CAL_LEVEL_SETTLE_MS = 20_000;
-export const CAL_LEVEL_SETTLE_MAX_MS = 120_000;
+export const CAL_LEVEL_SETTLE_MAX_MS = 240_000;
 export const CAL_FAN_SETTLE_MS = 15_000;
 export const CAL_FAN_SETTLE_MAX_MS = 30_000;
-/** Compressor ramp after a turn-on: AC_RAMP_MS floor, this the max cap. */
-export const CAL_RAMP_MAX_MS = 180_000;
+/**
+ * Compressor ramp after a turn-on. Decoupled from AC_RAMP_MS (which is now 240s
+ * for live leveling): the floor is just a minimum before plateau detection can
+ * sample — if the draw plateaus at ~90s we sample then; the max cap (300s) lets
+ * a slow ~4-min ramp fully settle before forcing a sample.
+ */
+export const CAL_RAMP_FLOOR_MS = 90_000;
+export const CAL_RAMP_MAX_MS = 300_000;
 /** Settle after powering ACs off before the all-off baseline is sampled (fixed — quick). */
 export const CAL_OFF_SETTLE_MS = 10_000;
 /** Consecutive settle-phase readings within the band that define a plateau (early release). */
@@ -382,7 +388,7 @@ export class AcCalibrator {
 
   /** Minimum settle before early release — never sample sooner than the proven floor. */
   private settleFloorMs(): number {
-    if (this.phase === "ramp") return AC_RAMP_MS;
+    if (this.phase === "ramp") return CAL_RAMP_FLOOR_MS;
     return this.steps[this.stepIndex]?.kind === "fan" ? CAL_FAN_SETTLE_MS : CAL_LEVEL_SETTLE_MS;
   }
 

@@ -52,6 +52,7 @@ function input(over: Partial<AllocatorInput> = {}): AllocatorInput {
   return {
     limitAmps: 30,
     marginAmps: 1,
+    raiseBufferAmps: 0,
     nonAcLoadAmps: 0,
     overLimitStreak: 0,
     severeOverLimitStreak: 0,
@@ -176,6 +177,95 @@ describe("computeAllocation — priority fill", () => {
   it("suppresses raises during settle", () => {
     const r = computeAllocation(input({ inSettle: true }));
     expect(r.desiredLevels).toEqual({});
+  });
+});
+
+describe("computeAllocation — raise buffer (hysteresis)", () => {
+  // Single Abdullah (base 2 + 1/level, max 3). limit 15, margin 1.
+  const oneAc = (over: Partial<LevelerAcSnapshot> = {}) => [ac("abdullah", { needTier: "full", ...over })];
+
+  it("stops the raise fill a buffer short of the real budget", () => {
+    // budget = 15 − 1 − 8.5 = 5.5; floor L1 = 2. Without buffer L1→…→ fits L3 (4).
+    // With buffer 2 → raiseBudget 3.5: from L1(2) only +1 (L2=3) fits, not L3(4).
+    const withBuffer = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 8.5, raiseBufferAmps: 2, acs: oneAc(),
+    }));
+    expect(withBuffer.idealLevels).toEqual({ abdullah: 2 });
+    // Same input, no buffer → fills to L3.
+    const noBuffer = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 8.5, raiseBufferAmps: 0, acs: oneAc(),
+    }));
+    expect(noBuffer.idealLevels).toEqual({ abdullah: 3 });
+  });
+
+  it("never sheds because of the buffer — over-budget uses the FULL budget", () => {
+    // Three ACs at floor cost 2+4+2 = 8. budget 15−1−5 = 9 (floors fit), but
+    // raiseBudget 9−3 = 6 < 8. The buffer must NOT trigger a shed.
+    const r = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 5, raiseBufferAmps: 3,
+      acs: [ac("najat"), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.toShed).toEqual([]);
+    expect(r.idealLevels).toEqual({ najat: 1, abdu: 1, abdullah: 1 });
+  });
+
+  it("never lowers a hard floor / boost minimum", () => {
+    // raiseBudget = 15 − 1 − 8 − 5 = 1 — the buffer eats the whole budget, yet
+    // the floor (L2 boost min) is never lowered below 2.
+    const r = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 8, raiseBufferAmps: 5,
+      acs: oneAc({ minLevel: 2, currentLevel: 2 }),
+    }));
+    expect(r.idealLevels).toEqual({ abdullah: 2 });
+  });
+
+  it("never blocks a below-floor correction (ungated by the buffer)", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 5, raiseBufferAmps: 5, headroomStreak: 0,
+      acs: oneAc({ minLevel: 2, currentLevel: 1 }),
+    }));
+    // Below the boost floor — corrected to the floor immediately even with no
+    // headroom streak and a budget-eating buffer.
+    expect(r.desiredLevels).toEqual({ abdullah: 2 });
+  });
+
+  it("honors the buffer for restore feasibility", () => {
+    // Najat (managed, shed, off) floor L1 = 2. One ON Abdullah at floor 2.
+    // budget = 15 − 1 − 9 = 5; cost so far 2 → restore needs 2 more = 4 ≤ 5 OK
+    // without buffer, but raiseBudget 5−2 = 3 < 4 → blocked with buffer 2.
+    const acs = [
+      ac("abdullah", { on: true, currentLevel: 2, minLevel: 2, needTier: "satisfied" }),
+      ac("najat", { on: false, shed: true, needTier: "full", needDelta: 3 }),
+    ];
+    const blocked = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 9, raiseBufferAmps: 2, acs,
+    }));
+    expect(blocked.toRestore).toEqual([]);
+    // Drop the buffer → restore fits.
+    const fits = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 9, raiseBufferAmps: 0, acs,
+    }));
+    expect(fits.toRestore).toEqual(["najat"]);
+  });
+
+  it("still caps a level-0 (unrestricted) AC immediately under any buffer", () => {
+    // raiseBudget = 15 − 1 − 8 − 5 = 1 → fill stays at the floor, but the
+    // level-0 AC must still be capped (never left unrestricted) → L1.
+    const r = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 8, raiseBufferAmps: 5,
+      acs: oneAc({ currentLevel: 0 }),
+    }));
+    expect(r.desiredLevels).toEqual({ abdullah: 1 });
+  });
+
+  it("clamps a negative buffer to zero (never raises above limit − margin)", () => {
+    const neg = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 8.5, raiseBufferAmps: -5, acs: oneAc(),
+    }));
+    const zero = computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 8.5, raiseBufferAmps: 0, acs: oneAc(),
+    }));
+    expect(neg.idealLevels).toEqual(zero.idealLevels);
   });
 });
 

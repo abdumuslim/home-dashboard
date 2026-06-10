@@ -14,6 +14,8 @@ export interface AcLevelingConfig {
   gridLimitAmps: number;
   genLimitAmps: number;
   marginAmps: number;
+  /** Extra headroom kept below the breaker when raising (asymmetric hysteresis). */
+  raiseBufferAmps: number;
   comfortTargetC: number;
   /** Device ids, highest priority first. */
   priority: string[];

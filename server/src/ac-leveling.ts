@@ -22,6 +22,14 @@ export interface AcLevelingConfig {
   gridLimitAmps: number;
   genLimitAmps: number;
   marginAmps: number;
+  /**
+   * Extra headroom kept below the breaker when RAISING (asymmetric hysteresis).
+   * Raises stop this far below `limit − margin`, so a freshly-raised AC rests
+   * below the limit and ordinary source-current fluctuation can't trip the
+   * over-limit reduce — killing the raise→over-limit→reduce→raise limit cycle.
+   * Reductions/sheds ignore this and stay on `limit − margin` (safety side).
+   */
+  raiseBufferAmps: number;
   comfortTargetC: number;
   /** Device ids, highest priority first. */
   priority: string[];
@@ -37,6 +45,7 @@ export const DEFAULT_LEVELING_CONFIG: AcLevelingConfig = {
   gridLimitAmps: 30,
   genLimitAmps: 15,
   marginAmps: 1,
+  raiseBufferAmps: 1,
   comfortTargetC: 26,
   priority: [],
   ampModels: {},
@@ -84,6 +93,8 @@ export interface LevelerAcSnapshot {
 export interface AllocatorInput {
   limitAmps: number;
   marginAmps: number;
+  /** Raise-side hysteresis buffer — raises stop this far below `limit − margin`. */
+  raiseBufferAmps: number;
   /** Estimated non-AC household draw (caller derives from measured − estimated AC draws). */
   nonAcLoadAmps: number;
   /** Consecutive power readings with measured > limit. */
@@ -114,7 +125,11 @@ export interface AllocationResult {
   toFanReduce: string[];
   /** One staged fan-restore step (highest-priority pending hold first). */
   toFanRaise: { deviceId: string; fan: number } | null;
-  /** Full budget-constrained ideal allocation for status display. */
+  /**
+   * Raise-budget-constrained ideal allocation for status display — the level
+   * the controller will actually drive toward (stops a raise buffer below the
+   * breaker), not a higher level it would never raise to.
+   */
   idealLevels: Record<string, number>;
   nonAcLoadAmps: number;
   budgetAmps: number;
@@ -150,9 +165,11 @@ export const SETTLE_MS = 30_000;
  * draw bleeds into the measured-derived non-AC load WHILE its full estimate is
  * also budgeted — understating the budget during the ramp. That delays raises
  * instead of letting a not-yet-ramped compressor masquerade as headroom
- * (raise → over-limit → reduce flap). 90s covers the observed TCL ramp.
+ * (raise → over-limit → reduce flap). 240s covers the measured ~4-min ramp —
+ * the compressor's full steady-state draw is not real until then. Armed on a
+ * turn-on AND on a power-source change (a Gen↔Grid flip restarts the compressors).
  */
-export const AC_RAMP_MS = 90_000;
+export const AC_RAMP_MS = 240_000;
 /** Grace before an observed-ON clears a shed flag (shadow lags the off command). */
 export const SHED_CLEAR_GRACE_MS = 15_000;
 /**
@@ -175,10 +192,13 @@ export const PREDICTION_WARN_AMPS = 2;
  * hold out. A gen level is a CAP, not a draw command — a nearly-satisfied
  * room's compressor won't draw more when the cap rises, leaving phantom
  * headroom that would stack raises which overshoot the moment the
- * compressors do kick in. Turn-ons hold longer (compressor ramp is slow).
+ * compressors do kick in. Turn-ons hold longer (compressor ramp is slow —
+ * the measured ~4-min start/restart settle). A gen-level cap raise on an
+ * already-running compressor settles faster, so it keeps the shorter hold;
+ * early release covers needy rooms regardless.
  */
 export const RAISE_HOLD_MS = 120_000;
-export const RESTORE_HOLD_MS = 180_000;
+export const RESTORE_HOLD_MS = 270_000;
 /** Fresh readings needed before the effect check can release a hold (~4 × 5s ESP). */
 export const RAISE_HOLD_CHECK_AFTER_MS = 20_000;
 /**
@@ -194,6 +214,14 @@ export const RAISE_HOLD_CHECK_AFTER_MS = 20_000;
 export const BOUNCE_MAX_EXTRA_AMPS = 3;
 /** Safety net: a bounce record older than this is dropped regardless (corrupted baseline insurance). */
 export const BOUNCE_SAFETY_EXPIRY_MS = 3_600_000;
+/**
+ * How long after a raise a reactive over-limit reduction still counts as that
+ * raise's BOUNCE. Decoupled from (and longer than) the effect-confirmation hold:
+ * a slow limit cycle can over-limit and reduce several minutes after the raise,
+ * well past RAISE_HOLD_MS — that reduce is still the raise's fault and must be
+ * recorded so the allocator stops re-picking the same AC.
+ */
+export const BOUNCE_WINDOW_MS = 300_000;
 
 const DEFAULT_AMP_MODEL: AcAmpModel = { baseAmps: 2, stepAmps: 1 };
 
@@ -287,6 +315,12 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
 
   const unmanagedDraw = onUnmanaged.reduce((sum, a) => sum + draw(a, a.currentLevel), 0);
   const budgetAmps = limitAmps - marginAmps - nonAcLoadAmps - unmanagedDraw;
+  // Raise-side budget (asymmetric hysteresis): the fill and restore-feasibility
+  // passes stop a buffer short of the real budget so a freshly-raised AC rests
+  // below the limit. Reductions/sheds/over-budget keep the FULL budget — they're
+  // the safety side and must trigger only when genuinely over `limit − margin`.
+  // Clamp the buffer ≥0 so a bad value can never raise ABOVE `limit − margin`.
+  const raiseBudgetAmps = budgetAmps - Math.max(0, input.raiseBufferAmps);
   const currentOnCost = onManaged.reduce((sum, a) => sum + draw(a, a.currentLevel), 0);
   const projectedAmps = nonAcLoadAmps + unmanagedDraw + currentOnCost;
 
@@ -334,7 +368,10 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       .sort((a, b) => b.needDelta - a.needDelta);
     for (const a of restoreOrder) {
       const floorDraw = draw(a, floorOf(a));
-      if (cost + floorDraw <= budgetAmps) {
+      // Restore is the single largest raise (a whole floor + slow compressor
+      // ramp), so it honors the raise buffer too — a restored AC must settle
+      // below the limit, not in the deadband where it would be re-shed.
+      if (cost + floorDraw <= raiseBudgetAmps) {
         restorePick = a.deviceId;
         // Not in onManaged (it's off), so the fill below fits the ON ACs
         // around its floor draw without ever raising it above the floor.
@@ -371,7 +408,9 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
         for (const a of onManaged) {
           const level = ideal.get(a.deviceId)!;
           if (level >= ceiling(a)) continue;
-          if (cost + model(a.deviceId).stepAmps > budgetAmps) continue;
+          // Raise admission uses the buffered budget — never fill into the
+          // deadband below the breaker (asymmetric hysteresis).
+          if (cost + model(a.deviceId).stepAmps > raiseBudgetAmps) continue;
           if (!pick) {
             pick = a;
             continue;

@@ -41,7 +41,10 @@ function seedDraft(config: AcLevelingConfig, acDevices: AcDevice[]): AcLevelingC
       levelBoosts[d.id] = { minLevel: 2, outdoorAtLeastC: 37 };
     }
   }
-  return { ...config, priority, ampModels, genAmpModels, levelBoosts };
+  // Prefill the raise buffer for configs saved before the field existed, so its
+  // input never renders uncontrolled. Seeding does NOT mark the draft dirty.
+  const raiseBufferAmps = config.raiseBufferAmps ?? 1;
+  return { ...config, priority, ampModels, genAmpModels, levelBoosts, raiseBufferAmps };
 }
 
 function NumberField({ label, value, step, onChange }: {
@@ -272,10 +275,11 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
       })()}
 
       {/* Limits */}
-      <div className="grid grid-cols-4 gap-2">
+      <div className="grid grid-cols-5 gap-2">
         <NumberField label="Grid limit A" value={draft.gridLimitAmps} onChange={(v) => update({ gridLimitAmps: v })} />
         <NumberField label="Gen limit A" value={draft.genLimitAmps} onChange={(v) => update({ genLimitAmps: v })} />
         <NumberField label="Margin A" step={0.5} value={draft.marginAmps} onChange={(v) => update({ marginAmps: v })} />
+        <NumberField label="Raise buffer A" step={0.5} value={draft.raiseBufferAmps} onChange={(v) => update({ raiseBufferAmps: v })} />
         <NumberField label="Comfort °C" step={0.5} value={draft.comfortTargetC} onChange={(v) => update({ comfortTargetC: v })} />
       </div>
 

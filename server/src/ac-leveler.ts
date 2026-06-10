@@ -11,6 +11,7 @@ import {
   AC_RAMP_MS,
   BOUNCE_MAX_EXTRA_AMPS,
   BOUNCE_SAFETY_EXPIRY_MS,
+  BOUNCE_WINDOW_MS,
   NON_AC_FREEZE_MS,
   OVER_LIMIT_SEVERE_AMPS,
   PREDICTION_WARN_AMPS,
@@ -128,6 +129,17 @@ export class AcLeveler {
   private headroomStreak = 0;
   // Runtime control state
   private lastSetLevel = new Map<string, number>();
+  /**
+   * The gen level the shadow has actually been observed at — the baseline the
+   * drift detector compares against. A divergence only counts as a manual
+   * change once the shadow has confirmed our last command at least once;
+   * otherwise it is an un-applied/lagging command, not a user action.
+   */
+  private confirmedLevel = new Map<string, number>();
+  /** The level last commanded but not yet confirmed by the shadow. */
+  private pendingLevel = new Map<string, number>();
+  /** Set on a source change so tick() re-arms the compressor ramp for ON ACs. */
+  private armRampOnSourceChange = false;
   private manualCap = new Map<string, number>();
   private manualTarget = new Map<string, number>();
   // Fan holds: fans reduced to minimum as the last try before a shed (persisted)
@@ -228,6 +240,9 @@ export class AcLeveler {
 
   async updateConfig(cfg: AcLevelingConfig): Promise<AcLevelingConfig> {
     await this.ensureLoaded();
+    // Merge over defaults so an old/partial client payload can't drop a field
+    // (e.g. raiseBufferAmps) and leave the budget math reading undefined → NaN.
+    cfg = { ...DEFAULT_LEVELING_CONFIG, ...cfg };
     await this.pool.query(
       `INSERT INTO ac_leveling_config (id, config, updated_at) VALUES (1, $1, NOW())
        ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()`,
@@ -377,6 +392,7 @@ export class AcLeveler {
     this.lastReadingAt = Date.now();
     const source = determineSource(this.lastReading, 0);
     if (source !== this.lastSource) {
+      const prevSource = this.lastSource;
       this.lastSource = source;
       this.overLimitStreak = 0;
       this.severeOverLimitStreak = 0;
@@ -391,6 +407,19 @@ export class AcLeveler {
       // Bounce evidence is per-source (different limit + amp models).
       this.bounce.clear();
       this.lastRaiseBatch = null;
+      // A true Gen↔Grid changeover restarts every running compressor — treat it
+      // like a turn-on so tick() re-arms the ~4-min ramp window for ON ACs.
+      // Coming back from "none" (ESP/power resuming) is NOT a restart: the ACs
+      // were already running steadily, so their draw stays in the load math.
+      if (prevSource !== "none" && source !== "none") this.armRampOnSourceChange = true;
+      // Moving onto Grid (15A→30A budget): a cap fitted to the generator budget
+      // no longer applies — release manual caps so ACs can run up again. Caps
+      // are kept on Grid→Gen (the tight budget may still need them).
+      if (source === "grid") {
+        this.manualCap.clear();
+        this.manualTarget.clear();
+        this.pendingLevel.clear();
+      }
       log.info(`[leveler] Power source changed → ${source}`);
     }
     if (source === "none") return;
@@ -407,6 +436,11 @@ export class AcLeveler {
       if (measured > limit + OVER_LIMIT_SEVERE_AMPS) this.severeOverLimitStreak++;
       else this.severeOverLimitStreak = 0;
     } else if (measured <= limit - this.config.marginAmps) {
+      // Headroom builds at the un-buffered threshold so cheap, comfort-positive
+      // fan restores (gated by canRaise) recover on real headroom — NOT held
+      // back by the gen-level raise buffer. Gen-level raises stay buffer-bound
+      // independently via the allocator's raiseBudgetAmps fill, so they still
+      // can't climb into the deadband below the breaker.
       this.headroomStreak++;
       this.overLimitStreak = 0;
       this.severeOverLimitStreak = 0;
@@ -446,6 +480,8 @@ export class AcLeveler {
     this.manualCap.delete(deviceId);
     this.manualTarget.delete(deviceId);
     this.lastSetLevel.delete(deviceId);
+    this.confirmedLevel.delete(deviceId);
+    this.pendingLevel.delete(deviceId);
     await this.clearFanHold(deviceId, "user_power_off");
     this.fanExempt.delete(deviceId);
     this.bounce.delete(deviceId);
@@ -493,6 +529,10 @@ export class AcLeveler {
       this.manualCap.set(deviceId, Math.max(1, rank(level)));
       this.manualTarget.delete(deviceId);
       this.lastSetLevel.set(deviceId, level);
+      // The route already drove the device to `level`; mark it pending so the
+      // drift loop waits for the shadow to confirm rather than re-deriving an
+      // intent from a still-lagging shadow.
+      this.pendingLevel.set(deviceId, level);
       this.forceEvaluate = true;
       log.info(`[leveler] Manual gen reduction on ${deviceId} → cap L${rank(level)}`);
       return { reverted: false, level };
@@ -513,6 +553,7 @@ export class AcLeveler {
         try {
           await tcl.sendControl(deviceId, "set_generator_mode", revertTo);
           this.lastSetLevel.set(deviceId, revertTo);
+          this.pendingLevel.set(deviceId, revertTo);
           log.warn(
             `[leveler] Manual gen increment on ${deviceId} to L${level} projects ${projected.toFixed(1)}A > ` +
             `${limit}A limit on ${source} — reverted to L${revertTo}`,
@@ -528,6 +569,7 @@ export class AcLeveler {
     this.manualTarget.set(deviceId, rank(level));
     this.manualCap.delete(deviceId);
     this.lastSetLevel.set(deviceId, level);
+    this.pendingLevel.set(deviceId, level);
     log.info(`[leveler] Manual gen target on ${deviceId} → L${rank(level)}`);
     return { reverted: false, level };
   }
@@ -589,6 +631,8 @@ export class AcLeveler {
         this.manualCap.delete(device.id);
         this.manualTarget.delete(device.id);
         this.lastSetLevel.delete(device.id);
+        this.confirmedLevel.delete(device.id);
+        this.pendingLevel.delete(device.id);
         this.rampUntil.delete(device.id);
         await this.clearFanHold(device.id, "power_off");
         this.fanExempt.delete(device.id);
@@ -596,6 +640,18 @@ export class AcLeveler {
         // survive here — a restore-bounced shed AC is off every tick.
         if (this.bounce.get(device.id)?.kind === "level") this.bounce.delete(device.id);
       }
+    }
+
+    // A power-source change restarts/re-disturbs every running compressor, so
+    // re-arm the ramp window for ON managed ACs — their estimated draw stays
+    // double-counted (out of the non-AC load derivation) through the ~4-min
+    // transition, preventing phantom-headroom raises and nonAcLoad miscalc.
+    if (this.armRampOnSourceChange) {
+      const now = Date.now();
+      for (const { device, managed } of ctx) {
+        if (device.power && managed) this.rampUntil.set(device.id, now + AC_RAMP_MS);
+      }
+      this.armRampOnSourceChange = false;
     }
 
     const inSettle = Date.now() < this.settleUntil;
@@ -617,27 +673,53 @@ export class AcLeveler {
       this.fanExempt.clear();
     }
 
-    // Shadow-drift detection: a gen level we did not set means a manual/remote change.
+    // Confirmation-gated shadow-drift detection. The drift reference is the
+    // CONFIRMED baseline — the level the shadow has actually been OBSERVED at,
+    // not the level we last commanded. A command in flight does not change the
+    // observed level until it lands, so a lagging or firmware-ignored gen-level
+    // write leaves obs === confirmed (no false cap). When the observed level
+    // finally CHANGES: if it changed to the level we commanded (pendingLevel),
+    // our command landed (no manual intent); otherwise it is a manual/remote
+    // change. Comparing against the observation — not the command — means a
+    // command that never lands can never strand drift detection.
     for (const { device, managed } of ctx) {
       if (!device.power || !managed) continue;
-      const expected = this.lastSetLevel.get(device.id);
-      if (expected == null) {
-        this.lastSetLevel.set(device.id, device.generatorMode);
+      const obs = device.generatorMode;
+      const confirmed = this.confirmedLevel.get(device.id);
+      if (confirmed == null) {
+        // First observation — adopt the shadow as the baseline (but not a
+        // mid-command shadow inside the settle window).
+        if (!inSettle) {
+          this.confirmedLevel.set(device.id, obs);
+          this.lastSetLevel.set(device.id, obs);
+        }
         continue;
       }
-      if (device.generatorMode === expected || inSettle) continue;
+      if (inSettle) continue;
+      if (obs === confirmed) continue; // observed level unchanged since last confirm
+      const pending = this.pendingLevel.get(device.id);
+      if (pending != null && obs === pending) {
+        // Our command landed — promote it to the confirmed baseline, no intent.
+        this.confirmedLevel.set(device.id, obs);
+        this.pendingLevel.delete(device.id);
+        continue;
+      }
+      // The observed level moved off the confirmed baseline to something we did
+      // not command: a genuine manual/remote change.
       const maxLevel = device.maxGeneratorLevel || 3;
       const rank = (l: number): number => (l <= 0 ? maxLevel + 1 : Math.min(l, maxLevel));
-      if (rank(device.generatorMode) < rank(expected)) {
-        this.manualCap.set(device.id, rank(device.generatorMode));
+      if (rank(obs) < rank(confirmed)) {
+        this.manualCap.set(device.id, rank(obs));
         this.manualTarget.delete(device.id);
-        log.info(`[leveler] ${device.name}: external gen reduction observed → cap L${rank(device.generatorMode)}`);
+        log.info(`[leveler] ${device.name}: external gen reduction observed → cap L${rank(obs)}`);
       } else {
-        this.manualTarget.set(device.id, rank(device.generatorMode));
+        this.manualTarget.set(device.id, rank(obs));
         this.manualCap.delete(device.id);
-        log.info(`[leveler] ${device.name}: external gen increment observed → target L${rank(device.generatorMode)}`);
+        log.info(`[leveler] ${device.name}: external gen increment observed → target L${rank(obs)}`);
       }
-      this.lastSetLevel.set(device.id, device.generatorMode);
+      this.confirmedLevel.set(device.id, obs);
+      this.lastSetLevel.set(device.id, obs);
+      this.pendingLevel.delete(device.id);
       this.forceEvaluate = true;
     }
 
@@ -670,12 +752,12 @@ export class AcLeveler {
         } else if (
           !inSettle &&
           this.recentMeasured.length >= 4 &&
-          smoothed + entry.requiredAmps <= limit - this.config.marginAmps
+          smoothed + entry.requiredAmps <= limit - this.config.marginAmps - this.config.raiseBufferAmps
         ) {
           this.bounce.delete(deviceId);
           log.info(
             `[leveler] ${this.deviceNames.get(deviceId) ?? deviceId}: load dropped ` +
-            `(${smoothed.toFixed(1)}A + ${entry.requiredAmps.toFixed(1)}A observed cost fits under ${limit}A) — bounce ${entry.kind === "level" ? `cap L${entry.cap}` : "restore block"} cleared`,
+            `(${smoothed.toFixed(1)}A + ${entry.requiredAmps.toFixed(1)}A observed cost fits under ${(limit - this.config.marginAmps - this.config.raiseBufferAmps).toFixed(1)}A) — bounce ${entry.kind === "level" ? `cap L${entry.cap}` : "restore block"} cleared`,
           );
         }
       }
@@ -810,6 +892,7 @@ export class AcLeveler {
     const input: AllocatorInput = {
       limitAmps: limit,
       marginAmps: this.config.marginAmps,
+      raiseBufferAmps: this.config.raiseBufferAmps,
       nonAcLoadAmps: nonAcLoad,
       overLimitStreak: this.overLimitStreak,
       severeOverLimitStreak: this.severeOverLimitStreak,
@@ -863,7 +946,7 @@ export class AcLeveler {
       log.warn(
         `[leveler] ${name(deviceId)}: ${kind === "level" ? `raise bounced — capped at L${cap}` : "restore bounced — re-shed"} ` +
         `(observed cost ${requiredAmps.toFixed(1)}A, retry below ` +
-        `${(limit - this.config.marginAmps - requiredAmps).toFixed(1)}A measured) — consider calibrating the amp model`,
+        `${(limit - this.config.marginAmps - this.config.raiseBufferAmps - requiredAmps).toFixed(1)}A measured) — consider calibrating the amp model`,
       );
     };
 
@@ -872,6 +955,7 @@ export class AcLeveler {
       try {
         await tcl.sendControl(deviceId, "set_generator_mode", level);
         this.lastSetLevel.set(deviceId, level);
+        this.pendingLevel.set(deviceId, level);
         sentAny = true;
         if (snap && (snap.currentLevel === 0 || level < snap.currentLevel)) didReduce = true;
         const raisedTo = batch?.raised.get(deviceId);
@@ -978,6 +1062,7 @@ export class AcLeveler {
         // A restore adds its whole floor draw to the expectation
         raisedAmps += estimateAcDraw(restoreLevel, snap?.maxLevel ?? 1, this.ampModelFor(deviceId, source));
         this.lastSetLevel.set(deviceId, restoreLevel);
+        this.pendingLevel.set(deviceId, restoreLevel);
         this.prevPowerStates.set(deviceId, true);
         this.rampUntil.set(deviceId, Date.now() + AC_RAMP_MS);
         this.deps.setDevicePowerCache(deviceId, "on");
@@ -1059,10 +1144,13 @@ export class AcLeveler {
         };
         if (raisedNow.size > 0 || restoredNow.size > 0) {
           // Bounce attribution window: a reactive reduction that undoes one of
-          // these raises/restores before the hold would expire is a bounce.
+          // these raises/restores within the window is a bounce. Decoupled from
+          // (and at least as long as) the effect-confirmation hold — a slow
+          // limit cycle can over-limit and reduce minutes after the raise, past
+          // RAISE_HOLD_MS, and that reduce is still this raise's fault.
           // preMeasured = the smoothed total these raises were stacked onto.
           this.lastRaiseBatch = {
-            windowUntil: now + holdMs,
+            windowUntil: now + Math.max(holdMs, BOUNCE_WINDOW_MS),
             preMeasured: this.smoothedMeasured(),
             raised: raisedNow,
             restored: new Set(restoredNow),
@@ -1139,7 +1227,9 @@ export class AcLeveler {
           })(),
           bounceRetryBelowAmps: (() => {
             const entry = this.bounce.get(device.id);
-            return entry && limit != null ? limit - this.config.marginAmps - entry.requiredAmps : null;
+            return entry && limit != null
+              ? limit - this.config.marginAmps - this.config.raiseBufferAmps - entry.requiredAmps
+              : null;
           })(),
           restoreBlocked: this.bounce.get(device.id)?.kind === "restore",
         };

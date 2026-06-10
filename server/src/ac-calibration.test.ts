@@ -12,10 +12,10 @@ import {
   CAL_REFERENCE_FAN,
   CAL_OFF_SETTLE_MS,
   CAL_LEVEL_SETTLE_MS,
+  CAL_RAMP_FLOOR_MS,
   CAL_RAMP_MAX_MS,
   CAL_STABLE_READINGS,
 } from "./ac-calibration.js";
-import { AC_RAMP_MS } from "./ac-leveling.js";
 
 describe("buildCalibrationSteps", () => {
   it("sweeps levels 1..max, then fans 1..7 when included", () => {
@@ -185,7 +185,7 @@ describe("AcCalibrator state machine", () => {
     expect(cal.getStatus().phase).toBe("ramp");
 
     // Compressor ramp: not sampled before the floor, even with a stable draw.
-    vi.advanceTimersByTime(AC_RAMP_MS - 5000);
+    vi.advanceTimersByTime(CAL_RAMP_FLOOR_MS - 5000);
     feedGen(cal, 5, CAL_STABLE_READINGS);
     await cal.tick();
     expect(cal.getStatus().phase).toBe("ramp"); // floor not reached yet
@@ -235,7 +235,7 @@ describe("AcCalibrator state machine", () => {
     vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
     feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
     await cal.tick(); // ac1 on → ramp
-    await settleStep(cal, AC_RAMP_MS, 5, CAL_SAMPLES_GEN); // ramp → L1 recorded → L2 commanded
+    await settleStep(cal, CAL_RAMP_FLOOR_MS, 5, CAL_SAMPLES_GEN); // ramp → L1 recorded → L2 commanded
     await settleStep(cal, CAL_LEVEL_SETTLE_MS, 6, CAL_SAMPLES_GEN); // L2 recorded → ac1 off, next baseline
 
     expect(tcl.executeAcAction).toHaveBeenLastCalledWith("ac1", { power: 0 });
@@ -274,7 +274,7 @@ describe("AcCalibrator state machine", () => {
     vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
     feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
     await cal.tick(); // ac1 on → ramp
-    await settleStep(cal, AC_RAMP_MS, 5, CAL_SAMPLES_GEN); // ramp → L1 recorded
+    await settleStep(cal, CAL_RAMP_FLOOR_MS, 5, CAL_SAMPLES_GEN); // ramp → L1 recorded
 
     cal.requestAbort("user_control");
     await cal.tick();
@@ -318,7 +318,7 @@ describe("AcCalibrator state machine", () => {
     await cal.tick(); // ac1 on → ramp
 
     // Past the floor but the draw keeps drifting (spread > band) → no early release.
-    vi.advanceTimersByTime(AC_RAMP_MS + 1000);
+    vi.advanceTimersByTime(CAL_RAMP_FLOOR_MS + 1000);
     for (const a of [4, 5, 6, 7]) feedGen(cal, a, 1);
     await cal.tick();
     expect(cal.getStatus().phase).toBe("ramp"); // not stable → still ramping

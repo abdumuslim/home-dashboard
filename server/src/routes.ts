@@ -1237,6 +1237,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     if (!num(b.gridLimitAmps) || b.gridLimitAmps < 1 || b.gridLimitAmps > 100) return "gridLimitAmps must be 1–100";
     if (!num(b.genLimitAmps) || b.genLimitAmps < 1 || b.genLimitAmps > 100) return "genLimitAmps must be 1–100";
     if (!num(b.marginAmps) || b.marginAmps < 0 || b.marginAmps > 10) return "marginAmps must be 0–10";
+    // Optional for backward compatibility (old clients omit it → defaults to 1).
+    if (b.raiseBufferAmps != null && (!num(b.raiseBufferAmps) || b.raiseBufferAmps < 0 || b.raiseBufferAmps > 10)) return "raiseBufferAmps must be 0–10";
     if (!num(b.comfortTargetC) || b.comfortTargetC < 16 || b.comfortTargetC > 32) return "comfortTargetC must be 16–32";
     if (!Array.isArray(b.priority) || b.priority.some((p) => typeof p !== "string")) return "priority must be a string array";
     if (!b.ampModels || typeof b.ampModels !== "object") return "ampModels required";
@@ -1282,6 +1284,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         gridLimitAmps: body.gridLimitAmps as number,
         genLimitAmps: body.genLimitAmps as number,
         marginAmps: body.marginAmps as number,
+        raiseBufferAmps: (body.raiseBufferAmps as number) ?? 1,
         comfortTargetC: body.comfortTargetC as number,
         priority: body.priority as string[],
         ampModels: body.ampModels as Record<string, AcAmpModel>,
