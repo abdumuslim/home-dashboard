@@ -91,6 +91,10 @@ export interface AcLevelingAcStatus {
   bounceRetryBelowAmps: number | null;
   /** A recent restore bounced (re-shed) — restore attempts paused until the load drops. */
   restoreBlocked: boolean;
+  /** Active range slot's generator-level hard cap (null = Auto). */
+  slotCap: number | null;
+  /** Levels the firmware never confirmed after repeated sends (empty = all reachable). */
+  unreachableLevels: number[];
 }
 
 export interface AcLevelingStatus {
@@ -1364,7 +1368,7 @@ export class AcLeveler {
       raiseHoldRemainingMs: Math.max(0, (this.raiseHold?.until ?? 0) - Date.now()),
       expectedAmps: this.expected?.amps ?? null,
       lastPrediction: this.lastPrediction,
-      acs: ctx.map(({ device, managed, needTier, needDelta }) => {
+      acs: ctx.map(({ device, managed, needTier, needDelta, slotGenCap }) => {
         const maxLevel = device.maxGeneratorLevel || 3;
         const boost = this.config.levelBoosts[device.id];
         const minLevel = boost && (this.boostActive.get(device.id) ?? false)
@@ -1401,6 +1405,8 @@ export class AcLeveler {
               : null;
           })(),
           restoreBlocked: this.bounce.get(device.id)?.kind === "restore",
+          slotCap: slotGenCap != null ? Math.max(1, Math.min(slotGenCap, maxLevel)) : null,
+          unreachableLevels: [...(this.unreachableLevels.get(device.id) ?? [])].sort((a, b) => a - b),
         };
       }),
     };

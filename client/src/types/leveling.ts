@@ -55,6 +55,10 @@ export interface AcLevelingAcStatus {
   bounceRetryBelowAmps: number | null;
   /** A recent restore bounced (re-shed) — restore attempts paused until the load drops. */
   restoreBlocked: boolean;
+  /** Active range slot's generator-level hard cap (null = Auto). */
+  slotCap: number | null;
+  /** Levels the firmware never confirmed after repeated sends (empty = all reachable). */
+  unreachableLevels: number[];
 }
 
 export interface AcLevelingStatus {

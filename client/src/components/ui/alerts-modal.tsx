@@ -934,10 +934,12 @@ function DeviceCheckboxes({ devices, selectedDevices, setSelectedDevices }: {
   );
 }
 
-function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
+function RangeSlotsEditor({ slots, metricDef, conflicts, maxGenLevel, onChange }: {
   slots: AutomationRangeSlot[];
   metricDef: MetricInfo | null;
   conflicts: Set<string>;
+  /** Selected AC's max generator level — bounds the per-slot Gen picker. */
+  maxGenLevel: number;
   onChange: (slots: AutomationRangeSlot[]) => void;
 }) {
   const [prayerOffsetDirs, setPrayerOffsetDirs] = useState<Record<string, "before" | "after">>({});
@@ -1152,6 +1154,33 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, onChange }: {
                   )}
                 >
                   {s === 0 ? "A" : s}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] text-dim shrink-0">Gen</span>
+              <button
+                onClick={() => updateSlot(slot.id, { gen_level: undefined })}
+                title="Auto — Smart AC Leveling picks the level for this range"
+                className={cn(
+                  "px-1.5 py-0.5 rounded text-[10px] border transition-colors",
+                  slot.gen_level == null ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                )}
+              >
+                Auto
+              </button>
+              {Array.from({ length: maxGenLevel }, (_, i) => i + 1).map((l) => (
+                <button
+                  key={l}
+                  onClick={() => updateSlot(slot.id, { gen_level: l })}
+                  title={`Cap the generator level at L${l} while this range is active — Smart Leveling never raises above it (sent directly when leveling is off)`}
+                  className={cn(
+                    "flex-1 min-w-0 py-0.5 rounded text-[10px] border transition-colors",
+                    slot.gen_level === l ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                  )}
+                >
+                  L{l}
                 </button>
               ))}
             </div>
@@ -1421,6 +1450,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
                 slots={rangeSlots}
                 metricDef={metricDef}
                 conflicts={slotValidation.conflicts}
+                maxGenLevel={acDevices.find((d) => d.id === selectedAcId)?.maxGeneratorLevel || 3}
                 onChange={setRangeSlots}
               />
               {slotValidation.error && <p className="text-xs text-red-400">{slotValidation.error}</p>}

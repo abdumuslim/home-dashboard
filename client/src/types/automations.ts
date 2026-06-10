@@ -38,6 +38,8 @@ export interface AutomationRangeSlot {
   threshold: number;
   /** 0 = smart auto (delta-based), 1–7 fixed level, absent = preset profile fan. */
   fan_speed?: number;
+  /** Generator-level hard cap while the slot is active (1–6); absent = Auto (Smart Leveling decides). */
+  gen_level?: number;
 }
 
 export interface AutomationRule {

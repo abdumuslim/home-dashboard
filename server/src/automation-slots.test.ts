@@ -118,7 +118,7 @@ describe("AC automation range slots", () => {
       { id: "s1", type: "all_day", threshold_low: 24, threshold: 26, gen_level: 3, unknown_field: 1 },
     ]);
     expect(normalized?.[0].gen_level).toBe(3);
-    expect((normalized?.[0] as Record<string, unknown>).unknown_field).toBeUndefined();
+    expect((normalized?.[0] as unknown as Record<string, unknown>).unknown_field).toBeUndefined();
   });
 
   it("validates slot count and threshold bounds", () => {

@@ -98,6 +98,19 @@ function AcStatusBadges({ ac }: { ac: AcLevelingAcStatus }) {
           min L{ac.minLevel}
         </span>
       )}
+      {ac.slotCap != null && (
+        <span className="px-1.5 py-0.5 rounded text-[0.6rem] font-medium bg-sky-400/15 text-sky-300" title="Range-slot cap — never raised above this while the slot is active">
+          slot L{ac.slotCap}
+        </span>
+      )}
+      {ac.unreachableLevels.length > 0 && (
+        <span
+          className="px-1.5 py-0.5 rounded text-[0.6rem] font-medium bg-amber-400/15 text-amber-400"
+          title="Firmware never confirmed these levels after repeated sends — using the next lower level"
+        >
+          L{ac.unreachableLevels.join("/L")} n/a
+        </span>
+      )}
       {ac.bounceCap != null && (
         <span
           className="px-1.5 py-0.5 rounded text-[0.6rem] font-medium bg-orange-400/15 text-orange-400"
