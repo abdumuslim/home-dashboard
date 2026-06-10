@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   findActiveRangeSlot,
+  normalizeRangeSlots,
   validateRangeSlots,
   type AutomationRangeSlot,
 } from "./automation-slots.js";
@@ -93,6 +94,31 @@ describe("AC automation range slots", () => {
     expect(validateRangeSlots([slot({ fan_speed: 8 })], metricBounds, () => null).ok).toBe(false);
     expect(validateRangeSlots([slot({ fan_speed: -1 })], metricBounds, () => null).ok).toBe(false);
     expect(validateRangeSlots([slot({ fan_speed: 2.5 })], metricBounds, () => null).ok).toBe(false);
+  });
+
+  it("accepts and preserves a valid per-slot generator level", () => {
+    const result = validateRangeSlots([
+      slot({ id: "capped", gen_level: 2 }),
+      slot({ id: "auto", start_time: "13:00", end_time: "15:00" }),
+    ], metricBounds, () => null);
+
+    expect(result.ok).toBe(true);
+    expect(result.slots?.[0].gen_level).toBe(2);
+    expect(result.slots?.[1].gen_level).toBeUndefined();
+  });
+
+  it("rejects out-of-range or non-integer generator levels (0 = use absent for Auto)", () => {
+    expect(validateRangeSlots([slot({ gen_level: 0 })], metricBounds, () => null).ok).toBe(false);
+    expect(validateRangeSlots([slot({ gen_level: 7 })], metricBounds, () => null).ok).toBe(false);
+    expect(validateRangeSlots([slot({ gen_level: 1.5 })], metricBounds, () => null).ok).toBe(false);
+  });
+
+  it("regression: normalizeRangeSlots whitelists gen_level (silently-dropped-field guard)", () => {
+    const normalized = normalizeRangeSlots([
+      { id: "s1", type: "all_day", threshold_low: 24, threshold: 26, gen_level: 3, unknown_field: 1 },
+    ]);
+    expect(normalized?.[0].gen_level).toBe(3);
+    expect((normalized?.[0] as Record<string, unknown>).unknown_field).toBeUndefined();
   });
 
   it("validates slot count and threshold bounds", () => {

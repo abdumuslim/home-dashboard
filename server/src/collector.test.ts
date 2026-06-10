@@ -2028,6 +2028,107 @@ describe("Smart AC leveling — fan command confirm-or-resend + fast fan pacing"
   });
 });
 
+describe("Per-range-slot generator level (gen_level)", () => {
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T08:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function slotCapRule(genLevel: number | undefined, over: Record<string, unknown> = {}) {
+    return {
+      ...acRangeRule(),
+      range_slots: [
+        { id: "default", type: "all_day", threshold_low: 22, threshold: 26, ...(genLevel != null ? { gen_level: genLevel } : {}) },
+      ] satisfies AutomationRangeSlot[],
+      ...over,
+    };
+  }
+
+  it("hard-caps the leveler at the active slot's gen level", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    (collector as never as { automationRules: unknown[] }).automationRules = [slotCapRule(2)];
+    await setWeatherValue(collector, 28); // full need — uncapped ideal would be L6
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 0, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac1", "set_generator_mode", 6);
+  });
+
+  it("a slot flip to a lower cap reduces immediately (no gating)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    (collector as never as { automationRules: unknown[] }).automationRules = [slotCapRule(3)];
+    await setWeatherValue(collector, 28);
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 0, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 3);
+
+    // The active slot's cap drops to L1 — still inside the settle window, the
+    // reduction ships on the very next tick (slot flip = structural change).
+    (collector as never as { automationRules: unknown[] }).automationRules = [slotCapRule(1)];
+    devices[0].generatorMode = 3;
+    vi.advanceTimersByTime(5_000);
+    gridReadings(collector, 12, 1);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 1);
+  });
+
+  it("sends the slot gen level directly when the automation opts out of leveling", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24); // dead zone of the 22–26 slot
+    const rule = slotCapRule(2, {
+      smart_leveling: false,
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, generator_mode: 4 },
+    });
+    await checkAcRangeAutomation(collector, rule);
+
+    // Slot gen level overrides the preset's generator_mode 4.
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 });
+  });
+
+  it("strips the slot gen level from profiles when the leveler manages the device", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    const rule = slotCapRule(2, {
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, generator_mode: 4 },
+    });
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
+  });
+});
+
 describe("Smart AC leveling — calibration handoff (ramp re-arm)", () => {
   beforeEach(() => {
     acTimers.clear();

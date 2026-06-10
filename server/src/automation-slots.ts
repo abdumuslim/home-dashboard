@@ -29,6 +29,14 @@ export interface AutomationRangeSlot {
   threshold: number;
   /** 0 = smart auto (delta-based), 1–7 fixed level, absent = preset profile fan. */
   fan_speed?: number;
+  /**
+   * Generator-level cap while this slot is active (1–6); absent = Auto.
+   * When Smart AC Leveling manages the device this is a HARD CAP (never raised
+   * above, reductions/sheds below stay allowed; a live manual target still
+   * wins). When unmanaged (leveler off or smart_leveling=false) it is sent
+   * directly as the profile's generator_mode, overriding the preset's.
+   */
+  gen_level?: number;
 }
 
 interface ResolvedWindow {
@@ -100,6 +108,7 @@ export function normalizeRangeSlots(value: unknown): AutomationRangeSlot[] | nul
       threshold_low: typeof item.threshold_low === "number" ? item.threshold_low : Number.NaN,
       threshold: typeof item.threshold === "number" ? item.threshold : Number.NaN,
       ...(typeof item.fan_speed === "number" ? { fan_speed: item.fan_speed } : {}),
+      ...(typeof item.gen_level === "number" ? { gen_level: item.gen_level } : {}),
     };
   });
 }
@@ -177,6 +186,11 @@ export function validateRangeSlots(
     }
     if (slot.fan_speed != null && (!Number.isInteger(slot.fan_speed) || slot.fan_speed < 0 || slot.fan_speed > 7)) {
       return { ok: false, error: `${label}: fan speed must be an integer 0–7` };
+    }
+    // 0 is deliberately rejected — "Auto" is the ABSENT field; level 0 means
+    // unrestricted in the TCL protocol, a footgun for a cap.
+    if (slot.gen_level != null && (!Number.isInteger(slot.gen_level) || slot.gen_level < 1 || slot.gen_level > 6)) {
+      return { ok: false, error: `${label}: generator level must be an integer 1–6` };
     }
 
     if (slot.type === "all_day") {

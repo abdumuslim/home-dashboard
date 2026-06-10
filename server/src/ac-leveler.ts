@@ -61,6 +61,8 @@ export interface LevelerDeviceContext {
   needTier: NeedTier;
   /** °C above the target/satisfied point (≤0 = satisfied). */
   needDelta: number;
+  /** Active range slot's generator-level hard cap (null = Auto / no slot). */
+  slotGenCap: number | null;
 }
 
 export interface AcLevelingAcStatus {
@@ -175,6 +177,8 @@ export class AcLeveler {
   }>();
   private fanExempt = new Set<string>();
   private prevPowerStates = new Map<string, boolean>();
+  /** Last tick's per-device slot cap — a slot flip re-evaluates immediately. */
+  private lastSlotCap = new Map<string, number | null>();
   private rampUntil = new Map<string, number>();
   private boostActive = new Map<string, boolean>();
   // Stable gen level remembered when an AC is auto-turned-off because its
@@ -674,6 +678,15 @@ export class AcLeveler {
       this.deviceNames.set(device.id, device.name);
     }
 
+    // A range-slot flip that changes a device's gen-level cap is a structural
+    // change: an over-cap AC reduces immediately (reductions are never
+    // hold-blocked), a freed AC re-fills on the next gated raise.
+    for (const { device, slotGenCap } of ctx) {
+      const prev = this.lastSlotCap.get(device.id);
+      if (prev !== undefined && prev !== (slotGenCap ?? null)) this.forceEvaluate = true;
+      this.lastSlotCap.set(device.id, slotGenCap ?? null);
+    }
+
     // Structural change detection: AC power flips since the last tick.
     for (const { device } of ctx) {
       const prev = this.prevPowerStates.get(device.id);
@@ -874,7 +887,7 @@ export class AcLeveler {
     const sorted = [...ctx].sort(
       (a, b) => (order.get(a.device.id) ?? 999) - (order.get(b.device.id) ?? 999),
     );
-    const snapshots: LevelerAcSnapshot[] = sorted.map(({ device, managed, needTier, needDelta }) => {
+    const snapshots: LevelerAcSnapshot[] = sorted.map(({ device, managed, needTier, needDelta, slotGenCap }) => {
       const maxLevel = device.maxGeneratorLevel || 3;
       const currentLevel = inSettle ? (this.lastSetLevel.get(device.id) ?? device.generatorMode) : device.generatorMode;
       // Warm restore: a remembered level still above where the AC came back on.
@@ -916,7 +929,7 @@ export class AcLeveler {
           return entry?.kind === "level" ? entry.cap : null;
         })(),
         restoreBlocked: this.bounce.get(device.id)?.kind === "restore",
-        slotCap: null,
+        slotCap: slotGenCap != null ? Math.max(1, Math.min(slotGenCap, maxLevel)) : null,
         reachableCap,
         warmStartLevel,
       };

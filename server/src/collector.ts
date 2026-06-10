@@ -997,9 +997,19 @@ export class Collector {
     return computeAutoFanLevel(delta, entry?.lastCommandedFan);
   }
 
-  /** rule.action_on with the resolved per-slot fan; fan + turbo dropped while a manual fan override is active. */
+  /**
+   * rule.action_on with the resolved per-slot fan and per-slot generator
+   * level; fan + turbo dropped while a manual fan override is active. The
+   * slot's gen_level overrides the preset's generator_mode (clamped to the
+   * device max) — stripLeveledControls removes it again when the leveler
+   * manages the device, so the direct send only lands when unmanaged.
+   */
   private effectiveAcRangeProfile(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, value: number): AcAction {
     const profile = { ...(rule.action_on as AcAction) };
+    if (slot.gen_level != null) {
+      const deviceMax = this.tclCloud?.getDevices().find((d) => d.id === deviceId)?.maxGeneratorLevel || 6;
+      profile.generator_mode = Math.min(slot.gen_level, deviceMax);
+    }
     const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, deviceId));
     if (entry?.manual) {
       // Non-Najat fan 7 == turbo — enforcing turbo would clobber a manual fan choice
@@ -1197,7 +1207,13 @@ export class Collector {
             // Automation power-on = power cycle: drop manual fan overrides, apply the slot fan
             for (const did of unlockedDeviceIds) this.clearAcFanEnforcement(rule.id, did);
             const fan = this.resolveRangeFan(rule, activeSlot, unlockedDeviceIds[0], value);
-            const onAction = fan != null ? { ...(rule.action_on as AcAction), fan_speed: fan } : rule.action_on;
+            const onAction = {
+              ...(rule.action_on as AcAction),
+              ...(fan != null ? { fan_speed: fan } : {}),
+              // Slot gen level overrides the preset's (stripped again downstream
+              // when the leveler manages the device).
+              ...(activeSlot.gen_level != null ? { generator_mode: activeSlot.gen_level } : {}),
+            };
             await this.executeAutomationAction(rule, onAction, unlockedDeviceIds);
             for (const did of unlockedDeviceIds) this.noteAcFanCommanded(rule, activeSlot, did, onAction as AcAction);
             this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
@@ -1505,9 +1521,10 @@ export class Collector {
    * Need for the leveler: ACs with an active range automation use the same
    * room metric vs the active slot; others use the AC's internal sensor vs the
    * comfort target (heat mode inverts the comparison). The delta (°C past the
-   * satisfied point) orders raises and shed selection.
+   * satisfied point) orders raises and shed selection. The active slot's
+   * gen_level rides along as the leveler's hard cap for this device.
    */
-  private computeAcNeed(deviceId: string, device: AcDevice): { tier: NeedTier; delta: number } {
+  private computeAcNeed(deviceId: string, device: AcDevice): { tier: NeedTier; delta: number; slotGenCap: number | null } {
     for (const rule of this.automationRules) {
       if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
       if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
@@ -1521,30 +1538,35 @@ export class Collector {
       const value = getMetricValue(rule.metric, this.latestWeatherRow, this.latestAirRow, this.latestPowerRow);
       if (value == null) continue;
       const isCool = (rule.action_on as Record<string, unknown>).mode === 1;
+      const slotGenCap = slot.gen_level ?? null;
       if (isCool) {
         return {
           tier: computeNeedTier({ kind: "range", value, slotLow: slot.threshold_low, slotHigh: slot.threshold }),
           delta: value - slot.threshold_low,
+          slotGenCap,
         };
       }
       // Heat: need grows as the value drops below the low limit — negate to reuse the cool mapping
       return {
         tier: computeNeedTier({ kind: "range", value: -value, slotLow: -slot.threshold, slotHigh: -slot.threshold_low }),
         delta: slot.threshold - value,
+        slotGenCap,
       };
     }
-    if (!device.currentTemp || device.currentTemp <= 0) return { tier: "mild", delta: 1 };
+    if (!device.currentTemp || device.currentTemp <= 0) return { tier: "mild", delta: 1, slotGenCap: null };
     const target = this.acLeveler.getComfortTarget();
     if (device.mode === 4) {
       // Heat mode: deviation is how far the room is below the comfort target
       return {
         tier: computeNeedTier({ kind: "comfort", currentTemp: 2 * target - device.currentTemp, target }),
         delta: target - device.currentTemp,
+        slotGenCap: null,
       };
     }
     return {
       tier: computeNeedTier({ kind: "comfort", currentTemp: device.currentTemp, target }),
       delta: device.currentTemp - target,
+      slotGenCap: null,
     };
   }
 
@@ -1580,6 +1602,7 @@ export class Collector {
         managed: !this.acRuleOptsOutOfLeveling(device.id),
         needTier: need.tier,
         needDelta: need.delta,
+        slotGenCap: need.slotGenCap,
       };
     });
     await this.acLeveler.tick(ctx, outdoorTempC);
