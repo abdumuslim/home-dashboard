@@ -219,6 +219,10 @@ export class Collector {
   private readonly AC_MANUAL_OFF_CLEAR_GRACE_MS = 15_000;
   private acFanEnforcement = new Map<string, AcFanEnforcement>(); // key `${rule.id}:${deviceId}`
   private readonly AC_FAN_SETTLE_MS = 15_000;
+  // Last automation-sent power-off per device — the shadow can lag past the 5s power
+  // cache TTL, so off branches re-firing inside this grace are duplicates, not state.
+  private acRangeOffAt = new Map<string, number>();
+  private readonly AC_OFF_REFIRE_GRACE_MS = 15_000;
   // Persistent per-AC beep-off preference (firmware resets beepSwitch on power-loss restarts)
   private acBeepOffPrefs = new Set<string>();
   private acBeepPrefsLoaded = false;
@@ -1200,15 +1204,18 @@ export class Collector {
           this.automationState.set(rule.id, state);
         }
       } else if (now - state.lastToggle >= cooldownMs) {
+        let adopted = false;
         for (const did of deviceIds) {
           try {
             const power = await this.getDevicePowerCached(did, "ac");
             if (power === "on") {
               if (shouldTurnOff) {
+                if (now - (this.acRangeOffAt.get(did) ?? 0) < this.AC_OFF_REFIRE_GRACE_MS) continue; // off already sent — shadow lagging
                 log.info(`[collector] AC range "${rule.name}": device ${did} is ON past turn-off limit (${rule.metric}=${value}), turning OFF`);
                 // Temperature-cycling off — remember the stable level for warm restore.
                 await this.acLeveler.rememberStableLevel(did);
                 await this.executeAutomationAction(rule, { power: 0 } as AcAction, [did]);
+                this.acRangeOffAt.set(did, now);
                 this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
               } else {
                 this.updateAcFanTracking(rule, activeSlot, did, value, now);
@@ -1220,14 +1227,16 @@ export class Collector {
                   this.noteAcFanCommanded(rule, activeSlot, did, diff);
                 }
                 this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
+                adopted = true;
               }
             }
           } catch (err) {
             log.error(`[collector] AC range "${rule.name}" adopt-check failed for ${did}:`, (err as Error).message);
           }
         }
-        state.conditionSince = null;
-        if (state.status === "idle") this.automationState.set(rule.id, state);
+        // The adoption above already persisted "triggered" — writing the stale local
+        // state here would clobber it back to idle (the dead-zone clobber bug).
+        if (!adopted) this.automationState.set(rule.id, { ...state, conditionSince: null });
       } else {
         state.conditionSince = null;
         this.automationState.set(rule.id, state);
@@ -1244,6 +1253,8 @@ export class Collector {
           for (const did of deviceIds) {
             await this.acLeveler.clearShed(did, "range_turn_off");
             this.clearAcFanEnforcement(rule.id, did);
+            this.acRangeOffAt.set(did, now);
+            this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
           }
         } catch (err) {
           log.error(`[collector] AC range "${rule.name}" turn-off failed:`, (err as Error).message);
@@ -1292,9 +1303,10 @@ export class Collector {
     for (const did of deviceIds) {
       try {
         const power = await this.getDevicePowerCached(did, "ac");
-        if (power !== "off") {
+        if (power !== "off" && now - (this.acRangeOffAt.get(did) ?? 0) >= this.AC_OFF_REFIRE_GRACE_MS) {
           log.info(`[collector] AC range "${rule.name}": no active range slot, turning OFF ${did} [${deviceNames}]`);
           await this.executeAutomationAction(rule, { power: 0 } as AcAction, [did]);
+          this.acRangeOffAt.set(did, now);
           this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
           sentOff = true;
         }

@@ -389,6 +389,69 @@ function getFanEnforcement(collector: Collector) {
   return (collector as never as { acFanEnforcement: Map<string, { manual: boolean }> }).acFanEnforcement;
 }
 
+describe("AC range dead-zone adoption + turn-off re-fire (regressions)", () => {
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T04:30:00.000Z")); // 07:30 Baghdad — morning slot active
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("regression: dead-zone adoption persists the triggered status", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    await setWeatherValue(collector, 23); // dead zone (22 < 23 < 26)
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    const state = (collector as never as { automationState: Map<number, { status: string }> }).automationState.get(1);
+    expect(state?.status).toBe("triggered");
+  });
+
+  it("regression: manual fan override survives dead-zone adoption and the triggered path", async () => {
+    const { collector, tclCloud } = createCollector();
+    const rule = acFanRule(2);
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    getFanEnforcement(collector).set("1:ac1", {
+      slotId: "morning", lastCommandedFan: 4, lastFanCommandAt: Date.now(), manual: true,
+    } as never);
+
+    await setWeatherValue(collector, 23); // dead zone of the morning slot (22–25)
+    await checkAcRangeAutomation(collector, rule); // dead-zone adoption → triggered
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+
+    await checkAcRangeAutomation(collector, rule); // triggered re-enforcement
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+  });
+
+  it("regression: range turn-off does not double-fire while the shadow lags", async () => {
+    const { collector, tclCloud, actions } = createCollector();
+    const remember = vi.spyOn(collector.acLeveler, "rememberStableLevel");
+    setTriggered(collector, 1);
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    const offs = () => actions.filter((a) => (a.action as { power?: number }).power === 0);
+
+    await setWeatherValue(collector, 21); // ≤ low limit → turn off
+    await checkAcRangeAutomation(collector, acRangeRule());
+    expect(offs()).toHaveLength(1);
+    expect(remember).toHaveBeenCalledTimes(1);
+
+    // 7s later the shadow still reads ON (power cache TTL is 5s) — must not re-fire
+    vi.advanceTimersByTime(7_000);
+    await checkAcRangeAutomation(collector, acRangeRule());
+    expect(offs()).toHaveLength(1);
+    expect(remember).toHaveBeenCalledTimes(1);
+
+    // past the grace a genuinely still-ON AC is turned off again
+    vi.advanceTimersByTime(9_000);
+    await checkAcRangeAutomation(collector, acRangeRule());
+    expect(offs()).toHaveLength(2);
+  });
+});
+
 describe("AC range fan enforcement", () => {
   beforeEach(() => {
     acTimers.clear();
