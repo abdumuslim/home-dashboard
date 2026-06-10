@@ -82,6 +82,21 @@ export interface LevelerAcSnapshot {
   /** A recent restore bounced (restore → over-limit → re-shed) — skip in restore selection until it clears. */
   restoreBlocked: boolean;
   /**
+   * Active range slot's generator-level hard cap (explicit user intent for this
+   * time window): never raise above it — including past boost floors, mirroring
+   * the manual-reduction rule — but reductions/sheds below it stay allowed.
+   * A live manualTarget still wins (manual beats automation). Null = Auto.
+   */
+  slotCap: number | null;
+  /**
+   * Highest generator level the firmware has actually been observed to apply.
+   * Some units silently ignore their top level(s) (Najat never confirms L6) —
+   * targeting one re-sends the command forever. Physics beats every intent:
+   * this clamps need caps, manualTarget, bounce caps AND floors. Null = all
+   * levels assumed reachable.
+   */
+  reachableCap: number | null;
+  /**
    * Remembered stable level from before a temperature-cycling off. When set and
    * the AC just came back on below it, a raise up to this level may skip the
    * headroom-streak gate (still budget-clamped, still deferred during
@@ -155,6 +170,23 @@ export const STALE_POWER_MS = 15_000;
 export const NOISE_THRESHOLD = 0.1;
 /** Pause after sending commands so compressors and measurements settle. */
 export const SETTLE_MS = 30_000;
+/**
+ * Settle window for FAN-ONLY command batches. Fans draw little and stabilize
+ * in seconds — pausing the whole loop 30s per fan command made restoring a
+ * held fan crawl (~35s/step staged, minutes total) and blocked level raises
+ * the entire time. Level/power batches keep the full SETTLE_MS.
+ */
+export const FAN_SETTLE_MS = 10_000;
+/**
+ * Consecutive unconfirmed re-sends of the SAME generator level before the
+ * level is marked firmware-unreachable for that device and the allocator
+ * falls back to the next lower level. Some units accept the command (cloud
+ * returns OK) but never apply/report it — Najat never confirms L6 — and
+ * without this the never-level-0 correction re-sends it forever. Doubles as
+ * the command retry Najat's flaky firmware needs anyway. L1 is never marked
+ * (a managed AC must always get SOME cap).
+ */
+export const UNREACHABLE_LEVEL_SENDS = 3;
 /**
  * Compressor ramp-up window after an AC turns ON. While ramping, the AC's
  * estimated draw is NOT subtracted from measured current when deriving the
@@ -269,21 +301,34 @@ export function needCap(tier: NeedTier, maxLevel: number): number {
   return maxLevel;
 }
 
-/** Hard floor: the boost minimum, unless the user manually reduced below it. */
+/**
+ * Hard floor: the boost minimum, unless the user manually reduced below it,
+ * a range slot caps below it (explicit per-window intent beats the boost), or
+ * the firmware can't reach it (reachableCap — physics beats every floor).
+ */
 function floorOf(ac: LevelerAcSnapshot): number {
   let floor = Math.max(1, Math.min(ac.minLevel, ac.maxLevel));
   if (ac.manualCap != null) floor = Math.min(floor, Math.max(1, ac.manualCap));
+  if (ac.slotCap != null) floor = Math.min(floor, Math.max(1, ac.slotCap));
+  if (ac.reachableCap != null) floor = Math.min(floor, Math.max(1, ac.reachableCap));
   return floor;
 }
 
-/** Ceiling from need tier / manual intents / bounce caps, never below the floor. */
+/** Ceiling from need tier / manual intents / slot caps / bounce caps, never below the floor. */
 function ceilOf(ac: LevelerAcSnapshot): number {
+  // A manualTarget bypasses the need cap AND the slot cap (manual beats
+  // automation); manualCap/slotCap intersect otherwise.
   const cap = ac.manualTarget != null
     ? ac.manualTarget
-    : Math.min(needCap(ac.needTier, ac.maxLevel), ac.manualCap ?? ac.maxLevel);
+    : Math.min(needCap(ac.needTier, ac.maxLevel), ac.manualCap ?? ac.maxLevel, ac.slotCap ?? ac.maxLevel);
   // A bounce cap also defers manualTarget-driven raises — the target stays,
-  // the retry waits for the load to drop. Hard boost floors still win (max).
-  return Math.max(floorOf(ac), Math.min(cap, ac.bounceCap ?? ac.maxLevel, ac.maxLevel));
+  // the retry waits for the load to drop. reachableCap clamps everything:
+  // a level the firmware never applies cannot be a target of any kind.
+  // Hard boost floors still win (max) — except where floorOf itself clamped.
+  return Math.max(
+    floorOf(ac),
+    Math.min(cap, ac.bounceCap ?? ac.maxLevel, ac.reachableCap ?? ac.maxLevel, ac.maxLevel),
+  );
 }
 
 /**
@@ -291,14 +336,19 @@ function ceilOf(ac: LevelerAcSnapshot): number {
  * raising toward max — need caps only bite when amps are tight. Satisfied
  * rooms stay at their cap (the range automation is about to turn them off /
  * the compressor idles at the setpoint), and manual intents remain hard.
+ * The slot cap stays hard here too (the user picked it for this window)
+ * unless a live manualTarget overrides it.
  */
 function softCeilOf(ac: LevelerAcSnapshot): number {
   if (ac.needTier === "satisfied") return ceilOf(ac);
+  const slotLimit = ac.manualTarget != null ? ac.maxLevel : (ac.slotCap ?? ac.maxLevel);
   const cap = Math.min(
     ac.maxLevel,
     ac.manualCap ?? ac.maxLevel,
     ac.manualTarget ?? ac.maxLevel,
     ac.bounceCap ?? ac.maxLevel,
+    ac.reachableCap ?? ac.maxLevel,
+    slotLimit,
   );
   return Math.max(floorOf(ac), cap);
 }
@@ -434,9 +484,11 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   const toFanReduce = canReduce ? fanReducible.map((a) => a.deviceId) : [];
   const toRestore: string[] = restorePick ? [restorePick] : [];
 
-  // Staged fan restore: one step toward the hold's original fan per call,
-  // highest-priority pending hold first. Restoring a shed AC takes precedence;
-  // gen raises wait until every held fan is back (a fan step costs fewer amps).
+  // Fan restore: ONE JUMP straight back to the hold's original fan (fans cost
+  // ~0.5A and stabilize in seconds — the old one-step-per-~35s staging kept
+  // ACs at silent fan 1 for minutes; user re-decided 2026-06-10), highest-
+  // priority pending hold first. Restoring a shed AC takes precedence; gen
+  // raises wait until every held fan is back (a fan step costs fewer amps).
   const holdPending = (a: LevelerAcSnapshot): boolean =>
     a.on && a.managed && a.fanRestoreTarget != null && a.fanSpeed != null &&
     (a.fanRestoreTarget === 0 ? a.fanSpeed !== 0 : a.fanSpeed < a.fanRestoreTarget);
@@ -445,12 +497,7 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   if (canRaise && !overBudget && toRestore.length === 0) {
     const pick = acs.find(holdPending);
     if (pick) {
-      toFanRaise = {
-        deviceId: pick.deviceId,
-        // Original fan 0 = built-in auto — restore in one gated step (stepping
-        // up through 7 first would briefly engage turbo on non-Najat units).
-        fan: pick.fanRestoreTarget === 0 ? 0 : Math.min(pick.fanSpeed! + 1, pick.fanRestoreTarget!),
-      };
+      toFanRaise = { deviceId: pick.deviceId, fan: pick.fanRestoreTarget! };
     }
   }
 

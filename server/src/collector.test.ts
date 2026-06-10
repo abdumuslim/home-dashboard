@@ -1814,7 +1814,7 @@ describe("Smart AC leveling — fan reduction before shed", () => {
     expect(fanHolds.has("ac1")).toBe(true);
   });
 
-  it("restores held fans one gated step at a time and suppresses gen raises meanwhile", async () => {
+  it("restores a held fan in one jump and suppresses gen raises meanwhile", async () => {
     const { collector, tclCloud, fanHolds, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     fanHolds.set("ac1", { original_fan: 3, last_set_fan: 1 });
@@ -1828,9 +1828,9 @@ describe("Smart AC leveling — fan reduction before shed", () => {
     headroomReadings(collector, 6);
     await checkAcLeveling(collector);
 
-    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_fan_speed", 2);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_fan_speed", 3);
     expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac1", "set_generator_mode", expect.anything());
-    expect(fanHolds.get("ac1")).toEqual({ original_fan: 3, last_set_fan: 2 });
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(false); // one jump → hold complete
   });
 
   it("releases the hold and re-baselines fan enforcement when the restore completes", async () => {

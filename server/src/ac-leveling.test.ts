@@ -40,6 +40,8 @@ function ac(id: string, over: Partial<LevelerAcSnapshot> = {}): LevelerAcSnapsho
     fanExempt: false,
     bounceCap: null,
     restoreBlocked: false,
+    slotCap: null,
+    reachableCap: null,
     warmStartLevel: null,
     ...over,
   };
@@ -909,8 +911,8 @@ describe("computeAllocation — fan reduction before shed", () => {
   });
 });
 
-describe("computeAllocation — staged fan restore", () => {
-  it("raises the highest-priority pending hold one step", () => {
+describe("computeAllocation — fan restore (one jump)", () => {
+  it("restores the highest-priority pending hold straight to its original fan", () => {
     const r = computeAllocation(input({
       acs: [
         ac("najat", { fanSpeed: 1, fanRestoreTarget: 4 }),
@@ -918,7 +920,7 @@ describe("computeAllocation — staged fan restore", () => {
         ac("abdullah"),
       ],
     }));
-    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 2 });
+    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 4 });
   });
 
   it("restores an auto-fan hold straight to 0", () => {
@@ -928,11 +930,11 @@ describe("computeAllocation — staged fan restore", () => {
     expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 0 });
   });
 
-  it("clamps the final step to the target", () => {
+  it("jumps to the target from any intermediate fan", () => {
     const r = computeAllocation(input({
-      acs: [ac("najat", { fanSpeed: 3, fanRestoreTarget: 4 }), ac("abdu"), ac("abdullah")],
+      acs: [ac("najat", { fanSpeed: 3, fanRestoreTarget: 7 }), ac("abdu"), ac("abdullah")],
     }));
-    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 4 });
+    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 7 });
   });
 
   it("emits nothing when the hold is already complete", () => {
@@ -974,7 +976,7 @@ describe("computeAllocation — staged fan restore", () => {
         ac("abdullah", { currentLevel: 1 }),
       ],
     }));
-    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 2 });
+    expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 4 });
     expect(r.desiredLevels).toEqual({});
   });
 
@@ -1068,5 +1070,116 @@ describe("computeAllocation — bounce caps", () => {
       ],
     }));
     expect(r.toRestore).toEqual([]);
+  });
+});
+
+describe("computeAllocation — slot gen caps (per-range-slot level)", () => {
+  it("never raises above an active slot cap in the fill", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { slotCap: 2 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.desiredLevels.najat).toBe(2);
+    expect(r.desiredLevels.abdu).toBe(3);
+    expect(r.desiredLevels.abdullah).toBe(3);
+  });
+
+  it("slot cap below a boost floor wins (explicit per-window intent)", () => {
+    const r = computeAllocation(input({
+      forceEvaluate: true,
+      acs: [ac("najat"), ac("abdu"), ac("abdullah", { minLevel: 2, currentLevel: 2, slotCap: 1 })],
+    }));
+    expect(r.desiredLevels.abdullah).toBe(1);
+  });
+
+  it("still sheds a slot-capped AC when the budget demands it", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 13, // budget 1 < najat's floor 2A
+      overLimitStreak: REDUCE_STREAK,
+      acs: [ac("najat", { slotCap: 3 })],
+    }));
+    expect(r.toShed).toEqual(["najat"]);
+  });
+
+  it("still reduces below the slot cap when over the limit", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 11, // budget 3 — fill stops at L2 (2A floor + 1A step)
+      overLimitStreak: REDUCE_STREAK,
+      acs: [ac("najat", { currentLevel: 4, slotCap: 4 })],
+    }));
+    expect(r.desiredLevels.najat).toBe(2);
+  });
+
+  it("intersects with a bounce cap — the lower wins", () => {
+    const capped = computeAllocation(input({
+      acs: [ac("najat", { slotCap: 4, bounceCap: 2 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(capped.desiredLevels.najat).toBe(2);
+    const slotLower = computeAllocation(input({
+      acs: [ac("najat", { slotCap: 2, bounceCap: 4 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(slotLower.desiredLevels.najat).toBe(2);
+  });
+
+  it("a slot cap of 1 still caps a level-0 AC at L1, never 0", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { currentLevel: 0, slotCap: 1 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.desiredLevels.najat).toBe(1);
+  });
+
+  it("the soft surplus pass respects the slot cap too", () => {
+    // Mild tier caps najat at ceil(6/2)=3; surplus budget would soft-fill to 6
+    // — the slot cap holds it at 4.
+    const r = computeAllocation(input({
+      acs: [ac("najat", { needTier: "mild", slotCap: 4 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.desiredLevels.najat).toBe(4);
+  });
+
+  it("manualTarget above the slot cap wins — manual beats automation", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { slotCap: 2, manualTarget: 5 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.desiredLevels.najat).toBe(5);
+  });
+});
+
+describe("computeAllocation — reachable caps (firmware-unreachable levels)", () => {
+  it("never targets a level above the reachable cap in either pass", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { reachableCap: 5 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.desiredLevels.najat).toBe(5);
+  });
+
+  it("clamps a manualTarget the firmware cannot reach", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { manualTarget: 6, reachableCap: 5 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.desiredLevels.najat).toBe(5);
+  });
+
+  it("clamps a boost floor the firmware cannot reach", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat"), ac("abdu"), ac("abdullah", { minLevel: 3, currentLevel: 1, reachableCap: 2 })],
+    }));
+    expect(r.desiredLevels.abdullah).toBe(2);
+  });
+
+  it("clamps a warm-start jump to the reachable cap", () => {
+    const r = computeAllocation(input({
+      headroomStreak: 0, // raise gate closed — only the warm-start path may act
+      acs: [ac("najat", { warmStartLevel: 6, reachableCap: 4 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.desiredLevels.najat).toBe(4);
+  });
+
+  it("a reachable cap of 1 still caps a level-0 AC at L1, never 0", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { currentLevel: 0, reachableCap: 1 }), ac("abdu"), ac("abdullah")],
+    }));
+    expect(r.desiredLevels.najat).toBe(1);
   });
 });

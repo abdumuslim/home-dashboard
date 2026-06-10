@@ -801,6 +801,8 @@ export class AcLeveler {
           return entry?.kind === "level" ? entry.cap : null;
         })(),
         restoreBlocked: this.bounce.get(device.id)?.kind === "restore",
+        slotCap: null,
+        reachableCap: null,
         warmStartLevel,
       };
     });
