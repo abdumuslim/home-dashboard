@@ -26,6 +26,7 @@ ssh_out*.txt
 
 # Claude Code / AI context (contain credentials, VPS details)
 CLAUDE.md
+docs/agent/operations.md
 GEMINI.md
 HANDOFF.md
 home-dashboard-plan.md
@@ -34,3 +35,4 @@ home-dashboard-plan.md
 # Misc
 test.md
 docs/conversation.jsonl
+.migration-backup/

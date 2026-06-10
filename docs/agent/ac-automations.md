@@ -1,0 +1,139 @@
+<!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
+# Purifier & AC Automations
+
+**TL;DR**: The collector loop (every ~5s) runs two automation types — metric-based and schedule-based — for two device types: Xiaomi purifiers (`device_type='purifier'`) and TCL ACs (`device_type='ac'`). AC metric rules are a thermostat-hysteresis state machine (`checkAcRangeAutomation()`) with multi-range time slots, per-slot fan speed (incl. server-computed smart auto), diff-based re-enforcement, and persistent manual-off locks. AC presets (server-side, 10 slots) are the action source for AC rules; preset apply/save syncs into automations. Sticky beep-off is enforced separately each tick. Leveler interaction points (generator_mode/fan stripping, shed vs manual-off) are documented here; leveler internals live in [ac-leveling.md](ac-leveling.md).
+
+## Overview & device routing
+
+- Two automation types (metric, schedule) are processed in the collector loop, configurable via dashboard. Supports both **purifier** (`device_type='purifier'`) and **AC** (`device_type='ac'`) devices. The `device_type` column on the `automations` table routes execution: purifiers → `xiaomiCloud.executeAction()`, ACs → `tclCloud.executeAcAction()`. (AC automation system added 2026-04-21.)
+- Power state cache (`getDevicePowerCached`) queries the appropriate cloud based on device type: `fetchDevicesLive()` for AC (live shadow query) vs `getDevicePower()` for purifiers. 5s TTL.
+- AC automations use **single-device selection** (radio buttons, not checkboxes).
+- Key collector methods: `checkMetricAutomation` (purifier single-threshold), `checkAcRangeAutomation` (AC dual-threshold hysteresis), `checkScheduleAutomation`, `checkAcTimers`, `checkAcBeepEnforcement`, `executeAutomationAction` (routes to xiaomi or tcl based on `device_type`). These are the two separate code paths to remember when modifying automation logic: `checkMetricAutomation` (single-threshold, purifiers) vs `checkAcRangeAutomation` (dual-threshold hysteresis, AC).
+- `automations` table fields: `id`, `automation_type` (metric/schedule), `device_type` (purifier/ac), `device_ids`, `device_names`, `metric`, `condition`, `threshold`, `threshold_low` (AC range hysteresis), `sustained_minutes` (metric type), `time_start`, `time_end`, `turn_off_at_end` (both types), `start_mode`, `start_prayer`, `start_prayer_offset`, `end_mode`, `end_prayer`, `end_prayer_offset` (schedule type), `action_on` (JSONB — purifier: `{power:"on"}`, AC: full preset profile `{power:1, mode, temperature, fan_speed, eco, turbo, screen, vertical_swing, horizontal_swing, fresh_air, generator_mode}`), `action_off`, `cooldown_secs`, `enabled`, `smart_leveling`, `range_slots`. Full schema in [database.md](database.md).
+- **Rule cache invalidation**: collector caches automation rules for 30s; `collector.invalidateAutomationRules()` resets `automationRulesLastFetch=0` so the next tick (≤5s) reloads rules from DB. Routes wires this via the `onAutomationRulesChanged?.()` callback.
+- **TCL Cloud auto-recovery** (added 2026-05-01): when a TCL 403 retry fails, `tokenData` stays null and `isReady()` returns false permanently — silently disabling ALL AC automations with zero log output. Root cause: the 403 handler sets `this.tokenData = null` before calling `ensureValidTokens()`; if re-auth fails, it stays null. Fix: collector's `checkAutomations()` attempts `tclCloud.init()` when `isReady()` is false, with a 60s retry cooldown. Diagnostic warnings were also added for unknown/null metrics in `checkAcRangeAutomation()`. TCL protocol details: [tcl-ac.md](tcl-ac.md).
+- **Calibration suspension**: while `acCalibrator.isActive()` the collector skips ALL AC automations, AC timers (they stay pending and fire late), and the leveler tick — so calibration turn-offs never record manual-off locks. Beep enforcement is also skipped while calibration is active.
+- **Why this system exists**: the user needed temperature-based AC control with hysteresis to prevent rapid cycling, plus quick timers for delayed on/off from the AC card.
+
+## Metric-based (purifier)
+
+- AQI threshold triggers (e.g., PM2.5 above 50 → turn on purifier). Single threshold + condition (above/below).
+- Supports `sustained_minutes` (condition must hold continuously before triggering).
+- While the condition holds, re-checks device power every cooldown (default 5s) and re-sends turn-on if off.
+- Optional `turn_off_at_end` (labeled "Turn off when resolved" in UI): when the condition clears, after a 60s grace period, sends power-off to all devices.
+- **Cooldown = 5s** (changed 2026-04-25, was 300s) for both `checkMetricAutomation` and `checkAcRangeAutomation` — the collector acts on every loop tick (loop runs every 5s). New metric automations INSERT with `cooldown_secs=5` (routes.ts); existing rows were migrated via the `database.ts` MIGRATIONS list. Schedule automations remain at 60s.
+
+## Metric-based (AC) — thermostat hysteresis
+
+- Dual-threshold range: `threshold` = high limit, `threshold_low` = low limit; both support decimals.
+- The AC trigger form supports a "Real temp" vs "Feels like" toggle for indoor temperature metrics (added 2026-04-25): maps `temp_indoor_c` → `feels_like_indoor_c` and `temp_ch8_c` → `feels_like_ch8_c` via `FEELS_LIKE_MAP` / `REVERSE_FEELS_LIKE` in `alerts-modal.tsx`. Both feels-like metrics exist in server + client `alert-metrics.ts`. When editing an existing rule, the form detects whether the stored metric is a feels-like variant and pre-selects the toggle.
+- **Presets are the action source**: AC automations do NOT have a custom mode/temp/fan editor. The frontend reads saved presets from the server-side `ac_presets` table and copies the full `PresetData` (10 properties) into `action_on` JSONB with snake_case keys (mode, temp, fan_speed, eco, turbo, screen, vertical_swing, horizontal_swing, fresh_air, generator_mode) plus a `_preset_slot` reference. Presets must be saved in the AC widget first, then referenced when creating automations. When editing an automation, the form pre-selects the preset from `action_on._preset_slot`.
+- The preset's **mode determines hysteresis direction**:
+  - **Cool (mode=1)**: turns ON when temp >= high limit, turns OFF when temp <= low limit.
+  - **Heat (mode=4)**: turns ON when temp <= low limit, turns OFF when temp >= high limit.
+- Processed by `checkAcRangeAutomation()` in `server/src/collector.ts` — a state machine: IDLE → TRIGGERED at threshold limits; the dead zone re-enforces the profile (no power toggle). `AcAction.power` is optional — when undefined, `executeAcAction` sends only profile commands (no `set_power`, no restore delay). Cooldown is 5s (acts every loop tick).
+- **Diff-based re-enforcement** (fixed 2026-04-25): dead-zone and triggered-state re-enforcement use `computeAcDiff()` — compares current device state with the desired profile and only sends properties that differ; skips the send entirely when everything matches. Previously it sent ALL 10 profile commands blindly every 5s.
+- **Model-aware filtering** (the AC models are handled differently; full protocol details in [tcl-ac.md](tcl-ac.md)):
+  - **Najat (TAC-24CHSA)**: `windSpeed7Gear`, `verticalWind`/`horizontalWind`, has `newWindSwitch` (fresh air). Does NOT have `ECO`, `turbo`, `silenceSwitch` — these are filtered out in `buildProfileShadowPayload`.
+  - **Abdu/Abdullah (TAC-12CHSD)**: `windSpeed`+`silenceSwitch`+`turbo`, `verticalSwitch`/`horizontalSwitch`, has `ECO`. Does NOT have `newWindSwitch` — `set_fresh_air` is filtered out.
+  - Model detection via `isNajatModel()` depends on `cachedDevices` being populated. `ensureDeviceCachePopulated()` is called in `executeAutomationAction()` for AC devices (added 2026-05-10), in the test endpoint, and before initial turn-on.
+  - `executeAcAction` with power=1 + profile sends power and profile as two separate shadow updates with a 3s boot delay (NOT combined — Najat firmware quirk, see [tcl-ac.md](tcl-ac.md)).
+  - **Fan-speed/turbo coupling** (hardened 2026-06-08): for non-Najat, the fan block owns `windSpeed`/`silenceSwitch`/`turbo` atomically (7=turbo, 1=silence; the shadow-derived `fanSpeed` reads 7 *because* `turbo===1`). ANY `fan_speed` in a profile drops the explicit `turbo` from `buildProfileShadowPayload`, and `computeAcDiff` skips the `turbo` comparison when desired `fan_speed` is present. **Why**: a preset's `turbo:0` + smart-auto-resolved fan 7 is self-contradictory on this model — the diff alternated `{turbo:0}`/`{fan_speed:7}` commands every 5s tick forever (the Abdu AC beeped every 5s, 2026-06-08). Manual-fan drift detection couldn't break the loop because each flip landed inside the 15s settle window of our own command. Regression tests in `tcl-cloud.test.ts`.
+- **Shadow-reported gotcha** (discovered 2026-05-10): the AC may report (in shadow `state.reported`) that settings are applied even when physically they aren't. This affects `computeAcDiff()` — it reads reported state from cache and may see no diff when the physical AC doesn't match. The two-step power/profile approach (3s delay) mitigates this for initial turn-on. For re-enforcement, the diff catches settings that were later changed via remote control.
+- **Dead zone** (temperature between the limits):
+  - If the AC is ON → diff-based re-enforcement: compares current device state with the desired profile via `computeAcDiff()`, only sends properties that differ (overrides manual remote changes without blind resends).
+  - If the AC is OFF because the user manually turned it off, the collector records a device-level manual-off lock in `ac_manual_off_locks`. That lock blocks all AC auto-on paths until a manual-on is observed; temperature reaching the low/off limit must **NOT** unlock it (see Manual-off locks below).
+- **Warm-restore hook** (automation-side call site, 2026-06-08): when the range automation auto-turns-off an AC because its temperature left the comfort range (the two `shouldTurnOff` branches in `checkAcRangeAutomation` — scoped to temperature cycling only, NOT time-window/schedule ends, NOT manual-off, NOT leveler sheds), the collector calls `acLeveler.rememberStableLevel(did)` BEFORE sending the off command. Leveler-side behavior of the remembered level: [ac-leveling.md](ac-leveling.md).
+
+## Range slots & fan speed
+
+- **Range slots** (`range_slots` JSONB, `AutomationRangeSlot` type in `server/src/automation-slots.ts`; added 2026-06 on branch codex/ac-manual-off-lock): one AC rule can hold **1–24 time-windowed ranges**, each with its own `threshold_low`/`threshold` pair. Windows are exact HH:MM or prayer-relative, overnight is supported, max one `all_day` fallback slot, no overlaps (`validateRangeSlots`).
+  - `findActiveRangeSlot()` picks the active slot each tick; no active slot → `turnOffAcOutsideRange()` (the AC is turned off).
+  - Legacy rules without `range_slots` convert via `getLegacyRangeSlots()`.
+  - **Persistence choke point gotcha**: `normalizeRangeSlots()` whitelists slot fields — new slot fields MUST be added to the whitelist or they are silently dropped before storage.
+- **Per-slot fan speed** (`slot.fan_speed`, optional; added 2026-06-06): overrides the preset's fan while that slot is active — `1–7` = fixed level, `0` = **delta-based smart auto**, absent = preset fan (which itself resolves through smart auto if it's 0).
+  - **Smart auto** (`server/src/ac-auto-fan.ts`, `computeAutoFanLevel`, pure + unit-tested): cool delta = value − slot low (heat mirrors: slot high − value); ≤0.5° → L1, then +1 level per 0.3° (L2 ≤0.8°, L3 ≤1.1°, …), cap L7, with 0.1° down-hysteresis (raises immediate/instant, lowers only past the band). Range automations **never** send the AC's built-in fan auto (0).
+  - Resolution happens in `resolveRangeFan()`/`effectiveAcRangeProfile()` in collector.ts, applied at all **4 profile sites** in `checkAcRangeAutomation()`: turn-on, lock-check adoption, dead-zone adoption, triggered re-enforcement.
+- **Manual fan override — manual fan always wins**: a manual fan change (remote or UI) suspends fan **and turbo** enforcement (non-Najat fan 7 == turbo) for that rule+device until the active slot changes or the AC power cycles.
+  - In-memory `acFanEnforcement` Map in the collector, keyed `${ruleId}:${deviceId}` — lost on restart by design (accepted, like leveler manual gen intents).
+  - **Remote detection** in `updateAcFanTracking()`: shadow `fan_speed` drift vs the last-commanded fan, with a 15s settle window (`AC_FAN_SETTLE_MS`) so our own just-sent command isn't misread; the baseline is adopted when the observed fan already matches the desired one.
+  - **UI detection** is instant via the `set_fan_speed`/`set_turbo` hook in the routes control endpoint → `collector.noteUserAcFanChange()` (wired through `AcManualOffLockHandlers.onUserFanChange`), which also releases any leveler fan hold (`acLeveler.onUserFanChange`).
+  - **UI fan Auto is the resume switch** (2026-06-07): `set_fan_speed` with value 0 routes to `onUserFanAuto` → `collector.noteUserAcFanAuto()` — deletes the device's `acFanEnforcement` entries (clears the manual override) and releases any leveler fan hold, so the automation's resolved fan (smart auto for Auto slots/presets) re-enforces on the next tick (within ≤5s). The AC's built-in auto only sticks/persists on devices no automation owns. Note: a *remote*-set auto still reads as a manual change via drift — only the dashboard A (Auto) button resumes enforcement.
+  - All off paths (range off, observed off, outside-range off) and automation turn-on clear the fan-enforcement bookkeeping.
+  - **Leveler fan holds override fan enforcement** (2026-06-06 evening): while the leveler holds an AC's fan (last try before a shed — see [ac-leveling.md](ac-leveling.md)), enforcement defers entirely: `stripLeveledControls(rule, action, deviceId)` (the deviceId-aware wrapper around `stripGenIfLeveled`) drops `fan_speed`+`turbo` at all 4 profile sites, `updateAcFanTracking` early-returns (a hold is not a manual change), and every leveler fan command re-stamps `lastCommandedFan`/`lastFanCommandAt` via `refreshAcFanBaseline()` so neither the hold nor its release trips false manual-change detection. After the hold releases, the automation re-takes fan control as a normal diff.
+
+## Manual-off locks
+
+Persistent device-level user intent stored in `ac_manual_off_locks` (`device_id TEXT PRIMARY KEY`, `locked_at TIMESTAMPTZ`, `reason TEXT` — schema in [database.md](database.md)). The table prevents deploys/restarts from clearing a user's manual-off choice.
+
+- **`recordAcManualOff()`** is called for: UI `set_power=0`, detected physical/remote off while an AC automation had seen the device on, and turn-off timers.
+- **`clearAcManualOff()`** is called for: UI `set_power=1`, or observed physical ON after a 15s stale-shadow grace.
+- A lock **blocks all AC auto-on paths** (metric/range, schedule, turn-on timers) until a manual-on is observed. **Never auto-clear from temperature thresholds** — temperature reaching the low/off limit must NOT unlock it.
+- Locked ACs expose `manualOffLocked` from `/api/ac/devices`; the UI shows a lock icon and disables turn-on timers. Turn-on timer creation is rejected with 409 when locked, and an older turn-on timer that fires while locked is skipped.
+- **History / superseded design**: the old in-memory mechanism set `canAutoTurnOn=false` on `AutomationState` when a manual off was detected in the dead-zone cooldown check, and unlocked (`canAutoTurnOn=true`) when temp reached the opposite (turn-off) limit. That itself replaced an even older `"override"` status (removed 2026-04-24) with a simpler flag on the existing `"idle"`/`"triggered"` two-state model. **Superseded 2026-06 by persistent DB locks** (CLAUDE.md is authoritative here): `AutomationState.canAutoTurnOn` still exists for legacy/shared state-shape compatibility, but the device locks are the real mechanism — **do not reintroduce temperature-based unlocks**.
+- **Shed ≠ manual-off** (leveler interaction; leveler side in [ac-leveling.md](ac-leveling.md)): all observed-off lock recorders and all auto-on paths (metric/range/schedule/timers) skip leveler-shed devices; automation-driven turn-offs (range off, outside-range off, `turn_off_at_end`, timer off) clear the shed flag; a UI power-off converts shed → manual-off lock; an observed external ON clears shed after a 15s grace.
+
+## Schedule-based
+
+- Daily time-window enforcement (e.g., 22:00–07:00 → keep device ON, re-checks every cooldown cycle, default **60s**). Works for both purifiers and ACs. Optional `turn_off_at_end`. Uses `getDevicePowerCached()` with 5s TTL.
+- **AC schedules respect manual-off locks**: if a locked AC is OFF during an active window, the schedule skips auto-on; if a triggered schedule later sees the AC manually off, it records the lock.
+- Both start and end times support two modes:
+  - **Exact**: fixed HH:MM time (stored in `time_start`/`time_end`).
+  - **Prayer-relative**: dynamic time based on daily prayer calculation (e.g., "30 min before Fajr"). Uses `start_mode`/`end_mode` (`'exact'`|`'prayer'`), `start_prayer`/`end_prayer` (prayer name), `start_prayer_offset`/`end_prayer_offset` (signed minutes, -120 to +120). Prayer times are resolved via `resolvePrayerMinutes()` in the collector using cached `adhan` PrayerTimes (same Baghdad coords / Dubai method as alerts). `ensurePrayerTimesForToday()` caches prayer times per day, independently of alert subscriptions.
+
+## AC Timers
+
+- Server-side countdown timers, **in-memory only** (`acTimers` Map in `server/src/routes.ts`) — lost on container restart.
+- API: `GET /api/ac/timers`, `POST /api/ac/timer` (body: deviceId, action on/off, minutes 1–480, optional preset), `DELETE /api/ac/timer/:deviceId`.
+- The collector checks timers each cycle via `checkAcTimers()` (skipped while calibration is active — timers stay pending and fire late).
+- UI: timer section in the AC detail overlay (visible even when the AC is off), compact countdown indicator on the AC widget capsule (green=turn-on, red=turn-off). `useAcTimers()` hook polls `/api/ac/timers` every 5s. Timer props flow: IndoorSection → DevicesCard → AcWidget → AcDetailOverlay. (An older memory note said IndoorSection → IndoorCard → AcWidget; CLAUDE.md wins — DevicesCard is current.)
+- **Turn-off timers are treated as user intent** and create a manual-off lock. **Turn-on timers cannot override** a manual-off lock or a leveler shed (rejected with 409 at creation when locked; skipped if an older timer fires while locked).
+- **Leveler integration**: turn-on timer presets have `generator_mode` stripped when the leveler manages the device.
+
+## AC Presets — server-side behavior
+
+(The preset VISUAL UI — the 5×2 grid of detail cards, in-flight glow, active-match ring/`presetMatchesCurrent()` highlight — is documented in [frontend.md](frontend.md); it exists and matches on the 4 visible props only.)
+
+- **10 slots per device** (was 5 until 2026-06-06), stored server-side in the `ac_presets` PostgreSQL table (moved from localStorage 2026-05-01; shared across all browsers/devices). The DB CHECK constraint was widened 5→10 via the idempotent `DROP CONSTRAINT IF EXISTS ac_presets_slot_check` + `ADD CONSTRAINT` migration pair in `database.ts` MIGRATIONS. Table schema in [database.md](database.md).
+- API: `GET /api/ac/presets/:deviceId` (returns slots 1–10), `PUT /api/ac/presets/:deviceId/:slot` (validates slot 1–10).
+- `PresetData` captures **10 properties**: mode, targetTemp, fanSpeed, eco, turbo, screen, verticalSwing, horizontalSwing, freshAir, generatorMode.
+- Frontend slot count derives from the `PRESET_COUNT`/`PRESET_SLOTS` constants in `ac-widget.tsx` — **never hardcode `[1,2,3,4,5]` arrays**.
+- **Apply syncs to automations** (added 2026-05-13, reworked 2026-06-06): `POST /api/ac/preset-apply` updates `action_on` on **ALL enabled AC automations for that device** (no `_preset_slot` filter — the user's explicit apply overrides any automation's configured preset), then routes calls the `onAutomationRulesChanged?.()` callback → `collector.invalidateAutomationRules()` resets `automationRulesLastFetch=0` → the next collector tick (≤5s) reloads rules from DB with the new profile.
+  - Since 2026-06-06 presets apply **directly on tap** via `applyPreset(slot, p)` in `ac-widget.tsx` (no Apply button; the old stage-then-apply flow with staged values/preview was removed). The fire-and-forget POST happens inside `applyPreset` after the control commands. The sync only triggers on a preset tap — NOT for individual manual control changes.
+- **Save syncs** via `POST /api/ac/preset-sync` — updates automations referencing that `_preset_slot`.
+- Preset data is copied into `action_on` JSONB (with the `_preset_slot` reference) when creating AC automations.
+- **One-time migration from localStorage** runs on first overlay open (legacy browser-stored presets are pushed to the server).
+
+## Sticky beep-off enforcement
+
+Persistent per-AC beep-off preference (added 2026-06-07). The `ac_beep_off` table (`device_id TEXT PRIMARY KEY`, `set_at TIMESTAMPTZ`) schema lives in [database.md](database.md); the behavior:
+
+- **Row present = enforce off**: the collector re-sends `set_beep 0` whenever the AC is observed ON with shadow `beep: true`. Rationale: TCL firmware resets `beepSwitch` to ON after a power-loss restart (mains cuts / changeover) — the pref survives both server and AC restarts.
+- **Written via the UI Beep toggle**: `set_beep 0` records the row, `set_beep 1` deletes it — via the `onUserBeep` hook → `collector.noteUserAcBeep()`. Turning Beep off in the AC widget makes it sticky; turning it on releases the pref.
+- **Enforced by `checkAcBeepEnforcement()` each collector tick**: 30s per-device resend cooldown; its own 30s-gated `fetchDevicesLive` when the shared device cache is cold (nothing else refreshing it); skipped while calibration is active. Recording the pref stamps the cooldown so the UI's own send isn't doubled.
+- **Enforce-OFF only.** Deliberately NOT part of presets/`AcAction`/last-state restore — the table is the single source of truth.
+
+## Leveler integration points (automation side)
+
+Leveler internals (budgets, allocator, sheds, fan holds, warm restore mechanics) are in [ac-leveling.md](ac-leveling.md). What the automation code does:
+
+- **Per-automation opt-out**: `automations.smart_leveling BOOLEAN DEFAULT true` (AC rules only). When **false** (checkbox in the AC trigger form), the automation keeps sending `generator_mode` from its preset and the leveler counts the AC's draw but never adjusts/sheds it. When **true** + leveler enabled, `stripGenIfLeveled()` removes `generator_mode` from turn-on profiles and at all **3** `computeAcDiff` re-enforcement sites. **Gotcha**: opt-out only applies while the rule is **enabled** — a disabled rule means the leveler manages the device.
+- **`stripLeveledControls(rule, action, deviceId)`** wraps `stripGenIfLeveled` and additionally strips `fan_speed`+`turbo` at the turn-on + 3 re-enforcement sites while a leveler fan hold is active (see Range slots & fan above for the full fan-hold deference behavior, incl. `refreshAcFanBaseline()`).
+- **Shed vs manual-off**: leveler-shed devices are skipped by all observed-off lock recorders and all auto-on paths (metric/range/schedule/timers); automation-driven turn-offs (range off, outside-range, `turn_off_at_end`, timer off) clear the shed flag; UI power-off converts shed → manual-off lock; observed external ON clears shed after a 15s grace.
+- **Timers**: turn-on timer presets have `generator_mode` stripped when the leveler manages the device; turn-on timers cannot override a leveler shed.
+- **Warm-restore hook**: temperature-cycle auto-offs in `checkAcRangeAutomation` call `acLeveler.rememberStableLevel(did)` before the off command (scoped to temperature cycling only — not schedule/time-window ends, not manual-off, not sheds).
+- **Manual fan change hooks**: `collector.noteUserAcFanChange()` also releases any leveler fan hold via `acLeveler.onUserFanChange`; `collector.noteUserAcFanAuto()` likewise releases a hold.
+
+## Known bugs
+
+### Dead-zone status clobber (latent, intentionally worked around)
+
+Latent bug in `checkAcRangeAutomation()` (`server/src/collector.ts`), discovered 2026-06-06 while adding per-range fan speed:
+
+In the **idle + dead-zone adoption** branch, the device loop calls `this.automationState.set(rule.id, { status: "triggered", ... })` when it adopts an ON device — but after the loop, the code checks `if (state.status === "idle") this.automationState.set(rule.id, state)` using the **stale local `state` object**, which still says `idle`. So the adoption never persists `triggered`, and the dead-zone adoption path re-runs every 5s tick instead of moving to the triggered re-enforcement path.
+
+**Impact**: mostly cosmetic/efficiency — both paths do diff-based re-enforcement via `computeAcDiff()` so behavior converges, but: (1) "adopting with diff" log lines repeat, (2) the manual-fan-override design deliberately does NOT clear fan enforcement in the dead-zone adoption path *because* it repeats every tick (clearing there would make manual overrides unholdable). If this bug is ever fixed, re-check the fan-enforcement clear/reset placement in that path.
+
+**Why not fixed**: known and intentionally worked-around — fixing changes state-machine timing and needs its own test pass.
+
+**How to apply**: if touching the idle-branch flow of `checkAcRangeAutomation`, fix the trailing `state.status === "idle"` check to re-read from `this.automationState` (or track adoption in a local flag), and revisit whether dead-zone adoption should then clear fan enforcement on its first transition.
