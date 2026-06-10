@@ -151,8 +151,14 @@ export class AcLeveler {
   private confirmedLevel = new Map<string, number>();
   /** The level last commanded but not yet confirmed by the shadow. */
   private pendingLevel = new Map<string, number>();
-  /** Consecutive sends of the same still-unconfirmed level (per device). */
-  private pendingSendCount = new Map<string, number>();
+  /**
+   * Unconfirmed sends PER LEVEL (per device). Counted per level — not "same
+   * level as the last send" — so a budget flutter that alternates the target
+   * between two levels (L3, L2, L3, …) cannot reset the count and evade the
+   * unreachable detection forever. Any shadow confirm clears the device's
+   * whole map (the firmware proved responsive — stale counts would mis-mark).
+   */
+  private pendingSendCounts = new Map<string, Map<number, number>>();
   /**
    * Generator levels the firmware never applied after UNREACHABLE_LEVEL_SENDS
    * attempts (per device) — Najat accepts set_generator_mode=6 (cloud OK) but
@@ -463,7 +469,7 @@ export class AcLeveler {
       // post-change observation simply re-adopts the baseline.
       this.confirmedLevel.clear();
       this.pendingLevel.clear();
-      this.pendingSendCount.clear();
+      this.pendingSendCounts.clear();
       // A true Gen↔Grid changeover restarts every running compressor — treat it
       // like a turn-on so tick() re-arms the ~4-min ramp window for ON ACs.
       // Coming back from "none" (ESP/power resuming) is NOT a restart: the ACs
@@ -538,7 +544,7 @@ export class AcLeveler {
     this.lastSetLevel.delete(deviceId);
     this.confirmedLevel.delete(deviceId);
     this.pendingLevel.delete(deviceId);
-    this.pendingSendCount.delete(deviceId);
+    this.pendingSendCounts.delete(deviceId);
     await this.clearFanHold(deviceId, "user_power_off");
     this.fanExempt.delete(deviceId);
     this.bounce.delete(deviceId);
@@ -593,7 +599,7 @@ export class AcLeveler {
     // unreachable-level marks reset (mirrors bounce clearing).
     this.bounce.delete(deviceId);
     this.unreachableLevels.delete(deviceId);
-    this.pendingSendCount.delete(deviceId);
+    this.pendingSendCounts.delete(deviceId);
     await this.clearRememberedLevel(deviceId, "manual_gen_change");
 
     if (rank(level) < rank(previous)) {
@@ -715,7 +721,7 @@ export class AcLeveler {
         this.lastSetLevel.delete(device.id);
         this.confirmedLevel.delete(device.id);
         this.pendingLevel.delete(device.id);
-        this.pendingSendCount.delete(device.id);
+        this.pendingSendCounts.delete(device.id);
         this.rampUntil.delete(device.id);
         await this.clearFanHold(device.id, "power_off");
         this.fanExempt.delete(device.id);
@@ -820,11 +826,20 @@ export class AcLeveler {
         // Our command landed — promote it to the confirmed baseline, no intent.
         this.confirmedLevel.set(device.id, obs);
         this.pendingLevel.delete(device.id);
-        this.pendingSendCount.delete(device.id);
+        this.pendingSendCounts.delete(device.id);
         // The firmware applied it after all — drop any unreachable mark.
         if (this.unreachableLevels.get(device.id)?.delete(obs)) {
           log.info(`[leveler] ${device.name}: L${obs} confirmed after all — unreachable mark cleared`);
         }
+        continue;
+      }
+      if (obs <= 0) {
+        // A shadow snapping to 0 (unrestricted) is a firmware reset/non-apply,
+        // never a user intent — live 2026-06-10 it was stamped as a manual
+        // "target L7" while Najat ran unrestricted at 31A on grid. Re-adopt the
+        // baseline silently; the never-level-0 correction re-caps it (ungated)
+        // and the kept pendingLevel lets the unreachable counting continue.
+        this.confirmedLevel.set(device.id, obs);
         continue;
       }
       // The observed level moved off the confirmed baseline to something we did
@@ -1096,12 +1111,13 @@ export class AcLeveler {
       const snap = snapshots.find((s) => s.deviceId === deviceId);
       try {
         await tcl.sendControl(deviceId, "set_generator_mode", level);
-        // Re-sending the same still-unconfirmed level counts toward the
-        // unreachable mark; the count doubles as Najat's needed command retry.
-        const sends = this.pendingLevel.get(deviceId) === level
-          ? (this.pendingSendCount.get(deviceId) ?? 1) + 1
-          : 1;
-        this.pendingSendCount.set(deviceId, sends);
+        // Unconfirmed sends count PER LEVEL toward the unreachable mark (a
+        // fluttering target alternating two levels can't reset them); the
+        // re-sends double as Najat's needed command retry.
+        const counts = this.pendingSendCounts.get(deviceId) ?? new Map<number, number>();
+        const sends = (counts.get(level) ?? 0) + 1;
+        counts.set(level, sends);
+        this.pendingSendCounts.set(deviceId, counts);
         this.lastSetLevel.set(deviceId, level);
         this.pendingLevel.set(deviceId, level);
         if (sends >= UNREACHABLE_LEVEL_SENDS && level >= 2) {
@@ -1109,10 +1125,12 @@ export class AcLeveler {
           if (!set.has(level)) {
             set.add(level);
             this.unreachableLevels.set(deviceId, set);
-            this.forceEvaluate = true; // ship the next-lower fallback next tick
+            this.forceEvaluate = true; // ship the fallback next tick
+            let fallback = level - 1;
+            while (fallback > 1 && set.has(fallback)) fallback--;
             log.warn(
               `[leveler] ${name(deviceId)}: firmware never confirmed L${level} after ${sends} sends — ` +
-              `marking unreachable, falling back to L${level - 1}`,
+              `marking unreachable, falling back to L${fallback}`,
             );
           }
         }

@@ -1004,11 +1004,22 @@ export class Collector {
    * device max) — stripLeveledControls removes it again when the leveler
    * manages the device, so the direct send only lands when unmanaged.
    */
+  /**
+   * Slot gen level clamped to the device's real max. Null when the device
+   * cache is cold — better to skip the override for one tick (diff
+   * re-enforcement retries within 5s) than to guess a max and send an
+   * out-of-range level to a max-3 unit.
+   */
+  private clampSlotGenLevel(deviceId: string, genLevel: number): number | null {
+    const deviceMax = this.tclCloud?.getDevices().find((d) => d.id === deviceId)?.maxGeneratorLevel;
+    return deviceMax ? Math.min(genLevel, deviceMax) : null;
+  }
+
   private effectiveAcRangeProfile(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, value: number): AcAction {
     const profile = { ...(rule.action_on as AcAction) };
     if (slot.gen_level != null) {
-      const deviceMax = this.tclCloud?.getDevices().find((d) => d.id === deviceId)?.maxGeneratorLevel || 6;
-      profile.generator_mode = Math.min(slot.gen_level, deviceMax);
+      const clamped = this.clampSlotGenLevel(deviceId, slot.gen_level);
+      if (clamped != null) profile.generator_mode = clamped;
     }
     const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, deviceId));
     if (entry?.manual) {
@@ -1207,12 +1218,15 @@ export class Collector {
             // Automation power-on = power cycle: drop manual fan overrides, apply the slot fan
             for (const did of unlockedDeviceIds) this.clearAcFanEnforcement(rule.id, did);
             const fan = this.resolveRangeFan(rule, activeSlot, unlockedDeviceIds[0], value);
+            // Slot gen level overrides the preset's (clamped to the device max;
+            // stripped again downstream when the leveler manages the device).
+            const slotGen = activeSlot.gen_level != null
+              ? this.clampSlotGenLevel(unlockedDeviceIds[0], activeSlot.gen_level)
+              : null;
             const onAction = {
               ...(rule.action_on as AcAction),
               ...(fan != null ? { fan_speed: fan } : {}),
-              // Slot gen level overrides the preset's (stripped again downstream
-              // when the leveler manages the device).
-              ...(activeSlot.gen_level != null ? { generator_mode: activeSlot.gen_level } : {}),
+              ...(slotGen != null ? { generator_mode: slotGen } : {}),
             };
             await this.executeAutomationAction(rule, onAction, unlockedDeviceIds);
             for (const did of unlockedDeviceIds) this.noteAcFanCommanded(rule, activeSlot, did, onAction as AcAction);

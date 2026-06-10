@@ -1888,6 +1888,72 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
     expect(genCalls(tclCloud, 6)).toBeGreaterThanOrEqual(4); // L6 attempted again
   });
 
+  it("regression: a shadow snapping to 0 never records a manual target (31A grid incident)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 2, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Confirmed at L2, then raised toward L6 (command in flight).
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 6);
+
+    // The firmware resets to 0 instead of applying L6. Live 2026-06-10 this was
+    // stamped as "external gen increment observed → target L7" while the AC ran
+    // unrestricted at 31A. It must be silent — no manual intent of any kind.
+    devices[0].generatorMode = 0;
+    vi.advanceTimersByTime(31_000);
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    const ac = collector.acLeveler.getStatus().acs.find((a) => a.deviceId === "ac1");
+    expect(ac?.manualTarget).toBeNull();
+    expect(ac?.manualCap).toBeNull();
+
+    // The never-level-0 rule keeps re-capping and the unreachable counting
+    // still completes (pendingLevel survives the 0-observation).
+    await resendTicks(collector, 2);
+    expect(genCalls(tclCloud, 6)).toBe(3);
+    await resendTicks(collector, 1);
+    expect(genCalls(tclCloud, 5)).toBeGreaterThanOrEqual(1);
+  });
+
+  it("regression: a fluttering target cannot evade unreachable detection (per-level send counts)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = najatAtZero();
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // The active slot cap alternates L6/L5 every tick (stand-in for a budget
+    // flutter) while the shadow never applies anything — with a same-level-only
+    // counter neither level would ever reach 3 sends.
+    const capRule = (cap: number) => ({
+      ...acRangeRule(),
+      range_slots: [
+        { id: "default", type: "all_day", threshold_low: 22, threshold: 26, gen_level: cap },
+      ] satisfies AutomationRangeSlot[],
+    });
+    await setWeatherValue(collector, 28);
+    for (let i = 0; i < 7; i++) {
+      (collector as never as { automationRules: unknown[] }).automationRules = [capRule(i % 2 === 0 ? 6 : 5)];
+      vi.advanceTimersByTime(31_000);
+      gridReadings(collector, 12, 6);
+      await checkAcLeveling(collector);
+    }
+
+    // Both alternating levels get marked (3 sends each) and the controller
+    // falls through to L4 instead of re-sending 6/5 forever.
+    expect(genCalls(tclCloud, 6)).toBeLessThanOrEqual(3);
+    expect(genCalls(tclCloud, 5)).toBeLessThanOrEqual(3);
+    expect(genCalls(tclCloud, 4)).toBeGreaterThanOrEqual(1);
+  });
+
   it("regression: warm-restore memory survives an observed level 0 (not 'reached')", async () => {
     const { collector, tclCloud, remembered, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
@@ -2098,6 +2164,7 @@ describe("Per-range-slot generator level (gen_level)", () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", maxGeneratorLevel: 6 }]);
     tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
 
     setTriggered(collector, 1);
@@ -2110,6 +2177,42 @@ describe("Per-range-slot generator level (gen_level)", () => {
 
     // Slot gen level overrides the preset's generator_mode 4.
     expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 });
+  });
+
+  it("clamps the direct-send slot gen level to the device max", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", maxGeneratorLevel: 3 }]);
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    const rule = slotCapRule(5, {
+      smart_leveling: false,
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3 },
+    });
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3, generator_mode: 3 });
+  });
+
+  it("skips the direct-send when the device cache is cold (no guessed max)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    tclCloud.getDevices.mockReturnValue([]); // cache cold — max unknown
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    const rule = slotCapRule(5, {
+      smart_leveling: false,
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3 },
+    });
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
   });
 
   it("strips the slot gen level from profiles when the leveler manages the device", async () => {
