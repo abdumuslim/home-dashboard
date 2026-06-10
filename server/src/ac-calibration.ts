@@ -97,6 +97,14 @@ export interface AcCalibratorDeps {
   getTclCloud: () => TclCloud | null;
   getLimits: () => { gridLimitAmps: number; genLimitAmps: number; marginAmps: number };
   broadcast: (payload: Record<string, unknown>) => Promise<void>;
+  /**
+   * Fired after the end-of-run restore (finish AND abort) with the devices
+   * powered back ON. The leveler re-arms their compressor ramp windows —
+   * leveling was suspended the whole run, so without this the first
+   * post-calibration tick would treat freshly-restarted compressors as
+   * established draw and chase phantom headroom.
+   */
+  onDevicesRestored?: (deviceIds: string[]) => void;
 }
 
 interface SavedAcState {
@@ -454,6 +462,7 @@ export class AcCalibrator {
   }
 
   private async restoreAll(tcl: TclCloud): Promise<void> {
+    const restoredOn: string[] = [];
     for (const [id, saved] of this.savedStates) {
       try {
         if (saved.power) {
@@ -462,12 +471,14 @@ export class AcCalibrator {
             ...(saved.generatorMode > 0 ? { generator_mode: saved.generatorMode } : {}),
             fan_speed: saved.fanSpeed,
           });
+          restoredOn.push(id);
         }
         // ACs that were off are already off (prep turned everything off).
       } catch (err) {
         log.error(`[calibration] Restore failed for ${this.deviceNames.get(id) ?? id}:`, (err as Error).message);
       }
     }
+    if (restoredOn.length > 0) this.deps.onDevicesRestored?.(restoredOn);
   }
 
   private finish(reason: string | null): void {

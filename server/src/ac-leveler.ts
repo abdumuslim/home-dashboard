@@ -22,6 +22,8 @@ import {
   REDUCE_STREAK,
   REDUCE_STREAK_SEVERE,
   SETTLE_MS,
+  FAN_SETTLE_MS,
+  UNREACHABLE_LEVEL_SENDS,
   SHED_CLEAR_GRACE_MS,
   STALE_POWER_MS,
   DEFAULT_LEVELING_CONFIG,
@@ -37,6 +39,11 @@ import type { TclCloud, AcDevice } from "./tcl-cloud.js";
 import { childLogger } from "./logger.js";
 
 const log = childLogger("ac-leveler");
+
+/** Bounded re-sends of an unconfirmed fan command (Najat needs commands re-done). */
+const FAN_RESEND_MAX = 2;
+/** Minimum spacing between fan command re-sends. */
+const FAN_RESEND_SPACING_MS = 15_000;
 
 export interface AcLevelerDeps {
   getTclCloud: () => TclCloud | null;
@@ -138,12 +145,34 @@ export class AcLeveler {
   private confirmedLevel = new Map<string, number>();
   /** The level last commanded but not yet confirmed by the shadow. */
   private pendingLevel = new Map<string, number>();
+  /** Consecutive sends of the same still-unconfirmed level (per device). */
+  private pendingSendCount = new Map<string, number>();
+  /**
+   * Generator levels the firmware never applied after UNREACHABLE_LEVEL_SENDS
+   * attempts (per device) — Najat accepts set_generator_mode=6 (cloud OK) but
+   * her shadow never leaves 0, so the never-level-0 correction re-sent L6
+   * forever (live 2026-06-09). The allocator's reachableCap falls back to the
+   * next lower level. In-memory; survives power cycles and source changes
+   * (firmware property), un-marked if the shadow ever confirms the level,
+   * cleared by an explicit manual gen change (user probe) and on restart.
+   */
+  private unreachableLevels = new Map<string, Set<number>>();
   /** Set on a source change so tick() re-arms the compressor ramp for ON ACs. */
   private armRampOnSourceChange = false;
   private manualCap = new Map<string, number>();
   private manualTarget = new Map<string, number>();
-  // Fan holds: fans reduced to minimum as the last try before a shed (persisted)
-  private fanHold = new Map<string, { originalFan: number; lastSetFan: number }>();
+  // Fan holds: fans reduced to minimum as the last try before a shed.
+  // originalFan/lastSetFan are persisted; confirmedFan (the fan the shadow has
+  // actually been OBSERVED at — the drift baseline, like confirmedLevel for gen
+  // levels) and the resend bookkeeping are in-memory: after a restart the first
+  // observation re-adopts the baseline.
+  private fanHold = new Map<string, {
+    originalFan: number;
+    lastSetFan: number;
+    confirmedFan: number | null;
+    resends: number;
+    lastSendAt: number;
+  }>();
   private fanExempt = new Set<string>();
   private prevPowerStates = new Map<string, boolean>();
   private rampUntil = new Map<string, number>();
@@ -218,6 +247,9 @@ export class AcLeveler {
       this.fanHold.set(String(row.device_id), {
         originalFan: Number(row.original_fan),
         lastSetFan: Number(row.last_set_fan),
+        confirmedFan: null, // restart — re-adopt the baseline on first observation
+        resends: 0,
+        lastSendAt: 0,
       });
     }
     const remRes = await this.pool.query("SELECT device_id, level FROM ac_leveling_remembered_level");
@@ -325,7 +357,15 @@ export class AcLeveler {
   }
 
   private async recordFanHold(deviceId: string, originalFan: number): Promise<void> {
-    this.fanHold.set(deviceId, { originalFan, lastSetFan: originalFan });
+    // The original fan was just OBSERVED on the device, so it doubles as the
+    // confirmed drift baseline for the command about to be sent.
+    this.fanHold.set(deviceId, {
+      originalFan,
+      lastSetFan: originalFan,
+      confirmedFan: originalFan,
+      resends: 0,
+      lastSendAt: Date.now(),
+    });
     await this.pool.query(
       `INSERT INTO ac_leveling_fan_hold (device_id, original_fan, last_set_fan, held_at)
        VALUES ($1, $2, $2, NOW())
@@ -337,7 +377,8 @@ export class AcLeveler {
   private async setFanHoldLastSet(deviceId: string, fan: number): Promise<void> {
     const hold = this.fanHold.get(deviceId);
     if (!hold) return;
-    this.fanHold.set(deviceId, { ...hold, lastSetFan: fan });
+    // A fresh command starts a fresh confirm/resend cycle.
+    this.fanHold.set(deviceId, { ...hold, lastSetFan: fan, resends: 0, lastSendAt: Date.now() });
     await this.pool.query(
       "UPDATE ac_leveling_fan_hold SET last_set_fan = $2 WHERE device_id = $1",
       [deviceId, fan],
@@ -407,6 +448,14 @@ export class AcLeveler {
       // Bounce evidence is per-source (different limit + amp models).
       this.bounce.clear();
       this.lastRaiseBatch = null;
+      // Drift baselines are per-source too: a changeover restarts the
+      // compressors and the firmware can come back at a different level — a
+      // stale cross-source baseline (or a command left in flight) would let
+      // the drift detector stamp a false manualCap/manualTarget. The first
+      // post-change observation simply re-adopts the baseline.
+      this.confirmedLevel.clear();
+      this.pendingLevel.clear();
+      this.pendingSendCount.clear();
       // A true Gen↔Grid changeover restarts every running compressor — treat it
       // like a turn-on so tick() re-arms the ~4-min ramp window for ON ACs.
       // Coming back from "none" (ESP/power resuming) is NOT a restart: the ACs
@@ -418,7 +467,6 @@ export class AcLeveler {
       if (source === "grid") {
         this.manualCap.clear();
         this.manualTarget.clear();
-        this.pendingLevel.clear();
       }
       log.info(`[leveler] Power source changed → ${source}`);
     }
@@ -482,6 +530,7 @@ export class AcLeveler {
     this.lastSetLevel.delete(deviceId);
     this.confirmedLevel.delete(deviceId);
     this.pendingLevel.delete(deviceId);
+    this.pendingSendCount.delete(deviceId);
     await this.clearFanHold(deviceId, "user_power_off");
     this.fanExempt.delete(deviceId);
     this.bounce.delete(deviceId);
@@ -505,6 +554,17 @@ export class AcLeveler {
   }
 
   /**
+   * Re-arm compressor ramp windows for devices an external flow just power-
+   * cycled (the calibration end-of-run restore). Narrow on purpose: unlike
+   * onUserPowerOn it must NOT clear sheds or bounce evidence.
+   */
+  rearmRamp(deviceIds: string[]): void {
+    const until = Date.now() + AC_RAMP_MS;
+    for (const id of deviceIds) this.rampUntil.set(id, until);
+    this.forceEvaluate = true;
+  }
+
+  /**
    * User changed the generator level (UI route or agent). Reduction → manual cap.
    * Increment within budget → manual target. Increment over budget → instant revert.
    */
@@ -520,8 +580,12 @@ export class AcLeveler {
     const previous = this.lastSetLevel.get(deviceId) ?? device.generatorMode;
     const rank = (l: number): number => (l <= 0 ? maxLevel + 1 : Math.min(l, maxLevel));
     // Manual intent replaces bounce evidence (manualCap/manualTarget take over)
-    // and any warm-restore target — the user owns the level now.
+    // and any warm-restore target — the user owns the level now. An explicit
+    // gen change is also a fresh probe of what the firmware accepts, so
+    // unreachable-level marks reset (mirrors bounce clearing).
     this.bounce.delete(deviceId);
+    this.unreachableLevels.delete(deviceId);
+    this.pendingSendCount.delete(deviceId);
     await this.clearRememberedLevel(deviceId, "manual_gen_change");
 
     if (rank(level) < rank(previous)) {
@@ -628,11 +692,13 @@ export class AcLeveler {
       }
       if (!device.power) {
         // Power-off clears manual gen intents, drift tracking, and fan holds.
+        // Unreachable-level marks deliberately SURVIVE (firmware property).
         this.manualCap.delete(device.id);
         this.manualTarget.delete(device.id);
         this.lastSetLevel.delete(device.id);
         this.confirmedLevel.delete(device.id);
         this.pendingLevel.delete(device.id);
+        this.pendingSendCount.delete(device.id);
         this.rampUntil.delete(device.id);
         await this.clearFanHold(device.id, "power_off");
         this.fanExempt.delete(device.id);
@@ -656,16 +722,51 @@ export class AcLeveler {
 
     const inSettle = Date.now() < this.settleUntil;
 
-    // Fan-drift detection: a fan we did not set while holding means a remote/
-    // manual change — the user's fan wins; never re-reduce this episode.
+    // Confirmation-gated fan-drift detection (mirrors the gen-level design):
+    // the drift baseline is the fan the shadow has actually been OBSERVED at,
+    // not the fan we last commanded. A shadow that still shows the PRE-command
+    // fan is a lagging or firmware-ignored command — Najat routinely needs
+    // commands re-done — so it gets re-sent (bounded), never misread as a
+    // manual change. Only an observed move to a fan we never commanded
+    // releases the hold (the user's fan wins; never re-reduce this episode).
     for (const { device } of ctx) {
       const hold = this.fanHold.get(device.id);
       if (!hold || !device.power || inSettle || typeof device.fanSpeed !== "number") continue;
-      if (device.fanSpeed !== hold.lastSetFan) {
-        log.info(`[leveler] ${device.name}: external fan change observed (fan=${device.fanSpeed}) — releasing hold`);
-        await this.clearFanHold(device.id, "external_fan_change");
-        this.fanExempt.add(device.id);
+      const obs = device.fanSpeed;
+      if (obs === hold.lastSetFan) {
+        // Our command landed — promote it to the confirmed baseline.
+        if (hold.confirmedFan !== obs) {
+          this.fanHold.set(device.id, { ...hold, confirmedFan: obs, resends: 0 });
+        }
+        continue;
       }
+      if (hold.confirmedFan == null) {
+        // Restart mid-hold — adopt the first observation as the baseline.
+        this.fanHold.set(device.id, { ...hold, confirmedFan: obs });
+        continue;
+      }
+      if (obs === hold.confirmedFan) {
+        // Command in flight not applied yet — confirm-or-resend, then leave the
+        // hold in place (it is NOT a manual change; releasing here exempted
+        // Najat from fan reduction every episode, live 2026-06-09).
+        if (hold.resends < FAN_RESEND_MAX && Date.now() - hold.lastSendAt >= FAN_RESEND_SPACING_MS) {
+          try {
+            await tcl.sendControl(device.id, "set_fan_speed", hold.lastSetFan);
+            this.deps.onLevelerFanCommand(device.id, hold.lastSetFan);
+            this.fanHold.set(device.id, { ...hold, resends: hold.resends + 1, lastSendAt: Date.now() });
+            log.info(
+              `[leveler] ${device.name}: fan ${hold.lastSetFan} not applied (shadow still ${obs}) — ` +
+              `re-sent (${hold.resends + 1}/${FAN_RESEND_MAX})`,
+            );
+          } catch (err) {
+            log.error(`[leveler] Fan re-send failed for ${device.name}:`, (err as Error).message);
+          }
+        }
+        continue;
+      }
+      log.info(`[leveler] ${device.name}: external fan change observed (fan=${obs}) — releasing hold`);
+      await this.clearFanHold(device.id, "external_fan_change");
+      this.fanExempt.add(device.id);
     }
 
     // Sustained headroom ends the over-limit episode — user fan exemptions reset.
@@ -702,6 +803,11 @@ export class AcLeveler {
         // Our command landed — promote it to the confirmed baseline, no intent.
         this.confirmedLevel.set(device.id, obs);
         this.pendingLevel.delete(device.id);
+        this.pendingSendCount.delete(device.id);
+        // The firmware applied it after all — drop any unreachable mark.
+        if (this.unreachableLevels.get(device.id)?.delete(obs)) {
+          log.info(`[leveler] ${device.name}: L${obs} confirmed after all — unreachable mark cleared`);
+        }
         continue;
       }
       // The observed level moved off the confirmed baseline to something we did
@@ -779,6 +885,15 @@ export class AcLeveler {
       const warmStartLevel = managed && device.power && remembered != null && rank(currentLevel) < remembered
         ? remembered
         : null;
+      // Highest level not marked firmware-unreachable, walking down from the
+      // top (marks accumulate top-down via the fallback; L1 is never marked).
+      const unreachable = this.unreachableLevels.get(device.id);
+      let reachableCap: number | null = null;
+      if (unreachable && unreachable.size > 0) {
+        let cap = maxLevel;
+        while (cap > 1 && unreachable.has(cap)) cap--;
+        reachableCap = cap;
+      }
       return {
         deviceId: device.id,
         on: device.power,
@@ -802,16 +917,21 @@ export class AcLeveler {
         })(),
         restoreBlocked: this.bounce.get(device.id)?.kind === "restore",
         slotCap: null,
-        reachableCap: null,
+        reachableCap,
         warmStartLevel,
       };
     });
 
-    // Clear remembered levels that have been reached (or whose AC is on at/above
-    // it) — the warm restore is done. Off devices keep their memory for the
-    // next turn-on.
+    // Clear remembered levels that have been reached (AC on at/above the
+    // remembered level) — the warm restore is done. Off devices keep their
+    // memory for the next turn-on. "Reached" requires a CONFIRMED level ≥ 1:
+    // an observed generatorMode 0 ranks as maxLevel+1 in the warm-start math,
+    // which silently erased the memory ~300ms after it was written whenever
+    // the shadow lagged or never applied the level (Najat, live 2026-06-09).
     for (const s of snapshots) {
-      if (s.warmStartLevel == null && s.on && s.managed && this.rememberedLevel.has(s.deviceId)) {
+      const remembered = this.rememberedLevel.get(s.deviceId);
+      if (remembered == null || !s.on || !s.managed) continue;
+      if (s.currentLevel >= 1 && Math.min(s.currentLevel, s.maxLevel) >= remembered) {
         await this.clearRememberedLevel(s.deviceId, "reached");
       }
     }
@@ -927,6 +1047,9 @@ export class AcLeveler {
     reactive: boolean,
   ): Promise<void> {
     let sentAny = false;
+    // Level/power commands need the full settle (compressor response); a
+    // fan-only batch settles in seconds and gets the short FAN_SETTLE_MS.
+    let levelOrPowerSent = false;
     let didReduce = false;
     let raisedAmps = 0;
     const raisedNow = new Map<string, number>();
@@ -956,9 +1079,28 @@ export class AcLeveler {
       const snap = snapshots.find((s) => s.deviceId === deviceId);
       try {
         await tcl.sendControl(deviceId, "set_generator_mode", level);
+        // Re-sending the same still-unconfirmed level counts toward the
+        // unreachable mark; the count doubles as Najat's needed command retry.
+        const sends = this.pendingLevel.get(deviceId) === level
+          ? (this.pendingSendCount.get(deviceId) ?? 1) + 1
+          : 1;
+        this.pendingSendCount.set(deviceId, sends);
         this.lastSetLevel.set(deviceId, level);
         this.pendingLevel.set(deviceId, level);
+        if (sends >= UNREACHABLE_LEVEL_SENDS && level >= 2) {
+          const set = this.unreachableLevels.get(deviceId) ?? new Set<number>();
+          if (!set.has(level)) {
+            set.add(level);
+            this.unreachableLevels.set(deviceId, set);
+            this.forceEvaluate = true; // ship the next-lower fallback next tick
+            log.warn(
+              `[leveler] ${name(deviceId)}: firmware never confirmed L${level} after ${sends} sends — ` +
+              `marking unreachable, falling back to L${level - 1}`,
+            );
+          }
+        }
         sentAny = true;
+        levelOrPowerSent = true;
         if (snap && (snap.currentLevel === 0 || level < snap.currentLevel)) didReduce = true;
         const raisedTo = batch?.raised.get(deviceId);
         if (raisedTo != null && level < raisedTo) {
@@ -1034,6 +1176,7 @@ export class AcLeveler {
           recordBounce(deviceId, "restore", null, anchor);
         }
         sentAny = true;
+        levelOrPowerSent = true;
         didReduce = true;
         // Fire-and-forget — push HTTP calls must not block the collector loop
         void this.deps.broadcast({
@@ -1055,12 +1198,19 @@ export class AcLeveler {
           await this.clearShed(deviceId, "manual_off_lock");
           continue;
         }
-        // Restore at the floor level (boost minimum when active, else L1)
+        // Restore at the floor level (boost minimum when active, else L1) —
+        // clamped by what the firmware can actually hold and any active slot cap.
         const snap = snapshots.find((s) => s.deviceId === deviceId);
-        const restoreLevel = Math.max(1, Math.min(snap?.minLevel ?? 1, snap?.maxLevel ?? 1));
+        const restoreLevel = Math.max(1, Math.min(
+          snap?.minLevel ?? 1,
+          snap?.maxLevel ?? 1,
+          snap?.reachableCap ?? Number.MAX_SAFE_INTEGER,
+          snap?.slotCap ?? Number.MAX_SAFE_INTEGER,
+        ));
         await tcl.executeAcAction(deviceId, { power: 1, generator_mode: restoreLevel });
         await this.clearShed(deviceId, "restored");
         restoredNow.add(deviceId);
+        levelOrPowerSent = true;
         // A restore adds its whole floor draw to the expectation
         raisedAmps += estimateAcDraw(restoreLevel, snap?.maxLevel ?? 1, this.ampModelFor(deviceId, source));
         this.lastSetLevel.set(deviceId, restoreLevel);
@@ -1103,7 +1253,9 @@ export class AcLeveler {
 
     if (sentAny) {
       const now = Date.now();
-      this.settleUntil = now + SETTLE_MS;
+      // Fan-only batches settle fast — a 30s pause per fan command crawled
+      // through restores and blocked level raises the whole time.
+      this.settleUntil = now + (levelOrPowerSent ? SETTLE_MS : FAN_SETTLE_MS);
       // Freeze the non-AC load the allocation was computed with — fresh
       // derivations are contaminated until compressors respond to the
       // commands just sent (see NON_AC_FREEZE_MS).
@@ -1127,11 +1279,13 @@ export class AcLeveler {
       }
       const expectedAmps = result.nonAcLoadAmps + expectedDraw;
       this.expected = { amps: expectedAmps, raisedAmps, at: now, compareAfter };
-      // Every raise batch arms the effect-confirmation hold: the next raise
-      // must either see this batch's amps arrive (early release in tick) or
-      // wait the hold out. Turn-ons hold longest — compressor ramps are slow.
-      // Pure-reduction batches leave any existing hold untouched.
-      const hasRaise = raisedAmps > 0 || restoredNow.size > 0 || result.toFanRaise != null;
+      // Every LEVEL raise batch arms the effect-confirmation hold: the next
+      // raise must either see this batch's amps arrive (early release in tick)
+      // or wait the hold out. Turn-ons hold longest — compressor ramps are
+      // slow. Fan-only raises no longer arm it (fans are ~0.5A and settle in
+      // seconds — user re-decided 2026-06-10, superseding the 2026-06-07
+      // "2 min for fan" spec). Pure-reduction batches leave any hold untouched.
+      const hasRaise = raisedAmps > 0 || restoredNow.size > 0;
       if (hasRaise) {
         // A warm-restore raise targets a still-ramping just-turned-on AC, so it
         // gets the longer turn-on hold — the compressor ramp is what we wait on.

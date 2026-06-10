@@ -403,6 +403,10 @@ export class Collector {
       getTclCloud: () => this.tclCloud,
       getLimits: () => this.acLeveler.getLimits(),
       broadcast: (payload) => this.broadcastPush(payload),
+      // Calibration power-cycled these ACs while leveling was suspended —
+      // re-arm their compressor ramps so the first post-run tick doesn't
+      // misread the restart as established draw (phantom headroom).
+      onDevicesRestored: (deviceIds) => this.acLeveler.rearmRamp(deviceIds),
     });
 
     if (config.vapidPublicKey && config.vapidPrivateKey) {

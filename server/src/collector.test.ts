@@ -1751,6 +1751,310 @@ describe("Smart AC leveling — confirmation-gated drift + source change", () =>
     await checkAcLeveling(collector);
     expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(8);
   });
+
+  it("re-adopts the drift baseline after a changeover instead of stamping a false cap", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 3, maxGeneratorLevel: 6, currentTemp: 23, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // On gen, the shadow is confirmed at L3 (first observation adopts it).
+    genReadings(collector, 8, 6);
+    await checkAcLeveling(collector);
+
+    // Changeover to grid restarts the compressor and the firmware comes back
+    // at L1. The pre-changeover L3 baseline was cleared with the source — the
+    // first grid observation re-adopts L1, it must NOT read as a manual
+    // reduction (false `cap L1`).
+    devices[0].generatorMode = 1;
+    vi.advanceTimersByTime(11_000);
+    gridReadings(collector, 8, 6);
+    await checkAcLeveling(collector);
+
+    const ac = collector.acLeveler.getStatus().acs.find((a) => a.deviceId === "ac1");
+    expect(ac?.manualCap).toBeNull();
+    expect(ac?.manualTarget).toBeNull();
+  });
+});
+
+describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T08:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const genCalls = (tclCloud: { sendControl: { mock: { calls: unknown[][] } } }, level: number) =>
+    tclCloud.sendControl.mock.calls.filter((c) => c[1] === "set_generator_mode" && c[2] === level).length;
+
+  function najatAtZero() {
+    return [{ id: "ac1", name: "Najat", power: true, generatorMode: 0, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 }];
+  }
+
+  /** Drive `n` post-settle ticks with the shadow pinned (each re-sends the unconfirmed level). */
+  async function resendTicks(collector: Collector, n: number) {
+    for (let i = 0; i < n; i++) {
+      vi.advanceTimersByTime(31_000);
+      gridReadings(collector, 12, 6);
+      await checkAcLeveling(collector);
+    }
+  }
+
+  it("regression: marks a never-confirmed level unreachable after 3 sends and falls back (Najat L6)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = najatAtZero();
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Level-0 correction targets the fitted ideal L6; the shadow never applies
+    // it (stays 0) — live 2026-06-09 this re-sent L6 every ~35s for 2 hours.
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(genCalls(tclCloud, 6)).toBe(1);
+
+    await resendTicks(collector, 2); // sends #2 and #3 → marked unreachable
+    expect(genCalls(tclCloud, 6)).toBe(3);
+
+    // Fallback: the next correction targets L5, never L6 again.
+    await resendTicks(collector, 1);
+    expect(genCalls(tclCloud, 6)).toBe(3);
+    expect(genCalls(tclCloud, 5)).toBe(1);
+
+    // The shadow applies L5 → confirmed at the top of the next tick → quiet.
+    devices[0].generatorMode = 5;
+    await resendTicks(collector, 2);
+    expect(genCalls(tclCloud, 5)).toBe(1);
+    expect(genCalls(tclCloud, 6)).toBe(3);
+  });
+
+  it("un-marks the level if the firmware confirms it after all", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = najatAtZero();
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    await resendTicks(collector, 2); // 3 sends → marked
+    expect(genCalls(tclCloud, 6)).toBe(3);
+
+    // The pending L6 lands late — confirm un-marks it; no L5 fallback ships.
+    devices[0].generatorMode = 6;
+    await resendTicks(collector, 2);
+    expect(genCalls(tclCloud, 5)).toBe(0);
+    expect(genCalls(tclCloud, 6)).toBe(3);
+  });
+
+  it("marks survive a power cycle; an explicit manual gen change clears them", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = najatAtZero();
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    await resendTicks(collector, 2); // L6 marked unreachable
+    expect(genCalls(tclCloud, 6)).toBe(3);
+
+    // Power cycle: off tick, then back on at level 0.
+    devices[0].power = false;
+    await resendTicks(collector, 1);
+    devices[0].power = true;
+    devices[0].generatorMode = 0;
+    await resendTicks(collector, 1);
+    // The correction after the cycle targets L5 — the mark survived.
+    expect(genCalls(tclCloud, 6)).toBe(3);
+    expect(genCalls(tclCloud, 5)).toBeGreaterThanOrEqual(1);
+
+    // Shadow settles at L5; the user then explicitly sets L6 — a fresh probe.
+    devices[0].generatorMode = 5;
+    await resendTicks(collector, 1);
+    await collector.acLeveler.onUserGenLevel("ac1", 6);
+    await resendTicks(collector, 1);
+    expect(genCalls(tclCloud, 6)).toBeGreaterThanOrEqual(4); // L6 attempted again
+  });
+
+  it("regression: warm-restore memory survives an observed level 0 (not 'reached')", async () => {
+    const { collector, tclCloud, remembered, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+
+    // Stable at a confirmed L4 → automation temperature-cycles it off.
+    const onAtL4 = [{ id: "ac1", name: "Najat", power: true, generatorMode: 4, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 }];
+    tclCloud.getDevices.mockReturnValue(onAtL4);
+    tclCloud.fetchDevicesLive.mockResolvedValue(onAtL4 as never);
+    gridReadings(collector, 12, 1);
+    await checkAcLeveling(collector);
+    await setWeatherValue(collector, 20);
+    await checkAcRangeAutomation(collector, acRangeRule());
+    expect(remembered.get("ac1")).toBe(4);
+
+    // Back ON with the shadow reporting 0 (firmware reset / never-applied level
+    // — Najat's normal state). rank(0) = max+1 read as "reached" and erased
+    // the memory ~300ms after every remember (live 2026-06-09). It must survive.
+    const backOnAtZero = [{ id: "ac1", name: "Najat", power: true, generatorMode: 0, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 }];
+    tclCloud.getDevices.mockReturnValue(backOnAtZero);
+    tclCloud.fetchDevicesLive.mockResolvedValue(backOnAtZero as never);
+    vi.advanceTimersByTime(11_000);
+    gridReadings(collector, 12, 1);
+    await checkAcLeveling(collector);
+    expect(remembered.get("ac1")).toBe(4);
+
+    // Once the AC is genuinely observed at/above L4 the memory is consumed.
+    const atL4 = [{ id: "ac1", name: "Najat", power: true, generatorMode: 4, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 }];
+    tclCloud.getDevices.mockReturnValue(atL4);
+    tclCloud.fetchDevicesLive.mockResolvedValue(atL4 as never);
+    vi.advanceTimersByTime(31_000);
+    gridReadings(collector, 12, 1);
+    await checkAcLeveling(collector);
+    expect(remembered.has("ac1")).toBe(false);
+  });
+});
+
+describe("Smart AC leveling — fan command confirm-or-resend + fast fan pacing", () => {
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T08:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const fanCalls = (tclCloud: { sendControl: { mock: { calls: unknown[][] } } }, fan: number) =>
+    tclCloud.sendControl.mock.calls.filter((c) => c[1] === "set_fan_speed" && c[2] === fan).length;
+
+  it("regression: a lagging fan shadow is re-sent (bounded), never misread as a manual change", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 28, mode: 1, fanSpeed: 7 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Over the gen limit with floors not fitting → fan reduce 7→1 (last try
+    // before shed). The shadow never applies it — Najat's normal behavior.
+    overLimitReadings(collector, 5);
+    await checkAcLeveling(collector);
+    expect(fanCalls(tclCloud, 1)).toBe(1);
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(true);
+
+    // 11s later (past the 10s fan settle, before the 15s resend spacing):
+    // shadow still 7 — the OLD detector released the hold here as an
+    // "external fan change" and exempted the AC (live 2026-06-09).
+    vi.advanceTimersByTime(11_000);
+    genReadings(collector, 14.5, 1); // dead band — no allocator action
+    await checkAcLeveling(collector);
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(true);
+    expect(fanCalls(tclCloud, 1)).toBe(1); // spacing not reached yet
+
+    // Past the 15s spacing → re-send #1, then #2; then it stops (bounded).
+    vi.advanceTimersByTime(5_000);
+    genReadings(collector, 14.5, 1);
+    await checkAcLeveling(collector);
+    expect(fanCalls(tclCloud, 1)).toBe(2);
+
+    vi.advanceTimersByTime(16_000);
+    genReadings(collector, 14.5, 1);
+    await checkAcLeveling(collector);
+    expect(fanCalls(tclCloud, 1)).toBe(3);
+
+    vi.advanceTimersByTime(16_000);
+    genReadings(collector, 14.5, 1);
+    await checkAcLeveling(collector);
+    expect(fanCalls(tclCloud, 1)).toBe(3); // resends exhausted, hold kept
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(true);
+
+    // The command finally lands → confirmed; a later move to a fan we never
+    // commanded is a genuine user change → release.
+    devices[0].fanSpeed = 1;
+    vi.advanceTimersByTime(11_000);
+    genReadings(collector, 14.5, 1);
+    await checkAcLeveling(collector);
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(true);
+
+    devices[0].fanSpeed = 4;
+    vi.advanceTimersByTime(11_000);
+    genReadings(collector, 14.5, 1);
+    await checkAcLeveling(collector);
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(false);
+  });
+
+  it("fan-only batches settle in ~10s, arm no raise hold, and restore one AC per gated action", async () => {
+    const { collector, tclCloud, fanHolds, setLevelingConfig } = createCollector();
+    setLevelingConfig({ ...LEVELING_CONFIG, priority: ["ac1", "ac2"] });
+    fanHolds.set("ac1", { original_fan: 4, last_set_fan: 1 });
+    fanHolds.set("ac2", { original_fan: 5, last_set_fan: 1 });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 23, mode: 1, fanSpeed: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 23, mode: 1, fanSpeed: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Headroom → highest-priority hold restored in ONE jump (1→4, no steps).
+    headroomReadings(collector, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_fan_speed", 4);
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(false);
+    expect(collector.acLeveler.getStatus().raiseHoldRemainingMs).toBe(0); // fan raises arm no hold
+
+    // Only ~11s later (NOT 30s) the next held AC restores — fan-only settle.
+    devices[0].fanSpeed = 4;
+    vi.advanceTimersByTime(11_000);
+    headroomReadings(collector, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_fan_speed", 5);
+    expect(collector.acLeveler.hasFanHold("ac2")).toBe(false);
+    expect(collector.acLeveler.getStatus().raiseHoldRemainingMs).toBe(0);
+  });
+});
+
+describe("Smart AC leveling — calibration handoff (ramp re-arm)", () => {
+  beforeEach(() => {
+    acTimers.clear();
+  });
+
+  it("rearmRamp keeps a calibration-restored AC's draw out of the non-AC load", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 23, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Established: est(L1)=2A is subtracted → nonAcLoad 10.
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(10);
+
+    // Calibration restored it (compressor restarted while leveling was
+    // suspended) → ramp re-armed → its est stays OUT of the derivation.
+    collector.acLeveler.rearmRamp(["ac1"]);
+    gridReadings(collector, 12, 1);
+    await checkAcLeveling(collector);
+    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(12);
+  });
 });
 
 describe("Smart AC leveling — fan reduction before shed", () => {
@@ -1881,7 +2185,7 @@ describe("Smart AC leveling — fan reduction before shed", () => {
     expect(actions).toEqual([{ deviceId: "ac1", action: { power: 0 } }]);
   });
 
-  it("releases the hold when an external fan change is observed outside settle", async () => {
+  it("a restart-loaded hold adopts the observed fan as baseline, then releases on a real change", async () => {
     const { collector, tclCloud, fanHolds, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     fanHolds.set("ac1", { original_fan: 3, last_set_fan: 1 });
@@ -1892,12 +2196,17 @@ describe("Smart AC leveling — fan reduction before shed", () => {
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
+    // First post-restart observation: confirmedFan is unknown — adopt, don't release.
     headroomReadings(collector, 1);
     await checkAcLeveling(collector);
+    expect(collector.acLeveler.hasFanHold("ac1")).toBe(true);
 
+    // A subsequent move off the adopted baseline is a genuine external change.
+    devices[0].fanSpeed = 5;
+    headroomReadings(collector, 1);
+    await checkAcLeveling(collector);
     expect(collector.acLeveler.hasFanHold("ac1")).toBe(false);
     expect(fanHolds.size).toBe(0);
-    expect(tclCloud.sendControl).not.toHaveBeenCalled();
   });
 });
 

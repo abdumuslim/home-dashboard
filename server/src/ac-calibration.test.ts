@@ -123,12 +123,14 @@ function createCalibrator() {
       commands.push({ deviceId, cmd, value });
     }),
   };
+  const onDevicesRestored = vi.fn();
   const cal = new AcCalibrator(pool as never, {
     getTclCloud: () => tcl as never,
     getLimits: () => ({ gridLimitAmps: 30, genLimitAmps: 15, marginAmps: 1 }),
     broadcast: vi.fn(async () => undefined),
+    onDevicesRestored,
   });
-  return { cal, tcl, pool, rows, commands, devices };
+  return { cal, tcl, pool, rows, commands, devices, onDevicesRestored };
 }
 
 function feedGen(cal: AcCalibrator, amps: number, count: number) {
@@ -281,6 +283,19 @@ describe("AcCalibrator state machine", () => {
     expect(cal.isActive()).toBe(false);
     expect(cal.getStatus().abortReason).toBe("user_control");
     expect(rows.get("ac1:gen:level:1")).toBeDefined(); // partial result kept
+  });
+
+  it("fires onDevicesRestored with the powered-back-on ACs after the end-of-run restore", async () => {
+    const { cal, onDevicesRestored } = createCalibrator();
+    feedGen(cal, 9, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep — ac1 + ac2 turned off (both were ON)
+
+    cal.requestAbort("user_control");
+    await cal.tick(); // restoreAll powers ac1 + ac2 back on (ac3 stays off)
+
+    expect(onDevicesRestored).toHaveBeenCalledTimes(1);
+    expect(new Set(onDevicesRestored.mock.calls[0][0] as string[])).toEqual(new Set(["ac1", "ac2"]));
   });
 
   it("rejects start when already running, no power, or unknown devices", async () => {
