@@ -51,6 +51,10 @@
   - `findActiveRangeSlot()` picks the active slot each tick; no active slot → `turnOffAcOutsideRange()` (the AC is turned off).
   - Legacy rules without `range_slots` convert via `getLegacyRangeSlots()`.
   - **Persistence choke point gotcha**: `normalizeRangeSlots()` whitelists slot fields — new slot fields MUST be added to the whitelist or they are silently dropped before storage.
+- **Per-slot generator level** (`slot.gen_level`, optional; added 2026-06-10): `1–6` = level for that range, absent = **Auto**. Validation rejects 0 (Auto = absent; level 0 = unrestricted footgun). Two behaviors:
+  - **Leveler-managed device** (leveler enabled + `smart_leveling` true): the value rides the leveling tick context (`computeAcNeed` → `LevelerDeviceContext.slotGenCap`) as a **HARD CAP** — never raised above (beats boost floors; a live manual target still wins), reductions/sheds below stay allowed; a slot flip re-evaluates immediately. Leveler-side precedence details: [ac-leveling.md](ac-leveling.md).
+  - **Unmanaged** (leveler off or rule opted out): `effectiveAcRangeProfile()` merges `generator_mode = min(gen_level, deviceMax)` into the profile (overriding the preset's `generator_mode`) at the turn-on + all 3 re-enforcement sites; diff re-enforcement retries it every 5s. ⚠️ Najat caveat: her firmware never applies L6 — an unmanaged direct-send of 6 would re-send forever (the leveler's unreachable-level detection only guards its own commands).
+  - UI: a "Gen" row (Auto + `L1..Lmax` from the selected AC's `maxGeneratorLevel`) in the slot editor, under the Fan row.
 - **Per-slot fan speed** (`slot.fan_speed`, optional; added 2026-06-06): overrides the preset's fan while that slot is active — `1–7` = fixed level, `0` = **delta-based smart auto**, absent = preset fan (which itself resolves through smart auto if it's 0).
   - **Smart auto** (`server/src/ac-auto-fan.ts`, `computeAutoFanLevel`, pure + unit-tested): cool delta = value − slot low (heat mirrors: slot high − value); ≤0.5° → L1, then +1 level per 0.3° (L2 ≤0.8°, L3 ≤1.1°, …), cap L7, with 0.1° down-hysteresis (raises immediate/instant, lowers only past the band). Range automations **never** send the AC's built-in fan auto (0).
   - Resolution happens in `resolveRangeFan()`/`effectiveAcRangeProfile()` in collector.ts, applied at all **4 profile sites** in `checkAcRangeAutomation()`: turn-on, lock-check adoption, dead-zone adoption, triggered re-enforcement.
@@ -124,16 +128,14 @@ Leveler internals (budgets, allocator, sheds, fan holds, warm restore mechanics)
 - **Warm-restore hook**: temperature-cycle auto-offs in `checkAcRangeAutomation` call `acLeveler.rememberStableLevel(did)` before the off command (scoped to temperature cycling only — not schedule/time-window ends, not manual-off, not sheds).
 - **Manual fan change hooks**: `collector.noteUserAcFanChange()` also releases any leveler fan hold via `acLeveler.onUserFanChange`; `collector.noteUserAcFanAuto()` likewise releases a hold.
 
-## Known bugs
+## Fixed bugs (history)
 
-### Dead-zone status clobber (latent, intentionally worked around)
+### Dead-zone status clobber — FIXED 2026-06-10
 
-Latent bug in `checkAcRangeAutomation()` (`server/src/collector.ts`), discovered 2026-06-06 while adding per-range fan speed:
+The **idle + dead-zone adoption** branch of `checkAcRangeAutomation()` set `status: "triggered"` inside the device loop, but a trailing `if (state.status === "idle")` write with the **stale local `state` object** clobbered it back to idle — so the adoption path re-ran every 5s tick (repeating "adopting with diff" logs; behavior converged since both paths diff-enforce).
 
-In the **idle + dead-zone adoption** branch, the device loop calls `this.automationState.set(rule.id, { status: "triggered", ... })` when it adopts an ON device — but after the loop, the code checks `if (state.status === "idle") this.automationState.set(rule.id, state)` using the **stale local `state` object**, which still says `idle`. So the adoption never persists `triggered`, and the dead-zone adoption path re-runs every 5s tick instead of moving to the triggered re-enforcement path.
+**Fix**: a local `adopted` flag — the trailing write only happens when no device was adopted (`if (!adopted) set({...state, conditionSince: null})`). **Fan-enforcement clear placement outcome**: adoption still does NOT clear `acFanEnforcement` — manual fan overrides clear only on slot change / power cycle / automation turn-on (pinned by the regression test `manual fan override survives dead-zone adoption`).
 
-**Impact**: mostly cosmetic/efficiency — both paths do diff-based re-enforcement via `computeAcDiff()` so behavior converges, but: (1) "adopting with diff" log lines repeat, (2) the manual-fan-override design deliberately does NOT clear fan enforcement in the dead-zone adoption path *because* it repeats every tick (clearing there would make manual overrides unholdable). If this bug is ever fixed, re-check the fan-enforcement clear/reset placement in that path.
+### Double turn-off re-fire — FIXED 2026-06-10
 
-**Why not fixed**: known and intentionally worked-around — fixing changes state-machine timing and needs its own test pass.
-
-**How to apply**: if touching the idle-branch flow of `checkAcRangeAutomation`, fix the trailing `state.status === "idle"` check to re-read from `this.automationState` (or track adoption in a local flag), and revisit whether dead-zone adoption should then clear fan enforcement on its first transition.
+The triggered turn-off didn't stamp `devicePowerCache` "off"; the shadow lags past the 5s cache TTL, so ~7s later the idle branch saw the device "ON past turn-off limit" and re-fired the off (+ a second `rememberStableLevel`) — seen live 2026-06-09. **Fix**: `acRangeOffAt` map + `AC_OFF_REFIRE_GRACE_MS` 15s — all 3 automation off sites (triggered turn-off, idle past-limit, outside-range) stamp it and the re-fire paths skip inside the grace; the triggered site also stamps the power cache now. Past the grace a genuinely still-ON AC is retried (Najat sometimes needs commands re-done).
