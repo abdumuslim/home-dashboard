@@ -203,8 +203,24 @@ export const FAN_SETTLE_MS = 10_000;
  * without this the never-level-0 correction re-sends it forever. Doubles as
  * the command retry Najat's flaky firmware needs anyway. L1 is never marked
  * (a managed AC must always get SOME cap).
+ *
+ * 4 sends ≈ a 140s landing window (raised from 3 on 2026-06-11): Najat's
+ * firmware applies L4+ EXTREMELY slowly when it does at all — her L4 once
+ * landed ~111s after the first send, 6s past the old 3-send mark, and the
+ * fallback's desired-shadow overwrite (shipped seconds after a mark) can
+ * cancel a slow apply that was about to land. One extra send per genuinely
+ * dead level is noise; a false mark costs the room its cooling headroom.
  */
-export const UNREACHABLE_LEVEL_SENDS = 3;
+export const UNREACHABLE_LEVEL_SENDS = 4;
+/**
+ * Safety expiry per unreachable mark. A transient shadow-stuck-at-0 episode
+ * (firmware reset) mints marks for levels that normally apply — live
+ * 2026-06-11 a morning grid episode marked Najat L4–L6 and capped her at L3
+ * all day despite ~19A of free budget. Expired marks are re-probed; genuinely
+ * dead levels just re-mark after UNREACHABLE_LEVEL_SENDS. Mirrors
+ * BOUNCE_SAFETY_EXPIRY_MS.
+ */
+export const UNREACHABLE_SAFETY_EXPIRY_MS = 60 * 60_000;
 /**
  * Compressor ramp-up window after an AC turns ON. While ramping, the AC's
  * estimated draw is NOT subtracted from measured current when deriving the

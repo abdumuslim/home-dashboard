@@ -24,6 +24,7 @@ import {
   SETTLE_MS,
   FAN_SETTLE_MS,
   UNREACHABLE_LEVEL_SENDS,
+  UNREACHABLE_SAFETY_EXPIRY_MS,
   SHED_CLEAR_GRACE_MS,
   STALE_POWER_MS,
   DEFAULT_LEVELING_CONFIG,
@@ -161,14 +162,17 @@ export class AcLeveler {
   private pendingSendCounts = new Map<string, Map<number, number>>();
   /**
    * Generator levels the firmware never applied after UNREACHABLE_LEVEL_SENDS
-   * attempts (per device) — Najat accepts set_generator_mode=6 (cloud OK) but
-   * her shadow never leaves 0, so the never-level-0 correction re-sent L6
-   * forever (live 2026-06-09). The allocator's reachableCap falls back to the
-   * next lower level. In-memory; survives power cycles and source changes
-   * (firmware property), un-marked if the shadow ever confirms the level,
-   * cleared by an explicit manual gen change (user probe) and on restart.
+   * attempts (per device), mapped to WHEN they were marked — Najat accepts
+   * set_generator_mode=6 (cloud OK) but her shadow never leaves 0, so the
+   * never-level-0 correction re-sent L6 forever (live 2026-06-09). The
+   * allocator's reachableCap falls back to the next lower level. In-memory;
+   * survives power cycles and source changes (firmware property), un-marked if
+   * the shadow ever confirms the level, cleared by an explicit manual gen
+   * change (user probe), on restart, and by the per-mark
+   * UNREACHABLE_SAFETY_EXPIRY_MS re-probe (a shadow-stuck-at-0 episode mints
+   * junk marks — live 2026-06-11 Najat sat capped at L3 on grid all day).
    */
-  private unreachableLevels = new Map<string, Set<number>>();
+  private unreachableLevels = new Map<string, Map<number, number>>();
   /** Set on a source change so tick() re-arms the compressor ramp for ON ACs. */
   private armRampOnSourceChange = false;
   private manualCap = new Map<string, number>();
@@ -893,6 +897,25 @@ export class AcLeveler {
     }
     const limit = source === "grid" ? this.config.gridLimitAmps : this.config.genLimitAmps;
 
+    // Unreachable-mark safety expiry: a transient shadow-stuck-at-0 episode
+    // (firmware reset) can mint marks for levels that normally apply — live
+    // 2026-06-11 a morning grid episode marked Najat L4–L6 and capped her at
+    // L3 all day despite ~19A of free budget. Expired marks get re-probed;
+    // genuinely dead levels just re-mark after UNREACHABLE_LEVEL_SENDS.
+    if (this.unreachableLevels.size > 0) {
+      const nowMs = Date.now();
+      for (const [deviceId, marks] of [...this.unreachableLevels]) {
+        for (const [level, markedAt] of [...marks]) {
+          if (nowMs - markedAt >= UNREACHABLE_SAFETY_EXPIRY_MS) {
+            marks.delete(level);
+            this.forceEvaluate = true;
+            log.info(`[leveler] ${this.deviceNames.get(deviceId) ?? deviceId}: unreachable mark L${level} expired (safety net) — re-probing`);
+          }
+        }
+        if (marks.size === 0) this.unreachableLevels.delete(deviceId);
+      }
+    }
+
     // Bounce retry check: a bounced raise/restore unlocks once the measured
     // total drops enough to absorb its OBSERVED cost under the limit, or the
     // safety expiry passes. Settle-window readings are skipped — they still
@@ -1152,9 +1175,9 @@ export class AcLeveler {
         this.lastSetLevel.set(deviceId, level);
         this.pendingLevel.set(deviceId, level);
         if (sends >= UNREACHABLE_LEVEL_SENDS && level >= 2) {
-          const set = this.unreachableLevels.get(deviceId) ?? new Set<number>();
+          const set = this.unreachableLevels.get(deviceId) ?? new Map<number, number>();
           if (!set.has(level)) {
-            set.add(level);
+            set.set(level, Date.now());
             this.unreachableLevels.set(deviceId, set);
             this.forceEvaluate = true; // ship the fallback next tick
             let fallback = level - 1;
@@ -1457,7 +1480,7 @@ export class AcLeveler {
           })(),
           restoreBlocked: this.bounce.get(device.id)?.kind === "restore",
           slotCap: slotGenCap != null ? Math.max(1, Math.min(slotGenCap, maxLevel)) : null,
-          unreachableLevels: [...(this.unreachableLevels.get(device.id) ?? [])].sort((a, b) => a - b),
+          unreachableLevels: [...(this.unreachableLevels.get(device.id)?.keys() ?? [])].sort((a, b) => a - b),
         };
       }),
     };

@@ -113,14 +113,40 @@ function createCalibrator() {
     { id: "ac2", name: "Najat", power: true, generatorMode: 3, fanSpeed: 0, maxGeneratorLevel: 6 },
     { id: "ac3", name: "Abdu", power: false, generatorMode: 1, fanSpeed: 1, maxGeneratorLevel: 3 },
   ];
+  // Firmware quirk simulation (Najat-style): gen levels in `ignoreGenLevels`
+  // never apply to the shadow; `genLevelSendsNeeded` applies a level only after
+  // the N-th send (lagging firmware). Well-behaved levels apply instantly.
+  const firmware = { ignoreGenLevels: new Set<number>(), genLevelSendsNeeded: new Map<number, number>() };
+  const genSendCounts = new Map<string, number>();
+  const applyGenLevel = (deviceId: string, value: number) => {
+    if (firmware.ignoreGenLevels.has(value)) return;
+    const key = `${deviceId}:${value}`;
+    const sends = (genSendCounts.get(key) ?? 0) + 1;
+    genSendCounts.set(key, sends);
+    if (sends < (firmware.genLevelSendsNeeded.get(value) ?? 1)) return;
+    const dev = devices.find((d) => d.id === deviceId);
+    if (dev) dev.generatorMode = value;
+  };
   const tcl = {
     isReady: vi.fn(() => true),
     getDevices: vi.fn(() => devices),
+    fetchDevicesLive: vi.fn(async () => devices),
     executeAcAction: vi.fn(async (deviceId: string, action: Record<string, unknown>) => {
       commands.push({ deviceId, cmd: "action", value: action });
+      const dev = devices.find((d) => d.id === deviceId);
+      if (dev) {
+        if (action.power != null) dev.power = action.power === 1;
+        if (typeof action.fan_speed === "number") dev.fanSpeed = action.fan_speed;
+        if (typeof action.generator_mode === "number") applyGenLevel(deviceId, action.generator_mode);
+      }
     }),
     sendControl: vi.fn(async (deviceId: string, cmd: string, value: unknown) => {
       commands.push({ deviceId, cmd, value });
+      const dev = devices.find((d) => d.id === deviceId);
+      if (dev && typeof value === "number") {
+        if (cmd === "set_generator_mode") applyGenLevel(deviceId, value);
+        if (cmd === "set_fan_speed") dev.fanSpeed = value;
+      }
     }),
   };
   const onDevicesRestored = vi.fn();
@@ -130,7 +156,7 @@ function createCalibrator() {
     broadcast: vi.fn(async () => undefined),
     onDevicesRestored,
   });
-  return { cal, tcl, pool, rows, commands, devices, onDevicesRestored };
+  return { cal, tcl, pool, rows, commands, devices, firmware, onDevicesRestored };
 }
 
 function feedGen(cal: AcCalibrator, amps: number, count: number) {
@@ -140,15 +166,28 @@ function feedGen(cal: AcCalibrator, amps: number, count: number) {
 }
 
 /**
- * Pass one settle step: advance to the settle floor, feed a stable plateau so
- * the calibrator early-releases, collapse the window with a tick, then collect
- * the measurement samples and record with a second tick.
+ * Feed readings at the realistic ~5s ESP cadence. The plateau detector needs
+ * the window to SPAN ≥ CAL_STABLE_SPAN_MS and the sample phase needs a minimum
+ * duration — same-instant batches satisfy neither.
+ */
+function feedGenSpread(cal: AcCalibrator, amps: number, count: number, gapMs = 5_000) {
+  for (let i = 0; i < count; i++) {
+    if (i > 0) vi.advanceTimersByTime(gapMs);
+    cal.onPowerReading({ current_1: 0, current_2: amps, voltage: 200 });
+  }
+}
+
+/**
+ * Pass one settle step: advance to the settle floor, feed a stable plateau
+ * (spread over ≥15s) so the calibrator early-releases, collapse the window
+ * with a tick, then collect the measurement samples (spread to satisfy the
+ * minimum sampling duration) and record with a second tick.
  */
 async function settleStep(cal: AcCalibrator, floorMs: number, amps: number, count: number) {
   vi.advanceTimersByTime(floorMs + 1000);
-  feedGen(cal, amps, CAL_STABLE_READINGS); // plateau → early release
+  feedGenSpread(cal, amps, CAL_STABLE_READINGS); // plateau → early release
   await cal.tick(); // collapse the settle window
-  feedGen(cal, amps, count); // measurement samples
+  feedGenSpread(cal, amps, count); // measurement samples over count×5s
   await cal.tick(); // record the step
 }
 
@@ -192,15 +231,15 @@ describe("AcCalibrator state machine", () => {
     await cal.tick();
     expect(cal.getStatus().phase).toBe("ramp"); // floor not reached yet
 
-    // Past the floor + stable draw → early release into sampling.
+    // Past the floor + stable draw (spanning ≥15s) → early release into sampling.
     vi.advanceTimersByTime(6000);
-    feedGen(cal, 5, CAL_STABLE_READINGS);
+    feedGenSpread(cal, 5, CAL_STABLE_READINGS);
     await cal.tick();
     expect(cal.getStatus().phase).toBe("sample");
     expect(cal.getStatus().step).toEqual({ kind: "level", value: 1 });
 
-    // L1: 12 gen samples at 5A → draw = 5 − baseline 2 = 3
-    feedGen(cal, 5, CAL_SAMPLES_GEN);
+    // L1: 12 gen samples at 5A over the minimum duration → draw = 5 − baseline 2 = 3
+    feedGenSpread(cal, 5, CAL_SAMPLES_GEN);
     await cal.tick();
     expect(rows.get("ac1:gen:level:1")).toMatchObject({ amps: 3, samples: CAL_SAMPLES_GEN });
     expect(tcl.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
@@ -208,10 +247,10 @@ describe("AcCalibrator state machine", () => {
     // L2: plateau readings during the settle don't count as samples; once stable
     // past the floor the window collapses and the real samples are collected.
     vi.advanceTimersByTime(CAL_LEVEL_SETTLE_MS + 1000);
-    feedGen(cal, 6, CAL_STABLE_READINGS);
+    feedGenSpread(cal, 6, CAL_STABLE_READINGS);
     expect(cal.getStatus().samplesCollected).toBe(0);
     await cal.tick(); // early release
-    feedGen(cal, 6, CAL_SAMPLES_GEN);
+    feedGenSpread(cal, 6, CAL_SAMPLES_GEN);
     await cal.tick();
     expect(rows.get("ac1:gen:level:2")).toMatchObject({ amps: 4 });
 
@@ -343,5 +382,184 @@ describe("AcCalibrator state machine", () => {
     feedGen(cal, 6, 1); // keep-alive so the source stays gen
     await cal.tick();
     expect(cal.getStatus().phase).toBe("sample");
+  });
+
+  // ---------- Methodology guards (2026-06-11 — the Najat gen run) ----------
+
+  it("does not early-release the ramp while the draw sits at baseline (compressor not started)", async () => {
+    const { cal } = createCalibrator();
+    feedGen(cal, 2, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
+    feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN); // baseline 2A
+    await cal.tick(); // ac1 on → ramp
+
+    // Past the floor, perfectly stable — but stable AT baseline: the
+    // compressor hasn't started, so "plateau" means nothing yet. This is
+    // exactly how Najat's L1 recorded 0.00A at 94s on the live gen run.
+    vi.advanceTimersByTime(CAL_RAMP_FLOOR_MS + 1000);
+    feedGenSpread(cal, 2, CAL_STABLE_READINGS);
+    await cal.tick();
+    expect(cal.getStatus().phase).toBe("ramp");
+
+    // The compressor finally kicks in and the higher draw stabilizes → release.
+    vi.advanceTimersByTime(5000);
+    feedGenSpread(cal, 5, CAL_STABLE_READINGS + 1);
+    await cal.tick();
+    expect(cal.getStatus().phase).toBe("sample");
+  });
+
+  it("records a never-started L1 at ~0A only at the ramp cap, and the fit excludes it", async () => {
+    const { cal, rows } = createCalibrator();
+    feedGen(cal, 2, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
+    feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
+    await cal.tick(); // ac1 on → ramp
+    feedGen(cal, 2, 1);
+    await cal.tick(); // consume the power-on confirm during the settle
+
+    // Draw never rises above baseline — the ramp holds to the max cap.
+    vi.advanceTimersByTime(CAL_RAMP_MAX_MS + 1000);
+    feedGen(cal, 2, 1); // keep-alive
+    await cal.tick();
+    expect(cal.getStatus().phase).toBe("sample");
+    feedGenSpread(cal, 2, CAL_SAMPLES_GEN); // still baseline → 0A draw recorded
+    await cal.tick();
+    expect(rows.get("ac1:gen:level:1")).toMatchObject({ amps: 0 });
+
+    // L2 behaves (compressor running) and records normally.
+    await settleStep(cal, CAL_LEVEL_SETTLE_MS, 6, CAL_SAMPLES_GEN);
+    expect(rows.get("ac1:gen:level:2")).toMatchObject({ amps: 4 });
+
+    // The suggested fit learns ONLY from the valid L2 point.
+    const { suggestedFit } = await cal.getResults();
+    expect(suggestedFit.ac1.gen).toEqual({ baseAmps: 4, stepAmps: 0 });
+  });
+
+  it("skips a level the firmware never applies after bounded re-sends (Najat-style)", async () => {
+    const { cal, rows, commands, firmware } = createCalibrator();
+    firmware.ignoreGenLevels.add(2); // ac1's L2 never reaches the shadow
+    feedGen(cal, 2, 1);
+    await cal.start(["ac1"], false); // maxLevel 2 → L1, L2
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
+    feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
+    await cal.tick(); // ac1 on → ramp
+    await settleStep(cal, CAL_RAMP_FLOOR_MS, 5, CAL_SAMPLES_GEN); // L1 recorded → L2 commanded
+    expect(rows.get("ac1:gen:level:1")).toBeDefined();
+
+    // L2 never confirms: re-sent at 15s spacing (×2), then skipped entirely.
+    for (let i = 0; i < 4; i++) {
+      vi.advanceTimersByTime(16_000);
+      feedGen(cal, 5, 1); // keep-alive
+      await cal.tick();
+      // No samples ever collect while the command is unconfirmed.
+      expect(cal.getStatus().samplesCollected).toBe(0);
+    }
+    const l2Sends = commands.filter((c) => c.cmd === "set_generator_mode" && c.value === 2);
+    expect(l2Sends).toHaveLength(3); // initial + 2 re-sends
+    expect(rows.get("ac1:gen:level:2")).toBeUndefined(); // skipped — no bogus row
+
+    // The run moved on and finished cleanly (device off → restore).
+    expect(cal.isActive()).toBe(false);
+    expect(cal.getStatus().abortReason).toBeNull();
+  });
+
+  it("records normally when a lagging command confirms only after a re-send", async () => {
+    const { cal, rows, commands, firmware } = createCalibrator();
+    firmware.genLevelSendsNeeded.set(2, 2); // L2 applies on the 2nd send
+    feedGen(cal, 2, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
+    feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
+    await cal.tick(); // ac1 on → ramp
+    await settleStep(cal, CAL_RAMP_FLOOR_MS, 5, CAL_SAMPLES_GEN); // L1 recorded → L2 commanded (1st send, ignored)
+
+    vi.advanceTimersByTime(16_000);
+    feedGen(cal, 5, 1);
+    await cal.tick(); // re-send — firmware applies this one
+    vi.advanceTimersByTime(5_000);
+    feedGen(cal, 5, 1);
+    await cal.tick(); // confirm observed
+
+    // The step then settles and records like any other.
+    vi.advanceTimersByTime(5000);
+    feedGenSpread(cal, 6, CAL_STABLE_READINGS + 1);
+    await cal.tick(); // plateau → early release
+    feedGenSpread(cal, 6, CAL_SAMPLES_GEN);
+    await cal.tick(); // record
+    expect(rows.get("ac1:gen:level:2")).toMatchObject({ amps: 4 });
+    const l2Sends = commands.filter((c) => c.cmd === "set_generator_mode" && c.value === 2);
+    expect(l2Sends).toHaveLength(2); // initial + 1 re-send
+  });
+
+  it("requires the plateau window to span 15s — same-instant readings don't release", async () => {
+    const { cal } = createCalibrator();
+    feedGen(cal, 2, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
+    feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
+    await cal.tick(); // ac1 on → ramp
+
+    // Stable, compressor clearly running — but all readings at one instant
+    // (the live ESP reported every ~2.7s, not the assumed ~5s, shrinking
+    // count-based windows). Count alone must not satisfy the plateau.
+    vi.advanceTimersByTime(CAL_RAMP_FLOOR_MS + 1000);
+    feedGen(cal, 5, CAL_STABLE_READINGS);
+    await cal.tick();
+    expect(cal.getStatus().phase).toBe("ramp");
+
+    // The same readings spread over ≥15s release normally.
+    feedGenSpread(cal, 5, CAL_STABLE_READINGS + 1);
+    await cal.tick();
+    expect(cal.getStatus().phase).toBe("sample");
+  });
+
+  it("holds the sample phase to a minimum duration even when counts fill fast", async () => {
+    const { cal, rows } = createCalibrator();
+    feedGen(cal, 2, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
+    feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
+    await cal.tick(); // ac1 on → ramp
+    vi.advanceTimersByTime(CAL_RAMP_FLOOR_MS + 1000);
+    feedGenSpread(cal, 5, CAL_STABLE_READINGS);
+    await cal.tick(); // early release into sampling
+
+    // A fast ESP fills the COUNT instantly — the duration floor still holds.
+    feedGen(cal, 5, CAL_SAMPLES_GEN);
+    await cal.tick();
+    expect(rows.get("ac1:gen:level:1")).toBeUndefined();
+
+    // Once the minimum duration elapses the step records (extra samples kept).
+    feedGenSpread(cal, 5, 10);
+    await cal.tick();
+    expect(rows.get("ac1:gen:level:1")).toMatchObject({ amps: 3 });
+  });
+
+  it("excludes near-zero and high-spread rows from the fit (Najat 2026-06-11 gen regression)", async () => {
+    const { cal, pool } = createCalibrator();
+    // Najat's actual poisoned gen run: L1 sampled before the compressor
+    // started (0.00A), L2 mid-transition (±1.68 spread), L3–L6 clean and flat.
+    const najatRows: Array<[number, number, number]> = [
+      [1, 0, 0.28], [2, 1.07, 1.68], [3, 4.02, 0.09], [4, 4.12, 0.11], [5, 4.21, 0.13], [6, 4.45, 0.12],
+    ];
+    for (const [step, amps, stddev] of najatRows) {
+      await pool.query(
+        "INSERT INTO ac_calibration_results (device_id, source, kind, step, amps, voltage, stddev, samples, measured_at) VALUES",
+        ["ac2", "gen", "level", step, amps, 0, stddev, 12],
+      );
+    }
+    const { results, suggestedFit } = await cal.getResults();
+    // All rows stay visible in the table…
+    expect(results.filter((r) => r.deviceId === "ac2" && r.kind === "level")).toHaveLength(6);
+    // …but the fit learns only from L3–L6 (flat ~4.0–4.45A → not 0.7+0.9/level).
+    expect(suggestedFit.ac2.gen).toEqual({ baseAmps: 3.7, stepAmps: 0.1 });
   });
 });

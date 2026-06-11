@@ -26,15 +26,41 @@ export const CAL_FAN_SETTLE_MAX_MS = 30_000;
 /**
  * Compressor ramp after a turn-on. Decoupled from AC_RAMP_MS (which is now 240s
  * for live leveling): the floor is just a minimum before plateau detection can
- * sample — if the draw plateaus at ~90s we sample then; the max cap (300s) lets
- * a slow ~4-min ramp fully settle before forcing a sample.
+ * sample — if the draw plateaus at ~90s we sample then; the max cap (360s) lets
+ * a slow ~4-min compressor start (Najat) fully settle before forcing a sample.
  */
 export const CAL_RAMP_FLOOR_MS = 90_000;
-export const CAL_RAMP_MAX_MS = 300_000;
+export const CAL_RAMP_MAX_MS = 360_000;
 /** Settle after powering ACs off before the all-off baseline is sampled (fixed — quick). */
 export const CAL_OFF_SETTLE_MS = 10_000;
 /** Consecutive settle-phase readings within the band that define a plateau (early release). */
 export const CAL_STABLE_READINGS = 4;
+/**
+ * Plateau readings must also SPAN at least this long. "Stable at baseline for
+ * 4 readings" released the ramp at 94s while Najat's compressor (a ~4-min
+ * starter) hadn't begun drawing — her L1/L2 gen rows recorded 0A/1.07A and
+ * poisoned the fit (2026-06-11). Count alone also shrank the window when the
+ * ESP reported every ~2.7s instead of the assumed ~5s.
+ */
+export const CAL_STABLE_SPAN_MS = 15_000;
+/** Ramp early release additionally needs the draw to have RISEN above baseline (compressor evidence). */
+export const CAL_MIN_COMPRESSOR_AMPS = 1.0;
+/** Minimum sampling duration per step — sample COUNTS alone shrink with a fast ESP cadence. */
+export const CAL_SAMPLE_MIN_MS_GRID = 30_000;
+export const CAL_SAMPLE_MIN_MS_GEN = 45_000;
+/** Confirm-or-resend for step commands (Najat accepts commands and never applies them). */
+export const CAL_CONFIRM_RESEND_SPACING_MS = 15_000;
+export const CAL_CONFIRM_RESEND_MAX = 2;
+/** Shadow refresh throttle while a command awaits confirmation. */
+export const CAL_CONFIRM_FETCH_SPACING_MS = 10_000;
+/**
+ * Level rows below this draw (compressor never ran / command never applied)
+ * or with a sample spread above the stddev cap (transition mid-sampling) are
+ * excluded from the suggested fit — they record what was measured, but a
+ * linear amp model must not learn from them.
+ */
+export const CAL_FIT_MIN_AMPS = 1.0;
+export const CAL_FIT_MAX_STDDEV = 1.0;
 /** Max−min spread across the plateau window; generator voltage fluctuates more. */
 export const CAL_STABILITY_BAND_GRID = 0.4;
 export const CAL_STABILITY_BAND_GEN = 0.8;
@@ -202,7 +228,13 @@ export class AcCalibrator {
   // observed during it (before sampling). Sampling starts once the draw is
   // stable past the floor, or at settleUntil (the max cap).
   private settleStartedAt = 0;
-  private settleReadings: number[] = [];
+  private settleReadings: Array<{ amps: number; at: number }> = [];
+  private firstSampleAt = 0;
+  // Confirm-or-resend: the step command awaiting a shadow confirmation.
+  // Sampling never starts while a command is unconfirmed — "draw stable at the
+  // old value" is indistinguishable from "command not applied yet".
+  private pendingConfirm: { kind: "power_level" | "level" | "fan"; value: number; sentAt: number; resends: number } | null = null;
+  private lastShadowFetchAt = 0;
   private startedAt: number | null = null;
   private finishedAt: number | null = null;
   private abortReason: string | null = null;
@@ -241,12 +273,16 @@ export class AcCalibrator {
     }
     const now = Date.now();
     const collecting = this.phase === "baseline" || this.phase === "sample";
-    if (collecting && now >= this.settleUntil) {
+    // Step samples never collect while a command is unconfirmed — the meter
+    // would be reporting the PREVIOUS step's draw (baseline has no command).
+    const confirmed = this.phase === "baseline" || this.pendingConfirm == null;
+    if (collecting && confirmed && now >= this.settleUntil) {
+      if (this.samples.length === 0) this.firstSampleAt = now;
       this.samples.push({ amps: measured, voltage: data.voltage });
     } else if ((this.phase === "ramp" || this.phase === "sample") && now < this.settleUntil) {
       // Settle-phase reading — feeds plateau detection for early release.
-      this.settleReadings.push(measured);
-      if (this.settleReadings.length > 6) this.settleReadings.shift();
+      this.settleReadings.push({ amps: measured, at: now });
+      if (this.settleReadings.length > 12) this.settleReadings.shift();
     }
   }
 
@@ -288,6 +324,9 @@ export class AcCalibrator {
     );
     this.samples = [];
     this.settleUntil = 0;
+    this.firstSampleAt = 0;
+    this.pendingConfirm = null;
+    this.lastShadowFetchAt = 0;
     this.startedAt = Date.now();
     this.finishedAt = null;
     this.abortReason = null;
@@ -314,15 +353,44 @@ export class AcCalibrator {
       return;
     }
 
+    // Confirm-or-resend: while a step command is unconfirmed, refresh the
+    // shadow (throttled), re-send a bounded number of times, and SKIP the step
+    // if the firmware never applies it (Najat L6 never confirms — sampling an
+    // unapplied level would just re-measure the previous step's draw).
+    const now = Date.now();
+    if (this.pendingConfirm && (this.phase === "ramp" || this.phase === "sample")) {
+      const verdict = await this.checkPendingConfirm(tcl, now);
+      if (verdict === "give_up") {
+        const target = this.queue[this.queueIndex];
+        const step = this.steps[this.stepIndex];
+        log.warn(
+          `[calibration] ${this.deviceNames.get(target) ?? target} never confirmed ${step?.kind ?? "power-on"} ` +
+          `${this.pendingConfirm.value} after ${this.pendingConfirm.resends} re-sends — skipping step (no result recorded)`,
+        );
+        this.pendingConfirm = null;
+        try {
+          await this.advanceStep(tcl);
+          // A skip during the ramp moves on to the next step's sampling flow.
+          if (this.phase === "ramp") this.phase = "sample";
+        } catch (err) {
+          log.error(`[calibration] Step skip failed:`, (err as Error).message);
+          await this.abort("command_failed");
+        }
+        return;
+      }
+    }
+
     // Early release: once the change has had at least its floor to take effect
     // and the measured draw has plateaued, collapse the remaining wait so
-    // sampling starts now instead of holding out to the max cap.
-    const now = Date.now();
+    // sampling starts now instead of holding out to the max cap. The ramp
+    // additionally needs the draw to have RISEN above baseline — "stable at
+    // baseline" just means the compressor hasn't started yet.
     if (
       (this.phase === "ramp" || this.phase === "sample") &&
       now < this.settleUntil &&
       now - this.settleStartedAt >= this.settleFloorMs() &&
-      this.isSettleStable()
+      this.isSettleStable(now) &&
+      (this.phase !== "ramp" || this.compressorStarted(now))
     ) {
       log.info(`[calibration] Draw stabilized after ${Math.round((now - this.settleStartedAt) / 1000)}s — sampling early`);
       this.settleUntil = now;
@@ -348,12 +416,20 @@ export class AcCalibrator {
           log.info(`[calibration] Baseline ${this.baselineAmps.toFixed(2)}A — starting ${this.deviceNames.get(target) ?? target} at L1 fan ${CAL_REFERENCE_FAN}`);
           // Power on at L1 with the reference fan, then wait out the compressor ramp.
           await tcl.executeAcAction(target, { power: 1, generator_mode: 1, fan_speed: CAL_REFERENCE_FAN });
+          this.pendingConfirm = { kind: "power_level", value: 1, sentAt: Date.now(), resends: 0 };
           this.phase = "ramp";
           this.armSettle(CAL_RAMP_MAX_MS);
           break;
         }
         case "ramp": {
           if (Date.now() < this.settleUntil) break;
+          if (!this.compressorStarted(Date.now())) {
+            const target = this.queue[this.queueIndex];
+            log.warn(
+              `[calibration] ${this.deviceNames.get(target) ?? target}: draw never rose ≥${CAL_MIN_COMPRESSOR_AMPS}A ` +
+              `above baseline within the ramp cap — compressor likely never started; the L1 row will be excluded from the fit`,
+            );
+          }
           // First step is L1 — already set at power-on, sample right away.
           this.samples = [];
           this.settleUntil = Date.now();
@@ -362,6 +438,7 @@ export class AcCalibrator {
         }
         case "sample": {
           if (this.samples.length < calSamplesNeeded(this.source, false)) break;
+          if (this.firstSampleAt > 0 && Date.now() - this.firstSampleAt < this.sampleMinMs()) break;
           await this.recordStep();
           await this.advanceStep(tcl);
           break;
@@ -400,12 +477,91 @@ export class AcCalibrator {
     return this.steps[this.stepIndex]?.kind === "fan" ? CAL_FAN_SETTLE_MS : CAL_LEVEL_SETTLE_MS;
   }
 
-  /** Plateau detection: the last few settle readings sit within the source band. */
-  private isSettleStable(): boolean {
-    if (this.settleReadings.length < CAL_STABLE_READINGS) return false;
-    const w = this.settleReadings.slice(-CAL_STABLE_READINGS);
+  /** Minimum sampling duration — counts alone shrink when the ESP reports faster than ~5s. */
+  private sampleMinMs(): number {
+    return this.source === "gen" ? CAL_SAMPLE_MIN_MS_GEN : CAL_SAMPLE_MIN_MS_GRID;
+  }
+
+  /** Recent settle readings (plateau window) — within the span plus a small grace. */
+  private recentSettleReadings(now: number): Array<{ amps: number; at: number }> {
+    return this.settleReadings.filter((r) => r.at >= now - CAL_STABLE_SPAN_MS - 5_000);
+  }
+
+  /**
+   * Plateau detection: enough readings, spanning at least CAL_STABLE_SPAN_MS,
+   * all within the source band. The span requirement keeps the window honest
+   * when the ESP reports faster than the assumed ~5s.
+   */
+  private isSettleStable(now: number): boolean {
+    const recent = this.recentSettleReadings(now);
+    if (recent.length < CAL_STABLE_READINGS) return false;
+    if (recent[recent.length - 1].at - recent[0].at < CAL_STABLE_SPAN_MS) return false;
+    const amps = recent.map((r) => r.amps);
     const band = this.source === "gen" ? CAL_STABILITY_BAND_GEN : CAL_STABILITY_BAND_GRID;
-    return Math.max(...w) - Math.min(...w) <= band;
+    return Math.max(...amps) - Math.min(...amps) <= band;
+  }
+
+  /** Compressor evidence: the recent draw sits meaningfully above the all-off baseline. */
+  private compressorStarted(now: number): boolean {
+    const recent = this.recentSettleReadings(now);
+    if (recent.length === 0) return false;
+    return calMedian(recent.map((r) => r.amps)) >= this.baselineAmps + CAL_MIN_COMPRESSOR_AMPS;
+  }
+
+  /**
+   * Drive the pending command's confirm-or-resend. Returns "give_up" once the
+   * bounded re-sends are exhausted and the grace after the last send passed —
+   * the caller skips the step. Confirmation reads the observed shadow via the
+   * throttled device refresh (nothing else refreshes the cache during a run —
+   * the leveler tick and AC automations stand down).
+   */
+  private async checkPendingConfirm(tcl: TclCloud, now: number): Promise<"pending" | "confirmed" | "give_up"> {
+    const pending = this.pendingConfirm;
+    if (!pending) return "confirmed";
+    const target = this.queue[this.queueIndex];
+    if (now - this.lastShadowFetchAt >= CAL_CONFIRM_FETCH_SPACING_MS) {
+      this.lastShadowFetchAt = now;
+      try {
+        await tcl.fetchDevicesLive();
+      } catch (err) {
+        log.warn(`[calibration] Shadow refresh failed (confirm check continues on cache):`, (err as Error).message);
+      }
+    }
+    const device = tcl.getDevices().find((d) => d.id === target);
+    const confirmed =
+      device != null &&
+      (pending.kind === "fan"
+        ? device.fanSpeed === pending.value
+        : pending.kind === "level"
+          ? device.generatorMode === pending.value
+          : device.power && device.generatorMode === pending.value);
+    if (confirmed) {
+      if (pending.resends > 0) {
+        log.info(`[calibration] ${this.deviceNames.get(target) ?? target} confirmed ${pending.kind} ${pending.value} after ${pending.resends} re-send(s)`);
+      }
+      this.pendingConfirm = null;
+      // A late confirm (settle already over) still deserves a fresh floor —
+      // the device only just applied the change.
+      if (now >= this.settleUntil) this.armSettle(this.settleFloorMs());
+      return "confirmed";
+    }
+    if (now - pending.sentAt < CAL_CONFIRM_RESEND_SPACING_MS) return "pending";
+    if (pending.resends >= CAL_CONFIRM_RESEND_MAX) return "give_up";
+    pending.resends++;
+    pending.sentAt = now;
+    log.info(`[calibration] ${this.deviceNames.get(target) ?? target}: ${pending.kind} ${pending.value} not confirmed — re-sending (${pending.resends}/${CAL_CONFIRM_RESEND_MAX})`);
+    try {
+      if (pending.kind === "fan") {
+        await tcl.sendControl(target, "set_fan_speed", pending.value);
+      } else if (pending.kind === "level") {
+        await tcl.sendControl(target, "set_generator_mode", pending.value);
+      } else {
+        await tcl.executeAcAction(target, { power: 1, generator_mode: 1, fan_speed: CAL_REFERENCE_FAN });
+      }
+    } catch (err) {
+      log.warn(`[calibration] Re-send failed:`, (err as Error).message);
+    }
+    return "pending";
   }
 
   private async recordStep(): Promise<void> {
@@ -438,6 +594,7 @@ export class AcCalibrator {
       const prev = this.steps[this.stepIndex - 1];
       if (next.kind === "level") {
         await tcl.sendControl(target, "set_generator_mode", next.value);
+        this.pendingConfirm = { kind: "level", value: next.value, sentAt: Date.now(), resends: 0 };
         this.armSettle(CAL_LEVEL_SETTLE_MAX_MS);
       } else {
         if (prev.kind === "level") {
@@ -446,12 +603,14 @@ export class AcCalibrator {
           if (prev.value !== maxLevel) await tcl.sendControl(target, "set_generator_mode", maxLevel);
         }
         await tcl.sendControl(target, "set_fan_speed", next.value);
+        this.pendingConfirm = { kind: "fan", value: next.value, sentAt: Date.now(), resends: 0 };
         this.armSettle(CAL_FAN_SETTLE_MAX_MS);
       }
       this.samples = [];
       return;
     }
     // Device sweep done — turn it off and move on
+    this.pendingConfirm = null;
     await tcl.executeAcAction(target, { power: 0 });
     this.queueIndex++;
     if (this.queueIndex < this.queue.length) {
@@ -487,6 +646,7 @@ export class AcCalibrator {
     this.finishedAt = Date.now();
     this.abortReason = reason;
     this.abortRequested = null;
+    this.pendingConfirm = null;
     if (reason) {
       log.warn(`[calibration] Aborted (${reason}) after ${this.stepsDone}/${this.totalSteps} steps — partial results kept`);
     } else {
@@ -553,8 +713,17 @@ export class AcCalibrator {
     const suggestedFit: Record<string, { grid?: CalibrationFit; gen?: CalibrationFit }> = {};
     for (const deviceId of new Set(results.map((r) => r.deviceId))) {
       for (const source of ["grid", "gen"] as const) {
+        // Exclude rows the linear model must not learn from: near-zero draw
+        // (compressor never ran / command never applied) and high-spread rows
+        // (a compressor transition mid-sampling). Najat's 2026-06-11 gen run
+        // recorded L1=0.00A and L2=1.07A±1.68 this way and the poisoned fit
+        // (0.7+0.9/level) under-credited her by 2-3A → live over-limit flapping.
         const points = results
-          .filter((r) => r.deviceId === deviceId && r.source === source && r.kind === "level")
+          .filter(
+            (r) =>
+              r.deviceId === deviceId && r.source === source && r.kind === "level" &&
+              r.amps >= CAL_FIT_MIN_AMPS && (r.stddev == null || r.stddev <= CAL_FIT_MAX_STDDEV),
+          )
           .map((r) => ({ level: r.step, amps: r.amps }));
         const fit = fitAmpModel(points);
         if (fit) {

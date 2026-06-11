@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import type { Config } from "./config.js";
 import { Collector } from "./collector.js";
 import { acTimers } from "./routes.js";
+import { UNREACHABLE_LEVEL_SENDS } from "./ac-leveling.js";
 import type { AutomationRangeSlot } from "./automation-slots.js";
 
 const config: Config = {
@@ -1894,19 +1895,19 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
     await checkAcLeveling(collector);
     expect(genCalls(tclCloud, 6)).toBe(1);
 
-    await resendTicks(collector, 2); // sends #2 and #3 → marked unreachable
-    expect(genCalls(tclCloud, 6)).toBe(3);
+    await resendTicks(collector, UNREACHABLE_LEVEL_SENDS - 1); // remaining sends → marked unreachable
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
 
     // Fallback: the next correction targets L5, never L6 again.
     await resendTicks(collector, 1);
-    expect(genCalls(tclCloud, 6)).toBe(3);
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
     expect(genCalls(tclCloud, 5)).toBe(1);
 
     // The shadow applies L5 → confirmed at the top of the next tick → quiet.
     devices[0].generatorMode = 5;
     await resendTicks(collector, 2);
     expect(genCalls(tclCloud, 5)).toBe(1);
-    expect(genCalls(tclCloud, 6)).toBe(3);
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
   });
 
   it("un-marks the level if the firmware confirms it after all", async () => {
@@ -1919,14 +1920,14 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
 
     gridReadings(collector, 12, 6);
     await checkAcLeveling(collector);
-    await resendTicks(collector, 2); // 3 sends → marked
-    expect(genCalls(tclCloud, 6)).toBe(3);
+    await resendTicks(collector, UNREACHABLE_LEVEL_SENDS - 1); // full send budget → marked
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
 
     // The pending L6 lands late — confirm un-marks it; no L5 fallback ships.
     devices[0].generatorMode = 6;
     await resendTicks(collector, 2);
     expect(genCalls(tclCloud, 5)).toBe(0);
-    expect(genCalls(tclCloud, 6)).toBe(3);
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
   });
 
   it("un-marks a level that confirms after the fallback moved on (no false manual target)", async () => {
@@ -1939,8 +1940,8 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
 
     gridReadings(collector, 12, 6);
     await checkAcLeveling(collector);
-    await resendTicks(collector, 2); // 3 sends → L6 marked unreachable
-    expect(genCalls(tclCloud, 6)).toBe(3);
+    await resendTicks(collector, UNREACHABLE_LEVEL_SENDS - 1); // full send budget → L6 marked unreachable
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
     await resendTicks(collector, 1); // fallback L5 ships — pending is now 5
     expect(genCalls(tclCloud, 5)).toBe(1);
 
@@ -1956,6 +1957,34 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
     expect(ac?.unreachableLevels).toEqual([]);
   });
 
+  it("regression: a stale mark expires after the 60-min safety window and the level is re-probed", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = najatAtZero();
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    await resendTicks(collector, UNREACHABLE_LEVEL_SENDS - 1); // full send budget → L6 marked unreachable
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
+    await resendTicks(collector, 1); // fallback L5 ships
+    devices[0].generatorMode = 5; // shadow confirms L5 → system goes quiet
+    await resendTicks(collector, 1);
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
+
+    // Live 2026-06-11: junk marks minted during a morning shadow-stuck-at-0
+    // episode capped Najat at L3 on grid ALL DAY with ~19A of budget free.
+    // After the safety expiry the mark drops and the level is re-probed.
+    vi.advanceTimersByTime(60 * 60_000 + 1000);
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    const ac = collector.acLeveler.getStatus().acs.find((a) => a.deviceId === "ac1");
+    expect(ac?.unreachableLevels).toEqual([]);
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS + 1); // re-probe shipped
+  });
+
   it("marks survive a power cycle; an explicit manual gen change clears them", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
@@ -1966,8 +1995,8 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
 
     gridReadings(collector, 12, 6);
     await checkAcLeveling(collector);
-    await resendTicks(collector, 2); // L6 marked unreachable
-    expect(genCalls(tclCloud, 6)).toBe(3);
+    await resendTicks(collector, UNREACHABLE_LEVEL_SENDS - 1); // L6 marked unreachable
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
 
     // Power cycle: off tick, then back on at level 0.
     devices[0].power = false;
@@ -1976,7 +2005,7 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
     devices[0].generatorMode = 0;
     await resendTicks(collector, 1);
     // The correction after the cycle targets L5 — the mark survived.
-    expect(genCalls(tclCloud, 6)).toBe(3);
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
     expect(genCalls(tclCloud, 5)).toBeGreaterThanOrEqual(1);
 
     // Shadow settles at L5; the user then explicitly sets L6 — a fresh probe.
@@ -1984,7 +2013,7 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
     await resendTicks(collector, 1);
     await collector.acLeveler.onUserGenLevel("ac1", 6);
     await resendTicks(collector, 1);
-    expect(genCalls(tclCloud, 6)).toBeGreaterThanOrEqual(4); // L6 attempted again
+    expect(genCalls(tclCloud, 6)).toBeGreaterThanOrEqual(UNREACHABLE_LEVEL_SENDS + 1); // L6 attempted again
   });
 
   it("regression: a shadow snapping to 0 never records a manual target (31A grid incident)", async () => {
@@ -2015,8 +2044,8 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
 
     // The never-level-0 rule keeps re-capping and the unreachable counting
     // still completes (pendingLevel survives the 0-observation).
-    await resendTicks(collector, 2);
-    expect(genCalls(tclCloud, 6)).toBe(3);
+    await resendTicks(collector, UNREACHABLE_LEVEL_SENDS - 1);
+    expect(genCalls(tclCloud, 6)).toBe(UNREACHABLE_LEVEL_SENDS);
     await resendTicks(collector, 1);
     expect(genCalls(tclCloud, 5)).toBeGreaterThanOrEqual(1);
   });
@@ -2039,17 +2068,17 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
       ] satisfies AutomationRangeSlot[],
     });
     await setWeatherValue(collector, 28);
-    for (let i = 0; i < 7; i++) {
+    for (let i = 0; i < UNREACHABLE_LEVEL_SENDS * 2 + 1; i++) {
       (collector as never as { automationRules: unknown[] }).automationRules = [capRule(i % 2 === 0 ? 6 : 5)];
       vi.advanceTimersByTime(31_000);
       gridReadings(collector, 12, 6);
       await checkAcLeveling(collector);
     }
 
-    // Both alternating levels get marked (3 sends each) and the controller
-    // falls through to L4 instead of re-sending 6/5 forever.
-    expect(genCalls(tclCloud, 6)).toBeLessThanOrEqual(3);
-    expect(genCalls(tclCloud, 5)).toBeLessThanOrEqual(3);
+    // Both alternating levels get marked (full send budget each) and the
+    // controller falls through to L4 instead of re-sending 6/5 forever.
+    expect(genCalls(tclCloud, 6)).toBeLessThanOrEqual(UNREACHABLE_LEVEL_SENDS);
+    expect(genCalls(tclCloud, 5)).toBeLessThanOrEqual(UNREACHABLE_LEVEL_SENDS);
     expect(genCalls(tclCloud, 4)).toBeGreaterThanOrEqual(1);
   });
 
