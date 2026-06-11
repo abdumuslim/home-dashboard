@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { TclCloud, latestReportedAtMs, deviceOnline, SHADOW_STALE_MS, type AcDevice, type AcAction } from "./tcl-cloud.js";
+import { describe, it, expect, vi } from "vitest";
+import { TclCloud, latestReportedAtMs, deviceOnline, SHADOW_STALE_MS, CONTROL_VERIFY_MAX_RESENDS, type AcDevice, type AcAction } from "./tcl-cloud.js";
 
 // Regression tests for the fan/turbo coupling on non-Najat models (TAC-12CHSD):
 // fan_speed 7 IS turbo:1/windSpeed:0 and fan_speed 1 IS silenceSwitch:1, so a
@@ -139,5 +139,100 @@ describe("shadow freshness → online flag (blackout detection)", () => {
     const now = 10_000_000;
     expect(deviceOnline(false, true, null, now, SHADOW_STALE_MS)).toBe(true);
     expect(deviceOnline(false, false, null, now, SHADOW_STALE_MS)).toBe(false);
+  });
+});
+
+// UI command verify-resend (2026-06-11): Najat's firmware routinely accepts a
+// command without applying it — the shadow keeps the pre-command value. After
+// a UI send, the shadow is re-checked every 5s and the command re-published up
+// to 3 times; an observed THIRD value (a genuine remote change) stops the loop.
+describe("sendControlVerified (5s × 3 confirm-or-resend)", () => {
+  type Shadow = { reported: Record<string, number>; reportedAt: number | null };
+
+  function verifiableTcl(dev: AcDevice, shadows: Array<Record<string, number>>): {
+    tcl: TclCloud;
+    sendControl: ReturnType<typeof vi.fn>;
+    publishWithRetry: ReturnType<typeof vi.fn>;
+    getThingShadow: ReturnType<typeof vi.fn>;
+    awaitVerify: () => Promise<void>;
+  } {
+    const tcl = tclWithDevice(dev);
+    const seam = tcl as unknown as {
+      sendControl: unknown;
+      publishWithRetry: unknown;
+      getThingShadow: unknown;
+      controlVerifyDelay: unknown;
+      lastControlVerify: Promise<void> | null;
+    };
+    const sendControl = vi.fn(async () => undefined);
+    const publishWithRetry = vi.fn(async () => undefined);
+    const queue: Shadow[] = shadows.map((reported) => ({ reported, reportedAt: null }));
+    const getThingShadow = vi.fn(async () => queue.length > 1 ? queue.shift()! : queue[0]);
+    seam.sendControl = sendControl;
+    seam.publishWithRetry = publishWithRetry;
+    seam.getThingShadow = getThingShadow;
+    seam.controlVerifyDelay = vi.fn(async () => undefined); // no real 5s waits in tests
+    return { tcl, sendControl, publishWithRetry, getThingShadow, awaitVerify: async () => { await seam.lastControlVerify; } };
+  }
+
+  const najat = () => acDevice({ name: "Najat", maxGeneratorLevel: 6 });
+
+  it("re-sends while the shadow still shows the pre-command value, then stops on apply", async () => {
+    const { tcl, publishWithRetry, awaitVerify } = verifiableTcl(najat(), [
+      { windSpeed7Gear: 3 }, // pre-command capture
+      { windSpeed7Gear: 3 }, // +5s: still pre → re-send 1
+      { windSpeed7Gear: 5 }, // +10s: applied → stop
+    ]);
+    await tcl.sendControlVerified("ac1", "set_fan_speed", 5);
+    await awaitVerify();
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { windSpeed7Gear: 5 });
+  });
+
+  it("gives up after the bounded re-sends when the firmware never applies", async () => {
+    const { tcl, publishWithRetry, awaitVerify } = verifiableTcl(najat(), [
+      { windSpeed7Gear: 3 }, // never moves
+    ]);
+    await tcl.sendControlVerified("ac1", "set_fan_speed", 5);
+    await awaitVerify();
+    expect(publishWithRetry).toHaveBeenCalledTimes(CONTROL_VERIFY_MAX_RESENDS);
+  });
+
+  it("stops without re-sending when the shadow moves to a third value (external change wins)", async () => {
+    const { tcl, publishWithRetry, awaitVerify } = verifiableTcl(najat(), [
+      { windSpeed7Gear: 3 }, // pre-command capture
+      { windSpeed7Gear: 7 }, // neither pre (3) nor commanded (5) → remote change
+    ]);
+    await tcl.sendControlVerified("ac1", "set_fan_speed", 5);
+    await awaitVerify();
+    expect(publishWithRetry).not.toHaveBeenCalled();
+  });
+
+  it("verifies the silence/turbo/windSpeed triple for a non-Najat fan command", async () => {
+    const { tcl, publishWithRetry, awaitVerify } = verifiableTcl(acDevice({}), [
+      { windSpeed: 4, silenceSwitch: 0, turbo: 0 }, // pre
+      { windSpeed: 4, silenceSwitch: 0, turbo: 0 }, // still pre → re-send 1
+      { windSpeed: 0, silenceSwitch: 1, turbo: 0 }, // fan 1 applied → stop
+    ]);
+    await tcl.sendControlVerified("ac1", "set_fan_speed", 1);
+    await awaitVerify();
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { windSpeed: 0, silenceSwitch: 1, turbo: 0 });
+  });
+
+  it("never schedules a verify for set_generator_mode (the leveler owns its retries)", async () => {
+    const { tcl, sendControl, publishWithRetry, getThingShadow } = verifiableTcl(najat(), [
+      { generatorMode: 2 },
+    ]);
+    await tcl.sendControlVerified("ac1", "set_generator_mode", 4);
+    expect(sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 4);
+    expect(getThingShadow).not.toHaveBeenCalled();
+    expect(publishWithRetry).not.toHaveBeenCalled();
+  });
+
+  it("never schedules a verify for fan Auto (control returns to the automation)", async () => {
+    const { tcl, getThingShadow } = verifiableTcl(acDevice({}), [{ windSpeed: 4 }]);
+    await tcl.sendControlVerified("ac1", "set_fan_speed", 0);
+    expect(getThingShadow).not.toHaveBeenCalled();
   });
 });

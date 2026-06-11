@@ -73,6 +73,17 @@ Auth chain summary: TCL login → token refresh (saasToken + cognitoToken) → A
 - **Must use `@aws-sdk/client-iot-data-plane` `PublishCommand`** — manual SigV4 signing for the `/topics/...` REST endpoint (POST) fails with 403, likely a URL-encoding issue with the `$` in the topic path. This was debugged extensively — even fresh credentials get 403 with manual signing. The SDK handles the `$` in topic paths correctly. (Shadow read via manual SigV4 is fine; only publish needs the SDK.)
 - Dependency: `@aws-sdk/client-iot-data-plane` is required for IoT publish (AC control).
 
+### UI command verify-resend (2026-06-11, 5s × 3)
+
+Najat's firmware routinely ACCEPTS a command (IoT publish OK) and never applies it — the shadow keeps reporting the pre-command value. The root cause is the firmware itself, so the fix is a bounded confirm-or-resend layer for **UI commands** (`routes.ts` control endpoint calls `sendControlVerified` instead of `sendControl`):
+
+- Captures the pre-command shadow (`getThingShadow`), sends normally, then re-checks the reported shadow every `CONTROL_VERIFY_DELAY_MS` **5s**; while it still shows the PRE-command value the desired payload is re-published, up to `CONTROL_VERIFY_MAX_RESENDS` **3** times (then a warn).
+- An observed move to a **third value** (neither pre nor commanded) stops the loop — a genuine remote/manual change wins.
+- Re-sends publish the raw desired payload via `publishWithRetry` — they bypass `sendControl` (a power-on retry must not re-run `restoreLastState`) and the route hooks (no duplicate manual-intent recording). Fan re-sends at 5/10/15s sit inside the automation's 15s `AC_FAN_SETTLE_MS` drift guard.
+- `controlShadowPayload()` maps command → exact desired props per model (non-Najat `set_fan_speed` verifies the `windSpeed`/`silenceSwitch`/`turbo` triple; swing verifies switch + direction).
+- **Excluded** (each already has its own retry/owner): `set_generator_mode` (leveler `pendingSendCounts`/unreachable machinery — a second retry path would corrupt the counts), `set_beep` (sticky beep-off enforcement), `set_fan_speed 0` (hands fan control back to the range automation, which re-enforces itself).
+- Other paths keep their existing coverage: automation profiles → 5s diff re-enforcement; leveler gen levels/fan holds → their own confirm-or-resend. Tests: `tcl-cloud.test.ts` "sendControlVerified" suite (the `controlVerifyDelay` protected method is the no-real-waits test seam; `lastControlVerify` holds the in-flight loop for awaiting).
+
 ### Retry-on-403 and the silent-death gotcha
 - `sendControl` has retry-on-403 logic: clears creds (`tokenData = null`), re-auths, retries once.
 - **Critical gotcha (found 2026-05-01):** the 403 retry sets `tokenData = null` BEFORE calling `ensureValidTokens()`. If the re-auth fails (network blip, TCL server down), `tokenData` stays null → `isReady()` returns false **permanently** → all AC automations silently stop forever with zero log output.

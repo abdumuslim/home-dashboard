@@ -984,13 +984,14 @@ export class Collector {
   }
 
   /**
-   * Slot fan override → preset fan; Auto (0) resolves to the delta-based smart
-   * level (the AC's built-in auto is never enforced by range automations).
+   * The range fan is ALWAYS the delta-based smart level unless the active slot
+   * explicitly fixes 1–7 (slot 0 or absent → smart auto). The preset's
+   * fan_speed never drives range enforcement — presets still apply their fan
+   * on a manual tap, which then counts as a manual override. The AC's
+   * built-in auto (0) is never enforced by range automations.
    */
-  private resolveRangeFan(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, value: number): number | null {
-    const resolved = slot.fan_speed ?? (rule.action_on as AcAction).fan_speed;
-    if (resolved == null) return null;
-    if (resolved !== 0) return resolved;
+  private resolveRangeFan(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, value: number): number {
+    if (slot.fan_speed != null && slot.fan_speed >= 1) return slot.fan_speed;
     const isCool = (rule.action_on as Record<string, unknown>).mode === 1;
     const delta = isCool ? value - slot.threshold_low : slot.threshold - value;
     const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, deviceId));
@@ -1028,8 +1029,7 @@ export class Collector {
       delete profile.turbo;
       return profile;
     }
-    const fan = this.resolveRangeFan(rule, slot, deviceId, value);
-    if (fan != null) profile.fan_speed = fan;
+    profile.fan_speed = this.resolveRangeFan(rule, slot, deviceId, value);
     return profile;
   }
 
@@ -1051,7 +1051,6 @@ export class Collector {
     }
     if (entry?.manual) return;
     const desiredFan = this.resolveRangeFan(rule, slot, deviceId, value);
-    if (desiredFan == null) return;
     const observed = this.tclCloud?.getDeviceState(deviceId)?.fan_speed;
     if (observed == null) return; // device not in cache yet — skip this tick
     if (!entry) {
@@ -1065,6 +1064,11 @@ export class Collector {
     if (observed === entry.lastCommandedFan) return;
     // Our own just-sent command may not be reflected in the shadow yet
     if (now - entry.lastFanCommandAt < this.AC_FAN_SETTLE_MS) return;
+    // Observed fan 0 (built-in auto) is NEVER a manual intent: the firmware
+    // resets to auto after a power-loss restart (changeovers) and automations
+    // never command 0 — the next tick's diff re-enforces the resolved fan.
+    // The dashboard A button is the explicit way back to auto (noteUserAcFanAuto).
+    if (observed === 0) return;
     this.acFanEnforcement.set(key, { ...entry, manual: true });
     log.info(`[collector] AC range "${rule.name}": manual fan change on ${deviceId} (fan=${observed}), suspending fan enforcement until slot change or power cycle`);
   }

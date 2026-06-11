@@ -31,6 +31,13 @@ export interface AcLevelingConfig {
    */
   raiseBufferAmps: number;
   comfortTargetC: number;
+  /**
+   * Near-target band (°C): an AC whose metric is within this band of its
+   * target (active range slot's low limit, else comfortTargetC) is hard-capped
+   * at L1 — the room is about to be satisfied, so spending amps there buys
+   * nothing. Beyond the band the budget decides (no intermediate need caps).
+   */
+  nearTargetBandC: number;
   /** Device ids, highest priority first. */
   priority: string[];
   /** Per-AC draw model on grid (and the fallback for gen when no gen model is set). */
@@ -47,6 +54,7 @@ export const DEFAULT_LEVELING_CONFIG: AcLevelingConfig = {
   marginAmps: 1,
   raiseBufferAmps: 1,
   comfortTargetC: 26,
+  nearTargetBandC: 0.5,
   priority: [],
   ampModels: {},
   genAmpModels: {},
@@ -110,6 +118,8 @@ export interface AllocatorInput {
   marginAmps: number;
   /** Raise-side hysteresis buffer — raises stop this far below `limit − margin`. */
   raiseBufferAmps: number;
+  /** Near-target band (°C): needDelta ≤ band → hard L1 cap; above → budget decides. */
+  nearTargetBandC: number;
   /** Estimated non-AC household draw (caller derives from measured − estimated AC draws). */
   nonAcLoadAmps: number;
   /** Consecutive power readings with measured > limit. */
@@ -122,6 +132,14 @@ export interface AllocatorInput {
   inSettle: boolean;
   /** Last raise under-delivered (expected amps missing) — raises wait out the hold. */
   raiseHold?: boolean;
+  /**
+   * The active raise hold's expected total measured amps. While the hold
+   * blocks ordinary raises, a RESTORE may still fire when this expectation
+   * plus the restored floor draw fits under the buffered limit — the hold's
+   * own prediction is the conservative budget (waiting out a slow compressor
+   * ramp cost Abdu ~20 min off, live 2026-06-11).
+   */
+  raiseHoldExpectedAmps?: number | null;
   /** Structural change (AC on/off, source change, manual change, config change) — allow immediate reductions. */
   forceEvaluate: boolean;
   /** Pre-sorted by priority, highest first. */
@@ -314,13 +332,24 @@ function floorOf(ac: LevelerAcSnapshot): number {
   return floor;
 }
 
-/** Ceiling from need tier / manual intents / slot caps / bounce caps, never below the floor. */
-function ceilOf(ac: LevelerAcSnapshot): number {
+/**
+ * Need cap from the near-target band: within the band of the target (the
+ * active slot's low limit, else comfortTargetC — both arrive as needDelta)
+ * the AC is hard-capped at L1 — the room is about to be satisfied, so amps
+ * spent there buy nothing. Beyond the band the budget decides; the old mild
+ * tier's ceil(max/2) intermediate cap is gone (2026-06-11 user decision).
+ */
+export function nearTargetNeedCap(needDelta: number, nearTargetBandC: number, maxLevel: number): number {
+  return needDelta <= nearTargetBandC ? 1 : maxLevel;
+}
+
+/** Ceiling from the near-target cap / manual intents / slot caps / bounce caps, never below the floor. */
+function ceilOf(ac: LevelerAcSnapshot, nearBand: number): number {
   // A manualTarget bypasses the need cap AND the slot cap (manual beats
   // automation); manualCap/slotCap intersect otherwise.
   const cap = ac.manualTarget != null
     ? ac.manualTarget
-    : Math.min(needCap(ac.needTier, ac.maxLevel), ac.manualCap ?? ac.maxLevel, ac.slotCap ?? ac.maxLevel);
+    : Math.min(nearTargetNeedCap(ac.needDelta, nearBand, ac.maxLevel), ac.manualCap ?? ac.maxLevel, ac.slotCap ?? ac.maxLevel);
   // A bounce cap also defers manualTarget-driven raises — the target stays,
   // the retry waits for the load to drop. reachableCap clamps everything:
   // a level the firmware never applies cannot be a target of any kind.
@@ -332,15 +361,14 @@ function ceilOf(ac: LevelerAcSnapshot): number {
 }
 
 /**
- * Soft ceiling: once everyone reaches their need cap, surplus budget keeps
- * raising toward max — need caps only bite when amps are tight. Satisfied
- * rooms stay at their cap (the range automation is about to turn them off /
+ * Soft ceiling: surplus budget keeps raising toward max. Near-target rooms
+ * stay hard at their cap (the range automation is about to turn them off /
  * the compressor idles at the setpoint), and manual intents remain hard.
  * The slot cap stays hard here too (the user picked it for this window)
  * unless a live manualTarget overrides it.
  */
-function softCeilOf(ac: LevelerAcSnapshot): number {
-  if (ac.needTier === "satisfied") return ceilOf(ac);
+function softCeilOf(ac: LevelerAcSnapshot, nearBand: number): number {
+  if (ac.needDelta <= nearBand) return ceilOf(ac, nearBand);
   const slotLimit = ac.manualTarget != null ? ac.maxLevel : (ac.slotCap ?? ac.maxLevel);
   const cap = Math.min(
     ac.maxLevel,
@@ -409,8 +437,30 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   // desiredLevels below). At most one restore per call, most-needy room first.
   // Boost floors stay hard: if the ON floors alone exceed the budget
   // (overBudget), no restore is attempted.
+  //
+  // Restores are gated by settle + headroom streak but NOT blindly by the
+  // raise hold: during a hold the hold's own expectation is the conservative
+  // budget — a restore fits when expected + the floor draw stays under the
+  // buffered limit (waiting out a slow compressor ramp cost Abdu ~20 min off,
+  // live 2026-06-11).
   let restorePick: string | null = null;
-  if (canRaise && !overBudget) {
+  // A floor-feasible restore that is merely gated this tick parks the raises:
+  // they would consume the headroom it needs and arm fresh holds that push it
+  // out further ("all ACs on beats higher levels"). An INFEASIBLE restore
+  // does not park anything — raises don't change floors-based feasibility,
+  // so the other ACs must not starve at their floors waiting for it.
+  let restoreWaiting = false;
+  if (!overBudget) {
+    const canRestore = !input.inSettle && input.headroomStreak >= RAISE_STREAK;
+    const bufferedLimit = limitAmps - marginAmps - Math.max(0, input.raiseBufferAmps);
+    // The restore batch pulls every raised AC down to the fitted ideal
+    // (floors here) in the same batch — those savings count against the
+    // hold's expectation (live: Abdullah's L3 hold expectation blocked Abdu's
+    // restore even though the batch would have reduced Abdullah right back).
+    const holdReductionSavings = onManaged.reduce(
+      (sum, a) => sum + Math.max(0, draw(a, a.currentLevel) - draw(a, floorOf(a))),
+      0,
+    );
     // A restore that bounced (over-limit → re-shed) waits for the load to drop
     // before another attempt — the next-most-needy unblocked room goes first.
     const restoreOrder = restoreCandidates
@@ -421,14 +471,21 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       // Restore is the single largest raise (a whole floor + slow compressor
       // ramp), so it honors the raise buffer too — a restored AC must settle
       // below the limit, not in the deadband where it would be re-shed.
-      if (cost + floorDraw <= raiseBudgetAmps) {
+      if (cost + floorDraw > raiseBudgetAmps) continue;
+      const fitsHold =
+        !input.raiseHold ||
+        (input.raiseHoldExpectedAmps != null &&
+          input.raiseHoldExpectedAmps - holdReductionSavings + floorDraw <= bufferedLimit);
+      if (canRestore && fitsHold) {
         restorePick = a.deviceId;
         // Not in onManaged (it's off), so the fill below fits the ON ACs
         // around its floor draw without ever raising it above the floor.
         ideal.set(a.deviceId, floorOf(a));
         cost += floorDraw;
-        break;
+      } else {
+        restoreWaiting = true;
       }
+      break; // most-needy feasible room only — no queue jumping while it's gated
     }
   }
 
@@ -447,12 +504,23 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       ideal.delete(a.deviceId);
       shedWanted.push(a.deviceId);
     }
-  } else if (!overBudget) {
+  } else if (!overBudget && !(restorePick != null && input.raiseHold)) {
     // Raise fill: spread level-by-level (everyone reaches L2 before anyone
     // gets L3); within a level the hottest-above-target room goes first;
     // priority order breaks delta ties. Two passes: need caps first, then
     // surplus budget soft-fills toward max (need caps only bite when tight).
-    for (const ceiling of [ceilOf, softCeilOf]) {
+    //
+    // Skipped for a restore DURING a raise hold: its feasibility was judged
+    // in expectation space with every ON AC pulled to its floor — letting
+    // the fill (whose nonAcLoad-based budget is optimistic while measured
+    // lags the hold) raise them back would take back the very savings the
+    // restore counted on. Everyone rides at floors for this batch; the fill
+    // resumes next tick.
+    const nearBand = input.nearTargetBandC;
+    for (const ceiling of [
+      (a: LevelerAcSnapshot): number => ceilOf(a, nearBand),
+      (a: LevelerAcSnapshot): number => softCeilOf(a, nearBand),
+    ]) {
       for (;;) {
         let pick: LevelerAcSnapshot | null = null;
         for (const a of onManaged) {
@@ -523,7 +591,7 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       desiredLevels[a.deviceId] = target;
       continue;
     }
-    if (target > a.currentLevel && toRestore.length === 0 && !anyHoldPending) {
+    if (target > a.currentLevel && toRestore.length === 0 && !anyHoldPending && !restoreWaiting) {
       if (canRaise) {
         // Jump straight to the budget-fitted ideal — the amp model is the guess,
         // the measurement feedback loop is the adjustment.

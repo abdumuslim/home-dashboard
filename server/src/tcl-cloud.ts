@@ -15,6 +15,11 @@ const log = childLogger("tcl");
  */
 export const SHADOW_STALE_MS = 10 * 60_000;
 
+/** UI command verify-resend: re-check the shadow this often… */
+export const CONTROL_VERIFY_DELAY_MS = 5_000;
+/** …and re-send an unapplied command at most this many times (user decision 2026-06-11). */
+export const CONTROL_VERIFY_MAX_RESENDS = 3;
+
 /** Newest per-field reported timestamp from an AWS IoT shadow `metadata.reported`, in ms (null if none). */
 export function latestReportedAtMs(
   metadataReported: Record<string, { timestamp?: number }> | undefined,
@@ -909,6 +914,115 @@ export class TclCloud {
         await this.publishWithRetry(deviceId, desired);
         log.info(`[tcl] Profile applied to device ${deviceId}: ${JSON.stringify(desired)}`);
       }
+    }
+  }
+
+  /**
+   * The exact desired-shadow payload sendControl publishes for a UI command,
+   * or null for commands the verify-resend layer must not touch:
+   * set_generator_mode (the leveler's pendingSendCounts/unreachable machinery
+   * owns its retries — a second retry path would corrupt the counts),
+   * set_beep (sticky beep-off enforcement already re-sends), and
+   * set_fan_speed 0 (hands control back to the range automation, which
+   * re-enforces on its own).
+   */
+  private controlShadowPayload(deviceId: string, command: string, value: unknown): Record<string, number> | null {
+    if (typeof value !== "number") return null;
+    if (command === "set_generator_mode" || command === "set_beep") return null;
+    if (command === "set_fan_speed" && value === 0) return null;
+    if (command === "set_vertical_swing" || command === "set_horizontal_swing") {
+      const prefix = command === "set_vertical_swing" ? "vertical" : "horizontal";
+      const switchProp = this.isNajatModel(deviceId) ? `${prefix}Wind` : `${prefix}Switch`;
+      if (value === 0) return { [switchProp]: 0, [`${prefix}Direction`]: 8 };
+      if (value >= 1 && value <= 4) return { [switchProp]: 1, [`${prefix}Direction`]: value };
+      if (value >= 9 && value <= 13) return { [switchProp]: 0, [`${prefix}Direction`]: value };
+      return null;
+    }
+    if (command === "set_fan_speed" && !this.isNajatModel(deviceId)) {
+      if (value === 1) return { windSpeed: 0, silenceSwitch: 1, turbo: 0 };
+      if (value === 7) return { windSpeed: 0, silenceSwitch: 0, turbo: 1 };
+      return { windSpeed: value, silenceSwitch: 0, turbo: 0 };
+    }
+    const propMap: Record<string, string> = {
+      set_power: "powerSwitch",
+      set_mode: "workMode",
+      set_temperature: "targetTemperature",
+      set_fan_speed: "windSpeed7Gear",
+      set_eco: "ECO",
+      set_screen: "screen",
+      set_sleep: "sleep",
+      set_turbo: "turbo",
+      set_fresh_air: "newWindSwitch",
+    };
+    const prop = propMap[command];
+    return prop ? { [prop]: value } : null;
+  }
+
+  /** Test seam for the verify-resend pacing. */
+  protected controlVerifyDelay(): Promise<void> {
+    return new Promise((r) => setTimeout(r, CONTROL_VERIFY_DELAY_MS));
+  }
+
+  /**
+   * UI command with confirm-or-resend (user decision 2026-06-11, "5 sec for
+   * retry for 3 times"): Najat's firmware routinely accepts a command and
+   * never applies it — the shadow keeps reporting the pre-command value. After
+   * the normal send, the reported shadow is re-checked every 5s; while it
+   * still shows the PRE-command value the command is re-published, up to 3
+   * times. An observed move to a THIRD value stops the loop (a genuine
+   * remote/manual change wins). Re-sends publish the raw desired payload —
+   * they bypass sendControl so a power-on retry can't re-trigger
+   * restoreLastState, and they bypass the route hooks so no duplicate
+   * manual-intent recording happens.
+   */
+  async sendControlVerified(deviceId: string, command: string, value: unknown): Promise<void> {
+    const payload = this.controlShadowPayload(deviceId, command, value);
+    let pre: Record<string, number> | null = null;
+    if (payload) {
+      try {
+        pre = (await this.getThingShadow(deviceId)).reported;
+      } catch {
+        // No pre-state — verification still runs, external-change detection degrades gracefully.
+      }
+    }
+    await this.sendControl(deviceId, command, value);
+    if (!payload) return;
+    // Fire-and-forget — the route responds immediately; kept on a field so
+    // tests can await the loop.
+    this.lastControlVerify = this.verifyControlApplied(deviceId, command, payload, pre).catch((err) => {
+      log.warn(`[tcl] Verify-resend loop failed for ${command} on ${deviceId}: ${(err as Error).message}`);
+    });
+  }
+
+  private lastControlVerify: Promise<void> | null = null;
+
+  private async verifyControlApplied(
+    deviceId: string,
+    command: string,
+    payload: Record<string, number>,
+    pre: Record<string, number> | null,
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= CONTROL_VERIFY_MAX_RESENDS + 1; attempt++) {
+      await this.controlVerifyDelay();
+      const reported = (await this.getThingShadow(deviceId)).reported;
+      const mismatched = Object.keys(payload).filter((k) => reported[k] !== payload[k]);
+      if (mismatched.length === 0) {
+        if (attempt > 1) log.info(`[tcl] ${command} on ${deviceId} confirmed after ${attempt - 1} re-send(s)`);
+        return;
+      }
+      const external = mismatched.some(
+        (k) => pre != null && k in pre && reported[k] !== pre[k],
+      );
+      if (external) {
+        log.info(`[tcl] ${command} on ${deviceId}: shadow moved to a third value (${mismatched.map((k) => `${k}=${reported[k]}`).join(", ")}) — external change wins, verify stopped`);
+        return;
+      }
+      if (attempt > CONTROL_VERIFY_MAX_RESENDS) {
+        log.warn(`[tcl] ${command} on ${deviceId} still not applied after ${CONTROL_VERIFY_MAX_RESENDS} re-sends (shadow still ${mismatched.map((k) => `${k}=${reported[k]}`).join(", ")}) — giving up`);
+        return;
+      }
+      log.info(`[tcl] ${command} on ${deviceId} not applied (shadow still ${mismatched.map((k) => `${k}=${reported[k]}`).join(", ")}) — re-sending (${attempt}/${CONTROL_VERIFY_MAX_RESENDS})`);
+      await this.publishWithRetry(deviceId, payload);
     }
   }
 

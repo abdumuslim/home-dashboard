@@ -7,7 +7,7 @@ import {
   computeAllocation,
   determineSource,
   estimateAcDraw,
-  needCap,
+  nearTargetNeedCap,
   AC_RAMP_MS,
   BOUNCE_MAX_EXTRA_AMPS,
   BOUNCE_SAFETY_EXPIRY_MS,
@@ -842,6 +842,23 @@ export class AcLeveler {
         this.confirmedLevel.set(device.id, obs);
         continue;
       }
+      const unreach = this.unreachableLevels.get(device.id);
+      if (unreach?.has(obs)) {
+        // The firmware applied a level we had already marked unreachable — its
+        // confirm lag outlasted the send window (live 2026-06-11: Najat's L4
+        // landed 6s AFTER the 3rd send marked it, and the fallback had already
+        // moved pending to L3, so this read as a manual "target L4"). The
+        // observation is proof of reachability: un-mark, re-adopt as the
+        // baseline with no manual intent, and re-evaluate to climb back.
+        unreach.delete(obs);
+        this.confirmedLevel.set(device.id, obs);
+        this.lastSetLevel.set(device.id, obs);
+        this.pendingLevel.delete(device.id);
+        this.pendingSendCounts.delete(device.id);
+        this.forceEvaluate = true;
+        log.info(`[leveler] ${device.name}: L${obs} confirmed late — unreachable mark cleared, re-adopting`);
+        continue;
+      }
       // The observed level moved off the confirmed baseline to something we did
       // not command: a genuine manual/remote change.
       const maxLevel = device.maxGeneratorLevel || 3;
@@ -1027,13 +1044,25 @@ export class AcLeveler {
     const ampModels = Object.fromEntries(
       snapshots.map((s) => [s.deviceId, this.ampModelFor(s.deviceId, source)]),
     );
-    // Non-AC load = measured minus the draw of ESTABLISHED ACs only. A freshly
-    // turned-on AC isn't pulling its estimated amps yet (measured is still
-    // pre-turn-on), so subtracting it would understate the household load and
-    // hide an imminent overload when running close to the limit.
+    // Non-AC load = measured minus estimated AC draw. An ESTABLISHED AC counts
+    // at its current level; a still-RAMPING AC counts at its FLOOR draw only —
+    // a freshly started compressor isn't pulling its full estimate yet, but it
+    // IS pulling roughly its floor draw within seconds. Crediting zero (the
+    // pre-2026-06-11 behavior) inflated nonAcLoad by each ramping AC's whole
+    // real draw for 240s after every turn-on/changeover — phantom 4A budgets
+    // froze shed restores and triggered spurious fan drops.
     const establishedDraw = snapshots
-      .filter((s) => s.on && (this.rampUntil.get(s.deviceId) ?? 0) <= now)
-      .reduce((sum, s) => sum + estimateAcDraw(s.currentLevel, s.maxLevel, this.ampModelFor(s.deviceId, source)), 0);
+      .filter((s) => s.on)
+      .reduce((sum, s) => {
+        const ramping = (this.rampUntil.get(s.deviceId) ?? 0) > now;
+        const floor = Math.max(1, Math.min(s.minLevel, s.maxLevel));
+        // Ramping credit never exceeds the AC's actual cap (a ramping AC held
+        // below its boost floor can't draw the floor's amps).
+        const level = ramping
+          ? (s.currentLevel >= 1 ? Math.min(floor, s.currentLevel) : floor)
+          : s.currentLevel;
+        return sum + estimateAcDraw(level, s.maxLevel, this.ampModelFor(s.deviceId, source));
+      }, 0);
     // While the post-command freeze is active, fresh derivations are
     // contaminated (measured still shows pre-command draw against post-command
     // snapshot levels) — use the value the command batch was computed with.
@@ -1053,6 +1082,8 @@ export class AcLeveler {
       headroomStreak: this.headroomStreak,
       inSettle,
       raiseHold: this.raiseHold != null,
+      raiseHoldExpectedAmps: this.raiseHold?.expectedAmps ?? null,
+      nearTargetBandC: this.config.nearTargetBandC,
       forceEvaluate: this.forceEvaluate,
       acs: snapshots,
       ampModels,
@@ -1405,7 +1436,9 @@ export class AcLeveler {
             ? estimateAcDraw(device.generatorMode, maxLevel, this.ampModelFor(device.id, source))
             : 0,
           needTier,
-          needCap: needCap(needTier, maxLevel),
+          // Delta-based since 2026-06-11: within the near-target band → L1,
+          // beyond it the budget decides (the tier dot stays for display).
+          needCap: nearTargetNeedCap(needDelta, this.config.nearTargetBandC, maxLevel),
           needDelta,
           manualCap: this.manualCap.get(device.id) ?? null,
           manualTarget: this.manualTarget.get(device.id) ?? null,

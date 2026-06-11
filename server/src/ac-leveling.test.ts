@@ -55,6 +55,9 @@ function input(over: Partial<AllocatorInput> = {}): AllocatorInput {
     limitAmps: 30,
     marginAmps: 1,
     raiseBufferAmps: 0,
+    // 0 keeps the near-target band a no-op for legacy tests (only delta ≤ 0 =
+    // satisfied caps at L1); the dedicated near-target suite sets 0.5.
+    nearTargetBandC: 0,
     nonAcLoadAmps: 0,
     overLimitStreak: 0,
     severeOverLimitStreak: 0,
@@ -1181,5 +1184,123 @@ describe("computeAllocation — reachable caps (firmware-unreachable levels)", (
       acs: [ac("najat", { currentLevel: 0, reachableCap: 1 }), ac("abdu"), ac("abdullah")],
     }));
     expect(r.desiredLevels.najat).toBe(1);
+  });
+});
+
+describe("near-target band (hard L1 cap, 2026-06-11)", () => {
+  it("hard-caps an AC within the band at L1 in both fill passes", () => {
+    const r = computeAllocation(input({
+      nearTargetBandC: 0.5,
+      acs: [ac("najat", { needTier: "mild", needDelta: 0.3 })],
+    }));
+    // Budget is ample (29A) — the soft pass must NOT raise a near-target room.
+    expect(r.idealLevels.najat).toBe(1);
+  });
+
+  it("fills toward max above the band — the mild ceil(max/2) cap is gone", () => {
+    const r = computeAllocation(input({
+      nearTargetBandC: 0.5,
+      acs: [ac("najat", { needTier: "mild", needDelta: 0.6 })],
+    }));
+    expect(r.idealLevels.najat).toBe(6);
+  });
+
+  it("a hard boost floor still wins over the near-target L1 cap", () => {
+    const r = computeAllocation(input({
+      nearTargetBandC: 0.5,
+      acs: [ac("najat", { needTier: "mild", needDelta: 0.3, minLevel: 2, currentLevel: 2 })],
+    }));
+    expect(r.idealLevels.najat).toBe(2);
+  });
+
+  it("manualTarget overrides the near-target cap", () => {
+    const r = computeAllocation(input({
+      nearTargetBandC: 0.5,
+      acs: [ac("najat", { needTier: "mild", needDelta: 0.3, manualTarget: 3 })],
+    }));
+    expect(r.idealLevels.najat).toBe(3);
+  });
+
+  it("caps a satisfied room (delta ≤ 0) at L1 like before", () => {
+    const r = computeAllocation(input({
+      nearTargetBandC: 0.5,
+      acs: [ac("najat", { needTier: "satisfied" })],
+    }));
+    expect(r.idealLevels.najat).toBe(1);
+  });
+});
+
+describe("restore during a raise hold (2026-06-11)", () => {
+  it("restores while a hold is active when the expectation leaves room", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 4,
+      raiseHold: true,
+      raiseHoldExpectedAmps: 6, // 4A non-AC + 2A restored floor of the prior batch
+      acs: [
+        ac("najat", { on: false, shed: true, needDelta: 3 }),
+      ],
+    }));
+    // 6A expected + 2A floor ≤ 14A buffered limit → the restore need not wait
+    // out the hold (waiting cost Abdu ~20 min off, live 2026-06-11).
+    expect(r.toRestore).toEqual(["najat"]);
+  });
+
+  it("waits out the hold when the expectation leaves no room", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 4,
+      raiseHold: true,
+      raiseHoldExpectedAmps: 12,
+      acs: [
+        ac("abdu", { on: false, shed: true, needDelta: 3 }),
+      ],
+    }));
+    // 12A expected + 4A floor > 14A → blocked until the hold releases.
+    expect(r.toRestore).toEqual([]);
+  });
+
+  it("counts the batch's own reductions against the hold expectation", () => {
+    // The live Abdullah-preemption shape: Abdullah was just raised to L3 (the
+    // hold expectation includes his 4A draw), but the restore batch pulls him
+    // back to his 2A floor in the same batch — those 2A of savings must count
+    // toward the expectation check, or the restore wrongly waits out the hold.
+    const restoreUnderHold = (expectedAmps: number) => computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 5,
+      raiseHold: true,
+      raiseHoldExpectedAmps: expectedAmps,
+      acs: [
+        ac("abdullah", { currentLevel: 3, needDelta: 1.2 }),
+        ac("abdu", { on: false, shed: true, needDelta: 3 }),
+      ],
+    }));
+    // savings = est(L3) − est(L1) = 2A; Abdu's floor = 4A; buffered limit 14A.
+    // Expectation 12: 12 − 2 + 4 = 14 ≤ 14 → fits (without the savings credit
+    // this would read 16 > 14 and wrongly block).
+    const fits = restoreUnderHold(12);
+    expect(fits.toRestore).toEqual(["abdu"]);
+    // The accompanying pull-to-floor ships in the same batch, and the fill is
+    // skipped so it can't take the savings back.
+    expect(fits.desiredLevels.abdullah).toBe(1);
+    // Expectation 13: 13 − 2 + 4 = 15 > 14 → still waits out the hold.
+    expect(restoreUnderHold(13).toRestore).toEqual([]);
+  });
+
+  it("warm-start raises are parked while a floor-feasible restore waits", () => {
+    const r = computeAllocation(input({
+      limitAmps: 15,
+      nonAcLoadAmps: 4,
+      headroomStreak: 0, // gates the restore (and ordinary raises)…
+      acs: [
+        ac("najat", { currentLevel: 1, warmStartLevel: 3, needDelta: 2 }),
+        ac("abdu", { on: false, shed: true, needDelta: 3 }),
+      ],
+    }));
+    // …but a warm-start raise skips the streak gate. While the shed AC's
+    // restore is floor-feasible and merely gated, the warm raise must not
+    // consume its headroom or arm a hold that pushes the restore out.
+    expect(r.toRestore).toEqual([]);
+    expect(r.desiredLevels.najat).toBeUndefined();
   });
 });

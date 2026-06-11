@@ -1176,7 +1176,10 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     try {
       // A user touching any AC mid-calibration aborts the run — their intent wins
       acCalibration?.requestAbort("user_control");
-      await cloud.sendControl(id, command, value);
+      // Verified send: the firmware (Najat especially) sometimes accepts a
+      // command without applying it — the shadow is re-checked every 5s and
+      // the command re-sent up to 3 times (gen level/beep/fan-auto excluded).
+      await cloud.sendControlVerified(id, command, value);
       if (command === "set_power") {
         if (value === 0) {
           // Record the lock first so a leveler restore can never slip in between
@@ -1240,6 +1243,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     // Optional for backward compatibility (old clients omit it → defaults to 1).
     if (b.raiseBufferAmps != null && (!num(b.raiseBufferAmps) || b.raiseBufferAmps < 0 || b.raiseBufferAmps > 10)) return "raiseBufferAmps must be 0–10";
     if (!num(b.comfortTargetC) || b.comfortTargetC < 16 || b.comfortTargetC > 32) return "comfortTargetC must be 16–32";
+    // Optional for backward compatibility (old clients omit it → defaults to 0.5).
+    if (b.nearTargetBandC != null && (!num(b.nearTargetBandC) || b.nearTargetBandC < 0 || b.nearTargetBandC > 5)) return "nearTargetBandC must be 0–5";
     if (!Array.isArray(b.priority) || b.priority.some((p) => typeof p !== "string")) return "priority must be a string array";
     if (!b.ampModels || typeof b.ampModels !== "object") return "ampModels required";
     for (const model of Object.values(b.ampModels as Record<string, AcAmpModel>)) {
@@ -1286,6 +1291,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         marginAmps: body.marginAmps as number,
         raiseBufferAmps: (body.raiseBufferAmps as number) ?? 1,
         comfortTargetC: body.comfortTargetC as number,
+        nearTargetBandC: (body.nearTargetBandC as number) ?? 0.5,
         priority: body.priority as string[],
         ampModels: body.ampModels as Record<string, AcAmpModel>,
         genAmpModels: (body.genAmpModels as Record<string, AcAmpModel>) ?? {},

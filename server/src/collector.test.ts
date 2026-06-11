@@ -322,7 +322,8 @@ describe("AC manual-off locks", () => {
       await setWeatherValue(collector, 25.5);
       await checkAcRangeAutomation(collector, acRangeRuleWithSlots());
 
-      expect(actions).toEqual([{ deviceId: "ac1", action: { power: 1, mode: 1, temperature: 23, fan_speed: 3 } }]);
+      // Smart-auto fan: delta 25.5−22=3.5 past the morning slot's low → L7
+      expect(actions).toEqual([{ deviceId: "ac1", action: { power: 1, mode: 1, temperature: 23, fan_speed: 7 } }]);
     } finally {
       vi.useRealTimers();
     }
@@ -483,15 +484,17 @@ describe("AC range fan enforcement", () => {
     expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 2 });
   });
 
-  it("falls back to the preset fan when the slot has no override", async () => {
+  it("uses smart auto when the slot has no fan override (preset fan ignored)", async () => {
     const { collector, tclCloud } = createCollector();
     tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
 
     setTriggered(collector, 1);
     await setWeatherValue(collector, 24);
-    await checkAcRangeAutomation(collector, acFanRule());
+    await checkAcRangeAutomation(collector, acFanRule()); // preset fan 3, no slot fan
 
-    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
+    // 2026-06-11: the fan is ALWAYS smart auto unless the slot fixes 1–7 —
+    // delta 24−22=2.0 → L6, the preset's fan 3 no longer drives enforcement.
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6 });
   });
 
   it("resolves slot Auto to the delta-based level and follows the delta", async () => {
@@ -540,6 +543,28 @@ describe("AC range fan enforcement", () => {
     expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
   });
 
+  it("treats an observed fan 0 as a firmware reset, not a manual change", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 2 });
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, acFanRule(2)); // baseline adopted (observed == desired 2)
+
+    // TCL firmware resets the fan to built-in auto (0) after a power-loss
+    // restart (changeovers) — automations never command 0, so a 0 observation
+    // must NOT suspend enforcement (live 2026-06-11: Abdu & Abdullah stuck at
+    // "A" after every changeover).
+    vi.setSystemTime(new Date("2026-05-20T04:30:20.000Z")); // +20s — past the settle window
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 0 });
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, acFanRule(2));
+
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(false);
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 2 });
+  });
+
   it("keeps enforcing fan when drift is within the settle window", async () => {
     const { collector, tclCloud } = createCollector();
     tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
@@ -568,7 +593,8 @@ describe("AC range fan enforcement", () => {
     await setWeatherValue(collector, 24);
     await checkAcRangeAutomation(collector, acFanRule(2));
 
-    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
+    // The all-day slot has no fan override → smart auto (delta 24−20=4 → L7)
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 7 });
   });
 
   it("drops the manual override when the AC is observed off (power cycle)", async () => {
@@ -659,7 +685,8 @@ describe("Smart AC leveling", () => {
     const rule = { ...acRangeRule(), action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 } };
     await checkAcRangeAutomation(collector, rule);
 
-    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
+    // fan = smart auto (delta 24−22=2.0 → L6); preset fan no longer enforced
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6 });
   });
 
   it("keeps generator_mode in re-enforcement when the automation opts out", async () => {
@@ -673,7 +700,7 @@ describe("Smart AC leveling", () => {
     const rule = { ...acRangeRule(), smart_leveling: false, action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 } };
     await checkAcRangeAutomation(collector, rule);
 
-    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 });
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6, generator_mode: 2 });
   });
 
   it("strips generator_mode from turn-on timer presets for managed devices", async () => {
@@ -838,10 +865,10 @@ describe("Smart AC leveling", () => {
     setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
 
-    // Tick 1: only Najat running at L4 (est 5A), generator at 12A — under the
+    // Tick 1: only Najat running at L6 (est 7A), generator at 12A — under the
     // 15A limit but close to it. Nothing to do.
     const before = [
-      { id: "ac1", name: "Najat", power: true, generatorMode: 4, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+      { id: "ac1", name: "Najat", power: true, generatorMode: 6, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
       { id: "ac2", name: "Abdu", power: false, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
     ];
     tclCloud.getDevices.mockReturnValue(before);
@@ -853,17 +880,17 @@ describe("Smart AC leveling", () => {
     await checkAcLeveling(collector);
     expect(tclCloud.sendControl).not.toHaveBeenCalled();
 
-    // Tick 2: Abdu turns ON (est 4A at L1) while measured is still 12A — the
-    // compressor hasn't ramped, so there are ZERO over-limit readings. The
-    // leveler must NOT subtract Abdu's estimated draw from the measured load
-    // (nonAcLoad stays 12−5=7 → budget 7) and must reduce Najat immediately.
+    // Tick 2: Abdu turns ON while measured is still 12A — the compressor
+    // hasn't ramped, so there are ZERO over-limit readings. The ramping AC
+    // gets FLOOR credit only (4A at L1, not its full estimate), so
+    // nonAcLoad = 12 − 7 − 4 = 1 → budget 13 → fitted ideal { ac1: 4, ac2: 3 }
+    // and Najat must be reduced L6→L4 immediately (power-flip forceEvaluate).
     const after = [{ ...before[0] }, { ...before[1], power: true }];
     tclCloud.getDevices.mockReturnValue(after);
     tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
     await checkAcLeveling(collector);
 
-    // floors 2+4=6 ≤ 7, one raise step fits → ideal { ac1: 2, ac2: 1 } → Najat L4→L2 now
-    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 4);
     expect(shed.size).toBe(0);
   });
 
@@ -887,6 +914,45 @@ describe("Smart AC leveling", () => {
 
     expect(actions).toEqual([{ deviceId: "ac2", action: { power: 1, generator_mode: 1 } }]);
     expect(shed.has("ac2")).toBe(false);
+  });
+
+  it("restores a second shed AC during the first restore's hold when the expectation leaves room", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T08:00:00.000Z"));
+    try {
+      const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
+      setLevelingConfig(LEVELING_CONFIG);
+      shed.add("ac1");
+      shed.add("ac2");
+      await collector.acLeveler.ensureLoaded();
+      const devices = [
+        { id: "ac1", name: "Najat", power: false, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 29, mode: 1 },
+        { id: "ac2", name: "Abdu", power: false, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      ];
+      tclCloud.getDevices.mockReturnValue(devices);
+      tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+      // Headroom on gen → Najat (most needy, Δ3) restores first and arms the
+      // 270s turn-on hold with expectation 4A non-AC + 2A floor = 6A.
+      genReadings(collector, 4, 6);
+      await checkAcLeveling(collector);
+      expect(actions).toEqual([{ deviceId: "ac1", action: { power: 1, generator_mode: 1 } }]);
+
+      // 31s later (past settle, hold still ~4 min out): Abdu's restore fits
+      // the hold's own expectation (6A + 4A floor ≤ 14A buffered limit) — it
+      // must NOT wait out the hold (that wait cost Abdu ~20 min, 2026-06-11).
+      vi.advanceTimersByTime(31_000);
+      genReadings(collector, 4, 6);
+      await checkAcLeveling(collector);
+
+      expect(actions).toEqual([
+        { deviceId: "ac1", action: { power: 1, generator_mode: 1 } },
+        { deviceId: "ac2", action: { power: 1, generator_mode: 1 } },
+      ]);
+      expect(shed.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1109,13 +1175,13 @@ describe("Smart AC leveling — predictive control", () => {
     expect(status.lastPrediction).toMatchObject({ expectedAmps: 14, actualAmps: 14 });
   });
 
-  it("keeps a freshly turned-on AC out of the established draw for the full 240s ramp", async () => {
+  it("credits a ramping AC at its floor draw for the full 240s ramp (full estimate after)", async () => {
     const { collector, tclCloud, shed, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
     const before = [
-      { id: "ac1", name: "Najat", power: true, generatorMode: 4, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
-      { id: "ac2", name: "Abdu", power: false, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac1", name: "Najat", power: true, generatorMode: 6, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: false, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
     ];
     tclCloud.getDevices.mockReturnValue(before);
     tclCloud.fetchDevicesLive.mockResolvedValue(before as never);
@@ -1123,29 +1189,33 @@ describe("Smart AC leveling — predictive control", () => {
     await checkAcLeveling(collector);
     expect(tclCloud.sendControl).not.toHaveBeenCalled();
 
-    // Abdu turns ON near the limit → instant proactive reduction of Najat
+    // Abdu turns ON (shadow at L3) near the limit. His ramping draw gets FLOOR
+    // credit (4A at L1), not zero and not the full L3 estimate (8A):
+    // nonAcLoad = 12 − Najat@L6 (7) − 4 = 1 → budget 13 → ideal { ac1: 4,
+    // ac2: 3 } → instant proactive reduction of Najat L6→L4.
     const after = [{ ...before[0] }, { ...before[1], power: true }];
     tclCloud.getDevices.mockReturnValue(after);
     tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
     await checkAcLeveling(collector);
-    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 4);
 
-    // 60s in (past the old 30s window): Abdu is still ramping — his estimate
-    // must stay OUT of establishedDraw, so nonAcLoad = 12 − Najat@L2 (3) = 9.
-    const settled = [{ ...after[0], generatorMode: 2 }, { ...after[1] }];
+    // 60s in (past the old 30s window): Abdu is still ramping at L3 — still
+    // only floor credit, so nonAcLoad = 12 − Najat@L4 (5) − 4 = 3.
+    const settled = [{ ...after[0], generatorMode: 4 }, { ...after[1] }];
     tclCloud.getDevices.mockReturnValue(settled);
     tclCloud.fetchDevicesLive.mockResolvedValue(settled as never);
     vi.advanceTimersByTime(60_000);
     genReadings(collector, 12, 1);
     await checkAcLeveling(collector);
-    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(9);
+    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(3);
     expect(shed.size).toBe(0);
 
-    // Past 240s the compressor is established: nonAcLoad = 12 − 3 − 4 = 5
+    // Past 240s the compressor is established at its full L3 estimate (8A):
+    // nonAcLoad = max(0, 12 − 5 − 8) = 0
     vi.advanceTimersByTime(185_000);
     genReadings(collector, 12, 1);
     await checkAcLeveling(collector);
-    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(5);
+    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(0);
   });
 
   it("blocks the next raise for 2 min when a level raise does not draw the expected amps", async () => {
@@ -1733,23 +1803,25 @@ describe("Smart AC leveling — confirmation-gated drift + source change", () =>
     const { collector, tclCloud, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
-    // Satisfied (24°<26° target) → capped at L1, so the leveler never raises
-    // and never reduces — isolating the nonAcLoad derivation.
-    const devices = [{ id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 24, mode: 1 }];
+    // L3 with the gen budget exactly fitting L3 (nonAcLoad 10 → budget 4 =
+    // floor 2A + two 1A steps) — the fitted ideal equals the current level,
+    // so the gen tick stays quiet and isolates the nonAcLoad derivation.
+    const devices = [{ id: "ac1", name: "Najat", power: true, generatorMode: 3, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 }];
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
-    // none→gen is the ESP resuming, NOT a restart → Najat is established and its
-    // est IS subtracted: nonAcLoad = 8 − est(L1=2) = 6.
-    genReadings(collector, 8, 6);
+    // none→gen is the ESP resuming, NOT a restart → Najat is established and
+    // its full L3 estimate IS subtracted: nonAcLoad = 14 − est(L3=4) = 10.
+    genReadings(collector, 14, 6);
     await checkAcLeveling(collector);
-    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(6);
+    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(10);
 
-    // A true Gen→Grid changeover restarts the compressor → ramp re-armed → est
-    // stays OUT of the derivation → nonAcLoad jumps back to the full 8.
-    gridReadings(collector, 8, 6);
+    // A true Gen→Grid changeover restarts the compressor → ramp re-armed →
+    // the ramping AC drops to FLOOR credit (L1 = 2A, not its L3 estimate):
+    // nonAcLoad = 14 − 2 = 12 (pre-2026-06-11 zero-credit read the full 14).
+    gridReadings(collector, 14, 6);
     await checkAcLeveling(collector);
-    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(8);
+    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(12);
   });
 
   it("re-adopts the drift baseline after a changeover instead of stamping a false cap", async () => {
@@ -1855,6 +1927,33 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
     await resendTicks(collector, 2);
     expect(genCalls(tclCloud, 5)).toBe(0);
     expect(genCalls(tclCloud, 6)).toBe(3);
+  });
+
+  it("un-marks a level that confirms after the fallback moved on (no false manual target)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = najatAtZero();
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    await resendTicks(collector, 2); // 3 sends → L6 marked unreachable
+    expect(genCalls(tclCloud, 6)).toBe(3);
+    await resendTicks(collector, 1); // fallback L5 ships — pending is now 5
+    expect(genCalls(tclCloud, 5)).toBe(1);
+
+    // The OLD L6 finally lands (live 2026-06-11: Najat's L4 landed 6s after
+    // the 3rd send marked it). obs ≠ pending — the pre-fix drift branch read
+    // this as a manual "target L6". It must un-mark instead.
+    devices[0].generatorMode = 6;
+    await resendTicks(collector, 1);
+
+    const ac = collector.acLeveler.getStatus().acs.find((a) => a.deviceId === "ac1");
+    expect(ac?.manualTarget).toBeNull();
+    expect(ac?.manualCap).toBeNull();
+    expect(ac?.unreachableLevels).toEqual([]);
   });
 
   it("marks survive a power cycle; an explicit manual gen change clears them", async () => {
@@ -2175,8 +2274,9 @@ describe("Per-range-slot generator level (gen_level)", () => {
     });
     await checkAcRangeAutomation(collector, rule);
 
-    // Slot gen level overrides the preset's generator_mode 4.
-    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 });
+    // Slot gen level overrides the preset's generator_mode 4; fan is smart
+    // auto (delta 24−22=2.0 → L6) since the slot has no fan override.
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6, generator_mode: 2 });
   });
 
   it("clamps the direct-send slot gen level to the device max", async () => {
@@ -2194,7 +2294,7 @@ describe("Per-range-slot generator level (gen_level)", () => {
     });
     await checkAcRangeAutomation(collector, rule);
 
-    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3, generator_mode: 3 });
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6, generator_mode: 3 });
   });
 
   it("skips the direct-send when the device cache is cold (no guessed max)", async () => {
@@ -2212,7 +2312,7 @@ describe("Per-range-slot generator level (gen_level)", () => {
     });
     await checkAcRangeAutomation(collector, rule);
 
-    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6 });
   });
 
   it("strips the slot gen level from profiles when the leveler manages the device", async () => {
@@ -2228,7 +2328,7 @@ describe("Per-range-slot generator level (gen_level)", () => {
     });
     await checkAcRangeAutomation(collector, rule);
 
-    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 3 });
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6 });
   });
 });
 
@@ -2241,23 +2341,26 @@ describe("Smart AC leveling — calibration handoff (ramp re-arm)", () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
+    // L3 with the grid budget exactly fitting L3 (29A measured → nonAcLoad 25
+    // → budget 4 = floor 2A + two 1A steps) — the fitted ideal equals the
+    // current level, so the first tick stays quiet.
     const devices = [
-      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 23, mode: 1 },
+      { id: "ac1", name: "Najat", power: true, generatorMode: 3, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
     ];
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
-    // Established: est(L1)=2A is subtracted → nonAcLoad 10.
-    gridReadings(collector, 12, 6);
+    // Established: the full est(L3)=4A is subtracted → nonAcLoad 25.
+    gridReadings(collector, 29, 6);
     await checkAcLeveling(collector);
-    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(10);
+    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(25);
 
     // Calibration restored it (compressor restarted while leveling was
-    // suspended) → ramp re-armed → its est stays OUT of the derivation.
+    // suspended) → ramp re-armed → only FLOOR credit (L1 = 2A) is subtracted.
     collector.acLeveler.rearmRamp(["ac1"]);
-    gridReadings(collector, 12, 1);
+    gridReadings(collector, 29, 1);
     await checkAcLeveling(collector);
-    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(12);
+    expect(collector.acLeveler.getStatus().nonAcLoadAmps).toBe(27);
   });
 });
 

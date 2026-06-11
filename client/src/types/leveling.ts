@@ -17,6 +17,8 @@ export interface AcLevelingConfig {
   /** Extra headroom kept below the breaker when raising (asymmetric hysteresis). */
   raiseBufferAmps: number;
   comfortTargetC: number;
+  /** Near-target band °C: within this band of the target the AC is hard-capped at L1. */
+  nearTargetBandC?: number;
   /** Device ids, highest priority first. */
   priority: string[];
   /** Per-AC draw model on grid (fallback for gen when no gen model is set). */
