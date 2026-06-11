@@ -110,7 +110,7 @@ function createCalibrator() {
   const commands: Array<{ deviceId: string; cmd: string; value?: unknown }> = [];
   const devices = [
     { id: "ac1", name: "Abdullah", power: true, generatorMode: 2, fanSpeed: 4, maxGeneratorLevel: 2 },
-    { id: "ac2", name: "Najat", power: true, generatorMode: 3, fanSpeed: 0, maxGeneratorLevel: 6 },
+    { id: "ac2", name: "Najat", power: true, generatorMode: 3, fanSpeed: 0, maxGeneratorLevel: 3 },
     { id: "ac3", name: "Abdu", power: false, generatorMode: 1, fanSpeed: 1, maxGeneratorLevel: 3 },
   ];
   // Firmware quirk simulation (Najat-style): gen levels in `ignoreGenLevels`

@@ -1800,6 +1800,33 @@ describe("Smart AC leveling — confirmation-gated drift + source change", () =>
     expect(acStatus(collector, "ac1")?.manualCap).toBe(1);
   });
 
+  it("clamps a stale-client gen level above the device max (TCL removed Najat's 4–6)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [{ id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 }];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 9, 6);
+    await checkAcLeveling(collector);
+    // An old cached client bundle posts L6. The intent must record at the max
+    // (3) and pendingLevel must be a level the shadow can actually confirm —
+    // an unconfirmable pending wedges drift bookkeeping.
+    await collector.acLeveler.onUserGenLevel("ac1", 6);
+    const pending = (collector.acLeveler as unknown as { pendingLevel: Map<string, number> }).pendingLevel;
+    expect(pending.get("ac1")).toBe(3);
+
+    // The (cloud-clamped) command lands at 3 — re-confirms with no drift intent.
+    devices[0].generatorMode = 3;
+    vi.advanceTimersByTime(31_000);
+    gridReadings(collector, 9, 6);
+    await checkAcLeveling(collector);
+    expect(acStatus(collector, "ac1")?.manualTarget).toBe(3);
+    expect(acStatus(collector, "ac1")?.manualCap).toBeNull();
+    expect(acStatus(collector, "ac1")?.unreachableLevels).toEqual([]);
+  });
+
   it("re-arms the compressor ramp window on a Gen↔Grid changeover", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);

@@ -27,7 +27,8 @@ function acDevice(overrides: Partial<AcDevice>): AcDevice {
     freshAir: false,
     hasFreshAir: false,
     generatorMode: 1,
-    maxGeneratorLevel: 3, // non-Najat unless overridden to 6
+    model: "TAC-12CHSD", // non-Najat unless overridden — protocol forks key on this, NOT maxGeneratorLevel
+    maxGeneratorLevel: 3,
     tempStep: 1,
     minFanSpeed: 1,
     maxFanSpeed: 7,
@@ -77,7 +78,7 @@ describe("computeAcDiff fan/turbo coupling (non-Najat)", () => {
   });
 
   it("keeps plain fan_speed diffs working on Najat", () => {
-    const tcl = tclWithDevice(acDevice({ maxGeneratorLevel: 6, fanSpeed: 4 }));
+    const tcl = tclWithDevice(acDevice({ model: "TAC-24CHSA", fanSpeed: 4 }));
     const diff = tcl.computeAcDiff("ac1", { mode: 1, temperature: 25, fan_speed: 5, turbo: 0 });
     expect(diff).toEqual({ fan_speed: 5 });
   });
@@ -100,6 +101,38 @@ describe("buildProfileShadowPayload fan/turbo coupling (non-Najat)", () => {
     const tcl = tclWithDevice(acDevice({}));
     const payload = buildPayload(tcl, "ac1", { turbo: 1 });
     expect(payload).toEqual({ turbo: 1 });
+  });
+});
+
+// Regression tests for the 2026-06 TCL gen-level removal: stored profiles and
+// presets may still carry levels above the device max (Najat's old 4–6). The
+// firmware ACCEPTS such commands but never applies them, so an unclamped diff
+// would re-send the same value every 5s forever.
+describe("generator-mode clamp (levels above device max)", () => {
+  it("clamps a stored profile's generator_mode to the device max in the payload", () => {
+    const tcl = tclWithDevice(acDevice({ model: "TAC-24CHSA" }));
+    const payload = buildPayload(tcl, "ac1", { generator_mode: 6 });
+    expect(payload).toEqual({ generatorMode: 3 });
+  });
+
+  it("passes generator_mode 0 (auto/unrestricted) through unchanged", () => {
+    const tcl = tclWithDevice(acDevice({}));
+    const payload = buildPayload(tcl, "ac1", { generator_mode: 0 });
+    expect(payload).toEqual({ generatorMode: 0 });
+  });
+
+  it("computeAcDiff goes quiet when the device already sits at the clamped level", () => {
+    // Device reports L3; a stale preset wants L6 → clamped to 3 → no diff →
+    // no 5s re-enforcement loop.
+    const tcl = tclWithDevice(acDevice({ model: "TAC-24CHSA", generatorMode: 3 }));
+    const diff = tcl.computeAcDiff("ac1", { generator_mode: 6 });
+    expect(diff).toBeNull();
+  });
+
+  it("computeAcDiff still raises to the clamped level when below it", () => {
+    const tcl = tclWithDevice(acDevice({ generatorMode: 1 }));
+    const diff = tcl.computeAcDiff("ac1", { generator_mode: 6 });
+    expect(diff).toEqual({ generator_mode: 3 });
   });
 });
 
@@ -175,7 +208,7 @@ describe("sendControlVerified (5s × 3 confirm-or-resend)", () => {
     return { tcl, sendControl, publishWithRetry, getThingShadow, awaitVerify: async () => { await seam.lastControlVerify; } };
   }
 
-  const najat = () => acDevice({ name: "Najat", maxGeneratorLevel: 6 });
+  const najat = () => acDevice({ name: "Najat", model: "TAC-24CHSA" });
 
   it("re-sends while the shadow still shows the pre-command value, then stops on apply", async () => {
     const { tcl, publishWithRetry, awaitVerify } = verifiableTcl(najat(), [

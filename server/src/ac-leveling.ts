@@ -199,17 +199,18 @@ export const FAN_SETTLE_MS = 10_000;
  * Consecutive unconfirmed re-sends of the SAME generator level before the
  * level is marked firmware-unreachable for that device and the allocator
  * falls back to the next lower level. Some units accept the command (cloud
- * returns OK) but never apply/report it — Najat never confirms L6 — and
- * without this the never-level-0 correction re-sends it forever. Doubles as
- * the command retry Najat's flaky firmware needs anyway. L1 is never marked
- * (a managed AC must always get SOME cap).
+ * returns OK) but never apply/report it, and without this the never-level-0
+ * correction re-sends it forever. Doubles as the command retry Najat's flaky
+ * firmware needs anyway. L1 is never marked (a managed AC must always get
+ * SOME cap).
  *
- * 4 sends ≈ a 140s landing window (raised from 3 on 2026-06-11): Najat's
- * firmware applies L4+ EXTREMELY slowly when it does at all — her L4 once
- * landed ~111s after the first send, 6s past the old 3-send mark, and the
- * fallback's desired-shadow overwrite (shipped seconds after a mark) can
- * cancel a slow apply that was about to land. One extra send per genuinely
- * dead level is noise; a false mark costs the room its cooling headroom.
+ * History: built for "Najat never confirms L6" — which turned out to be TCL
+ * REMOVING levels 4–6 from her model via firmware/app update (2026-06,
+ * maxGeneratorLevel is 3 for all models now; her slow L4 confirm ~111s after
+ * the first send drove the 3→4 send-budget raise on 2026-06-11). Kept as
+ * general defense: it catches slow-applying or future-removed levels at any
+ * max. One extra send per genuinely dead level is noise; a false mark costs
+ * the room its cooling headroom.
  */
 export const UNREACHABLE_LEVEL_SENDS = 4;
 /**

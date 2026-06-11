@@ -1,4 +1,5 @@
 import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
+import { MAX_GENERATOR_LEVEL } from "./tcl-cloud.js";
 
 const MINUTES_PER_DAY = 1440;
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -189,8 +190,8 @@ export function validateRangeSlots(
     }
     // 0 is deliberately rejected — "Auto" is the ABSENT field; level 0 means
     // unrestricted in the TCL protocol, a footgun for a cap.
-    if (slot.gen_level != null && (!Number.isInteger(slot.gen_level) || slot.gen_level < 1 || slot.gen_level > 6)) {
-      return { ok: false, error: `${label}: generator level must be an integer 1–6` };
+    if (slot.gen_level != null && (!Number.isInteger(slot.gen_level) || slot.gen_level < 1 || slot.gen_level > MAX_GENERATOR_LEVEL)) {
+      return { ok: false, error: `${label}: generator level must be an integer 1–${MAX_GENERATOR_LEVEL}` };
     }
 
     if (slot.type === "all_day") {

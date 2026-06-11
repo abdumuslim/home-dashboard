@@ -339,7 +339,8 @@ Keys are `"hour:slot"` where slot is the 5-minute index within the hour (0-11).
 | `freshAir` | boolean | Fresh air on/off |
 | `hasFreshAir` | boolean | Device supports fresh air |
 | `generatorMode` | number | Generator mode level |
-| `maxGeneratorLevel` | number | Max generator level (3 or 6) |
+| `model` | string | Hardware model family (`"TAC-24CHSA"` or `"TAC-12CHSD"`) — protocol/UI forks key on this |
+| `maxGeneratorLevel` | number | Max generator level (3 for all models since 2026-06 — TCL removed Najat's 4–6) |
 | `tempStep` | number | Temperature step (0.5 or 1) |
 | `minFanSpeed` | number | Minimum fan speed |
 | `maxFanSpeed` | number | Maximum fan speed |
@@ -426,11 +427,11 @@ Protocol differences are handled transparently by the server.
 **Known devices:**
 | Name | Model | maxGeneratorLevel | tempStep | ECO | Turbo | Fresh Air |
 |------|-------|:-:|:-:|:-:|:-:|:-:|
-| Najat | TAC-24CHSA | 6 | 0.5 | No | No | Yes |
+| Najat | TAC-24CHSA | 3 (was 6 until TCL removed 4–6 in 2026-06) | 0.5 | No | No | Yes |
 | Abdu AC | TAC-12CHSD | 3 | 1 | Yes | Yes | No |
 | Abdullah AC | TAC-12CHSD | 3 | 1 | Yes | Yes | No |
 
-**How to detect model:** If `maxGeneratorLevel === 6`, the device is Najat (Mom's room). Otherwise it's Abdu/Abdullah.
+**How to detect model:** use the `model` field (`"TAC-24CHSA"` = Najat, `"TAC-12CHSD"` = Abdu/Abdullah). Never infer the model from `maxGeneratorLevel` — TCL changes level counts via firmware updates.
 
 ### Xiaomi Auth Status
 
@@ -528,7 +529,7 @@ Note: ACs use `value` (single value), not `params`.
 | `set_vertical_swing` | `0`-`13` | See [Vertical Swing](#vertical-swing) |
 | `set_horizontal_swing` | `0`-`13` | See [Horizontal Swing](#horizontal-swing) |
 | `set_fresh_air` | `1` or `0` | Fresh air. **Najat only** (others ignore). |
-| `set_generator_mode` | `0`-`6` | Generator level. Najat: 0-6. Abdu/Abdullah: 0-3. |
+| `set_generator_mode` | `0`-`3` | Generator level, all models (route rejects 4+; Najat had 0-6 until TCL removed 4-6 in 2026-06). |
 | `set_beep` | `1` or `0` | Beep feedback |
 
 ### Model Differences
@@ -539,7 +540,7 @@ Note: ACs use `value` (single value), not `params`.
 | Turbo mode | Not supported | Supported |
 | Fresh air | Supported | Not supported |
 | Temperature step | 0.5°C | 1°C |
-| Generator levels | 0-6 | 0-3 |
+| Generator levels | 0-3 (was 0-6 until 2026-06) | 0-3 |
 | Fan speed 1 | Normal level 1 | Silent mode |
 | Fan speed 7 | Normal level 7 | Turbo mode |
 

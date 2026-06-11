@@ -595,6 +595,12 @@ export class AcLeveler {
       return { reverted: false, level };
     }
     const maxLevel = device.maxGeneratorLevel || 3;
+    // A stale client/agent can post a level above the device max (e.g. Najat
+    // 4–6 after TCL removed them in 2026-06). The cloud layer clamps the
+    // publish; clamp the intent too so pendingLevel is a level the shadow can
+    // actually confirm (an unconfirmable pending wedges drift bookkeeping and
+    // mints a pointless unreachable mark). 0 (auto) passes through.
+    if (level > maxLevel) level = maxLevel;
     const previous = this.lastSetLevel.get(deviceId) ?? device.generatorMode;
     const rank = (l: number): number => (l <= 0 ? maxLevel + 1 : Math.min(l, maxLevel));
     // Manual intent replaces bounce evidence (manualCap/manualTarget take over)

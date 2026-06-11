@@ -109,6 +109,8 @@ describe("AC automation range slots", () => {
 
   it("rejects out-of-range or non-integer generator levels (0 = use absent for Auto)", () => {
     expect(validateRangeSlots([slot({ gen_level: 0 })], metricBounds, () => null).ok).toBe(false);
+    // 4 was valid for Najat until TCL removed levels 4–6 in 2026-06
+    expect(validateRangeSlots([slot({ gen_level: 4 })], metricBounds, () => null).ok).toBe(false);
     expect(validateRangeSlots([slot({ gen_level: 7 })], metricBounds, () => null).ok).toBe(false);
     expect(validateRangeSlots([slot({ gen_level: 1.5 })], metricBounds, () => null).ok).toBe(false);
   });

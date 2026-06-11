@@ -28,7 +28,10 @@ function ac(id: string, over: Partial<LevelerAcSnapshot> = {}): LevelerAcSnapsho
     on: true,
     managed: true,
     shed: false,
-    maxLevel: id === "najat" ? 6 : 3,
+    // All production ACs are 3-level since 2026-06 (TCL removed Najat's 4–6).
+    // Tests that exercise >3-level math pass an explicit maxLevel override —
+    // the allocator takes maxLevel as data and must stay generic.
+    maxLevel: 3,
     currentLevel: 1,
     minLevel: 1,
     needTier: "full",
@@ -135,14 +138,14 @@ describe("needCap", () => {
 describe("computeAllocation — priority fill", () => {
   it("saturates highest priority first in the ideal allocation", () => {
     const r = computeAllocation(input());
-    // budget 29: najat L6 (7) + abdu L3 (8) + abdullah L3 (4) = 19
-    expect(r.idealLevels).toEqual({ najat: 6, abdu: 3, abdullah: 3 });
+    // budget 29: najat L3 (4) + abdu L3 (8) + abdullah L3 (4) = 16
+    expect(r.idealLevels).toEqual({ najat: 3, abdu: 3, abdullah: 3 });
     expect(r.budgetAmps).toBe(29);
   });
 
   it("jumps straight to the ideal allocation when headroom is sustained", () => {
     const r = computeAllocation(input());
-    expect(r.desiredLevels).toEqual({ najat: 6, abdu: 3, abdullah: 3 });
+    expect(r.desiredLevels).toEqual({ najat: 3, abdu: 3, abdullah: 3 });
     expect(r.toShed).toEqual([]);
     expect(r.toRestore).toEqual([]);
   });
@@ -276,9 +279,10 @@ describe("computeAllocation — raise buffer (hysteresis)", () => {
 
 describe("computeAllocation — warm restore", () => {
   it("jumps to the remembered level skipping the headroom streak, capped at remembered", () => {
+    // 6-level max: generic >3 coverage (the allocator takes maxLevel as data)
     const r = computeAllocation(input({
       headroomStreak: 0,
-      acs: [ac("najat", { currentLevel: 1, warmStartLevel: 4 })],
+      acs: [ac("najat", { maxLevel: 6, currentLevel: 1, warmStartLevel: 4 })],
     }));
     // budget fits L6, but the warm restore only goes back to the remembered L4.
     expect(r.desiredLevels).toEqual({ najat: 4 });
@@ -323,7 +327,7 @@ describe("computeAllocation — warm restore", () => {
   it("raises past the remembered level once headroom is sustained", () => {
     const r = computeAllocation(input({
       headroomStreak: RAISE_STREAK,
-      acs: [ac("najat", { currentLevel: 1, warmStartLevel: 4 })],
+      acs: [ac("najat", { maxLevel: 6, currentLevel: 1, warmStartLevel: 4 })],
     }));
     // canRaise is met → full budget-fitted ideal, not capped at the remembered L4.
     expect(r.desiredLevels).toEqual({ najat: 6 });
@@ -339,8 +343,8 @@ describe("computeAllocation — need and manual caps", () => {
         ac("abdullah", { needTier: "full" }),
       ],
     }));
-    // budget 29: surplus lets mild najat soft-fill past its need cap (3) to max
-    expect(r.idealLevels).toEqual({ najat: 6, abdu: 1, abdullah: 3 });
+    // budget 29: surplus lets mild najat soft-fill to max while satisfied abdu stays L1
+    expect(r.idealLevels).toEqual({ najat: 3, abdu: 1, abdullah: 3 });
   });
 
   it("keeps the mild cap when the budget is tight", () => {
@@ -364,10 +368,11 @@ describe("computeAllocation — need and manual caps", () => {
   });
 
   it("lets a manual target override the need cap", () => {
+    // satisfied → need cap L1; the user's explicit L3 wins
     const r = computeAllocation(input({
-      acs: [ac("najat", { needTier: "satisfied", manualTarget: 4 }), ac("abdu"), ac("abdullah")],
+      acs: [ac("najat", { needTier: "satisfied", manualTarget: 3 }), ac("abdu"), ac("abdullah")],
     }));
-    expect(r.idealLevels.najat).toBe(4);
+    expect(r.idealLevels.najat).toBe(3);
   });
 
   it("clamps manual targets to the device max level", () => {
@@ -447,7 +452,7 @@ describe("computeAllocation — reductions", () => {
       acs: [ac("najat", { currentLevel: 0 }), ac("abdu"), ac("abdullah")],
       headroomStreak: 0,
     }));
-    expect(r.desiredLevels.najat).toBe(6);
+    expect(r.desiredLevels.najat).toBe(3);
   });
 });
 
@@ -635,7 +640,7 @@ describe("computeAllocation — raise-miss hold", () => {
     const r = computeAllocation(input({ raiseHold: true }));
     // budget 29 would normally raise everyone to the ideal — hold gates it
     expect(r.desiredLevels).toEqual({});
-    expect(r.idealLevels).toEqual({ najat: 6, abdu: 3, abdullah: 3 });
+    expect(r.idealLevels).toEqual({ najat: 3, abdu: 3, abdullah: 3 });
   });
 
   it("blocks restores while the hold is active", () => {
@@ -783,9 +788,9 @@ describe("computeAllocation — unmanaged ACs", () => {
         ac("abdullah"),
       ],
     }));
-    // unmanaged abdu at L0 = 10A fixed → budget 19; najat L6 (7) + abdullah L3 (4) = 11
+    // unmanaged abdu at L0 = 10A fixed → budget 19; najat L3 (4) + abdullah L3 (4) = 8
     expect(r.budgetAmps).toBe(19);
-    expect(r.idealLevels).toEqual({ najat: 6, abdullah: 3 });
+    expect(r.idealLevels).toEqual({ najat: 3, abdullah: 3 });
     expect(r.desiredLevels.abdu).toBeUndefined();
     expect(r.toShed).not.toContain("abdu");
   });
@@ -809,23 +814,24 @@ describe("computeAllocation — status fields", () => {
 
 describe("computeAllocation — soft need caps", () => {
   it("spreads surplus budget across mild rooms level-by-level", () => {
+    // najat at a generic 6-level max so the spread past L3 stays covered
     const r = computeAllocation(input({
       acs: [
-        ac("najat", { needTier: "mild" }),
+        ac("najat", { maxLevel: 6, needTier: "mild" }),
         ac("abdu", { needTier: "mild" }),
         ac("abdullah", { needTier: "mild" }),
       ],
     }));
-    // budget 29: need caps {3,2,2} cost 4+6+3=13, surplus soft-fills all to max
+    // budget 29: surplus soft-fills all to max
     expect(r.idealLevels).toEqual({ najat: 6, abdu: 3, abdullah: 3 });
   });
 
   it("never soft-fills past a manual target", () => {
     const r = computeAllocation(input({
-      acs: [ac("najat", { needTier: "mild", manualTarget: 4 }), ac("abdu"), ac("abdullah")],
+      acs: [ac("najat", { needTier: "mild", manualTarget: 2 }), ac("abdu"), ac("abdullah")],
     }));
-    // surplus budget, but the user's explicit pick stays the ceiling
-    expect(r.idealLevels.najat).toBe(4);
+    // surplus budget would fill to max 3, but the user's explicit pick stays the ceiling
+    expect(r.idealLevels.najat).toBe(2);
   });
 
   it("never soft-fills past a manual cap", () => {
@@ -1002,7 +1008,7 @@ describe("computeAllocation — bounce caps", () => {
       acs: [ac("najat"), ac("abdu", { bounceCap: 1 }), ac("abdullah")],
     }));
     // budget 29: without the cap abdu (full tier) would soft-fill to 3
-    expect(r.idealLevels).toEqual({ najat: 6, abdu: 1, abdullah: 3 });
+    expect(r.idealLevels).toEqual({ najat: 3, abdu: 1, abdullah: 3 });
   });
 
   it("gives the budget to the other ACs when the neediest is bounce-capped", () => {
@@ -1133,35 +1139,34 @@ describe("computeAllocation — slot gen caps (per-range-slot level)", () => {
   });
 
   it("the soft surplus pass respects the slot cap too", () => {
-    // Mild tier caps najat at ceil(6/2)=3; surplus budget would soft-fill to 6
-    // — the slot cap holds it at 4.
+    // Surplus budget would soft-fill mild najat to max 3 — the slot cap holds it at 2.
     const r = computeAllocation(input({
-      acs: [ac("najat", { needTier: "mild", slotCap: 4 }), ac("abdu"), ac("abdullah")],
+      acs: [ac("najat", { needTier: "mild", slotCap: 2 }), ac("abdu"), ac("abdullah")],
     }));
-    expect(r.desiredLevels.najat).toBe(4);
+    expect(r.desiredLevels.najat).toBe(2);
   });
 
   it("manualTarget above the slot cap wins — manual beats automation", () => {
     const r = computeAllocation(input({
-      acs: [ac("najat", { slotCap: 2, manualTarget: 5 }), ac("abdu"), ac("abdullah")],
+      acs: [ac("najat", { slotCap: 1, manualTarget: 3 }), ac("abdu"), ac("abdullah")],
     }));
-    expect(r.desiredLevels.najat).toBe(5);
+    expect(r.desiredLevels.najat).toBe(3);
   });
 });
 
 describe("computeAllocation — reachable caps (firmware-unreachable levels)", () => {
   it("never targets a level above the reachable cap in either pass", () => {
     const r = computeAllocation(input({
-      acs: [ac("najat", { reachableCap: 5 }), ac("abdu"), ac("abdullah")],
+      acs: [ac("najat", { reachableCap: 2 }), ac("abdu"), ac("abdullah")],
     }));
-    expect(r.desiredLevels.najat).toBe(5);
+    expect(r.desiredLevels.najat).toBe(2);
   });
 
   it("clamps a manualTarget the firmware cannot reach", () => {
     const r = computeAllocation(input({
-      acs: [ac("najat", { manualTarget: 6, reachableCap: 5 }), ac("abdu"), ac("abdullah")],
+      acs: [ac("najat", { manualTarget: 3, reachableCap: 2 }), ac("abdu"), ac("abdullah")],
     }));
-    expect(r.desiredLevels.najat).toBe(5);
+    expect(r.desiredLevels.najat).toBe(2);
   });
 
   it("clamps a boost floor the firmware cannot reach", () => {
@@ -1174,9 +1179,9 @@ describe("computeAllocation — reachable caps (firmware-unreachable levels)", (
   it("clamps a warm-start jump to the reachable cap", () => {
     const r = computeAllocation(input({
       headroomStreak: 0, // raise gate closed — only the warm-start path may act
-      acs: [ac("najat", { warmStartLevel: 6, reachableCap: 4 }), ac("abdu"), ac("abdullah")],
+      acs: [ac("najat", { warmStartLevel: 3, reachableCap: 2 }), ac("abdu"), ac("abdullah")],
     }));
-    expect(r.desiredLevels.najat).toBe(4);
+    expect(r.desiredLevels.najat).toBe(2);
   });
 
   it("a reachable cap of 1 still caps a level-0 AC at L1, never 0", () => {
@@ -1198,9 +1203,11 @@ describe("near-target band (hard L1 cap, 2026-06-11)", () => {
   });
 
   it("fills toward max above the band — the mild ceil(max/2) cap is gone", () => {
+    // 6-level max keeps the regression contrast sharp: the old mild cap was
+    // ceil(6/2)=3, the fill must reach 6.
     const r = computeAllocation(input({
       nearTargetBandC: 0.5,
-      acs: [ac("najat", { needTier: "mild", needDelta: 0.6 })],
+      acs: [ac("najat", { maxLevel: 6, needTier: "mild", needDelta: 0.6 })],
     }));
     expect(r.idealLevels.najat).toBe(6);
   });

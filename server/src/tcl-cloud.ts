@@ -64,9 +64,19 @@ export interface AcAction {
   generator_mode?: number;
 }
 
+/**
+ * AC hardware model family — drives protocol differences (fan encoding,
+ * swing property names, eco/turbo support, save-props list, temp step).
+ * Detected from the shadow: presence of `autoGeneratorMode` → TAC-24CHSA
+ * (Najat); absence → TAC-12CHSD (Abdu/Abdullah). Never infer the model from
+ * maxGeneratorLevel — TCL changes level counts via firmware updates.
+ */
+export type AcModel = "TAC-24CHSA" | "TAC-12CHSD";
+
 export interface AcDevice {
   id: string;
   name: string;
+  model: AcModel;
   isOnline: boolean;
   /** Epoch ms of the device's last shadow report (null if unknown) — drives "last seen" + the offline check. */
   lastSeenAt: number | null;
@@ -120,6 +130,16 @@ interface PersistedState {
   tokenExpiry?: number;
   baseApiUrl?: string;
 }
+
+/**
+ * Max generator-mode level for ALL models since 2026-06: TCL removed levels
+ * 4–6 from the TAC-24CHSA (Najat) via firmware/app update, standardizing on
+ * the documented 3-level GEN mode (L1=30%, L2=50%, L3=70% of rated current).
+ * The cloud still ACCEPTS set_generator_mode 4–6 but the firmware never
+ * applies them (shadow keeps reporting the old value) — hence the clamp in
+ * clampGeneratorMode().
+ */
+export const MAX_GENERATOR_LEVEL = 3;
 
 const CREDENTIALS_FILE = "/app/data/tcl-credentials.json";
 const TCL_CLIENT_ID = "54148614";
@@ -239,11 +259,17 @@ export class TclCloud {
     // derived fan_speed comparison subsumes the turbo flag. Comparing both
     // alternated {turbo:0}/{fan_speed:7} commands forever (beep loop).
     const skipTurbo = desired.fan_speed != null && !this.isNajatModel(deviceId);
+    // Clamp the desired gen level to the device max BEFORE diffing — a stored
+    // profile with a no-longer-supported level (e.g. Najat 6 after TCL removed
+    // 4–6) would otherwise diff against the reported level every 5s forever.
+    const desiredEffective: AcAction = desired.generator_mode != null
+      ? { ...desired, generator_mode: this.clampGeneratorMode(deviceId, desired.generator_mode) }
+      : desired;
     const diff: Partial<AcAction> = {};
     for (const key of ["mode", "temperature", "fan_speed", "eco", "turbo", "screen", "vertical_swing", "horizontal_swing", "fresh_air", "generator_mode"] as const) {
       if (key === "turbo" && skipTurbo) continue;
-      if (desired[key] != null && desired[key] !== current[key]) {
-        (diff as Record<string, unknown>)[key] = desired[key];
+      if (desiredEffective[key] != null && desiredEffective[key] !== current[key]) {
+        (diff as Record<string, unknown>)[key] = desiredEffective[key];
       }
     }
     return Object.keys(diff).length > 0 ? (diff as AcAction) : null;
@@ -251,7 +277,20 @@ export class TclCloud {
 
   private isNajatModel(deviceId: string): boolean {
     const dev = this.cachedDevices.find(d => d.id === deviceId);
-    return dev ? dev.maxGeneratorLevel === 6 : false;
+    return dev ? dev.model === "TAC-24CHSA" : false;
+  }
+
+  /**
+   * Clamp a generator-mode level to the device's max. 0 (auto/unrestricted)
+   * passes through. Firmware silently ignores levels above the max (accepts
+   * the command, never applies it), which would otherwise leave diff-based
+   * re-enforcement re-sending the same value every 5s forever.
+   */
+  private clampGeneratorMode(deviceId: string, level: number): number {
+    if (level <= 0) return level;
+    const dev = this.cachedDevices.find(d => d.id === deviceId);
+    const max = dev?.maxGeneratorLevel || MAX_GENERATOR_LEVEL;
+    return Math.min(level, max);
   }
 
   async sendControl(deviceId: string, command: string, value: unknown, skipRestore = false): Promise<void> {
@@ -368,6 +407,10 @@ export class TclCloud {
     const prop = propMap[command];
     if (!prop) throw new Error(`Unknown command: ${command}`);
 
+    // Firmware ignores gen levels above the device max — send the clamped value
+    if (command === "set_generator_mode" && typeof value === "number") {
+      value = this.clampGeneratorMode(deviceId, value);
+    }
     const desired: Record<string, unknown> = { [prop]: value };
     try {
       await this.publishShadowUpdate(deviceId, desired);
@@ -694,6 +737,7 @@ export class TclCloud {
         devices.push({
           id: dev.deviceId,
           name: dev.nickName || dev.deviceName || dev.deviceId,
+          model: isNajatModel ? "TAC-24CHSA" : "TAC-12CHSD",
           isOnline: online,
           lastSeenAt: reportedAt,
           power: shadow.powerSwitch != null ? shadow.powerSwitch === 1 : powerFromId?.value === 1,
@@ -716,7 +760,9 @@ export class TclCloud {
           freshAir: shadow.newWindSwitch === 1,
           hasFreshAir: 'newWindSwitch' in shadow,
           generatorMode: shadow.generatorMode ?? 0,
-          maxGeneratorLevel: isNajatModel ? 6 : 3,
+          // 3 for ALL models since 2026-06 — TCL removed Najat's levels 4–6
+          // (see MAX_GENERATOR_LEVEL). Kept per-device for future divergence.
+          maxGeneratorLevel: MAX_GENERATOR_LEVEL,
           tempStep: isNajatModel ? 0.5 : 1,
           minFanSpeed: 1,
           maxFanSpeed: 7,
@@ -1128,7 +1174,8 @@ export class TclCloud {
     }
 
     if (action.generator_mode != null) {
-      desired.generatorMode = action.generator_mode;
+      // Stored profiles/presets may predate a firmware level-count reduction
+      desired.generatorMode = this.clampGeneratorMode(deviceId, action.generator_mode);
     }
 
     return desired;
@@ -1139,8 +1186,12 @@ export class TclCloud {
     if (!saved || Object.keys(saved).length === 0) return;
     try {
       await new Promise(r => setTimeout(r, 1000));
-      await this.publishShadowUpdate(deviceId, saved);
-      log.info(`[tcl] Restored last state for device ${deviceId}:`, JSON.stringify(saved));
+      // Saved state may predate a firmware level-count reduction
+      const payload = typeof saved.generatorMode === "number"
+        ? { ...saved, generatorMode: this.clampGeneratorMode(deviceId, saved.generatorMode) }
+        : saved;
+      await this.publishShadowUpdate(deviceId, payload);
+      log.info(`[tcl] Restored last state for device ${deviceId}:`, JSON.stringify(payload));
     } catch (err) {
       log.warn(`[tcl] Failed to restore last state for ${deviceId}:`, (err as Error).message);
     }

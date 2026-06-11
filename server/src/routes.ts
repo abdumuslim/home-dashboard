@@ -5,6 +5,7 @@ import type { Config } from "./config.js";
 import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
+import { MAX_GENERATOR_LEVEL } from "./tcl-cloud.js";
 import type { ForecastResponse } from "./forecast.js";
 import type { AcLevelingConfig, AcAmpModel, AcLevelBoost } from "./ac-leveling.js";
 import type { AcLevelingStatus } from "./ac-leveler.js";
@@ -1173,6 +1174,12 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       res.status(400).json({ error: `Invalid command. Allowed: ${ALLOWED_AC_COMMANDS.join(", ")}` });
       return;
     }
+    // 0 = auto/unrestricted is a valid picker value; levels above the device
+    // max no longer exist (TCL removed Najat's 4–6 in 2026-06)
+    if (command === "set_generator_mode" && (!Number.isInteger(value) || (value as number) < 0 || (value as number) > MAX_GENERATOR_LEVEL)) {
+      res.status(400).json({ error: `generator level must be an integer 0–${MAX_GENERATOR_LEVEL}` });
+      return;
+    }
     try {
       // A user touching any AC mid-calibration aborts the run — their intent wins
       acCalibration?.requestAbort("user_control");
@@ -1261,7 +1268,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     if (b.levelBoosts != null) {
       if (typeof b.levelBoosts !== "object" || Array.isArray(b.levelBoosts)) return "levelBoosts must be an object";
       for (const boost of Object.values(b.levelBoosts as Record<string, AcLevelBoost>)) {
-        if (!boost || !Number.isInteger(boost.minLevel) || boost.minLevel < 1 || boost.minLevel > 6) return "boost minLevel must be 1–6";
+        if (!boost || !Number.isInteger(boost.minLevel) || boost.minLevel < 1 || boost.minLevel > MAX_GENERATOR_LEVEL) return `boost minLevel must be 1–${MAX_GENERATOR_LEVEL}`;
         if (!num(boost.outdoorAtLeastC) || boost.outdoorAtLeastC < 25 || boost.outdoorAtLeastC > 55) return "boost outdoor temp must be 25–55";
       }
     }

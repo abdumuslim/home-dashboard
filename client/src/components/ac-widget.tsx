@@ -597,9 +597,9 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                         )}
                         style={d.fanSpeed === s ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
                       >
-                        {d.maxGeneratorLevel !== 6 && s === 1
+                        {d.model !== "TAC-24CHSA" && s === 1
                           ? <EarOff className="w-3 h-3 mx-auto" />
-                          : d.maxGeneratorLevel !== 6 && s >= 2
+                          : d.model !== "TAC-24CHSA" && s >= 2
                             ? `${s - 1}`
                             : (FAN_LABELS[s] ?? `${s}`)}
                       </button>

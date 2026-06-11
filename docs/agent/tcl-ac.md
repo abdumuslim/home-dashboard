@@ -111,7 +111,7 @@ The backend resolves property names per device model (e.g., `set_fan_speed` → 
 
 ## AC Models & Shadow Properties
 
-Two AC hardware models with different shadow properties. Detection: presence of `autoGeneratorMode` in the shadow → Najat (TAC-24CHSA); absence → Abdu/Abdullah (TAC-12CHSD).
+Two AC hardware models with different shadow properties. Detection: presence of `autoGeneratorMode` in the shadow → Najat (TAC-24CHSA); absence → Abdu/Abdullah (TAC-12CHSD). The result is stored as an explicit `model: "TAC-24CHSA" | "TAC-12CHSD"` field on `AcDevice` (server + client) — **all protocol forks (`isNajatModel()`, client fan labels) key on `model`, never on `maxGeneratorLevel`** (they used to check `=== 6`, which broke when TCL changed the level count in 2026-06).
 
 ### Common properties (shadow `state.reported`)
 | Property | Type | Values |
@@ -124,7 +124,7 @@ Two AC hardware models with different shadow properties. Detection: presence of 
 | `sleep` | int | 0=off, 1=standard, 2=elderly, 3=child |
 | `verticalDirection` | int | 0–13 (swing direction/fixed position) |
 | `horizontalDirection` | int | 0–13 (swing direction/fixed position) |
-| `generatorMode` | int | 0=off, 1–N=level (Najat: 1–6, Abdu/Abdullah: 1–3) |
+| `generatorMode` | int | 0=off, 1–3=level (ALL models since 2026-06 — TCL removed Najat's 4–6, see Generator mode) |
 
 ### Najat-specific (TAC-24CHSA, detected by `autoGeneratorMode` in shadow)
 | Property | Type | Values |
@@ -146,9 +146,9 @@ Two AC hardware models with different shadow properties. Detection: presence of 
 | `silenceSwitch` | int | 0/1 (used as "silent" fan speed level 1) |
 
 ### Generator mode
-- `generatorMode`: 0=off, 1–N=level. Limits the unit's power consumption for generator use (per-unit current cap).
-- Najat has `autoGeneratorMode` in the shadow → 6 levels (1–6). Abdu/Abdullah don't → 3 levels (1–3).
-- The `maxGeneratorLevel` field on `AcDevice` is computed from `autoGeneratorMode` presence.
+- `generatorMode`: 0=off, 1–3=level. Limits the unit's power consumption for generator use (per-unit current cap). TCL's documented mapping: L1=30%, L2=50%, L3=70% of rated current.
+- **`maxGeneratorLevel` is 3 for ALL models since 2026-06** (`MAX_GENERATOR_LEVEL` export in tcl-cloud.ts). Najat (TAC-24CHSA) historically had 6 levels; TCL removed 4–6 via firmware/app update — the cloud still ACCEPTS `set_generator_mode` 4–6 but the firmware never applies them (shadow keeps the old value; verified live 2026-06-11: L3 confirms in ~1s, L4–L6 time out every send budget, and the TCL app no longer shows them).
+- **Clamp defense (`clampGeneratorMode`)**: every gen-level publish path (sendControl, profile payloads, computeAcDiff desired, restoreLastState) clamps to the device max, preserving 0 — a stored preset/profile with a removed level can never cause the 5s diff re-enforcement to re-send forever. The control route validates 0–3; `onUserGenLevel` clamps the intent too (stale cached clients).
 - Generator-mode UI (Zap icon, level buttons) → [frontend.md](frontend.md); the Smart AC Leveling controller that drives these levels → [ac-leveling.md](ac-leveling.md).
 
 ## Firmware Quirks (both discovered 2026-05-10)
@@ -170,6 +170,9 @@ Discovered 2026-05-10 when debugging "abdu ac not taking fan speed."
 Both quirks share the same signature: shadow `state.reported` shows the settings as applied (the device acknowledges), but the physical AC ignores them. `computeAcDiff()` sees no difference because the reported state looks correct. The mitigation in both cases is to split the conflicting properties into separate shadow updates with a delay.
 
 **How to apply:** When adding new AC firmware integrations or changing `executeAcAction`, never assume all properties can be sent in a single shadow update. Test each property group separately and watch for the "shadow says yes but device says no" pattern.
+
+### TCL can REMOVE features via OTA (2026-06)
+TCL removed Najat's generator levels 4–6 entirely (firmware + app; see Generator mode above). Pattern: the cloud accepts the command but `state.reported` never moves — same signature as a flaky non-apply, but permanent. There is no bypass: we already publish at the lowest available layer (the same AWS IoT shadow the app uses); the rejection is in the indoor unit's firmware. Treat any "level/value never confirms across days + app UI no longer offers it" as a removal, not a quirk — update `MAX_GENERATOR_LEVEL`/validations and sweep stored presets/profiles for the dead values.
 
 ## Key Functions
 

@@ -379,11 +379,11 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
                 <input
                   type="number"
                   min={1}
-                  max={6}
+                  max={3}
                   value={boost.minLevel}
                   onChange={(e) => {
                     const v = parseInt(e.target.value, 10);
-                    if (Number.isInteger(v) && v >= 1 && v <= 6) {
+                    if (Number.isInteger(v) && v >= 1 && v <= 3) {
                       update({ levelBoosts: { ...draft.levelBoosts, [id]: { ...boost, minLevel: v } } });
                     }
                   }}
