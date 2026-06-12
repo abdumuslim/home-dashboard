@@ -647,7 +647,12 @@ describe("AC range fan enforcement", () => {
 });
 
 async function checkAcLeveling(collector: Collector) {
-  await (collector as never as { checkAcLeveling: () => Promise<void> }).checkAcLeveling();
+  // Through the serialized wrapper, NOT the private checkAcLeveling directly:
+  // severe readings fed via setLatestPower fire the urgent-leveling dep, and a
+  // direct call would interleave with that in-flight urgent pass at await
+  // points (double-shedding nondeterministically — exactly what the guard
+  // exists to prevent in production).
+  await (collector as never as { runLevelingCheck: () => Promise<void> }).runLevelingCheck();
 }
 
 describe("Smart AC leveling", () => {
@@ -739,20 +744,20 @@ describe("Smart AC leveling", () => {
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
-    // First over-limit tick sheds proactively (source just became gen →
-    // forceEvaluate), independent of the reactive streak gate.
+    // 16A = exactly +1A over → severe (≥ boundary since 2026-06-12): the
+    // urgent emergency pass acts at streak 2, before the explicit tick below.
     for (let i = 0; i < 5; i++) {
       collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 16, power_1: 0, power_2: 3520 });
     }
     await checkAcLeveling(collector);
 
-    // budget = 15 − 1 − nonAcLoad(16 − 6) = 4 < L1 sum 6 → shed ac2 (lowest priority)
+    // Both at L1 floors, no reducible fans → emergency sheds ac2 (lowest priority)
     expect(actions).toEqual([{ deviceId: "ac2", action: { power: 0 } }]);
     expect(shed.has("ac2")).toBe(true);
     expect(locks.size).toBe(0); // shed is not a manual-off lock
   });
 
-  it("waits 5 readings for a mild over-limit (1A over) before reacting", async () => {
+  it("waits 5 readings for a mild over-limit (0.5A over) before reacting", async () => {
     const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
@@ -769,7 +774,7 @@ describe("Smart AC leveling", () => {
     await checkAcLeveling(collector);
     expect(actions).toEqual([]);
 
-    // 16A is only 1A over the 15A limit (mild) → 4 readings is not enough.
+    // 15.5A is only 0.5A over the 15A limit (mild) → 4 readings is not enough.
     overLimitReadings(collector, 4);
     await checkAcLeveling(collector);
     expect(actions).toEqual([]);
@@ -782,7 +787,7 @@ describe("Smart AC leveling", () => {
     expect(shed.has("ac2")).toBe(true);
   });
 
-  it("sheds fast after just 2 severe over-limit readings (>1A over)", async () => {
+  it("sheds fast after just 2 severe over-limit readings (≥1A over)", async () => {
     const { collector, tclCloud, actions, shed, locks, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
@@ -1047,9 +1052,12 @@ describe("Smart AC leveling — warm restore after temperature cycle", () => {
   });
 });
 
+// 15.5A on the 15A gen limit: over, but UNDER the severe boundary (≥ limit+1A
+// since 2026-06-12) — exercises the MILD 5-reading staged path. Severe-path
+// tests feed ≥16A explicitly.
 function overLimitReadings(collector: Collector, count: number) {
   for (let i = 0; i < count; i++) {
-    collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 16, power_1: 0, power_2: 3520 });
+    collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 15.5, power_1: 0, power_2: 3410 });
   }
 }
 
@@ -1124,25 +1132,26 @@ describe("Smart AC leveling — predictive control", () => {
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
-    // 16A over the 15A gen limit → nonAcLoad 16−13=3, budget 11 → Abdu L3→L2
-    genReadings(collector, 16, 5);
+    // 15.5A (mild) over the 15A gen limit → nonAcLoad 15.5−13=2.5, budget 11.5
+    // → fitted ideal Najat L4 + Abdu L2 → Abdu L3→L2
+    genReadings(collector, 15.5, 5);
     await checkAcLeveling(collector);
     expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
     expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 2);
 
-    // 8s later the compressor hasn't responded — measured still 16A. A fresh
-    // derivation would read nonAcLoad = 16−(5+6) = 5 and over-reduce Najat;
-    // the frozen value (3) reproduces the already-commanded allocation.
+    // 8s later the compressor hasn't responded — measured still 15.5A. A fresh
+    // derivation would read nonAcLoad = 15.5−(5+6) = 4.5 and over-reduce Najat;
+    // the frozen value (2.5) reproduces the already-commanded allocation.
     vi.advanceTimersByTime(8_000);
-    genReadings(collector, 16, 5);
+    genReadings(collector, 15.5, 5);
     await checkAcLeveling(collector);
     expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
     expect(shed.size).toBe(0);
 
-    // Past the freeze window the persistent 16A is real — derivation resumes
-    // (nonAcLoad 5 → budget 9) and the leveler reduces further.
+    // Past the freeze window the persistent 15.5A is real — derivation resumes
+    // (nonAcLoad 4.5 → budget 9.5) and the leveler reduces further.
     vi.advanceTimersByTime(8_000);
-    genReadings(collector, 16, 5);
+    genReadings(collector, 15.5, 5);
     await checkAcLeveling(collector);
     expect(tclCloud.sendControl).toHaveBeenCalledTimes(2);
     expect(tclCloud.sendControl).toHaveBeenLastCalledWith("ac1", "set_generator_mode", 2);
@@ -1467,8 +1476,9 @@ describe("Smart AC leveling — bounce detection", () => {
     await checkAcLeveling(collector);
     expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 2);
 
-    // The raise delivers MORE than estimated — 16A breaches the limit. After
-    // 5 over-limit readings (mild, 1A over) the reduction undoes the raise → bounce recorded.
+    // The raise delivers MORE than estimated — 16A breaches the limit (severe
+    // at exactly +1A since 2026-06-12): the meter-sized emergency cut (1A over
+    // + 1A margin = 2A = Abdu's step) undoes the raise → bounce recorded.
     const after = devices.map((d) => (d.id === "ac2" ? { ...d, generatorMode: 2 } : { ...d }));
     tclCloud.getDevices.mockReturnValue(after);
     tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
@@ -2707,5 +2717,195 @@ describe("AC beep-off enforcement", () => {
 
     await checkAcBeep(collector);
     expect(tclCloud.sendControl).not.toHaveBeenCalled();
+  });
+});
+
+describe("Smart AC leveling — emergency reduction fast path", () => {
+  beforeEach(() => {
+    acTimers.clear();
+  });
+
+  /** Prime away the initial source-change forceEvaluate so the emergency gate is what acts. */
+  async function primeGen(collector: Collector) {
+    genReadings(collector, 4, 1);
+    await checkAcLeveling(collector);
+  }
+
+  it("acts on the 2nd reading at exactly +1A over, without waiting for the collector tick", async () => {
+    const { collector, tclCloud, actions, shed, locks, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+    await primeGen(collector);
+    expect(actions).toEqual([]);
+
+    // Exactly 16.0A on the 15A limit = exactly +1A — severe since 2026-06-12
+    // (the live 31A incident's readings sat exactly on the boundary). The 2nd
+    // reading fires the urgent dep; NO explicit leveling tick happens here —
+    // only the microtask queue drains.
+    genReadings(collector, 16, 2);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // required = 1 (overshoot) + 1 (margin) = 2A; both ACs at L1 floors with
+    // no reducible fans → nothing to cut → shed the least-needy (ac2, 4A ≥ 2A).
+    expect(actions).toEqual([{ deviceId: "ac2", action: { power: 0 } }]);
+    expect(shed.has("ac2")).toBe(true);
+    expect(locks.size).toBe(0);
+
+    // A late explicit tick coalesces — no duplicate batch.
+    await checkAcLeveling(collector);
+    expect(actions).toEqual([{ deviceId: "ac2", action: { power: 0 } }]);
+  });
+
+  it("oscillation: 29↔31 around the 30A grid limit fires the emergency (31A-incident regression)", async () => {
+    const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+    gridReadings(collector, 29, 1);
+    await checkAcLeveling(collector);
+    expect(actions).toEqual([]);
+
+    // The live 31A pattern: every 29A reading resets BOTH consecutive streaks
+    // (29 ≤ 30−1 is headroom), so neither the 5-mild nor the 2-severe gate can
+    // EVER fire while the breaker heats on the duty cycle. The windowed gate
+    // (≥3 of last 6 over, ≥1 severe, current over) catches it.
+    for (const amps of [31, 29, 31, 29, 31]) {
+      gridReadings(collector, amps, 1);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // overshoot = median(over-limit readings) − 30 = 1 → required 2A; both at
+    // L1 floors, no fans → shed the least-needy (ac2).
+    expect(actions).toEqual([{ deviceId: "ac2", action: { power: 0 } }]);
+    expect(shed.has("ac2")).toBe(true);
+  });
+
+  it("the same oscillation on the generator does NOT fire the windowed gate (grid only)", async () => {
+    const { collector, tclCloud, actions, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+    await primeGen(collector);
+
+    // 14↔16 around the 15A gen limit — the user deliberately rides near the
+    // gen breaker, where this pattern is ordinary noise (user decision
+    // 2026-06-12: windowed gate on grid only).
+    for (const amps of [16, 14, 16, 14, 16]) {
+      genReadings(collector, amps, 1);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await checkAcLeveling(collector);
+
+    expect(actions).toEqual([]);
+    expect(tclCloud.sendControl).not.toHaveBeenCalled();
+  });
+
+  it("cuts from the measured overshoot even when the frozen budget math says everything fits", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T08:00:00.000Z"));
+    try {
+      const { collector, tclCloud, setLevelingConfig } = createCollector();
+      setLevelingConfig(LEVELING_CONFIG);
+      await collector.acLeveler.ensureLoaded();
+      const devices = [
+        { id: "ac1", name: "Najat", power: true, generatorMode: 4, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },
+        { id: "ac2", name: "Abdu", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      ];
+      tclCloud.getDevices.mockReturnValue(devices);
+      tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+      // Mild fitted reduce (Abdu L3→L2) arms the 15s nonAcLoad freeze at 2.5A.
+      genReadings(collector, 15.5, 5);
+      await checkAcLeveling(collector);
+      expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+      expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 2);
+
+      // 5s later a non-AC load spike pushes the meter to 19A (severe ×2).
+      // The FROZEN budget (15−1−2.5 = 11.5) still fits the fitted ideal
+      // (Najat L4 + Abdu L2 == current levels), so computeAllocation ships
+      // NOTHING despite 4A over — the meter-sized emergency must cut anyway:
+      // required = 4 + 1 = 5A → Abdu L2→L1 (2A) + Najat L4→L1 (3A), one batch.
+      vi.advanceTimersByTime(5_000);
+      genReadings(collector, 19, 2);
+      await checkAcLeveling(collector);
+      expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 1);
+      expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 1);
+      const emergency = collector.acLeveler.getStatus().lastEmergency;
+      expect(emergency?.requiredAmps).toBe(5);
+      expect(emergency?.savedAmps).toBe(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("discounts a second streak while the batch lands, escalates by feedback, sheds only when nothing is left", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T08:00:00.000Z"));
+    try {
+      const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
+      setLevelingConfig(LEVELING_CONFIG);
+      await collector.acLeveler.ensureLoaded();
+      const devices = [
+        { id: "ac1", name: "Najat", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+        { id: "ac2", name: "Abdu", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      ];
+      tclCloud.getDevices.mockReturnValue(devices);
+      tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+      await primeGen(collector);
+
+      // Batch 1: 18A severe ×2 → required 3+1 = 4A → Abdu (least needy by
+      // priority tiebreak) L3→L1 covers it exactly. Streaks reset after.
+      genReadings(collector, 18, 2);
+      await checkAcLeveling(collector);
+      expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+      expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 1);
+      expect(collector.acLeveler.getStatus().severeOverLimitStreak).toBe(0);
+      expect(collector.acLeveler.getStatus().lastEmergency).toMatchObject({ requiredAmps: 4, savedAmps: 4 });
+
+      // 8s later the meter still reads 18A — the compressor hasn't responded
+      // yet. The fresh severe streak is fully discounted by the in-flight 4A
+      // (within EMERGENCY_PENDING_MS) → no stacked cut.
+      vi.advanceTimersByTime(8_000);
+      genReadings(collector, 18, 2);
+      await checkAcLeveling(collector);
+      expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+
+      // 16s after batch 1 the discount has expired and 18A persists — the cut
+      // demonstrably wasn't enough (model error). Fresh required 4A: Najat
+      // L3→L1 (2A) is all that's left to cut. Cuts shipped → NO shed yet.
+      vi.advanceTimersByTime(8_000);
+      genReadings(collector, 18, 2);
+      await checkAcLeveling(collector);
+      expect(tclCloud.sendControl).toHaveBeenCalledTimes(2);
+      expect(tclCloud.sendControl).toHaveBeenLastCalledWith("ac1", "set_generator_mode", 1);
+      expect(actions).toEqual([]);
+
+      // Another fresh severe streak with everything at floors and no fans —
+      // nothing reducible remains → the shed finally fires, least-needy first
+      // (shed-separate user decision 2026-06-12).
+      vi.advanceTimersByTime(20_000);
+      genReadings(collector, 18, 2);
+      await checkAcLeveling(collector);
+      expect(actions).toEqual([{ deviceId: "ac2", action: { power: 0 } }]);
+      expect(shed.has("ac2")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

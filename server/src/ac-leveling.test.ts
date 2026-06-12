@@ -1,14 +1,17 @@
 import { describe, it, expect } from "vitest";
 import {
   computeAllocation,
+  computeEmergencyReduction,
   estimateAcDraw,
   determineSource,
   computeNeedTier,
   needCap,
+  FAN_REDUCE_SAVINGS_AMPS,
   REDUCE_STREAK,
   REDUCE_STREAK_SEVERE,
   RAISE_STREAK,
   type AllocatorInput,
+  type EmergencyInput,
   type LevelerAcSnapshot,
   type AcAmpModel,
 } from "./ac-leveling.js";
@@ -1309,5 +1312,225 @@ describe("restore during a raise hold (2026-06-11)", () => {
     // consume its headroom or arm a hold that pushes the restore out.
     expect(r.toRestore).toEqual([]);
     expect(r.desiredLevels.najat).toBeUndefined();
+  });
+});
+
+// Meter-sized emergency cuts (severe over-limit fast path). Draw math with
+// MODELS (maxLevel 3): najat/abdullah L1=2 L2=3 L3=4 L0=5; abdu L1=4 L2=6
+// L3=8 L0=10. Priority order in acs: najat (top, protected) > abdu > abdullah.
+describe("computeEmergencyReduction", () => {
+  function eInput(over: Partial<EmergencyInput> = {}): EmergencyInput {
+    return {
+      limitAmps: 30,
+      marginAmps: 1,
+      nonAcLoadAmps: 0,
+      requiredSavingsAmps: 1,
+      acs: [ac("najat"), ac("abdu"), ac("abdullah")],
+      ampModels: MODELS,
+      ...over,
+    };
+  }
+
+  it("drops the least-needy AC's levels first and stops once the required savings are met", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 2,
+      acs: [
+        ac("najat", { needDelta: 2 }),
+        ac("abdu", { currentLevel: 3, needDelta: 2 }),
+        ac("abdullah", { currentLevel: 3, needDelta: 0.5 }),
+      ],
+    }));
+    // Abdullah (least needy): L3→L2 (1A) → L2→L1 (1A) = 2A — abdu untouched.
+    expect(r.desiredLevels).toEqual({ abdullah: 1 });
+    expect(r.toFanReduce).toEqual([]);
+    expect(r.toShed).toEqual([]);
+    expect(r.toRestore).toEqual([]);
+    expect(r.toFanRaise).toBeNull();
+    expect(r.estimatedSavingsAmps).toBe(2);
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("moves to the next AC's levels when the first reaches its floor", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 3,
+      acs: [
+        ac("najat", { needDelta: 2 }),
+        ac("abdu", { currentLevel: 3, needDelta: 1 }),
+        ac("abdullah", { currentLevel: 2, needDelta: 0.5 }),
+      ],
+    }));
+    // Abdullah L2→L1 (1A) hits floor; abdu L3→L2 (2A) covers the rest.
+    expect(r.desiredLevels).toEqual({ abdullah: 1, abdu: 2 });
+    expect(r.estimatedSavingsAmps).toBe(3);
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("cuts the top-priority AC's levels only after every other AC is at its floor", () => {
+    const acs = [
+      ac("najat", { currentLevel: 2, needDelta: 1 }),
+      ac("abdu", { currentLevel: 2, needDelta: 1 }),
+      ac("abdullah", { currentLevel: 2, needDelta: 1 }),
+    ];
+    // Others cover 3A (abdullah 1 + abdu 2) — najat untouched at 3A required…
+    const spared = computeEmergencyReduction(eInput({ requiredSavingsAmps: 3, acs }));
+    expect(spared.desiredLevels.najat).toBeUndefined();
+    expect(spared.desiredLevels).toEqual({ abdullah: 1, abdu: 1 });
+    // …but at 3.5A she is the only level cut left.
+    const cut = computeEmergencyReduction(eInput({ requiredSavingsAmps: 3.5, acs }));
+    expect(cut.desiredLevels.najat).toBe(1);
+  });
+
+  it("adds fan drops in the same batch when floors aren't enough", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 1,
+      acs: [
+        ac("najat", { needDelta: 2 }),
+        ac("abdu", { fanSpeed: 3, needDelta: 1 }),
+        ac("abdullah", { fanSpeed: 0, needDelta: 0.5 }), // built-in auto counts as reducible
+      ],
+    }));
+    // Everyone at L1 floors — two 0.5A fan drops cover the 1A in ONE batch.
+    expect(r.desiredLevels).toEqual({});
+    expect(r.toFanReduce).toEqual(["abdullah", "abdu"]);
+    expect(r.toShed).toEqual([]);
+    expect(r.estimatedSavingsAmps).toBe(2 * FAN_REDUCE_SAVINGS_AMPS);
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("skips fan-exempt, fan-unknown, and fan-already-1 ACs in the fan phase", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 0.5,
+      acs: [
+        ac("najat", { fanSpeed: 1 }),
+        ac("abdu", { fanSpeed: 5, fanExempt: true }),
+        ac("abdullah", { fanSpeed: null }),
+        ac("extra", { fanSpeed: 4, needDelta: 3 }),
+      ],
+    }));
+    expect(r.toFanReduce).toEqual(["extra"]);
+  });
+
+  it("best-fit final step: a sub-fan-sized remainder takes a fan drop, not a level step", () => {
+    const acs = [
+      ac("najat", { fanSpeed: 3, needDelta: 2 }),
+      ac("abdu", { currentLevel: 3, needDelta: 1 }),
+      ac("abdullah", { needDelta: 0.5 }),
+    ];
+    // 0.4A remainder ≤ one fan (0.5A) → the 2A abdu level step is spared.
+    const fan = computeEmergencyReduction(eInput({ requiredSavingsAmps: 0.4, acs }));
+    expect(fan.desiredLevels).toEqual({});
+    expect(fan.toFanReduce).toEqual(["najat"]);
+    expect(fan.estimatedSavingsAmps).toBe(FAN_REDUCE_SAVINGS_AMPS);
+    // No fan available → the level step is the only cut that covers it.
+    const noFan = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 0.4,
+      acs: acs.map((a) => ({ ...a, fanSpeed: 1 })),
+    }));
+    expect(noFan.desiredLevels).toEqual({ abdu: 2 });
+    expect(noFan.toFanReduce).toEqual([]);
+  });
+
+  it("does NOT shed when any level or fan cut shipped, even if unsatisfied", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 10,
+      acs: [
+        ac("najat"),
+        ac("abdu"),
+        ac("abdullah", { currentLevel: 2, needDelta: 0.5 }),
+      ],
+    }));
+    // Only 1A of level cuts exists — ship it; the shed waits for its own
+    // fresh severe streak (user decision 2026-06-12).
+    expect(r.desiredLevels).toEqual({ abdullah: 1 });
+    expect(r.toShed).toEqual([]);
+    expect(r.satisfied).toBe(false);
+  });
+
+  it("sheds the least-needy AC when nothing else is reducible", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 2,
+      acs: [
+        ac("najat", { needDelta: 2 }),
+        ac("abdu", { needDelta: 0.2 }),
+        ac("abdullah", { needDelta: 1 }),
+      ],
+    }));
+    // Everyone at L1/fan-1 — abdu (least needy, 4A at L1) covers the 2A alone.
+    expect(r.desiredLevels).toEqual({});
+    expect(r.toFanReduce).toEqual([]);
+    expect(r.toShed).toEqual(["abdu"]);
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("sheds multiple ACs for a large overshoot; the top-priority AC only as last resort", () => {
+    const acs = [
+      ac("najat", { needDelta: 2 }),
+      ac("abdu", { needDelta: 0.2 }),
+      ac("abdullah", { needDelta: 1 }),
+    ];
+    const two = computeEmergencyReduction(eInput({ requiredSavingsAmps: 5, acs }));
+    expect(two.toShed).toEqual(["abdu", "abdullah"]); // 4A + 2A ≥ 5A — najat protected
+    const all = computeEmergencyReduction(eInput({ requiredSavingsAmps: 12, acs }));
+    expect(all.toShed).toEqual(["abdu", "abdullah", "najat"]);
+    expect(all.satisfied).toBe(false); // 8A total < 12A — everything cut, still short
+    expect(all.desiredLevels).toEqual({}); // shed ACs get no level/fan commands
+    expect(all.toFanReduce).toEqual([]);
+  });
+
+  it("never cuts below a boost floor via levels — only a shed goes below", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 10,
+      acs: [
+        ac("najat", { needDelta: 2 }),
+        ac("abdu", { needDelta: 1 }),
+        ac("abdullah", { currentLevel: 3, minLevel: 2, needDelta: 0.5 }),
+      ],
+    }));
+    expect(r.desiredLevels.abdullah).toBe(2); // L3→L2 stops at the boost floor
+    expect(r.toShed).toEqual([]);
+  });
+
+  it("caps a level-0 unrestricted AC with the smallest cut regardless of the savings target", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 0.1,
+      acs: [
+        ac("najat", { currentLevel: 0, needDelta: 2 }),
+        ac("abdu", { needDelta: 1 }),
+        ac("abdullah", { needDelta: 0.5 }),
+      ],
+    }));
+    // Never-level-0 is a hard rule — but the re-entry is the TOP commandable
+    // level (L3), not the floor: the invariant alone must not over-reduce.
+    expect(r.desiredLevels).toEqual({ najat: 3 });
+    expect(r.estimatedSavingsAmps).toBe(1); // draw(0)=5 − draw(3)=4
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("honors reachable and slot caps for the level-0 re-entry", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 0.1,
+      acs: [
+        ac("najat", { currentLevel: 0, reachableCap: 2, needDelta: 2 }),
+        ac("abdu", { currentLevel: 0, slotCap: 1, needDelta: 1 }),
+        ac("abdullah", { needDelta: 0.5 }),
+      ],
+    }));
+    expect(r.desiredLevels.najat).toBe(2); // firmware can't hold L3
+    expect(r.desiredLevels.abdu).toBe(1); // slot cap is a hard ceiling
+  });
+
+  it("ignores off, unmanaged, and already-shed ACs", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 5,
+      acs: [
+        ac("najat", { on: false }),
+        ac("abdu", { managed: false, currentLevel: 3 }),
+        ac("abdullah", { shed: true }),
+      ],
+    }));
+    expect(r.desiredLevels).toEqual({});
+    expect(r.toFanReduce).toEqual([]);
+    expect(r.toShed).toEqual([]);
+    expect(r.satisfied).toBe(false);
   });
 });

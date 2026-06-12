@@ -71,7 +71,7 @@ export interface AcLevelingStatus {
   budgetAmps: number | null;
   nonAcLoadAmps: number | null;
   overLimitStreak: number;
-  /** Consecutive readings badly over the limit (> limit + 1A) — drives the fast reduce path. */
+  /** Consecutive readings badly over the limit (≥ limit + 1A) — drives the emergency fast path. */
   severeOverLimitStreak: number;
   headroomStreak: number;
   settleRemainingMs: number;
@@ -81,6 +81,8 @@ export interface AcLevelingStatus {
   expectedAmps: number | null;
   /** Last completed amp-model accuracy check. */
   lastPrediction: { expectedAmps: number; actualAmps: number; at: number } | null;
+  /** Last meter-sized emergency cut batch (severe over-limit fast path). */
+  lastEmergency: { at: number; requiredAmps: number; savedAmps: number } | null;
   acs: AcLevelingAcStatus[];
 }
 

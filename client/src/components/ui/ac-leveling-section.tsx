@@ -247,9 +247,14 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
       </div>
 
       {/* Gating hints */}
-      {draft.enabled && status && (status.overLimitStreak > 0 || status.settleRemainingMs > 0 || status.raiseHoldRemainingMs > 0 || status.expectedAmps != null) && (
+      {draft.enabled && status && (status.overLimitStreak > 0 || status.settleRemainingMs > 0 || status.raiseHoldRemainingMs > 0 || status.expectedAmps != null || (status.lastEmergency != null && Date.now() - status.lastEmergency.at < 30 * 60_000)) && (
         <div className="text-[0.65rem] text-dim -mt-1.5">
           {[
+            status.lastEmergency != null && Date.now() - status.lastEmergency.at < 30 * 60_000 && (
+              <span key="emergency" className="text-red-400" title="Severe over-limit — a meter-sized emergency cut was shipped (overshoot + margin)">
+                emergency cut {status.lastEmergency.savedAmps.toFixed(1)} A · {new Date(status.lastEmergency.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+              </span>
+            ),
             status.overLimitStreak > 0 && (
               status.severeOverLimitStreak > 0 ? (
                 <span key="over" className="text-amber-400">severe over-limit {Math.min(status.severeOverLimitStreak, 2)}/2 readings</span>

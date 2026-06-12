@@ -5,10 +5,12 @@
 import pg from "pg";
 import {
   computeAllocation,
+  computeEmergencyReduction,
   determineSource,
   estimateAcDraw,
   nearTargetNeedCap,
   AC_RAMP_MS,
+  EMERGENCY_PENDING_MS,
   BOUNCE_MAX_EXTRA_AMPS,
   BOUNCE_SAFETY_EXPIRY_MS,
   BOUNCE_WINDOW_MS,
@@ -53,6 +55,13 @@ export interface AcLevelerDeps {
   isManualOffLocked: (deviceId: string) => Promise<boolean>;
   /** Fired on every leveler fan command so range-automation fan enforcement re-baselines. */
   onLevelerFanCommand: (deviceId: string, fan: number) => void;
+  /**
+   * Fired from onPowerReading when an emergency trigger confirms (severe
+   * streak / grid oscillation) so the collector runs a leveling check NOW
+   * instead of waiting up to 5s for the next loop tick — the breaker trips
+   * in seconds. Fired per qualifying reading; the collector coalesces.
+   */
+  onUrgentLevelingNeeded?: () => void;
 }
 
 export interface LevelerDeviceContext {
@@ -116,6 +125,8 @@ export interface AcLevelingStatus {
   expectedAmps: number | null;
   /** Last completed amp-model accuracy check (expected vs measured after effects settled). */
   lastPrediction: { expectedAmps: number; actualAmps: number; at: number } | null;
+  /** Last meter-sized emergency cut batch (severe over-limit fast path). */
+  lastEmergency: { at: number; requiredAmps: number; savedAmps: number } | null;
   acs: AcLevelingAcStatus[];
 }
 
@@ -138,9 +149,24 @@ export class AcLeveler {
   private lastSource: PowerSource = "none";
   private recentMeasured: number[] = [];
   private overLimitStreak = 0;
-  /** Consecutive readings measured > limit + OVER_LIMIT_SEVERE_AMPS — the fast reduce path. */
+  /** Consecutive readings measured ≥ limit + OVER_LIMIT_SEVERE_AMPS — the fast reduce path. */
   private severeOverLimitStreak = 0;
+  /**
+   * Raw measured values of the CURRENT severe streak — the emergency cut is
+   * sized from min() of these (every reading in the streak supports it; a
+   * one-reading spike can't inflate the cut, and the median-of-4 smoothing
+   * would dilute a fresh spike with pre-spike readings). Cleared wherever the
+   * severe streak resets.
+   */
+  private severeStreakReadings: number[] = [];
   private headroomStreak = 0;
+  /**
+   * Last emergency batch: discounts a new severe streak's savings target for
+   * EMERGENCY_PENDING_MS (compressors take seconds to respond — cutting again
+   * before the meter reflects the batch would stack cuts), and feeds the
+   * status/UI. savedAmps = the batch's estimated savings.
+   */
+  private lastEmergency: { at: number; requiredAmps: number; savedAmps: number } | null = null;
   // Runtime control state
   private lastSetLevel = new Map<string, number>();
   /**
@@ -309,6 +335,7 @@ export class AcLeveler {
       this.freezeUntil = 0;
       this.expected = null;
       this.raiseHold = null;
+      this.lastEmergency = null;
     }
     if (!cfg.enabled && this.fanHold.size > 0) {
       // Leveler switched off mid-hold — leave the house physically right.
@@ -455,6 +482,7 @@ export class AcLeveler {
       this.lastSource = source;
       this.overLimitStreak = 0;
       this.severeOverLimitStreak = 0;
+      this.severeStreakReadings = [];
       this.headroomStreak = 0;
       this.recentMeasured = [];
       this.forceEvaluate = true;
@@ -463,6 +491,8 @@ export class AcLeveler {
       this.freezeUntil = 0;
       this.expected = null;
       this.raiseHold = null;
+      // An emergency discount sized on the other source's readings is meaningless too.
+      this.lastEmergency = null;
       // Bounce evidence is per-source (different limit + amp models).
       this.bounce.clear();
       this.lastRaiseBatch = null;
@@ -499,8 +529,16 @@ export class AcLeveler {
       this.overLimitStreak++;
       this.headroomStreak = 0;
       // Badly over → escalate the fast path; a merely-mild reading breaks it.
-      if (measured > limit + OVER_LIMIT_SEVERE_AMPS) this.severeOverLimitStreak++;
-      else this.severeOverLimitStreak = 0;
+      // ≥ since 2026-06-12: exactly +1.0A counts as severe — the live 31A
+      // incident's readings sat exactly on the boundary and stayed mild.
+      if (measured >= limit + OVER_LIMIT_SEVERE_AMPS) {
+        this.severeOverLimitStreak++;
+        this.severeStreakReadings.push(measured);
+        if (this.severeStreakReadings.length > 8) this.severeStreakReadings.shift();
+      } else {
+        this.severeOverLimitStreak = 0;
+        this.severeStreakReadings = [];
+      }
     } else if (measured <= limit - this.config.marginAmps) {
       // Headroom builds at the un-buffered threshold so cheap, comfort-positive
       // fan restores (gated by canRaise) recover on real headroom — NOT held
@@ -510,12 +548,50 @@ export class AcLeveler {
       this.headroomStreak++;
       this.overLimitStreak = 0;
       this.severeOverLimitStreak = 0;
+      this.severeStreakReadings = [];
     } else {
       // Inside the margin band — neither raise nor reduce.
       this.overLimitStreak = 0;
       this.severeOverLimitStreak = 0;
+      this.severeStreakReadings = [];
       this.headroomStreak = 0;
     }
+
+    // Emergency trigger confirmed on THIS reading → ask the collector to run
+    // a leveling check now instead of waiting up to 5s for the loop tick (the
+    // breaker trips in seconds). ≥ not === so a tick that failed (TCL error)
+    // re-fires on the next qualifying reading; the collector guard coalesces.
+    if (
+      this.severeOverLimitStreak >= REDUCE_STREAK_SEVERE ||
+      this.oscillationOvershoot(source, limit) != null
+    ) {
+      this.deps.onUrgentLevelingNeeded?.();
+    }
+  }
+
+  /**
+   * Grid oscillation trigger (the 31A incident pattern): readings alternating
+   * around the limit (29↔31 on a 30A breaker) reset every consecutive streak,
+   * so neither the mild nor the severe gate can EVER fire while the breaker
+   * heats on the duty cycle. A windowed gate catches it: ≥3 of the last 6
+   * readings over the limit, at least one of them severe, and the current
+   * reading over. Grid only (user decision 2026-06-12) — the user deliberately
+   * rides 14.3–14.8A on the 15A generator, where noise would false-trigger.
+   * Returns the overshoot (median of the window's over-limit readings − limit)
+   * or null when the pattern doesn't hold.
+   */
+  private oscillationOvershoot(source: PowerSource, limit: number): number | null {
+    if (source !== "grid") return null;
+    const window = this.recentMeasured.slice(-6);
+    if (window.length < 6) return null;
+    if (!(window[window.length - 1] > limit)) return null;
+    const over = window.filter((m) => m > limit);
+    if (over.length < 3) return null;
+    if (!window.some((m) => m >= limit + OVER_LIMIT_SEVERE_AMPS)) return null;
+    const sorted = [...over].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const median = sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    return median - limit;
   }
 
   /** Median of the last 4 readings — smooths generator fluctuation for budget math. */
@@ -893,11 +969,13 @@ export class AcLeveler {
       // No electricity / no ESP signal — pause decisions, reset gating.
       this.overLimitStreak = 0;
       this.severeOverLimitStreak = 0;
+      this.severeStreakReadings = [];
       this.headroomStreak = 0;
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
       this.expected = null;
       this.raiseHold = null;
+      this.lastEmergency = null;
       this.lastStatus = this.buildStatus(ctx, source, null, null, null);
       return;
     }
@@ -1101,13 +1179,69 @@ export class AcLeveler {
       : freshNonAcLoad;
     this.lastNonAcLoad = nonAcLoad;
 
+    // Emergency fast path — a confirmed severe streak (or the grid oscillation
+    // pattern) sizes ONE decisive cut batch from the METER readings themselves,
+    // bypassing the model-derived budget: when an amp model under-credits an
+    // AC, computeAllocation concludes ideal == current and ships nothing while
+    // the meter reads 1A+ over (live: the 31A grid incident — breaker tripped).
+    const severeReady = this.severeOverLimitStreak >= REDUCE_STREAK_SEVERE;
+    const oscillation = severeReady ? null : this.oscillationOvershoot(source, limit);
+    let emergencyDeferred = false;
+    if (severeReady || oscillation != null) {
+      // min() of the severe readings: every reading in the streak supports
+      // that overshoot — a one-reading spike can't inflate the cut, and the
+      // median-of-4 smoothing would dilute a fresh spike with older readings.
+      const severeWindow = this.severeStreakReadings.slice(-4);
+      const overshoot = severeReady
+        ? (severeWindow.length > 0
+            ? Math.min(...severeWindow) - limit
+            : Math.max(OVER_LIMIT_SEVERE_AMPS, measured - limit))
+        : oscillation!;
+      let required = overshoot + this.config.marginAmps;
+      // A batch still landing (compressors take seconds to respond) discounts
+      // the target — never stack cuts before the meter reflects the previous
+      // batch (the over-reduction → bounce cycle the user explicitly rejected).
+      if (this.lastEmergency && now - this.lastEmergency.at < EMERGENCY_PENDING_MS) {
+        required -= this.lastEmergency.savedAmps;
+      }
+      if (required > 0) {
+        const eres = computeEmergencyReduction({
+          limitAmps: limit,
+          marginAmps: this.config.marginAmps,
+          nonAcLoadAmps: nonAcLoad,
+          requiredSavingsAmps: required,
+          acs: snapshots,
+          ampModels,
+        });
+        log.warn(
+          `[leveler] EMERGENCY: ~${overshoot.toFixed(1)}A over the ${limit}A ${source} limit ` +
+          `(${severeReady ? `severe streak ${this.severeOverLimitStreak}` : "grid oscillation"}) — ` +
+          `cutting ~${eres.estimatedSavingsAmps.toFixed(1)}A of ${required.toFixed(1)}A needed ` +
+          `(${Object.keys(eres.desiredLevels).length} level, ${eres.toFanReduce.length} fan, ` +
+          `${eres.toShed.length} shed)${eres.satisfied ? "" : " — not fully covered, escalating on the next streak"}`,
+        );
+        this.lastEmergency = { at: now, requiredAmps: required, savedAmps: eres.estimatedSavingsAmps };
+        this.forceEvaluate = false;
+        // reactive=true: an emergency cut that undoes a recent raise is still
+        // that raise's bounce. execute() handles shed persistence, fan holds,
+        // unreachable counting, settle/freeze/expectation, and streak resets.
+        await this.execute(tcl, snapshots, eres, source, limit, true);
+        this.lastStatus = this.buildStatus(ctx, source, measured, limit, eres);
+        return;
+      }
+      // Discounted to ≤ 0: the previous batch's savings should cover the
+      // current overshoot once they land — defer, and keep the allocator's
+      // own severe gate from double-reducing on the same readings.
+      emergencyDeferred = true;
+    }
+
     const input: AllocatorInput = {
       limitAmps: limit,
       marginAmps: this.config.marginAmps,
       raiseBufferAmps: this.config.raiseBufferAmps,
       nonAcLoadAmps: nonAcLoad,
       overLimitStreak: this.overLimitStreak,
-      severeOverLimitStreak: this.severeOverLimitStreak,
+      severeOverLimitStreak: emergencyDeferred ? 0 : this.severeOverLimitStreak,
       headroomStreak: this.headroomStreak,
       inSettle,
       raiseHold: this.raiseHold != null,
@@ -1419,6 +1553,7 @@ export class AcLeveler {
       // needs a fresh 6-reading headroom streak, which paces restores out.
       this.overLimitStreak = 0;
       this.severeOverLimitStreak = 0;
+      this.severeStreakReadings = [];
       this.headroomStreak = 0;
     }
   }
@@ -1446,6 +1581,7 @@ export class AcLeveler {
       raiseHoldRemainingMs: Math.max(0, (this.raiseHold?.until ?? 0) - Date.now()),
       expectedAmps: this.expected?.amps ?? null,
       lastPrediction: this.lastPrediction,
+      lastEmergency: this.lastEmergency,
       acs: ctx.map(({ device, managed, needTier, needDelta, slotGenCap }) => {
         const maxLevel = device.maxGeneratorLevel || 3;
         const boost = this.config.levelBoosts[device.id];
@@ -1509,6 +1645,7 @@ export class AcLeveler {
       raiseHoldRemainingMs: Math.max(0, (this.raiseHold?.until ?? 0) - Date.now()),
       expectedAmps: this.expected?.amps ?? null,
       lastPrediction: this.lastPrediction,
+      lastEmergency: this.lastEmergency,
       acs: [],
     };
   }

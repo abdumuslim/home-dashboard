@@ -637,3 +637,178 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
     projectedAmps,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Emergency reduction — the severe over-limit fast path (2026-06-12).
+//
+// computeAllocation sizes reductions from the MODEL (budget = limit − margin −
+// nonAcLoad, where nonAcLoad itself is measured − Σ estimates): when an amp
+// model under-credits an AC, the allocator can conclude ideal == current and
+// ship NOTHING while the meter reads 1A+ over (live: the 31A grid incident —
+// the breaker tripped). This path sizes the cut from the METER instead: the
+// caller derives requiredSavingsAmps from the actual severe readings and the
+// greedy below builds the SMALLEST cut set whose estimated savings cover it —
+// calculated, not extreme (user: no over-reduction that lands far under the
+// limit and then re-raises until stable).
+
+/**
+ * Heuristic amps saved by one fan-to-1 drop. Fans are small consumers (live
+ * observations ≈ 0.5A); used for emergency batch accounting only — level cuts
+ * use the calibrated amp models.
+ */
+export const FAN_REDUCE_SAVINGS_AMPS = 0.5;
+/**
+ * Window after an emergency batch during which a NEW severe streak is
+ * discounted by that batch's in-flight estimated savings — compressors take
+ * seconds to respond, and cutting again before the meter reflects the first
+ * batch would stack cuts (the over-reduction the user explicitly rejected).
+ * Same physics as the post-command nonAcLoad freeze.
+ */
+export const EMERGENCY_PENDING_MS = NON_AC_FREEZE_MS;
+
+export interface EmergencyInput {
+  limitAmps: number;
+  marginAmps: number;
+  /** For status parity only — the cut is sized by requiredSavingsAmps, not the budget. */
+  nonAcLoadAmps: number;
+  /** Meter-derived savings target: overshoot of the severe readings + margin. */
+  requiredSavingsAmps: number;
+  /** Pre-sorted by priority, highest first (same as AllocatorInput). */
+  acs: LevelerAcSnapshot[];
+  ampModels: Record<string, AcAmpModel>;
+}
+
+export interface EmergencyReductionResult extends AllocationResult {
+  requiredSavingsAmps: number;
+  /** Σ estimated savings of the planned cuts (amp-model steps + fan heuristic). */
+  estimatedSavingsAmps: number;
+  /** False when everything reducible was cut and the target still isn't covered. */
+  satisfied: boolean;
+}
+
+/**
+ * One decisive, meter-sized cut batch: level drops toward floors (least-needy
+ * room fully first, top-priority AC last — the allocator's shed-order
+ * semantics), then fan drops in the SAME batch; a power-off shed happens ONLY
+ * when there is nothing left to cut (user decision 2026-06-12: a shed always
+ * waits for its own fresh severe streak after a cut batch). Floors stay hard;
+ * never level 0; reachable/slot/manual caps honored; never raises anything.
+ */
+export function computeEmergencyReduction(input: EmergencyInput): EmergencyReductionResult {
+  const { limitAmps, marginAmps, nonAcLoadAmps, requiredSavingsAmps, acs, ampModels } = input;
+  const model = (id: string): AcAmpModel => ampModels[id] ?? DEFAULT_AMP_MODEL;
+  const draw = (ac: LevelerAcSnapshot, level: number): number =>
+    estimateAcDraw(level, ac.maxLevel, model(ac.deviceId));
+
+  const onUnmanaged = acs.filter((a) => a.on && !a.managed);
+  const candidates = acs.filter((a) => a.on && a.managed && !a.shed);
+  // Least-needy room first; priority breaks delta ties (lower priority cuts
+  // first); the top-priority AC is protected and cuts dead last.
+  const [top, ...rest] = candidates;
+  const order = [
+    ...rest.slice().sort((a, b) =>
+      a.needDelta - b.needDelta || candidates.indexOf(b) - candidates.indexOf(a)),
+    ...(top ? [top] : []),
+  ];
+
+  // Highest level the device may be COMMANDED to — the never-level-0 re-entry
+  // point. reachableCap (physics) and the hard user/slot caps clamp it; never
+  // below the floor.
+  const ceilCap = (ac: LevelerAcSnapshot): number => Math.max(
+    floorOf(ac),
+    Math.min(
+      ac.maxLevel,
+      ac.reachableCap ?? ac.maxLevel,
+      ac.slotCap ?? ac.maxLevel,
+      ac.manualCap ?? ac.maxLevel,
+    ),
+  );
+
+  const planned = new Map(candidates.map((a) => [a.deviceId, a.currentLevel]));
+  let saved = 0;
+
+  // Never-level-0 pre-pass: an unrestricted managed AC gets a cap regardless
+  // of the savings target (hard rule) — the SMALLEST cut that satisfies it
+  // (its top commandable level), so the invariant alone can't over-reduce.
+  for (const ac of order) {
+    if ((planned.get(ac.deviceId) ?? 1) <= 0) {
+      const to = ceilCap(ac);
+      saved += draw(ac, 0) - draw(ac, to);
+      planned.set(ac.deviceId, to);
+    }
+  }
+
+  const fanReducible = order.filter((a) =>
+    !a.fanExempt && a.fanSpeed != null && (a.fanSpeed === 0 || a.fanSpeed > 1));
+
+  // Phase 1 — level cuts toward floors. Stops at the smallest sufficient cut
+  // set; a remainder a single fan drop can cover is handed to the cheaper fan
+  // phase instead of burning another 1–2A level step (best-fit final step —
+  // bounds the typical over-cut to ~FAN_REDUCE_SAVINGS_AMPS).
+  outer: for (const ac of order) {
+    const floor = floorOf(ac);
+    for (;;) {
+      if (saved >= requiredSavingsAmps) break outer;
+      if (requiredSavingsAmps - saved <= FAN_REDUCE_SAVINGS_AMPS && fanReducible.length > 0) break outer;
+      const cur = planned.get(ac.deviceId)!;
+      if (cur <= floor) break;
+      planned.set(ac.deviceId, cur - 1);
+      saved += draw(ac, cur) - draw(ac, cur - 1);
+    }
+  }
+
+  // Phase 2 — fan drops in the SAME batch (no separate staged attempt; each
+  // ≈ FAN_REDUCE_SAVINGS_AMPS). Only as many as the remainder needs.
+  const toFanReduce: string[] = [];
+  for (const ac of fanReducible) {
+    if (saved >= requiredSavingsAmps) break;
+    toFanReduce.push(ac.deviceId);
+    saved += FAN_REDUCE_SAVINGS_AMPS;
+  }
+
+  const desiredLevels: Record<string, number> = {};
+  for (const ac of candidates) {
+    const to = planned.get(ac.deviceId)!;
+    if (to !== ac.currentLevel) desiredLevels[ac.deviceId] = to;
+  }
+
+  // Phase 3 — shed, ONLY when there was nothing left to cut: every candidate
+  // already at its floor with no reducible fan, and the meter still demands
+  // savings. Least-needy first, top-priority AC last resort, multiple if one
+  // doesn't cover it. A shed AC ships no level/fan commands.
+  const toShed: string[] = [];
+  if (
+    saved < requiredSavingsAmps &&
+    Object.keys(desiredLevels).length === 0 &&
+    toFanReduce.length === 0
+  ) {
+    for (const ac of order) {
+      if (saved >= requiredSavingsAmps) break;
+      saved += draw(ac, planned.get(ac.deviceId)!);
+      planned.delete(ac.deviceId);
+      toShed.push(ac.deviceId);
+    }
+  }
+
+  const unmanagedDraw = onUnmanaged.reduce((sum, a) => sum + draw(a, a.currentLevel), 0);
+  const budgetAmps = limitAmps - marginAmps - nonAcLoadAmps - unmanagedDraw;
+  const plannedDraw = candidates.reduce((sum, a) => {
+    const level = planned.get(a.deviceId);
+    return level == null ? sum : sum + draw(a, level);
+  }, 0);
+
+  return {
+    desiredLevels,
+    toShed,
+    toRestore: [],
+    toFanReduce,
+    toFanRaise: null,
+    idealLevels: Object.fromEntries(planned),
+    nonAcLoadAmps,
+    budgetAmps,
+    projectedAmps: nonAcLoadAmps + unmanagedDraw + plannedDraw,
+    requiredSavingsAmps,
+    estimatedSavingsAmps: saved,
+    satisfied: saved >= requiredSavingsAmps,
+  };
+}

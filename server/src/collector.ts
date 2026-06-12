@@ -398,6 +398,14 @@ export class Collector {
       },
       isManualOffLocked: (deviceId) => this.isAcManualOffLocked(deviceId),
       onLevelerFanCommand: (deviceId, fan) => this.refreshAcFanBaseline(deviceId, fan),
+      // Emergency trigger confirmed (severe streak / grid oscillation): run a
+      // leveling check NOW — waiting up to 5s for the loop tick costs seconds
+      // we don't have before the breaker trips. Errors are logged, never thrown
+      // into the ESP ingest path that fired this.
+      onUrgentLevelingNeeded: () => {
+        void this.runLevelingCheck().catch((err) =>
+          log.error("[collector] Urgent AC leveling check failed:", err));
+      },
     });
     this.acCalibrator = new AcCalibrator(pool, {
       getTclCloud: () => this.tclCloud,
@@ -528,7 +536,7 @@ export class Collector {
     }
 
     try {
-      await this.checkAcLeveling();
+      await this.runLevelingCheck();
     } catch (err) {
       log.error("[collector] AC leveling check failed:", err);
     }
@@ -1586,6 +1594,37 @@ export class Collector {
       delta: device.currentTemp - target,
       slotGenCap: null,
     };
+  }
+
+  /** In-flight leveling check — urgent and loop ticks share one mutual-exclusion point. */
+  private levelingCheckPromise: Promise<void> | null = null;
+  /** A request arrived mid-check — run one more pass when the current one finishes. */
+  private levelingCheckQueued = false;
+
+  /**
+   * Serialized wrapper around checkAcLeveling(): the loop tick and the
+   * urgent-trigger path (AcLeveler.onUrgentLevelingNeeded, fired per ESP
+   * reading during an emergency) both land here, so two passes can never
+   * interleave their awaits and double-send commands. A request that arrives
+   * mid-pass coalesces into exactly one follow-up pass, and every caller's
+   * await resolves only once that follow-up has run too.
+   */
+  private runLevelingCheck(): Promise<void> {
+    if (this.levelingCheckPromise) {
+      this.levelingCheckQueued = true;
+      return this.levelingCheckPromise;
+    }
+    this.levelingCheckPromise = (async () => {
+      try {
+        do {
+          this.levelingCheckQueued = false;
+          await this.checkAcLeveling();
+        } while (this.levelingCheckQueued);
+      } finally {
+        this.levelingCheckPromise = null;
+      }
+    })();
+    return this.levelingCheckPromise;
   }
 
   private async checkAcLeveling(): Promise<void> {
