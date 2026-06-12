@@ -7,7 +7,7 @@
 // automations, AC timers, and fan enforcement — and restores every AC to its
 // pre-run state on completion or abort.
 import pg from "pg";
-import { determineSource, type PowerSource } from "./ac-leveling.js";
+import { determineSource, STALE_POWER_MS, type PowerSource } from "./ac-leveling.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import { childLogger } from "./logger.js";
 
@@ -33,6 +33,14 @@ export const CAL_RAMP_FLOOR_MS = 90_000;
 export const CAL_RAMP_MAX_MS = 360_000;
 /** Settle after powering ACs off before the all-off baseline is sampled (fixed — quick). */
 export const CAL_OFF_SETTLE_MS = 10_000;
+/**
+ * Feed-gap grace: the ESP routinely goes silent for 1.5–3 min several times a
+ * day (2026-06-12: two grid runs died "power_lost" to 50–170s hiccups while
+ * the grid was fine). A run PAUSES through gaps up to this long — commanding
+ * or sampling blind is worse than waiting — and aborts only past the grace.
+ * Real blackouts silence the ESP far longer, so they still abort.
+ */
+export const CAL_POWER_GRACE_MS = 180_000;
 /** Consecutive settle-phase readings within the band that define a plateau (early release). */
 export const CAL_STABLE_READINGS = 4;
 /**
@@ -117,6 +125,8 @@ export interface AcCalibrationStatus {
   startedAt: number | null;
   finishedAt: number | null;
   abortReason: string | null;
+  /** Seconds since the last ESP reading while the run is paused on a feed gap; null when the feed is healthy. */
+  powerGapSeconds: number | null;
 }
 
 export interface AcCalibratorDeps {
@@ -239,6 +249,8 @@ export class AcCalibrator {
   private finishedAt: number | null = null;
   private abortReason: string | null = null;
   private abortRequested: string | null = null;
+  // Nonzero while the run is paused on an ESP feed gap (value = gap start).
+  private powerGapSince = 0;
   // Power reading state (fed from the collector, like the leveler)
   private lastReading: { current_1: number; current_2: number; voltage: number } | null = null;
   private lastReadingAt = 0;
@@ -331,6 +343,7 @@ export class AcCalibrator {
     this.finishedAt = null;
     this.abortReason = null;
     this.abortRequested = null;
+    this.powerGapSince = 0;
     log.info(`[calibration] Started on ${source} for [${queue.map((id) => this.deviceNames.get(id) ?? id).join(", ")}] (fan sweep: ${includeFan})`);
     return { ok: true };
   }
@@ -347,10 +360,42 @@ export class AcCalibrator {
       await this.abort("tcl_unavailable");
       return;
     }
-    const liveSource = determineSource(this.lastReading, Date.now() - this.lastReadingAt);
+    const staleMs = Date.now() - this.lastReadingAt;
+    if (staleMs > STALE_POWER_MS) {
+      // ESP feed gap — pause (no commands, no phase progress) up to the grace.
+      if (staleMs > CAL_POWER_GRACE_MS) {
+        await this.abort("power_lost");
+        return;
+      }
+      if (this.powerGapSince === 0) {
+        this.powerGapSince = this.lastReadingAt;
+        log.warn(
+          `[calibration] Power feed silent for ${Math.round(staleMs / 1000)}s — pausing run ` +
+          `(aborts after ${Math.round(CAL_POWER_GRACE_MS / 1000)}s without readings)`,
+        );
+      }
+      return;
+    }
+    const liveSource = determineSource(this.lastReading, staleMs);
     if (liveSource !== this.source) {
       await this.abort(liveSource === "none" ? "power_lost" : "source_changed");
       return;
+    }
+    if (this.powerGapSince > 0) {
+      log.info(
+        `[calibration] Power feed back after ~${Math.round((Date.now() - this.powerGapSince) / 1000)}s ` +
+        `on ${liveSource} — resuming (current step re-settles)`,
+      );
+      this.powerGapSince = 0;
+      // The compressor state may have shifted during the blind window — never
+      // mix pre-gap and post-gap draw in one measurement.
+      this.samples = [];
+      this.firstSampleAt = 0;
+      if ((this.phase === "ramp" || this.phase === "sample") && Date.now() >= this.settleUntil) {
+        this.armSettle(this.settleFloorMs());
+      }
+      // Don't let the confirm flow give_up off a timer that aged while blind.
+      if (this.pendingConfirm) this.pendingConfirm.sentAt = Date.now();
     }
 
     // Confirm-or-resend: while a step command is unconfirmed, refresh the
@@ -647,6 +692,7 @@ export class AcCalibrator {
     this.abortReason = reason;
     this.abortRequested = null;
     this.pendingConfirm = null;
+    this.powerGapSince = 0;
     if (reason) {
       log.warn(`[calibration] Aborted (${reason}) after ${this.stepsDone}/${this.totalSteps} steps — partial results kept`);
     } else {
@@ -674,6 +720,7 @@ export class AcCalibrator {
 
   getStatus(): AcCalibrationStatus {
     const currentDevice = this.active ? this.queue[this.queueIndex] ?? null : null;
+    const staleMs = Date.now() - this.lastReadingAt;
     return {
       active: this.active,
       source: this.active ? this.source : null,
@@ -691,6 +738,10 @@ export class AcCalibrator {
       startedAt: this.startedAt,
       finishedAt: this.finishedAt,
       abortReason: this.abortReason,
+      powerGapSeconds:
+        this.active && this.lastReadingAt > 0 && staleMs > STALE_POWER_MS
+          ? Math.round(staleMs / 1000)
+          : null,
     };
   }
 

@@ -15,6 +15,7 @@ import {
   CAL_RAMP_FLOOR_MS,
   CAL_RAMP_MAX_MS,
   CAL_STABLE_READINGS,
+  CAL_POWER_GRACE_MS,
 } from "./ac-calibration.js";
 
 describe("buildCalibrationSteps", () => {
@@ -561,5 +562,101 @@ describe("AcCalibrator state machine", () => {
     expect(results.filter((r) => r.deviceId === "ac2" && r.kind === "level")).toHaveLength(6);
     // …but the fit learns only from L3–L6 (flat ~4.0–4.45A → not 0.7+0.9/level).
     expect(suggestedFit.ac2.gen).toEqual({ baseAmps: 3.7, stepAmps: 0.1 });
+  });
+
+  // ---------- Power feed gaps (2026-06-12 — grid runs killed by ESP hiccups) ----------
+
+  it("pauses through a short feed gap and re-settles the interrupted step on resume", async () => {
+    const { cal, rows } = createCalibrator();
+    feedGen(cal, 9, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
+    feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
+    await cal.tick(); // ac1 on → ramp
+    vi.advanceTimersByTime(CAL_RAMP_FLOOR_MS + 1000);
+    feedGenSpread(cal, 5, CAL_STABLE_READINGS);
+    await cal.tick(); // early release into sampling
+    expect(cal.getStatus().phase).toBe("sample");
+    feedGenSpread(cal, 5, 3); // a few pre-gap samples
+    expect(cal.getStatus().samplesCollected).toBe(3);
+
+    // ESP goes silent for 60s — well past STALE_POWER_MS, inside the grace.
+    vi.advanceTimersByTime(60_000);
+    await cal.tick();
+    expect(cal.isActive()).toBe(true);
+    expect(cal.getStatus().abortReason).toBeNull();
+    expect(cal.getStatus().powerGapSeconds).toBeGreaterThanOrEqual(60);
+
+    // Feed returns on the SAME source → resume: pre-gap samples are discarded
+    // (compressor state may have shifted while blind) and the step re-settles.
+    feedGen(cal, 5, 1);
+    await cal.tick();
+    expect(cal.isActive()).toBe(true);
+    expect(cal.getStatus().powerGapSeconds).toBeNull();
+    expect(cal.getStatus().samplesCollected).toBe(0);
+
+    // Fresh settle floor passes, then sampling completes from post-gap draw.
+    feedGenSpread(cal, 5, 5); // spans the re-armed 20s floor, keeps the source alive
+    await cal.tick();
+    feedGenSpread(cal, 5, CAL_SAMPLES_GEN);
+    await cal.tick();
+    expect(rows.get("ac1:gen:level:1")).toMatchObject({ amps: 3 });
+  });
+
+  it("aborts power_lost only once the gap outlasts the grace, restoring ACs and keeping partials", async () => {
+    const { cal, tcl, rows } = createCalibrator();
+    feedGen(cal, 9, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(CAL_OFF_SETTLE_MS + 1000);
+    feedGen(cal, 2, CAL_BASELINE_SAMPLES_GEN);
+    await cal.tick(); // ac1 on → ramp
+    await settleStep(cal, CAL_RAMP_FLOOR_MS, 5, CAL_SAMPLES_GEN); // L1 recorded
+    expect(rows.get("ac1:gen:level:1")).toBeDefined();
+
+    // Inside the grace: paused, still active.
+    vi.advanceTimersByTime(CAL_POWER_GRACE_MS - 10_000);
+    await cal.tick();
+    expect(cal.isActive()).toBe(true);
+
+    // Past the grace: real outage — abort, restore, partial results kept.
+    vi.advanceTimersByTime(20_000);
+    await cal.tick();
+    expect(cal.isActive()).toBe(false);
+    expect(cal.getStatus().abortReason).toBe("power_lost");
+    expect(tcl.executeAcAction).toHaveBeenCalledWith("ac1", { power: 1, generator_mode: 2, fan_speed: 4 });
+    expect(rows.get("ac1:gen:level:1")).toBeDefined();
+  });
+
+  it("aborts source_changed when the feed resumes on a different source", async () => {
+    const { cal } = createCalibrator();
+    feedGen(cal, 9, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(30_000);
+    await cal.tick(); // paused — not aborted
+    expect(cal.isActive()).toBe(true);
+
+    cal.onPowerReading({ current_1: 9, current_2: 0, voltage: 220 }); // back on GRID
+    await cal.tick();
+    expect(cal.isActive()).toBe(false);
+    expect(cal.getStatus().abortReason).toBe("source_changed");
+  });
+
+  it("honors a user abort while paused on a feed gap", async () => {
+    const { cal, tcl } = createCalibrator();
+    feedGen(cal, 9, 1);
+    await cal.start(["ac1"], false);
+    await cal.tick(); // prep
+    vi.advanceTimersByTime(30_000);
+    await cal.tick(); // paused
+    expect(cal.isActive()).toBe(true);
+
+    cal.requestAbort("user_control");
+    await cal.tick();
+    expect(cal.isActive()).toBe(false);
+    expect(cal.getStatus().abortReason).toBe("user_control");
+    expect(tcl.executeAcAction).toHaveBeenCalledWith("ac2", { power: 1, generator_mode: 3, fan_speed: 0 });
   });
 });

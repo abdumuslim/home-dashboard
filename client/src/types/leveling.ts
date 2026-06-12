@@ -115,6 +115,8 @@ export interface AcCalibrationStatus {
   startedAt: number | null;
   finishedAt: number | null;
   abortReason: string | null;
+  /** Seconds since the last ESP reading while the run is paused on a feed gap; null when healthy. */
+  powerGapSeconds: number | null;
 }
 
 export interface CalibrationResultRow {

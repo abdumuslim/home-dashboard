@@ -141,6 +141,11 @@ export function AcCalibrationPanel({ active, acDevices, source, onApplyFit }: Ac
             {phaseLabel(status)}
             {status.phase === "sample" && ` · sample ${status.samplesCollected}/${status.samplesNeeded}`}
           </div>
+          {status.powerGapSeconds != null && (
+            <div className="text-[0.65rem] text-amber-400">
+              Power feed lost {status.powerGapSeconds}s ago — run paused (aborts at 3 min)
+            </div>
+          )}
           <div className="h-1 rounded-full bg-white/10 overflow-hidden">
             <div
               className="h-full bg-cyan transition-all"
