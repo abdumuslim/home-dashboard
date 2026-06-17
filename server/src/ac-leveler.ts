@@ -165,7 +165,7 @@ export class AcLeveler {
   /**
    * Over-limit leaky bucket (replaces the old consecutive mild/severe streaks +
    * the grid-only oscillation gate, 2026-06-17). Each over-limit reading drains
-   * points (a reading > limit + OVER_LIMIT_SEVERE_AMPS drains 2, within that
+   * points (a reading > limit + OVER_LIMIT_SEVERE_AMPS drains 3, within that
    * drains 1); the controller acts when the bucket empties (≤ 0). Sustained
    * genuine headroom (a full RAISE_STREAK of readings ≤ limit − margin) refills
    * it to full and ends the episode. Refill is deliberately EPISODE-based, NOT
@@ -616,7 +616,7 @@ export class AcLeveler {
 
     if (measured > limit) {
       // Over the limit → drain the bucket. Magnitude-weighted (user's rule):
-      // more than OVER_LIMIT_SEVERE_AMPS over costs 2 points, within it costs 1.
+      // more than OVER_LIMIT_SEVERE_AMPS over costs 3 points, within it costs 1.
       this.headroomStreak = 0;
       const drain = measured - limit > OVER_LIMIT_SEVERE_AMPS ? OVER_LIMIT_DRAIN_SEVERE : OVER_LIMIT_DRAIN_MILD;
       this.overLimitBudget = Math.max(0, this.overLimitBudget - drain);

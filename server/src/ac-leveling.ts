@@ -205,13 +205,14 @@ export const OVER_LIMIT_SEVERE_AMPS = 1;
  * I²t-style trip that tolerates brief fluctuation around the limit but accumulates
  * a sustained or oscillating overload (replacing the consecutive streaks that
  * reset on any single dip). User's rule: a reading > limit + OVER_LIMIT_SEVERE_AMPS
- * costs 2 points, within that costs 1; 4 points = act. No instant-act tier — a
- * single turn-on inrush spike drains ≤2 of 4 and refills on sustained calm, so it
- * can't false-trigger.
+ * costs 3 points, within that costs 1; 5 points = act. No instant-act tier — a
+ * single turn-on inrush spike drains ≤3 of 5 and refills on sustained calm, so it
+ * can't false-trigger. Severe drain (3) is sized so 2 severe readings (6 ≥ 5)
+ * still trip the fast path while mild overloads tolerate 5 readings.
  */
-export const OVER_LIMIT_BUDGET = 4;
+export const OVER_LIMIT_BUDGET = 5;
 /** Points drained by a reading more than OVER_LIMIT_SEVERE_AMPS over the limit. */
-export const OVER_LIMIT_DRAIN_SEVERE = 2;
+export const OVER_LIMIT_DRAIN_SEVERE = 3;
 /** Points drained by a reading within OVER_LIMIT_SEVERE_AMPS over the limit. */
 export const OVER_LIMIT_DRAIN_MILD = 1;
 /** Readings with headroom required before raising a level. */

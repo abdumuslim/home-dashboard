@@ -744,8 +744,8 @@ describe("Smart AC leveling", () => {
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
-    // 16A = +1A over (mild → 1 point each). 4 readings empty the 4-point bucket;
-    // the 5th confirms. All-mild empty → the allocator reduce path acts.
+    // 16A = +1A over (mild → 1 point each). 5 readings empty the 5-point bucket.
+    // All-mild empty → the allocator reduce path acts.
     for (let i = 0; i < 5; i++) {
       collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: 0, current_2: 16, power_1: 0, power_2: 3520 });
     }
@@ -757,7 +757,7 @@ describe("Smart AC leveling", () => {
     expect(locks.size).toBe(0); // shed is not a manual-off lock
   });
 
-  it("waits for the over-limit bucket to drain (4 mild readings) before reacting", async () => {
+  it("waits for the over-limit bucket to drain (5 mild readings) before reacting", async () => {
     const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
@@ -774,14 +774,14 @@ describe("Smart AC leveling", () => {
     await checkAcLeveling(collector);
     expect(actions).toEqual([]);
 
-    // 15.5A is only 0.5A over the 15A limit (mild → 1 point each). 3 readings
+    // 15.5A is only 0.5A over the 15A limit (mild → 1 point each). 4 readings
     // leave 1 point in the bucket — not yet empty.
-    overLimitReadings(collector, 3);
+    overLimitReadings(collector, 4);
     await checkAcLeveling(collector);
     expect(actions).toEqual([]);
     expect(shed.has("ac2")).toBe(false);
 
-    // The 4th mild reading empties the bucket → act (all at floors → shed ac2).
+    // The 5th mild reading empties the bucket → act (all at floors → shed ac2).
     overLimitReadings(collector, 1);
     await checkAcLeveling(collector);
     expect(actions).toEqual([{ deviceId: "ac2", action: { power: 0 } }]);
@@ -2684,7 +2684,7 @@ describe("Smart AC leveling — fan reduction before shed", () => {
     overLimitReadings(collector, 5);
     await checkAcLeveling(collector); // fan reduce + bucket refill
 
-    overLimitReadings(collector, 3);
+    overLimitReadings(collector, 4);
     await checkAcLeveling(collector);
     expect(actions).toEqual([]); // bucket not yet re-emptied (1 point left)
 
@@ -2950,9 +2950,9 @@ describe("Smart AC leveling — emergency reduction fast path", () => {
     await primeGen(collector);
     expect(actions).toEqual([]);
 
-    // 17A = +2A over (severe → 2 points each), so the 2nd reading empties the
-    // 4-point bucket and fires the urgent dep; NO explicit leveling tick happens
-    // here — only the microtask queue drains.
+    // 17A = +2A over (severe → 3 points each), so the 2nd reading empties the
+    // 5-point bucket (6 ≥ 5) and fires the urgent dep; NO explicit leveling tick
+    // happens here — only the microtask queue drains.
     genReadings(collector, 17, 2);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -2985,8 +2985,8 @@ describe("Smart AC leveling — emergency reduction fast path", () => {
     // so no streak gate could fire while the breaker heated on the duty cycle.
     // The leaky bucket accumulates instead: each 31A (+1A → 1 point) drains it,
     // the 29A dips don't refill (episode refill needs a full sustained-calm
-    // streak), so 4 over-limit readings empty the 4-point bucket → it acts.
-    for (const amps of [31, 29, 31, 29, 31, 29, 31]) {
+    // streak), so 5 over-limit readings empty the 5-point bucket → it acts.
+    for (const amps of [31, 29, 31, 29, 31, 29, 31, 29, 31]) {
       gridReadings(collector, amps, 1);
     }
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3011,7 +3011,7 @@ describe("Smart AC leveling — emergency reduction fast path", () => {
     // 14↔16 around the 15A gen limit — the user deliberately rides near the gen
     // breaker. The bucket works on BOTH sources now (no grid-only gate), but
     // tolerates this fluctuation: only 3 mild (+1A → 1 point) over-readings here
-    // leave 1 point in the 4-point bucket, so it does NOT act on noise.
+    // leave 2 points in the 5-point bucket, so it does NOT act on noise.
     for (const amps of [16, 14, 16, 14, 16]) {
       genReadings(collector, amps, 1);
     }
@@ -3034,7 +3034,7 @@ describe("Smart AC leveling — emergency reduction fast path", () => {
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
     await primeGen(collector);
 
-    // One 18A spike (severe → 2 points) leaves 2 of 4 in the bucket — NOT empty,
+    // One 18A spike (severe → 3 points) leaves 2 of 5 in the bucket — NOT empty,
     // so it does not act (tolerates a turn-on inrush / momentary surge).
     genReadings(collector, 18, 1);
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3046,7 +3046,7 @@ describe("Smart AC leveling — emergency reduction fast path", () => {
     // the episode is over, the momentary points forgiven.
     genReadings(collector, 4, 6);
     await checkAcLeveling(collector);
-    expect(collector.acLeveler.getStatus().overLimitBudget).toBe(4);
+    expect(collector.acLeveler.getStatus().overLimitBudget).toBe(5);
     expect(actions).toEqual([]);
   });
 
@@ -3149,7 +3149,7 @@ describe("Smart AC leveling — emergency reduction fast path", () => {
       await checkAcLeveling(collector);
       expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
       expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 1);
-      expect(collector.acLeveler.getStatus().overLimitBudget).toBe(4); // refilled after acting
+      expect(collector.acLeveler.getStatus().overLimitBudget).toBe(5); // refilled after acting
       expect(collector.acLeveler.getStatus().lastEmergency).toMatchObject({ requiredAmps: 4, savedAmps: 4 });
 
       // 8s later the meter still reads 18A — the compressor hasn't responded
