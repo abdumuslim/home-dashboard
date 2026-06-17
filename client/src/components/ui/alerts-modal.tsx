@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Fragment } from "react";
 import { createPortal } from "react-dom";
 import { X, Trash2, Pencil, Bell, BellOff, Plus, Loader2, Clock, Activity, Snowflake } from "lucide-react";
 import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
@@ -11,6 +11,7 @@ import { useAcDevices } from "@/hooks/use-ac-devices";
 import { useModalSections } from "@/hooks/use-modal-sections";
 import { CollapsibleModalSection } from "@/components/ui/collapsible-modal-section";
 import { AcLevelingSection } from "@/components/ui/ac-leveling-section";
+import { VERTICAL_SWING_OPTIONS, VerticalIcon } from "@/components/ui/swing-controls";
 import { ALERT_METRICS, PRAYER_NAMES, PRAYER_LABELS } from "@/constants/alert-metrics";
 import type { AlertCondition, PrayerTiming, AlertRule, MetricInfo } from "@/types/alerts";
 import type { PurifierDevice, AutomationRule, AutomationRangeSlot } from "@/types/automations";
@@ -1182,6 +1183,37 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, maxGenLevel, onChange }
                 >
                   L{l}
                 </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] text-dim shrink-0">Swing</span>
+              <button
+                onClick={() => updateSlot(slot.id, { vertical_swing: undefined })}
+                title="Use the preset profile's vertical swing"
+                className={cn(
+                  "px-1.5 py-0.5 rounded text-[10px] border transition-colors",
+                  slot.vertical_swing == null ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                )}
+              >
+                Preset
+              </button>
+              {VERTICAL_SWING_OPTIONS.map((o, i) => (
+                <Fragment key={o.value}>
+                  {o.type === "fix" && VERTICAL_SWING_OPTIONS[i - 1]?.type === "swing" && (
+                    <div className="w-px bg-white/10 self-stretch shrink-0" />
+                  )}
+                  <button
+                    onClick={() => updateSlot(slot.id, { vertical_swing: o.value })}
+                    title={`Vertical swing: ${o.label}`}
+                    className={cn(
+                      "flex-1 min-w-0 flex items-center justify-center py-0.5 rounded border transition-colors",
+                      slot.vertical_swing === o.value ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
+                    )}
+                  >
+                    <VerticalIcon value={o.value} />
+                  </button>
+                </Fragment>
               ))}
             </div>
           </div>

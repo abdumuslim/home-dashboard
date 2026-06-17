@@ -1030,6 +1030,8 @@ export class Collector {
       const clamped = this.clampSlotGenLevel(deviceId, slot.gen_level);
       if (clamped != null) profile.generator_mode = clamped;
     }
+    // 0 (Off) is a real value — overrides the preset's swing; absent falls through.
+    if (slot.vertical_swing != null) profile.vertical_swing = slot.vertical_swing;
     const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, deviceId));
     if (entry?.manual) {
       // Non-Najat fan 7 == turbo — enforcing turbo would clobber a manual fan choice
@@ -1235,10 +1237,13 @@ export class Collector {
             const slotGen = activeSlot.gen_level != null
               ? this.clampSlotGenLevel(unlockedDeviceIds[0], activeSlot.gen_level)
               : null;
+            // Slot vertical swing overrides the preset's (0 = Off is a real value).
+            const slotSwing = activeSlot.vertical_swing != null ? activeSlot.vertical_swing : null;
             const onAction = {
               ...(rule.action_on as AcAction),
               ...(fan != null ? { fan_speed: fan } : {}),
               ...(slotGen != null ? { generator_mode: slotGen } : {}),
+              ...(slotSwing != null ? { vertical_swing: slotSwing } : {}),
             };
             await this.executeAutomationAction(rule, onAction, unlockedDeviceIds);
             for (const did of unlockedDeviceIds) this.noteAcFanCommanded(rule, activeSlot, did, onAction as AcAction);

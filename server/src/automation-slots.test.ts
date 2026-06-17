@@ -123,6 +123,34 @@ describe("AC automation range slots", () => {
     expect((normalized?.[0] as unknown as Record<string, unknown>).unknown_field).toBeUndefined();
   });
 
+  it("accepts and preserves a valid per-slot vertical swing (0 = Off is a real value)", () => {
+    const result = validateRangeSlots([
+      slot({ id: "off", vertical_swing: 0 }),
+      slot({ id: "mid", start_time: "13:00", end_time: "15:00", vertical_swing: 11 }),
+      slot({ id: "preset", start_time: "16:00", end_time: "18:00" }),
+    ], metricBounds, () => null);
+
+    expect(result.ok).toBe(true);
+    expect(result.slots?.[0].vertical_swing).toBe(0);
+    expect(result.slots?.[1].vertical_swing).toBe(11);
+    expect(result.slots?.[2].vertical_swing).toBeUndefined();
+  });
+
+  it("rejects vertical swing values outside the valid set (4 is horizontal-only)", () => {
+    expect(validateRangeSlots([slot({ vertical_swing: 4 })], metricBounds, () => null).ok).toBe(false);
+    expect(validateRangeSlots([slot({ vertical_swing: 5 })], metricBounds, () => null).ok).toBe(false);
+    expect(validateRangeSlots([slot({ vertical_swing: 14 })], metricBounds, () => null).ok).toBe(false);
+    expect(validateRangeSlots([slot({ vertical_swing: 2.5 })], metricBounds, () => null).ok).toBe(false);
+  });
+
+  it("regression: normalizeRangeSlots whitelists vertical_swing including 0 (silently-dropped-field guard)", () => {
+    const normalized = normalizeRangeSlots([
+      { id: "s1", type: "all_day", threshold_low: 24, threshold: 26, vertical_swing: 0, unknown_field: 1 },
+    ]);
+    expect(normalized?.[0].vertical_swing).toBe(0);
+    expect((normalized?.[0] as unknown as Record<string, unknown>).unknown_field).toBeUndefined();
+  });
+
   it("validates slot count and threshold bounds", () => {
     expect(validateRangeSlots([], metricBounds, () => null).ok).toBe(false);
     expect(validateRangeSlots(

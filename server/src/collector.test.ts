@@ -2533,6 +2533,77 @@ describe("Per-range-slot generator level (gen_level)", () => {
   });
 });
 
+describe("Per-range-slot vertical swing (vertical_swing)", () => {
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T08:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function swingRule(swing: number | undefined, over: Record<string, unknown> = {}) {
+    return {
+      ...acRangeRule(),
+      smart_leveling: false,
+      range_slots: [
+        { id: "default", type: "all_day", threshold_low: 22, threshold: 26, ...(swing != null ? { vertical_swing: swing } : {}) },
+      ] satisfies AutomationRangeSlot[],
+      ...over,
+    };
+  }
+
+  async function reenforce(collector: Collector, rule: ReturnType<typeof swingRule>) {
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24); // dead zone of the 22–26 slot → adopt profile
+    await checkAcRangeAutomation(collector, rule);
+  }
+
+  it("applies the slot vertical swing, overriding the preset's", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    const rule = swingRule(11, {
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, vertical_swing: 1 },
+    });
+    await reenforce(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6, vertical_swing: 11 });
+  });
+
+  it("falls through to the preset's vertical swing when the slot has none", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    const rule = swingRule(undefined, {
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, vertical_swing: 1 },
+    });
+    await reenforce(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6, vertical_swing: 1 });
+  });
+
+  it("sends slot swing 0 (Off) — overrides the preset, not treated as absent", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    const rule = swingRule(0, {
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, vertical_swing: 11 },
+    });
+    await reenforce(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6, vertical_swing: 0 });
+  });
+
+  it("applies the slot vertical swing on turn-on", async () => {
+    const { collector, actions } = createCollector();
+    await setWeatherValue(collector, 27); // above the 26 high limit → turn ON
+    await checkAcRangeAutomation(collector, swingRule(2));
+
+    // Smart-auto fan: delta 27−22=5 → L7; slot pins vertical_swing 2.
+    expect(actions).toEqual([{ deviceId: "ac1", action: { power: 1, mode: 1, temperature: 23, fan_speed: 7, vertical_swing: 2 } }]);
+  });
+});
+
 describe("Smart AC leveling — calibration handoff (ramp re-arm)", () => {
   beforeEach(() => {
     acTimers.clear();

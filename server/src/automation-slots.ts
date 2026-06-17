@@ -4,6 +4,7 @@ import { MAX_GENERATOR_LEVEL } from "./tcl-cloud.js";
 const MINUTES_PER_DAY = 1440;
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const VALID_PRAYERS = new Set(["fajr", "dhuhr", "asr", "maghrib", "isha"]);
+const VALID_VERTICAL_SWING = new Set([0, 1, 2, 3, 9, 10, 11, 12, 13]);
 
 const BAGHDAD_COORDS = new Coordinates(33.321502, 44.358335);
 const PRAYER_PARAMS = CalculationMethod.Dubai();
@@ -38,6 +39,13 @@ export interface AutomationRangeSlot {
    * directly as the profile's generator_mode, overriding the preset's.
    */
   gen_level?: number;
+  /**
+   * Vertical swing while this slot is active (TCL vertical encoding:
+   * 0=Off, 1=Full, 2=Up, 3=Down, 9=Top, 10=Upper, 11=Mid, 12=Lower,
+   * 13=Bottom); absent = preset profile's vertical_swing. Unlike gen_level,
+   * 0 is a VALID stored value (swing mode), not "Auto".
+   */
+  vertical_swing?: number;
 }
 
 interface ResolvedWindow {
@@ -110,6 +118,7 @@ export function normalizeRangeSlots(value: unknown): AutomationRangeSlot[] | nul
       threshold: typeof item.threshold === "number" ? item.threshold : Number.NaN,
       ...(typeof item.fan_speed === "number" ? { fan_speed: item.fan_speed } : {}),
       ...(typeof item.gen_level === "number" ? { gen_level: item.gen_level } : {}),
+      ...(typeof item.vertical_swing === "number" ? { vertical_swing: item.vertical_swing } : {}),
     };
   });
 }
@@ -192,6 +201,10 @@ export function validateRangeSlots(
     // unrestricted in the TCL protocol, a footgun for a cap.
     if (slot.gen_level != null && (!Number.isInteger(slot.gen_level) || slot.gen_level < 1 || slot.gen_level > MAX_GENERATOR_LEVEL)) {
       return { ok: false, error: `${label}: generator level must be an integer 1–${MAX_GENERATOR_LEVEL}` };
+    }
+    // Unlike gen_level, 0 (Off) is a valid swing value — absent = preset's swing.
+    if (slot.vertical_swing != null && !VALID_VERTICAL_SWING.has(slot.vertical_swing)) {
+      return { ok: false, error: `${label}: vertical swing must be one of 0,1,2,3,9–13` };
     }
 
     if (slot.type === "all_day") {

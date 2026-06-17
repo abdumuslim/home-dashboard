@@ -40,6 +40,8 @@ export interface AutomationRangeSlot {
   fan_speed?: number;
   /** Generator-level hard cap while the slot is active (1–3); absent = Auto (Smart Leveling decides). */
   gen_level?: number;
+  /** Vertical swing (0=Off,1=Full,2=Up,3=Down,9=Top..13=Bottom); absent = preset profile's swing. */
+  vertical_swing?: number;
 }
 
 export interface AutomationRule {

@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
-import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, ChevronsUpDown, ChevronsLeftRight, ChevronLeft, ChevronRight, Minus, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent, Save, Check, Timer, TimerOff, Volume2, EarOff, Lock } from "lucide-react";
+import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent, Save, Check, Timer, TimerOff, Volume2, EarOff, Lock } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AcDevice } from "@/types/ac";
+import { VERTICAL_SWING_OPTIONS, HORIZONTAL_SWING_OPTIONS, VerticalIcon, HorizontalIcon } from "@/components/ui/swing-controls";
 
 const MODE_LABELS: Record<number, { label: string; icon: typeof Snowflake }> = {
   0: { label: "Auto", icon: Gauge },
@@ -769,70 +770,6 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
 
 // ---------- Swing Selector ----------
 
-const VERTICAL_OPTIONS: { value: number; label: string; type: "swing" | "fix" }[] = [
-  { value: 0, label: "Off", type: "swing" },
-  { value: 1, label: "Full", type: "swing" },
-  { value: 2, label: "Up", type: "swing" },
-  { value: 3, label: "Down", type: "swing" },
-  { value: 9, label: "Top", type: "fix" },
-  { value: 10, label: "Upper", type: "fix" },
-  { value: 11, label: "Mid", type: "fix" },
-  { value: 12, label: "Lower", type: "fix" },
-  { value: 13, label: "Bottom", type: "fix" },
-];
-
-const HORIZONTAL_OPTIONS: { value: number; label: string; type: "swing" | "fix" }[] = [
-  { value: 0, label: "Off", type: "swing" },
-  { value: 1, label: "Full", type: "swing" },
-  { value: 2, label: "Left", type: "swing" },
-  { value: 3, label: "Mid", type: "swing" },
-  { value: 4, label: "Right", type: "swing" },
-  { value: 9, label: "L", type: "fix" },
-  { value: 10, label: "CL", type: "fix" },
-  { value: 11, label: "M", type: "fix" },
-  { value: 12, label: "CR", type: "fix" },
-  { value: 13, label: "R", type: "fix" },
-];
-
-function VerticalIcon({ value }: { value: number }) {
-  switch (value) {
-    case 0: return <X className="w-3.5 h-3.5" />;
-    case 1: return <ChevronsUpDown className="w-3.5 h-3.5" />;
-    case 2: return <ChevronUp className="w-3.5 h-3.5" />;
-    case 3: return <ChevronDown className="w-3.5 h-3.5" />;
-    default: return <FixedPositionDot axis="vertical" position={value} />;
-  }
-}
-
-function HorizontalIcon({ value }: { value: number }) {
-  switch (value) {
-    case 0: return <X className="w-3.5 h-3.5" />;
-    case 1: return <ChevronsLeftRight className="w-3.5 h-3.5" />;
-    case 2: return <ChevronLeft className="w-3.5 h-3.5" />;
-    case 3: return <Minus className="w-3.5 h-3.5" />;
-    case 4: return <ChevronRight className="w-3.5 h-3.5" />;
-    default: return <FixedPositionDot axis="horizontal" position={value} />;
-  }
-}
-
-function FixedPositionDot({ axis, position }: { axis: "vertical" | "horizontal"; position: number }) {
-  const idx = position - 9; // 0-4
-  if (axis === "vertical") {
-    return (
-      <svg width="14" height="14" viewBox="0 0 14 14">
-        <line x1="7" y1="1" x2="7" y2="13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity={0.3} />
-        <circle cx="7" cy={1 + idx * 3} r="2" fill="currentColor" />
-      </svg>
-    );
-  }
-  return (
-    <svg width="14" height="14" viewBox="0 0 14 14">
-      <line x1="1" y1="7" x2="13" y2="7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity={0.3} />
-      <circle cx={1 + idx * 3} cy="7" r="2" fill="currentColor" />
-    </svg>
-  );
-}
-
 function SwingSelector({ label, value, onChange, axis, colors }: {
   label: string;
   value: number;
@@ -840,7 +777,7 @@ function SwingSelector({ label, value, onChange, axis, colors }: {
   axis: "vertical" | "horizontal";
   colors: { accent: string; border: string; bg: string; text: string };
 }) {
-  const options = axis === "vertical" ? VERTICAL_OPTIONS : HORIZONTAL_OPTIONS;
+  const options = axis === "vertical" ? VERTICAL_SWING_OPTIONS : HORIZONTAL_SWING_OPTIONS;
   const swingOpts = options.filter(o => o.type === "swing");
   const fixOpts = options.filter(o => o.type === "fix");
   const IconComponent = axis === "vertical" ? VerticalIcon : HorizontalIcon;
