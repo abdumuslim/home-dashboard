@@ -70,9 +70,9 @@ export interface AcLevelingStatus {
   limitAmps: number | null;
   budgetAmps: number | null;
   nonAcLoadAmps: number | null;
-  overLimitStreak: number;
-  /** Consecutive readings badly over the limit (≥ limit + 1A) — drives the emergency fast path. */
-  severeOverLimitStreak: number;
+  /** Over-limit leaky-bucket points remaining (acts at 0); `overLimitBudgetMax` is the capacity. */
+  overLimitBudget: number;
+  overLimitBudgetMax: number;
   headroomStreak: number;
   settleRemainingMs: number;
   /** Raises paused because the last raise's amps never showed up (0 = no hold). */

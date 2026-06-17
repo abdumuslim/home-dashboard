@@ -145,6 +145,25 @@ export interface AllocatorInput {
   /** Pre-sorted by priority, highest first. */
   acs: LevelerAcSnapshot[];
   ampModels: Record<string, AcAmpModel>;
+  /**
+   * Per-AC amps to charge when raising ABOVE the current level — the REAL
+   * compressor surge of releasing a cap, used for raise admission instead of
+   * the model step. A gen level is a cap, not a setpoint: the static model
+   * understates the surge on a hot/pinned compressor (live: observed 3.5A vs a
+   * 2.0A model step), so model-based raises overshoot the breaker. The leveler
+   * learns this per AC/source from observed raise effects + bounce costs.
+   * Absent (or below the model step) → the model step is used, so grid raises
+   * are unchanged (caps don't bind on the 28A budget).
+   */
+  raiseSurge?: Record<string, number>;
+  /**
+   * Max levels an AC may be raised ABOVE its current level in ONE allocation.
+   * Set to 1 on generator (one step, confirm the surge on the meter, then the
+   * next) so a single batch can never commit more than one step's surge —
+   * bounding overshoot. Undefined elsewhere (grid keeps straight-to-ideal batch
+   * raises). Re-filling up to the current level and reductions are unaffected.
+   */
+  maxRaiseStep?: number;
 }
 
 export interface AllocationResult {
@@ -180,8 +199,65 @@ export const REDUCE_STREAK = 5;
 export const REDUCE_STREAK_SEVERE = 2;
 /** Amps above the raw limit that classify a reading as "severely" over (fast path). */
 export const OVER_LIMIT_SEVERE_AMPS = 1;
-/** Readings with headroom required before raising a level or restoring a shed AC. */
+/**
+ * Over-limit leaky-bucket capacity, in "points" (2026-06-17). The leveler drains
+ * points on over-limit readings and acts when the bucket empties — an integral /
+ * I²t-style trip that tolerates brief fluctuation around the limit but accumulates
+ * a sustained or oscillating overload (replacing the consecutive streaks that
+ * reset on any single dip). User's rule: a reading > limit + OVER_LIMIT_SEVERE_AMPS
+ * costs 2 points, within that costs 1; 4 points = act. No instant-act tier — a
+ * single turn-on inrush spike drains ≤2 of 4 and refills on sustained calm, so it
+ * can't false-trigger.
+ */
+export const OVER_LIMIT_BUDGET = 4;
+/** Points drained by a reading more than OVER_LIMIT_SEVERE_AMPS over the limit. */
+export const OVER_LIMIT_DRAIN_SEVERE = 2;
+/** Points drained by a reading within OVER_LIMIT_SEVERE_AMPS over the limit. */
+export const OVER_LIMIT_DRAIN_MILD = 1;
+/** Readings with headroom required before raising a level. */
 export const RAISE_STREAK = 6;
+/**
+ * Shorter streak for RESTORING a fully-OFF shed AC (~15s vs the 30s a level raise
+ * waits). Turning a room the leveler shed back on is high-value the moment budget
+ * is there — the user's complaint was the restore lagging while budget was free.
+ * The raise buffer (a restored floor must fit under `limit − margin − raiseBuffer`)
+ * and bounce detection (a restore that re-breaches is blocked) remain the
+ * oscillation guards, so a shorter confirmation is safe.
+ */
+export const RESTORE_SHED_STREAK = 3;
+/**
+ * A measured-current drop at least this large (median of the recent readings vs
+ * the new reading), when we did NOT command it (outside the settle window),
+ * signals a probable breaker trip / blackout — the ACs are commanded ON but no
+ * longer drawing. The biggest single leveler cut is ~one AC and lands inside the
+ * settle window, so a drop this large OUTSIDE settle is a power event, not our
+ * own action. While latched, raises/restores are frozen: the low post-trip
+ * readings would otherwise build the headroom streak and raise an AC into a dead
+ * line (live 2026-06-13: the leveler raised Najat reading 3.7A as ~11A of free
+ * budget, worsening the recovery surge).
+ */
+export const POWER_COLLAPSE_DROP_AMPS = 6;
+/**
+ * …AND the reading must land at or below this absolute floor. A trip leaves only
+ * the small non-AC base load on the meter (live: ~3.7A), whereas a legitimate
+ * demand drop or a single-AC reduction still leaves the other ACs drawing (well
+ * above this). The floor is what separates "the AC load vanished (trip)" from
+ * "the load merely dropped" — without it, the bounce retry-clear path (which
+ * deliberately drops the load to re-allow a raise) reads as a false trip.
+ */
+export const POWER_COLLAPSE_FLOOR_AMPS = 5;
+/**
+ * A latched power collapse clears (raises resume, ramp re-arms for ON ACs) once
+ * measured climbs back to within this of the pre-collapse median — the AC load
+ * returned, so a fresh headroom streak can safely re-time raises.
+ */
+export const POWER_COLLAPSE_RECOVER_GAP = 3;
+/**
+ * Safety cap: a collapse that never "recovers" to near its pre-collapse median
+ * (e.g. the household load legitimately dropped) stops freezing raises after
+ * this long, so the freeze can never strand the leveler.
+ */
+export const POWER_COLLAPSE_MAX_MS = 300_000;
 /** Power reading older than this means no electricity (matches /api/current/power). */
 export const STALE_POWER_MS = 15_000;
 /** Same noise floor the power card uses to consider a line active. */
@@ -279,6 +355,16 @@ export const RAISE_HOLD_CHECK_AFTER_MS = 20_000;
  * at an impossible threshold.
  */
 export const BOUNCE_MAX_EXTRA_AMPS = 3;
+/**
+ * A raise is only CAPPED as a bounce when the measured cost overshot the amp
+ * model by more than this. An accurate model that still tipped over the limit
+ * was raised into a thin budget (a transient nonAcLoad misread), not a wrong
+ * model — capping it at L1 until the load drops by its full cost stranded rooms
+ * for up to an hour (live: Najat/Abdu at L1 7–61 min with `observed ≈ model`).
+ * Below this tolerance the reduction still ships (safety), but no sticky cap is
+ * set: the normal raise gate (buffer + headroom streak) re-times the raise.
+ */
+export const BOUNCE_MODEL_TOLERANCE_AMPS = 1;
 /** Safety net: a bounce record older than this is dropped regardless (corrupted baseline insurance). */
 export const BOUNCE_SAFETY_EXPIRY_MS = 3_600_000;
 /**
@@ -403,6 +489,17 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   const model = (id: string): AcAmpModel => ampModels[id] ?? DEFAULT_AMP_MODEL;
   const draw = (ac: LevelerAcSnapshot, level: number): number =>
     estimateAcDraw(level, ac.maxLevel, model(ac.deviceId));
+  // Marginal amps for raising `ac` from `fromLevel` to `fromLevel + 1` during
+  // the fill. A step that lands ABOVE the current level is a genuine new raise
+  // and is charged the learned surge (≥ the model step) so the admission can't
+  // commit a raise the real compressor surge would push over the breaker.
+  // A step at/below the current level merely re-fills the baseline back up to
+  // where the AC already is (a no-op command, no surge) — it uses the model.
+  const raiseStepCost = (ac: LevelerAcSnapshot, fromLevel: number): number => {
+    const step = model(ac.deviceId).stepAmps;
+    if (fromLevel < ac.currentLevel) return step;
+    return Math.max(step, input.raiseSurge?.[ac.deviceId] ?? step);
+  };
 
   const onManaged = acs.filter((a) => a.on && a.managed);
   const onUnmanaged = acs.filter((a) => a.on && !a.managed);
@@ -468,7 +565,11 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   // so the other ACs must not starve at their floors waiting for it.
   let restoreWaiting = false;
   if (!overBudget) {
-    const canRestore = !input.inSettle && input.headroomStreak >= RAISE_STREAK;
+    // Restoring a shed AC (a fully-OFF room) uses the shorter RESTORE_SHED_STREAK
+    // — it's the single highest-value raise and the user wants it back the moment
+    // budget is free; the raise buffer below keeps it from settling in the
+    // re-shed deadband. Level raises still wait the full RAISE_STREAK.
+    const canRestore = !input.inSettle && input.headroomStreak >= RESTORE_SHED_STREAK;
     const bufferedLimit = limitAmps - marginAmps - Math.max(0, input.raiseBufferAmps);
     // The restore batch pulls every raised AC down to the fitted ideal
     // (floors here) in the same batch — those savings count against the
@@ -507,19 +608,19 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   }
 
   if (overBudget && fanReducible.length === 0) {
-    // Shed the least-needy room first (smallest delta above target); the
-    // top-priority AC is protected and only sheds as the last resort.
-    const [top, ...rest] = onManaged;
-    const shedOrder = [
-      ...rest.slice().sort((a, b) =>
-        a.needDelta - b.needDelta || onManaged.indexOf(b) - onManaged.indexOf(a)),
-      ...(top ? [top] : []),
-    ];
-    for (const a of shedOrder) {
-      if (cost <= budgetAmps) break;
-      cost -= draw(a, ideal.get(a.deviceId)!);
-      ideal.delete(a.deviceId);
-      shedWanted.push(a.deviceId);
+    // Even at floors the ON ACs don't fit — power some OFF. The cost-aware
+    // optimizer picks the least-disruptive shed set covering the floor-budget
+    // shortfall (everyone is already pinned to floors here, so only sheds are
+    // available): a satisfied/cool room before a hot one, fewer rooms over a
+    // single big shed when over-cut is comparable, the top-priority AC last.
+    const shedPlan = selectReduction(onManaged, cost - budgetAmps, {
+      ampModels: input.ampModels,
+      fromFloor: true,
+    });
+    for (const id of shedPlan.toShed) {
+      cost -= draw(onManaged.find((a) => a.deviceId === id)!, ideal.get(id)!);
+      ideal.delete(id);
+      shedWanted.push(id);
     }
   } else if (!overBudget && !(restorePick != null && input.raiseHold)) {
     // Raise fill: spread level-by-level (everyone reaches L2 before anyone
@@ -540,24 +641,32 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
     ]) {
       for (;;) {
         let pick: LevelerAcSnapshot | null = null;
+        let pickCost = 0;
         for (const a of onManaged) {
           const level = ideal.get(a.deviceId)!;
           if (level >= ceiling(a)) continue;
-          // Raise admission uses the buffered budget — never fill into the
-          // deadband below the breaker (asymmetric hysteresis).
-          if (cost + model(a.deviceId).stepAmps > raiseBudgetAmps) continue;
+          // Raise admission uses the buffered budget AND the real step cost (the
+          // learned surge for an above-current step) — never fill into the
+          // deadband, and never commit a raise the surge would push over. The
+          // one-step-per-batch pacing is applied to the COMMAND in desiredLevels
+          // (not here) so the fitted ideal still reflects the true equilibrium:
+          // reductions reach it at once (safety); only raises are paced.
+          const stepCost = raiseStepCost(a, level);
+          if (cost + stepCost > raiseBudgetAmps) continue;
           if (!pick) {
             pick = a;
+            pickCost = stepCost;
             continue;
           }
           const pickLevel = ideal.get(pick.deviceId)!;
           if (level < pickLevel || (level === pickLevel && a.needDelta > pick.needDelta)) {
             pick = a;
+            pickCost = stepCost;
           }
         }
         if (!pick) break;
         ideal.set(pick.deviceId, ideal.get(pick.deviceId)! + 1);
-        cost += model(pick.deviceId).stepAmps;
+        cost += pickCost;
       }
     }
   }
@@ -579,7 +688,14 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
     (a.fanRestoreTarget === 0 ? a.fanSpeed !== 0 : a.fanSpeed < a.fanRestoreTarget);
   const anyHoldPending = acs.some(holdPending);
   let toFanRaise: AllocationResult["toFanRaise"] = null;
-  if (canRaise && !overBudget && toRestore.length === 0) {
+  // Buffer-gate the fan restore (2026-06-17, latent defect #1): the restored fan
+  // (~FAN_REDUCE_SAVINGS_AMPS) must fit the BUFFERED budget so jumping it back
+  // can't re-push the meter over near the limit (live: after an emergency fan
+  // cut, fans returned at measured ≤ limit−margin and re-crossed). With a 0
+  // buffer this is the old un-buffered behavior; with a buffer it leaves the fan
+  // a cushion below the breaker, like a gen raise.
+  const fanFitsBuffer = currentOnCost + FAN_REDUCE_SAVINGS_AMPS <= raiseBudgetAmps;
+  if (canRaise && !overBudget && toRestore.length === 0 && fanFitsBuffer) {
     const pick = acs.find(holdPending);
     if (pick) {
       toFanRaise = { deviceId: pick.deviceId, fan: pick.fanRestoreTarget! };
@@ -610,9 +726,14 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
     }
     if (target > a.currentLevel && toRestore.length === 0 && !anyHoldPending && !restoreWaiting) {
       if (canRaise) {
-        // Jump straight to the budget-fitted ideal — the amp model is the guess,
-        // the measurement feedback loop is the adjustment.
-        desiredLevels[a.deviceId] = target;
+        // Raise toward the budget-fitted ideal, but only ONE level per batch on
+        // the generator (maxRaiseStep): a gen level is a cap, and releasing it
+        // surges a hot compressor unpredictably, so confirm each step's surge on
+        // the meter before the next. Grid (maxRaiseStep undefined) jumps straight
+        // to the ideal — the model is the guess, the meter is the adjustment.
+        desiredLevels[a.deviceId] = input.maxRaiseStep != null
+          ? Math.min(target, a.currentLevel + input.maxRaiseStep)
+          : target;
       } else if (a.warmStartLevel != null && !input.inSettle && !input.raiseHold) {
         // Warm restore: the AC just came back from a temperature cycle and we
         // remember the level it was stable at. Skip the slow headroom-streak
@@ -666,6 +787,293 @@ export const FAN_REDUCE_SAVINGS_AMPS = 0.5;
  */
 export const EMERGENCY_PENDING_MS = NON_AC_FREEZE_MS;
 
+// ---------------------------------------------------------------------------
+// Cost-aware reduction optimizer (2026-06-13) — replaces the greedy shed/cut
+// ordering in BOTH the normal over-budget path and the emergency fast-path.
+//
+// Given a meter- or model-derived savings target, it enumerates every feasible
+// end-state for the (few) managed ACs — keep / level-down to any floor-
+// respecting level / power OFF, optionally a fan-to-1 drop — and returns the
+// LEXICOGRAPHICALLY least-disruptive plan that covers the target:
+//   0. feasible (covers the target) beats infeasible;
+//   1. minimize the NEED of the rooms turned off — shed the most satisfied rooms
+//      and keep the hot ones running. This is need-based, NOT priority-based: a
+//      cool high-priority room is shed before a hot low-priority one (the live
+//      complaint — abdu, hot, was shed to protect a cool higher-priority room);
+//   2. need-weighted disruption (shed ≫ level ≫ fan; cutting a HOT room costs
+//      more than a satisfied one; changing the top-priority AC's level carries a
+//      small surcharge so it is cut last among levels; re-shedding a bounced AC
+//      is penalized) — leveling a hot room, or shedding cool rooms (even two),
+//      always beats shedding the hot room;
+//   3. over-cut (land just under the limit, never deep below — the user's
+//      explicit anti-over-reduction rule), bucketed so noise can't outweigh (2);
+//   4. fewer device commands; then fewer ACs disturbed.
+// Over-cut is deliberately NOT primary: a minimal-over-cut end-state sits on the
+// knife edge at limit−margin and re-triggers every tick (the limit cycle the
+// raise buffer exists to kill). The search is REDUCE-ONLY — raises/restores stay
+// in computeAllocation's fill so the raise-buffer hysteresis is never bypassed.
+// The never-level-0 invariant is folded in: an observed level-0 AC has no "keep"
+// candidate (its only states are a cap to [floor..ceilCap] or a shed), so every
+// enumerated plan re-caps it, and the smallest cap (top commandable level) wins
+// unless more savings are owed.
+
+export interface ReductionWeights {
+  /** Per-AC penalty for powering a room OFF (× its need weight). */
+  shed: number;
+  /** Per level-step dropped (× its need weight). */
+  levelStep: number;
+  /** Per fan-to-1 drop (× its need weight). */
+  fan: number;
+  /**
+   * needWeight = 1 + needK·max(0, needDelta): cutting a hotter room costs more.
+   * This alone keeps a HOT room running: shedding it (shed × ~4) dwarfs leveling
+   * it (level ≪ shed) or shedding a satisfied room (shed × 1) — so the optimizer
+   * levels the hot room or sheds cool rooms (even two) before ever shedding it.
+   */
+  needK: number;
+  /**
+   * Surcharge for changing the top-priority AC's level — keeps it untouched
+   * while a non-top plan covers, and cut LAST among levels. Kept SMALL (≈ one
+   * level step, well below a shed) so nudging the priority room down a level
+   * stays cheaper than shedding a peer — leveling never pushes the optimizer
+   * into turning a room off. Shed protection is need-based (see `shedNeed`),
+   * not priority-based: a cool high-priority room is shed before a hot one.
+   */
+  topPriority: number;
+  /** Surcharge for re-shedding an AC whose restore recently bounced — anti-thrash. */
+  bounceShed: number;
+}
+
+export const DEFAULT_REDUCTION_WEIGHTS: ReductionWeights = {
+  shed: 100,
+  levelStep: 10,
+  fan: 1,
+  needK: 1.5,
+  topPriority: 25,
+  bounceShed: 400,
+};
+
+export interface ReductionPlan {
+  /** Level-change commands: deviceId → new level (changed, non-shed ACs only). */
+  desiredLevels: Record<string, number>;
+  /** Power OFF — emitted least-needy first, top-priority last. */
+  toShed: string[];
+  /** Drop to fan 1 — same ordering. */
+  toFanReduce: string[];
+  /** End-state level of every non-shed AC (for status / projected-amps parity). */
+  idealLevels: Record<string, number>;
+  estimatedSavingsAmps: number;
+  overCutAmps: number;
+  /** Whether the plan covers requiredSavingsAmps. */
+  satisfied: boolean;
+}
+
+export interface SelectReductionOptions {
+  ampModels: Record<string, AcAmpModel>;
+  weights?: ReductionWeights;
+  /** Reduce from each AC's floor (normal over-budget path): only shed is available. */
+  fromFloor?: boolean;
+}
+
+/** Never-level-0 re-entry ceiling: top commandable level, clamped by physics /
+ *  user caps, never below the floor. */
+function ceilCapOf(ac: LevelerAcSnapshot): number {
+  return Math.max(
+    floorOf(ac),
+    Math.min(
+      ac.maxLevel,
+      ac.reachableCap ?? ac.maxLevel,
+      ac.slotCap ?? ac.maxLevel,
+      ac.manualCap ?? ac.maxLevel,
+    ),
+  );
+}
+
+interface AcMove {
+  level: number | null; // end level, or null = shed/off
+  fanDrop: boolean;
+  savings: number;
+  cost: number;
+  commands: number;
+  disturbed: boolean;
+  /** max(0, needDelta) when this move sheds the AC, else 0 — summed to protect hot rooms. */
+  shedNeed: number;
+}
+
+interface ComboScore {
+  combo: AcMove[];
+  savings: number;
+  cost: number;
+  commands: number;
+  disturbed: number;
+  /** Σ need of the rooms this plan powers OFF — minimized so a HOT room is shed last. */
+  shedNeed: number;
+  feasible: boolean;
+}
+
+/** Output order for shed/fan arrays: least-needy first, top-priority last —
+ *  matches the historical shed-order semantics. acs are pre-sorted by priority. */
+function reductionOutputOrder(acs: LevelerAcSnapshot[]): LevelerAcSnapshot[] {
+  const [top, ...rest] = acs;
+  const sorted = rest.slice().sort((a, b) =>
+    a.needDelta - b.needDelta || acs.indexOf(b) - acs.indexOf(a));
+  return top ? [...sorted, top] : sorted;
+}
+
+/** True when candidate `a` is strictly preferred over the incumbent `b`. */
+function reductionBetter(a: ComboScore, b: ComboScore, required: number): boolean {
+  if (a.feasible !== b.feasible) return a.feasible;
+  if (a.feasible) {
+    // Protect HOT rooms first: shed the rooms that need cooling LEAST (priority
+    // is a tiebreak baked into `cost`, not a hard shield — a cool high-priority
+    // room is shed before a hot low-priority one). Bucketed so trivial need
+    // differences don't override the disruption cost below.
+    const an = Math.round(a.shedNeed * 10);
+    const bn = Math.round(b.shedNeed * 10);
+    if (an !== bn) return an < bn;
+    // EPS-guarded so float-rounding noise in need-weighted sums can't flip the
+    // choice tick-to-tick (deterministic plan = no thrash).
+    if (Math.abs(a.cost - b.cost) > 1e-9) return a.cost < b.cost;
+    const ao = Math.round(Math.max(0, a.savings - required) * 2);
+    const bo = Math.round(Math.max(0, b.savings - required) * 2);
+    if (ao !== bo) return ao < bo; // less over-cut (bucketed to 0.5A)
+    if (a.commands !== b.commands) return a.commands < b.commands;
+    return a.disturbed < b.disturbed;
+  }
+  // Both infeasible (no plan covers the target): take the most savings we can.
+  if (a.savings !== b.savings) return a.savings > b.savings;
+  return a.cost < b.cost;
+}
+
+/**
+ * Pure reduction planner. `acs` are the ON, managed, non-shed candidates,
+ * pre-sorted by priority (highest first). Returns the least-disruptive plan
+ * (levels/fans/sheds) whose estimated savings cover `requiredSavingsAmps`, or —
+ * if even cutting everything falls short — the maximum-savings plan with
+ * `satisfied=false`. Honors floors, boost minimums, near-target/reachable/slot/
+ * manual caps (via floorOf/ceilCapOf), and the never-level-0 invariant.
+ */
+export function selectReduction(
+  acs: LevelerAcSnapshot[],
+  requiredSavingsAmps: number,
+  opts: SelectReductionOptions,
+): ReductionPlan {
+  const w = opts.weights ?? DEFAULT_REDUCTION_WEIGHTS;
+  const model = (id: string): AcAmpModel => opts.ampModels[id] ?? DEFAULT_AMP_MODEL;
+  const draw = (ac: LevelerAcSnapshot, level: number): number =>
+    estimateAcDraw(level, ac.maxLevel, model(ac.deviceId));
+  const needWeight = (ac: LevelerAcSnapshot): number => 1 + w.needK * Math.max(0, ac.needDelta);
+  const topId = acs[0]?.deviceId ?? null;
+
+  const perAc = acs.map((ac, index) => {
+    const floor = floorOf(ac);
+    const fromLevel = opts.fromFloor ? floor : ac.currentLevel;
+    const baselineDraw = draw(ac, fromLevel);
+    const reducibleFan =
+      !ac.fanExempt && ac.fanSpeed != null && (ac.fanSpeed === 0 || ac.fanSpeed > 1);
+    // Upper candidate level: the observed level, except an unrestricted (0) AC
+    // re-enters at its top commandable level (never-level-0), and the floor
+    // path only ever sheds.
+    const upper = opts.fromFloor
+      ? floor
+      : ac.currentLevel > 0
+        ? ac.currentLevel
+        : ceilCapOf(ac);
+    const isTop = ac.deviceId === topId;
+    // Step count uses an effective "level 0 = one above max" so a re-cap of an
+    // unrestricted AC counts as a single step (smallest-cut re-entry).
+    const effFrom = fromLevel > 0 ? fromLevel : ac.maxLevel + 1;
+    const moves: AcMove[] = [];
+    for (let level = floor; level <= upper; level++) {
+      const steps = Math.max(0, effFrom - level);
+      const levelChanged = level !== ac.currentLevel;
+      const levelSavings = baselineDraw - draw(ac, level);
+      for (const fanDrop of reducibleFan ? [false, true] : [false]) {
+        const disturbed = levelChanged || fanDrop;
+        let cost = steps * w.levelStep * needWeight(ac);
+        if (fanDrop) cost += w.fan * needWeight(ac);
+        if (levelChanged && isTop) cost += w.topPriority; // fan drops of top stay cheap
+        moves.push({
+          level,
+          fanDrop,
+          savings: levelSavings + (fanDrop ? FAN_REDUCE_SAVINGS_AMPS : 0),
+          cost,
+          commands: (levelChanged ? 1 : 0) + (fanDrop ? 1 : 0),
+          disturbed,
+          shedNeed: 0,
+        });
+      }
+    }
+    // Power-off state. A higher-priority room costs an epsilon more to shed
+    // (priority breaks equal-need ties — lowest priority off first); need is the
+    // real driver via the shedNeed comparison term.
+    let shedCost = w.shed * needWeight(ac) + (acs.length - 1 - index) * 1e-3;
+    if (ac.restoreBlocked) shedCost += w.bounceShed;
+    moves.push({
+      level: null, fanDrop: false, savings: baselineDraw, cost: shedCost,
+      commands: 1, disturbed: true, shedNeed: Math.max(0, ac.needDelta),
+    });
+    return { ac, moves };
+  });
+
+  // Exhaustive cartesian search — ≤3 ACs × ~7 moves ≈ a few hundred leaves.
+  const EPS = 1e-9;
+  let best: ComboScore | null = null;
+  const combo: AcMove[] = new Array(perAc.length);
+  const recurse = (
+    i: number, savings: number, cost: number, commands: number, disturbed: number, shedNeed: number,
+  ): void => {
+    if (i === perAc.length) {
+      const candidate: ComboScore = {
+        combo: combo.slice(),
+        savings, cost, commands, disturbed, shedNeed,
+        feasible: savings >= requiredSavingsAmps - EPS,
+      };
+      if (best == null || reductionBetter(candidate, best, requiredSavingsAmps)) best = candidate;
+      return;
+    }
+    for (const mv of perAc[i].moves) {
+      combo[i] = mv;
+      recurse(
+        i + 1, savings + mv.savings, cost + mv.cost, commands + mv.commands,
+        disturbed + (mv.disturbed ? 1 : 0), shedNeed + mv.shedNeed,
+      );
+    }
+  };
+  recurse(0, 0, 0, 0, 0, 0);
+
+  const chosen = best ?? { combo: [], savings: 0, cost: 0, commands: 0, disturbed: 0, shedNeed: 0, feasible: requiredSavingsAmps <= EPS };
+  const moveOf = new Map<string, AcMove>();
+  perAc.forEach((p, i) => moveOf.set(p.ac.deviceId, chosen.combo[i]));
+  const desiredLevels: Record<string, number> = {};
+  const idealLevels: Record<string, number> = {};
+  const toShed: string[] = [];
+  const toFanReduce: string[] = [];
+  for (const ac of reductionOutputOrder(acs)) {
+    const mv = moveOf.get(ac.deviceId);
+    if (!mv) continue;
+    if (mv.level == null) { toShed.push(ac.deviceId); continue; }
+    idealLevels[ac.deviceId] = mv.level;
+    // Reduce-only contract: in fromFloor mode (normal over-budget shed) never
+    // emit a RAISE — if a boost floor sits above the observed level the keep-
+    // move is `floor` > currentLevel; the caller only consumes `toShed`, but
+    // suppress it so a future caller can't ship a raise mid-over-budget.
+    if (mv.level !== ac.currentLevel && !(opts.fromFloor && mv.level > ac.currentLevel)) {
+      desiredLevels[ac.deviceId] = mv.level;
+    }
+    if (mv.fanDrop) toFanReduce.push(ac.deviceId);
+  }
+  return {
+    desiredLevels,
+    toShed,
+    toFanReduce,
+    idealLevels,
+    estimatedSavingsAmps: chosen.savings,
+    overCutAmps: Math.max(0, chosen.savings - requiredSavingsAmps),
+    satisfied: chosen.feasible,
+  };
+}
+
 export interface EmergencyInput {
   limitAmps: number;
   marginAmps: number;
@@ -689,10 +1097,14 @@ export interface EmergencyReductionResult extends AllocationResult {
 /**
  * One decisive, meter-sized cut batch: level drops toward floors (least-needy
  * room fully first, top-priority AC last — the allocator's shed-order
- * semantics), then fan drops in the SAME batch; a power-off shed happens ONLY
- * when there is nothing left to cut (user decision 2026-06-12: a shed always
- * waits for its own fresh severe streak after a cut batch). Floors stay hard;
- * never level 0; reachable/slot/manual caps honored; never raises anything.
+ * semantics), then fan drops in the SAME batch. When the total cut capacity
+ * (every level to its floor + every reducible fan) knowably cannot cover the
+ * target, power-off sheds ride in the SAME batch — least-needy SUFFICIENT AC
+ * first (an AC whose savings can't cover the deficit is skipped: cycling its
+ * compressor fixes nothing), the top-priority AC strictly last resort (user
+ * decision 2026-06-12 PM, revising the morning's shed-separate staging after
+ * the live 18A gen incident burned 3 batches where 1 sufficed). Floors stay
+ * hard; never level 0; reachable/slot/manual caps honored; never raises.
  */
 export function computeEmergencyReduction(input: EmergencyInput): EmergencyReductionResult {
   const { limitAmps, marginAmps, nonAcLoadAmps, requiredSavingsAmps, acs, ampModels } = input;
@@ -702,113 +1114,29 @@ export function computeEmergencyReduction(input: EmergencyInput): EmergencyReduc
 
   const onUnmanaged = acs.filter((a) => a.on && !a.managed);
   const candidates = acs.filter((a) => a.on && a.managed && !a.shed);
-  // Least-needy room first; priority breaks delta ties (lower priority cuts
-  // first); the top-priority AC is protected and cuts dead last.
-  const [top, ...rest] = candidates;
-  const order = [
-    ...rest.slice().sort((a, b) =>
-      a.needDelta - b.needDelta || candidates.indexOf(b) - candidates.indexOf(a)),
-    ...(top ? [top] : []),
-  ];
 
-  // Highest level the device may be COMMANDED to — the never-level-0 re-entry
-  // point. reachableCap (physics) and the hard user/slot caps clamp it; never
-  // below the floor.
-  const ceilCap = (ac: LevelerAcSnapshot): number => Math.max(
-    floorOf(ac),
-    Math.min(
-      ac.maxLevel,
-      ac.reachableCap ?? ac.maxLevel,
-      ac.slotCap ?? ac.maxLevel,
-      ac.manualCap ?? ac.maxLevel,
-    ),
-  );
-
-  const planned = new Map(candidates.map((a) => [a.deviceId, a.currentLevel]));
-  let saved = 0;
-
-  // Never-level-0 pre-pass: an unrestricted managed AC gets a cap regardless
-  // of the savings target (hard rule) — the SMALLEST cut that satisfies it
-  // (its top commandable level), so the invariant alone can't over-reduce.
-  for (const ac of order) {
-    if ((planned.get(ac.deviceId) ?? 1) <= 0) {
-      const to = ceilCap(ac);
-      saved += draw(ac, 0) - draw(ac, to);
-      planned.set(ac.deviceId, to);
-    }
-  }
-
-  const fanReducible = order.filter((a) =>
-    !a.fanExempt && a.fanSpeed != null && (a.fanSpeed === 0 || a.fanSpeed > 1));
-
-  // Phase 1 — level cuts toward floors. Stops at the smallest sufficient cut
-  // set; a remainder a single fan drop can cover is handed to the cheaper fan
-  // phase instead of burning another 1–2A level step (best-fit final step —
-  // bounds the typical over-cut to ~FAN_REDUCE_SAVINGS_AMPS).
-  outer: for (const ac of order) {
-    const floor = floorOf(ac);
-    for (;;) {
-      if (saved >= requiredSavingsAmps) break outer;
-      if (requiredSavingsAmps - saved <= FAN_REDUCE_SAVINGS_AMPS && fanReducible.length > 0) break outer;
-      const cur = planned.get(ac.deviceId)!;
-      if (cur <= floor) break;
-      planned.set(ac.deviceId, cur - 1);
-      saved += draw(ac, cur) - draw(ac, cur - 1);
-    }
-  }
-
-  // Phase 2 — fan drops in the SAME batch (no separate staged attempt; each
-  // ≈ FAN_REDUCE_SAVINGS_AMPS). Only as many as the remainder needs.
-  const toFanReduce: string[] = [];
-  for (const ac of fanReducible) {
-    if (saved >= requiredSavingsAmps) break;
-    toFanReduce.push(ac.deviceId);
-    saved += FAN_REDUCE_SAVINGS_AMPS;
-  }
-
-  const desiredLevels: Record<string, number> = {};
-  for (const ac of candidates) {
-    const to = planned.get(ac.deviceId)!;
-    if (to !== ac.currentLevel) desiredLevels[ac.deviceId] = to;
-  }
-
-  // Phase 3 — shed, ONLY when there was nothing left to cut: every candidate
-  // already at its floor with no reducible fan, and the meter still demands
-  // savings. Least-needy first, top-priority AC last resort, multiple if one
-  // doesn't cover it. A shed AC ships no level/fan commands.
-  const toShed: string[] = [];
-  if (
-    saved < requiredSavingsAmps &&
-    Object.keys(desiredLevels).length === 0 &&
-    toFanReduce.length === 0
-  ) {
-    for (const ac of order) {
-      if (saved >= requiredSavingsAmps) break;
-      saved += draw(ac, planned.get(ac.deviceId)!);
-      planned.delete(ac.deviceId);
-      toShed.push(ac.deviceId);
-    }
-  }
+  const plan = selectReduction(candidates, requiredSavingsAmps, { ampModels });
 
   const unmanagedDraw = onUnmanaged.reduce((sum, a) => sum + draw(a, a.currentLevel), 0);
   const budgetAmps = limitAmps - marginAmps - nonAcLoadAmps - unmanagedDraw;
+  const shedSet = new Set(plan.toShed);
   const plannedDraw = candidates.reduce((sum, a) => {
-    const level = planned.get(a.deviceId);
-    return level == null ? sum : sum + draw(a, level);
+    if (shedSet.has(a.deviceId)) return sum;
+    return sum + draw(a, plan.idealLevels[a.deviceId] ?? a.currentLevel);
   }, 0);
 
   return {
-    desiredLevels,
-    toShed,
+    desiredLevels: plan.desiredLevels,
+    toShed: plan.toShed,
     toRestore: [],
-    toFanReduce,
+    toFanReduce: plan.toFanReduce,
     toFanRaise: null,
-    idealLevels: Object.fromEntries(planned),
+    idealLevels: plan.idealLevels,
     nonAcLoadAmps,
     budgetAmps,
     projectedAmps: nonAcLoadAmps + unmanagedDraw + plannedDraw,
     requiredSavingsAmps,
-    estimatedSavingsAmps: saved,
-    satisfied: saved >= requiredSavingsAmps,
+    estimatedSavingsAmps: plan.estimatedSavingsAmps,
+    satisfied: plan.satisfied,
   };
 }

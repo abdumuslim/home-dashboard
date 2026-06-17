@@ -12,23 +12,30 @@ import {
   AC_RAMP_MS,
   EMERGENCY_PENDING_MS,
   BOUNCE_MAX_EXTRA_AMPS,
+  BOUNCE_MODEL_TOLERANCE_AMPS,
   BOUNCE_SAFETY_EXPIRY_MS,
   BOUNCE_WINDOW_MS,
   NON_AC_FREEZE_MS,
   OVER_LIMIT_SEVERE_AMPS,
+  OVER_LIMIT_BUDGET,
+  OVER_LIMIT_DRAIN_SEVERE,
+  OVER_LIMIT_DRAIN_MILD,
   PREDICTION_WARN_AMPS,
   RAISE_HOLD_MS,
   RAISE_HOLD_CHECK_AFTER_MS,
   RESTORE_HOLD_MS,
   RAISE_STREAK,
   REDUCE_STREAK,
-  REDUCE_STREAK_SEVERE,
   SETTLE_MS,
   FAN_SETTLE_MS,
   UNREACHABLE_LEVEL_SENDS,
   UNREACHABLE_SAFETY_EXPIRY_MS,
   SHED_CLEAR_GRACE_MS,
   STALE_POWER_MS,
+  POWER_COLLAPSE_DROP_AMPS,
+  POWER_COLLAPSE_FLOOR_AMPS,
+  POWER_COLLAPSE_RECOVER_GAP,
+  POWER_COLLAPSE_MAX_MS,
   DEFAULT_LEVELING_CONFIG,
   type AcAmpModel,
   type AcLevelingConfig,
@@ -47,6 +54,13 @@ const log = childLogger("ac-leveler");
 const FAN_RESEND_MAX = 2;
 /** Minimum spacing between fan command re-sends. */
 const FAN_RESEND_SPACING_MS = 15_000;
+/**
+ * Minimum spacing between non-critical Smart AC Leveling push notifications
+ * (fan reductions, restores). A shed (an AC turned OFF) is actionable and always
+ * notifies; the rest are rate-limited so an over-limit episode can't spam the
+ * user (live: ~40 pushes/day trained the user to ignore them). 2026-06-17.
+ */
+const LEVELING_PUSH_THROTTLE_MS = 5 * 60_000;
 
 export interface AcLevelerDeps {
   getTclCloud: () => TclCloud | null;
@@ -114,9 +128,9 @@ export interface AcLevelingStatus {
   limitAmps: number | null;
   budgetAmps: number | null;
   nonAcLoadAmps: number | null;
-  overLimitStreak: number;
-  /** Consecutive readings badly over the limit (> limit + 1A) — drives the fast reduce path. */
-  severeOverLimitStreak: number;
+  /** Over-limit leaky-bucket points remaining (acts at 0); `overLimitBudgetMax` is the capacity. */
+  overLimitBudget: number;
+  overLimitBudgetMax: number;
   headroomStreak: number;
   settleRemainingMs: number;
   /** Raises paused because the last raise's amps never showed up (0 = no hold). */
@@ -148,17 +162,22 @@ export class AcLeveler {
   private lastReadingAt = 0;
   private lastSource: PowerSource = "none";
   private recentMeasured: number[] = [];
-  private overLimitStreak = 0;
-  /** Consecutive readings measured ≥ limit + OVER_LIMIT_SEVERE_AMPS — the fast reduce path. */
-  private severeOverLimitStreak = 0;
   /**
-   * Raw measured values of the CURRENT severe streak — the emergency cut is
-   * sized from min() of these (every reading in the streak supports it; a
-   * one-reading spike can't inflate the cut, and the median-of-4 smoothing
-   * would dilute a fresh spike with pre-spike readings). Cleared wherever the
-   * severe streak resets.
+   * Over-limit leaky bucket (replaces the old consecutive mild/severe streaks +
+   * the grid-only oscillation gate, 2026-06-17). Each over-limit reading drains
+   * points (a reading > limit + OVER_LIMIT_SEVERE_AMPS drains 2, within that
+   * drains 1); the controller acts when the bucket empties (≤ 0). Sustained
+   * genuine headroom (a full RAISE_STREAK of readings ≤ limit − margin) refills
+   * it to full and ends the episode. Refill is deliberately EPISODE-based, NOT
+   * per-reading: a per-reading refill would let a balanced oscillation around
+   * the limit (the 31A pattern) refill as fast as it drains and never act, and
+   * the consecutive-streak reset-on-any-dip was exactly the gap that missed it.
+   * This tolerates fluctuation above/below the limit until it genuinely
+   * accumulates — and works on BOTH sources (the old gate was grid-only).
    */
-  private severeStreakReadings: number[] = [];
+  private overLimitBudget = OVER_LIMIT_BUDGET;
+  /** Recent over-limit readings (window) — sizes the cut + classifies severe vs mild. */
+  private overLimitReadings: number[] = [];
   private headroomStreak = 0;
   /**
    * Last emergency batch: discounts a new severe streak's savings target for
@@ -201,6 +220,16 @@ export class AcLeveler {
   private unreachableLevels = new Map<string, Map<number, number>>();
   /** Set on a source change so tick() re-arms the compressor ramp for ON ACs. */
   private armRampOnSourceChange = false;
+  /**
+   * Latched when measured current collapses (probable breaker trip / blackout):
+   * raises/restores are frozen until measured recovers near `preMedian` or the
+   * safety cap (`POWER_COLLAPSE_MAX_MS`) elapses. Without this, the low post-trip
+   * readings build the headroom streak and raise an AC into a dead line (live
+   * 2026-06-13). `preMedian` = the smoothed measured just before the collapse.
+   */
+  private powerCollapse: { preMedian: number; until: number } | null = null;
+  /** Set when a collapse RECOVERS so tick() re-arms the compressor ramp for ON ACs. */
+  private armRampOnCollapseRecovery = false;
   private manualCap = new Map<string, number>();
   private manualTarget = new Map<string, number>();
   // Fan holds: fans reduced to minimum as the last try before a shed.
@@ -264,6 +293,18 @@ export class AcLeveler {
    * save), or after the safety expiry.
    */
   private bounce = new Map<string, { kind: "level" | "restore"; cap: number | null; requiredAmps: number; until: number }>();
+  /**
+   * Learned per-AC real raise cost on the CURRENT source (the compressor surge
+   * of releasing a cap), updated from observed bounce costs and fed back into
+   * the allocator's raise gate as `raiseSurge`. A gen level is a cap, not a
+   * setpoint, so the static model understates this on a hot compressor (live:
+   * 3.5A vs a 2A step) — learning it makes raises self-correct instead of
+   * trusting a model the user keeps having to retune. Per-source: cleared on a
+   * source change (different voltage + amp models) and on a config save.
+   */
+  private observedRaiseCost = new Map<string, number>();
+  /** Last leveling push timestamp — throttles non-critical notices (see LEVELING_PUSH_THROTTLE_MS). */
+  private lastLevelingPushAt = 0;
 
   constructor(pool: pg.Pool, deps: AcLevelerDeps) {
     this.pool = pool;
@@ -327,8 +368,9 @@ export class AcLeveler {
     this.config = cfg;
     this.forceEvaluate = true;
     // Limits/amp models may have changed (e.g. calibration applied) — old
-    // bounce evidence no longer describes the world.
+    // bounce evidence and learned raise surge no longer describe the world.
     this.bounce.clear();
+    this.observedRaiseCost.clear();
     this.lastRaiseBatch = null;
     if (!cfg.enabled) {
       this.frozenNonAcLoad = null;
@@ -480,11 +522,14 @@ export class AcLeveler {
     if (source !== this.lastSource) {
       const prevSource = this.lastSource;
       this.lastSource = source;
-      this.overLimitStreak = 0;
-      this.severeOverLimitStreak = 0;
-      this.severeStreakReadings = [];
+      this.overLimitBudget = OVER_LIMIT_BUDGET;
+      this.overLimitReadings = [];
       this.headroomStreak = 0;
       this.recentMeasured = [];
+      // A collapse latch is per-source (different baseline + the new source's
+      // readings re-establish the trend); a changeover restarts compressors anyway.
+      this.powerCollapse = null;
+      this.armRampOnCollapseRecovery = false;
       this.forceEvaluate = true;
       // A frozen load / pending expectation / raise hold from the other source is meaningless.
       this.frozenNonAcLoad = null;
@@ -495,6 +540,8 @@ export class AcLeveler {
       this.lastEmergency = null;
       // Bounce evidence is per-source (different limit + amp models).
       this.bounce.clear();
+      // Learned raise surge is per-source too (lower gen voltage → more amps).
+      this.observedRaiseCost.clear();
       this.lastRaiseBatch = null;
       // Drift baselines are per-source too: a changeover restarts the
       // compressors and the firmware can come back at a different level — a
@@ -522,76 +569,95 @@ export class AcLeveler {
 
     const limit = source === "grid" ? this.config.gridLimitAmps : this.config.genLimitAmps;
     const measured = source === "grid" ? data.current_1 : data.current_2;
+
+    // Probable trip/blackout handling (judged on the trend BEFORE this reading
+    // joins the window). A large measured drop that lands at/below the absolute
+    // floor means the AC load vanished — the breaker tripped; the latch freezes
+    // raises so the low post-trip readings can't build the headroom streak and
+    // raise an AC into a dead line. First resolve an active latch: recovery (the
+    // load came back near the pre-collapse level) clears it and re-arms the
+    // compressor ramp; the safety cap clears it so the freeze can't strand.
+    //
+    // 2026-06-17: detection is NO LONGER gated on `outside settle` — the leveler
+    // commands almost every tick during an over-limit episode, which kept the
+    // settle window fresh and made guard B miss a trip that happened mid-episode
+    // (live 03:14 trip, missed). The ≤ POWER_COLLAPSE_FLOOR_AMPS floor is the
+    // real discriminator: a normal reduction/shed leaves the remaining ACs
+    // drawing well above the floor, so only an actual trip latches. A deliberate
+    // big shed that DOES land ≤ floor latching is benign — raises should be
+    // frozen right after a big shed anyway, and the latch clears on recovery.
+    const now = this.lastReadingAt;
+    const priorMedian = this.recentMeasured.length >= 4 ? this.smoothedMeasured() : null;
+    if (this.powerCollapse != null) {
+      if (measured >= this.powerCollapse.preMedian - POWER_COLLAPSE_RECOVER_GAP) {
+        this.powerCollapse = null;
+        this.armRampOnCollapseRecovery = true;
+        this.headroomStreak = 0; // rebuild a fresh streak before any raise
+      } else if (now >= this.powerCollapse.until) {
+        this.powerCollapse = null;
+      }
+    }
+    if (
+      this.powerCollapse == null &&
+      priorMedian != null &&
+      priorMedian - measured >= POWER_COLLAPSE_DROP_AMPS &&
+      measured <= POWER_COLLAPSE_FLOOR_AMPS
+    ) {
+      this.powerCollapse = { preMedian: priorMedian, until: now + POWER_COLLAPSE_MAX_MS };
+      this.headroomStreak = 0;
+      log.warn(
+        `[leveler] Power collapse ${priorMedian.toFixed(1)}A → ${measured.toFixed(1)}A on ` +
+        `${source} — probable trip/blackout; freezing raises until recovery`,
+      );
+    }
+
     this.recentMeasured.push(measured);
     if (this.recentMeasured.length > 8) this.recentMeasured.shift();
 
     if (measured > limit) {
-      this.overLimitStreak++;
+      // Over the limit → drain the bucket. Magnitude-weighted (user's rule):
+      // more than OVER_LIMIT_SEVERE_AMPS over costs 2 points, within it costs 1.
       this.headroomStreak = 0;
-      // Badly over → escalate the fast path; a merely-mild reading breaks it.
-      // ≥ since 2026-06-12: exactly +1.0A counts as severe — the live 31A
-      // incident's readings sat exactly on the boundary and stayed mild.
-      if (measured >= limit + OVER_LIMIT_SEVERE_AMPS) {
-        this.severeOverLimitStreak++;
-        this.severeStreakReadings.push(measured);
-        if (this.severeStreakReadings.length > 8) this.severeStreakReadings.shift();
-      } else {
-        this.severeOverLimitStreak = 0;
-        this.severeStreakReadings = [];
-      }
+      const drain = measured - limit > OVER_LIMIT_SEVERE_AMPS ? OVER_LIMIT_DRAIN_SEVERE : OVER_LIMIT_DRAIN_MILD;
+      this.overLimitBudget = Math.max(0, this.overLimitBudget - drain);
+      this.overLimitReadings.push(measured);
+      if (this.overLimitReadings.length > 8) this.overLimitReadings.shift();
+      // Bucket empty → act now instead of waiting up to 5s for the loop tick
+      // (the breaker trips in seconds). Fires while ≤0 so a tick that failed
+      // (TCL error) re-fires on the next reading; the collector guard coalesces.
+      if (this.overLimitBudget <= 0) this.deps.onUrgentLevelingNeeded?.();
     } else if (measured <= limit - this.config.marginAmps) {
-      // Headroom builds at the un-buffered threshold so cheap, comfort-positive
-      // fan restores (gated by canRaise) recover on real headroom — NOT held
-      // back by the gen-level raise buffer. Gen-level raises stay buffer-bound
-      // independently via the allocator's raiseBudgetAmps fill, so they still
-      // can't climb into the deadband below the breaker.
-      this.headroomStreak++;
-      this.overLimitStreak = 0;
-      this.severeOverLimitStreak = 0;
-      this.severeStreakReadings = [];
+      // Genuine headroom builds at the un-buffered threshold so cheap, comfort-
+      // positive fan restores (gated by canRaise) recover on real headroom —
+      // gen-level raises stay buffer-bound via the allocator's raiseBudgetAmps.
+      if (this.powerCollapse != null) {
+        // Probable trip in progress — this low reading is lost AC load, not real
+        // headroom; don't let it unlock a raise/restore into a dead line.
+        this.headroomStreak = 0;
+      } else {
+        this.headroomStreak++;
+        // Sustained calm = the over-limit episode is over → refill the bucket to
+        // full and forget the episode. Episode-based, NOT per-reading, refill:
+        // a per-dip refill would let a balanced oscillation around the limit
+        // refill as fast as it drains and never act (the 31A failure mode).
+        if (this.headroomStreak >= RAISE_STREAK) {
+          this.overLimitBudget = OVER_LIMIT_BUDGET;
+          this.overLimitReadings = [];
+        }
+      }
     } else {
-      // Inside the margin band — neither raise nor reduce.
-      this.overLimitStreak = 0;
-      this.severeOverLimitStreak = 0;
-      this.severeStreakReadings = [];
+      // Margin band (limit−margin, limit]: riding just under the breaker —
+      // neither genuine headroom (no raise) nor over (no drain). Hold the bucket.
       this.headroomStreak = 0;
-    }
-
-    // Emergency trigger confirmed on THIS reading → ask the collector to run
-    // a leveling check now instead of waiting up to 5s for the loop tick (the
-    // breaker trips in seconds). ≥ not === so a tick that failed (TCL error)
-    // re-fires on the next qualifying reading; the collector guard coalesces.
-    if (
-      this.severeOverLimitStreak >= REDUCE_STREAK_SEVERE ||
-      this.oscillationOvershoot(source, limit) != null
-    ) {
-      this.deps.onUrgentLevelingNeeded?.();
     }
   }
 
-  /**
-   * Grid oscillation trigger (the 31A incident pattern): readings alternating
-   * around the limit (29↔31 on a 30A breaker) reset every consecutive streak,
-   * so neither the mild nor the severe gate can EVER fire while the breaker
-   * heats on the duty cycle. A windowed gate catches it: ≥3 of the last 6
-   * readings over the limit, at least one of them severe, and the current
-   * reading over. Grid only (user decision 2026-06-12) — the user deliberately
-   * rides 14.3–14.8A on the 15A generator, where noise would false-trigger.
-   * Returns the overshoot (median of the window's over-limit readings − limit)
-   * or null when the pattern doesn't hold.
-   */
-  private oscillationOvershoot(source: PowerSource, limit: number): number | null {
-    if (source !== "grid") return null;
-    const window = this.recentMeasured.slice(-6);
-    if (window.length < 6) return null;
-    if (!(window[window.length - 1] > limit)) return null;
-    const over = window.filter((m) => m > limit);
-    if (over.length < 3) return null;
-    if (!window.some((m) => m >= limit + OVER_LIMIT_SEVERE_AMPS)) return null;
-    const sorted = [...over].sort((a, b) => a - b);
+  /** Median of a list (sized cuts / overshoot from the over-limit window). */
+  private static median(values: number[]): number {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
     const mid = Math.floor(sorted.length / 2);
-    const median = sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-    return median - limit;
+    return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
   }
 
   /** Median of the last 4 readings — smooths generator fluctuation for budget math. */
@@ -817,16 +883,18 @@ export class AcLeveler {
       }
     }
 
-    // A power-source change restarts/re-disturbs every running compressor, so
-    // re-arm the ramp window for ON managed ACs — their estimated draw stays
-    // double-counted (out of the non-AC load derivation) through the ~4-min
-    // transition, preventing phantom-headroom raises and nonAcLoad miscalc.
-    if (this.armRampOnSourceChange) {
+    // A power-source change OR recovery from a collapse (trip/blackout) restarts
+    // / re-disturbs every running compressor, so re-arm the ramp window for ON
+    // managed ACs — their estimated draw stays double-counted (out of the non-AC
+    // load derivation) through the ~4-min transition, preventing phantom-headroom
+    // raises and nonAcLoad miscalc as the compressors spin back up.
+    if (this.armRampOnSourceChange || this.armRampOnCollapseRecovery) {
       const now = Date.now();
       for (const { device, managed } of ctx) {
         if (device.power && managed) this.rampUntil.set(device.id, now + AC_RAMP_MS);
       }
       this.armRampOnSourceChange = false;
+      this.armRampOnCollapseRecovery = false;
     }
 
     const inSettle = Date.now() < this.settleUntil;
@@ -967,9 +1035,8 @@ export class AcLeveler {
     const source = determineSource(this.lastReading, Date.now() - this.lastReadingAt);
     if (source === "none") {
       // No electricity / no ESP signal — pause decisions, reset gating.
-      this.overLimitStreak = 0;
-      this.severeOverLimitStreak = 0;
-      this.severeStreakReadings = [];
+      this.overLimitBudget = OVER_LIMIT_BUDGET;
+      this.overLimitReadings = [];
       this.headroomStreak = 0;
       this.frozenNonAcLoad = null;
       this.freezeUntil = 0;
@@ -1014,12 +1081,21 @@ export class AcLeveler {
         } else if (
           !inSettle &&
           this.recentMeasured.length >= 4 &&
+          // SUSTAINED genuine headroom, not just a momentary drop (2026-06-17):
+          // the old check cleared the cap the instant ANY cut dropped the total —
+          // including shedding a DIFFERENT AC, whose restore then re-loaded the
+          // line and re-bounced this one (live: Najat shed → Abdu bounce cleared
+          // → Abdu re-raised → re-bounce). Requiring a full RAISE_STREAK of
+          // headroom (longer than RESTORE_SHED_STREAK) lets a shed AC come back
+          // first, so a bounced AC only retries on real, lasting headroom. Still
+          // evidence-based (the load genuinely dropped and held), not a timer.
+          this.headroomStreak >= RAISE_STREAK &&
           smoothed + entry.requiredAmps <= limit - this.config.marginAmps - this.config.raiseBufferAmps
         ) {
           this.bounce.delete(deviceId);
           log.info(
             `[leveler] ${this.deviceNames.get(deviceId) ?? deviceId}: load dropped ` +
-            `(${smoothed.toFixed(1)}A + ${entry.requiredAmps.toFixed(1)}A observed cost fits under ${(limit - this.config.marginAmps - this.config.raiseBufferAmps).toFixed(1)}A) — bounce ${entry.kind === "level" ? `cap L${entry.cap}` : "restore block"} cleared`,
+            `(${smoothed.toFixed(1)}A + ${entry.requiredAmps.toFixed(1)}A observed cost fits under ${(limit - this.config.marginAmps - this.config.raiseBufferAmps).toFixed(1)}A, sustained) — bounce ${entry.kind === "level" ? `cap L${entry.cap}` : "restore block"} cleared`,
           );
         }
       }
@@ -1179,24 +1255,23 @@ export class AcLeveler {
       : freshNonAcLoad;
     this.lastNonAcLoad = nonAcLoad;
 
-    // Emergency fast path — a confirmed severe streak (or the grid oscillation
-    // pattern) sizes ONE decisive cut batch from the METER readings themselves,
-    // bypassing the model-derived budget: when an amp model under-credits an
-    // AC, computeAllocation concludes ideal == current and ships nothing while
-    // the meter reads 1A+ over (live: the 31A grid incident — breaker tripped).
-    const severeReady = this.severeOverLimitStreak >= REDUCE_STREAK_SEVERE;
-    const oscillation = severeReady ? null : this.oscillationOvershoot(source, limit);
+    // Reduce trigger = the over-limit leaky bucket (drained per reading in
+    // onPowerReading; replaces the consecutive mild/severe streaks + the
+    // grid-only oscillation gate). When it empties, the overshoot MAGNITUDE in
+    // the window picks the action: a SEVERE reading (> limit + 1A) → one
+    // meter-sized decisive cut (computeEmergencyReduction, bypassing the
+    // model-derived budget that can under-credit an AC and ship nothing while
+    // the meter reads over — the 31A trip); an ALL-MILD empty → the gentler
+    // allocator fitted reduce + fan-before-shed (driven via REDUCE_STREAK).
+    const bucketEmpty = this.overLimitBudget <= 0;
+    const overReadings = this.overLimitReadings.filter((m) => m > limit);
+    const recentSevere = overReadings.some((m) => m - limit > OVER_LIMIT_SEVERE_AMPS);
     let emergencyDeferred = false;
-    if (severeReady || oscillation != null) {
-      // min() of the severe readings: every reading in the streak supports
-      // that overshoot — a one-reading spike can't inflate the cut, and the
-      // median-of-4 smoothing would dilute a fresh spike with older readings.
-      const severeWindow = this.severeStreakReadings.slice(-4);
-      const overshoot = severeReady
-        ? (severeWindow.length > 0
-            ? Math.min(...severeWindow) - limit
-            : Math.max(OVER_LIMIT_SEVERE_AMPS, measured - limit))
-        : oscillation!;
+    if (bucketEmpty && recentSevere) {
+      // Median of the over-limit readings — a single spike can't inflate it.
+      const overshoot = overReadings.length > 0
+        ? AcLeveler.median(overReadings) - limit
+        : Math.max(OVER_LIMIT_SEVERE_AMPS, measured - limit);
       let required = overshoot + this.config.marginAmps;
       // A batch still landing (compressors take seconds to respond) discounts
       // the target — never stack cuts before the meter reflects the previous
@@ -1215,23 +1290,27 @@ export class AcLeveler {
         });
         log.warn(
           `[leveler] EMERGENCY: ~${overshoot.toFixed(1)}A over the ${limit}A ${source} limit ` +
-          `(${severeReady ? `severe streak ${this.severeOverLimitStreak}` : "grid oscillation"}) — ` +
+          `(over-limit bucket empty) — ` +
           `cutting ~${eres.estimatedSavingsAmps.toFixed(1)}A of ${required.toFixed(1)}A needed ` +
           `(${Object.keys(eres.desiredLevels).length} level, ${eres.toFanReduce.length} fan, ` +
-          `${eres.toShed.length} shed)${eres.satisfied ? "" : " — not fully covered, escalating on the next streak"}`,
+          `${eres.toShed.length} shed)${eres.satisfied ? "" : " — not fully covered, escalating on the next reading"}`,
         );
         this.lastEmergency = { at: now, requiredAmps: required, savedAmps: eres.estimatedSavingsAmps };
         this.forceEvaluate = false;
+        // Acted — refill the bucket so stale points don't re-fire before the cut
+        // lands (the anti-stacking discount covers the meter lag).
+        this.overLimitBudget = OVER_LIMIT_BUDGET;
+        this.overLimitReadings = [];
         // reactive=true: an emergency cut that undoes a recent raise is still
         // that raise's bounce. execute() handles shed persistence, fan holds,
-        // unreachable counting, settle/freeze/expectation, and streak resets.
+        // unreachable counting, settle/freeze/expectation, and bucket refill.
         await this.execute(tcl, snapshots, eres, source, limit, true);
         this.lastStatus = this.buildStatus(ctx, source, measured, limit, eres);
         return;
       }
-      // Discounted to ≤ 0: the previous batch's savings should cover the
-      // current overshoot once they land — defer, and keep the allocator's
-      // own severe gate from double-reducing on the same readings.
+      // Discounted to ≤ 0: the previous batch's savings should cover the current
+      // overshoot once they land — defer, and don't double-reduce via the mild
+      // allocator path on the same readings.
       emergencyDeferred = true;
     }
 
@@ -1240,8 +1319,11 @@ export class AcLeveler {
       marginAmps: this.config.marginAmps,
       raiseBufferAmps: this.config.raiseBufferAmps,
       nonAcLoadAmps: nonAcLoad,
-      overLimitStreak: this.overLimitStreak,
-      severeOverLimitStreak: emergencyDeferred ? 0 : this.severeOverLimitStreak,
+      // An all-mild bucket-empty drives the allocator's gentler reduce (fitted
+      // levels + fan-before-shed) via its REDUCE_STREAK gate. A severe empty is
+      // handled by the meter-sized emergency path above (deferred → stay quiet).
+      overLimitStreak: bucketEmpty && !recentSevere && !emergencyDeferred ? REDUCE_STREAK : 0,
+      severeOverLimitStreak: 0,
       headroomStreak: this.headroomStreak,
       inSettle,
       raiseHold: this.raiseHold != null,
@@ -1250,18 +1332,38 @@ export class AcLeveler {
       forceEvaluate: this.forceEvaluate,
       acs: snapshots,
       ampModels,
+      // One step per raise on the generator: a gen level is a CAP and releasing
+      // it surges a hot compressor unpredictably (live: 3.5A vs a 2A model step),
+      // so climb one level, confirm the surge on the meter, then the next. Grid
+      // (28A budget, caps don't bind) keeps straight-to-ideal batch raises.
+      maxRaiseStep: source === "gen" ? 1 : undefined,
+      // Learned per-AC raise surge (real cost of releasing a cap), so the raise
+      // gate self-corrects from observed overshoots instead of trusting the
+      // static model that the user has already had to retune. Empty on grid.
+      raiseSurge: source === "gen" ? Object.fromEntries(this.observedRaiseCost) : undefined,
     };
     const result = computeAllocation(input);
     this.forceEvaluate = false;
-    // Over-limit-driven reductions in this batch are bounce candidates;
-    // captured here because execute() resets the streaks afterwards.
-    const reactive =
-      this.overLimitStreak >= REDUCE_STREAK ||
-      this.severeOverLimitStreak >= REDUCE_STREAK_SEVERE;
+    // A bucket-empty (mild) reduce in this batch is a bounce candidate — the
+    // severe emergency path above already passed reactive=true for its cuts.
+    const reactive = bucketEmpty && !emergencyDeferred;
     // Execute BEFORE building status so the same tick reports the settle
     // window it just opened, fresh sheds, reset streaks, and the expectation.
     await this.execute(tcl, snapshots, result, source, limit, reactive);
     this.lastStatus = this.buildStatus(ctx, source, measured, limit, result);
+  }
+
+  /**
+   * Send a Smart AC Leveling push, rate-limited so an over-limit episode can't
+   * spam the user. `critical` (an AC turned OFF) always sends — it's actionable;
+   * fan reductions and restores are suppressed within LEVELING_PUSH_THROTTLE_MS
+   * of the last leveling push. Fire-and-forget (must not block the loop).
+   */
+  private pushLevelingNotice(body: string, critical = false): void {
+    const now = Date.now();
+    if (!critical && now - this.lastLevelingPushAt < LEVELING_PUSH_THROTTLE_MS) return;
+    this.lastLevelingPushAt = now;
+    void this.deps.broadcast({ title: "Smart AC Leveling", body, type: "leveling" });
   }
 
   private async execute(
@@ -1292,6 +1394,14 @@ export class AcLeveler {
     const recordBounce = (deviceId: string, kind: "level" | "restore", cap: number | null, anchorAmps: number): void => {
       const observed = peakMeasured - batch!.preMeasured;
       const requiredAmps = Math.min(Math.max(observed, anchorAmps), anchorAmps + BOUNCE_MAX_EXTRA_AMPS);
+      // Learn the real raise cost for a single-AC level bounce (the meter delta
+      // IS this AC's surge — a multi-AC batch's delta sums several raises and
+      // can't be attributed). Light EWMA so one noisy reading can't dominate;
+      // feeds the allocator's raise gate so it stops over-raising this AC.
+      if (kind === "level" && batch!.raised.size === 1 && observed > 0) {
+        const prev = this.observedRaiseCost.get(deviceId);
+        this.observedRaiseCost.set(deviceId, prev == null ? observed : prev * 0.5 + observed * 0.5);
+      }
       this.bounce.set(deviceId, { kind, cap, requiredAmps, until: startedAt + BOUNCE_SAFETY_EXPIRY_MS });
       this.lastRaiseBatch = null; // consumed — one bounce attribution per batch
       log.warn(
@@ -1337,7 +1447,18 @@ export class AcLeveler {
           const model = this.ampModelFor(deviceId, source);
           const anchor = estimateAcDraw(raisedTo, snap?.maxLevel ?? 1, model)
             - estimateAcDraw(level, snap?.maxLevel ?? 1, model);
-          recordBounce(deviceId, "level", level, anchor);
+          // Only CAP when the raise cost materially MORE than the model said —
+          // an accurate model that still bounced was raised into a thin budget
+          // (transient misread), and the normal raise gate will re-time it; a
+          // sticky cap would strand the room at L1 for up to an hour. The
+          // tolerance only applies to a SINGLE-AC raise batch, where the meter
+          // delta IS this AC's cost; a multi-AC batch's delta sums several
+          // raises, so fall back to the original unconditional cap there.
+          const observedCost = peakMeasured - batch!.preMeasured;
+          const singleRaise = batch!.raised.size === 1;
+          if (!singleRaise || observedCost > anchor + BOUNCE_MODEL_TOLERANCE_AMPS) {
+            recordBounce(deviceId, "level", level, anchor);
+          }
         }
         if (snap && snap.currentLevel >= 1 && level > snap.currentLevel) {
           // Predicted extra draw from this raise — graded against measured later
@@ -1379,11 +1500,9 @@ export class AcLeveler {
         }
       }
       if (fanReduced) {
-        void this.deps.broadcast({
-          title: "Smart AC Leveling",
-          body: `Fan speeds reduced to minimum to stay under the ${limit}A ${source === "grid" ? "Grid" : "Generator"} limit — they'll be restored when there is room.`,
-          type: "leveling",
-        });
+        this.pushLevelingNotice(
+          `Fan speeds reduced to minimum to stay under the ${limit}A ${source === "grid" ? "Grid" : "Generator"} limit — they'll be restored when there is room.`,
+        );
       }
     }
 
@@ -1407,12 +1526,11 @@ export class AcLeveler {
         sentAny = true;
         levelOrPowerSent = true;
         didReduce = true;
-        // Fire-and-forget — push HTTP calls must not block the collector loop
-        void this.deps.broadcast({
-          title: "Smart AC Leveling",
-          body: `${name(deviceId)} turned off — total current over the ${limit}A ${source === "grid" ? "Grid" : "Generator"} limit. It will be restored when there is room.`,
-          type: "leveling",
-        });
+        // An AC turned OFF is actionable → always notify (critical).
+        this.pushLevelingNotice(
+          `${name(deviceId)} turned off — total current over the ${limit}A ${source === "grid" ? "Grid" : "Generator"} limit. It will be restored when there is room.`,
+          true,
+        );
       } catch (err) {
         log.error(`[leveler] Shed failed for ${name(deviceId)}:`, (err as Error).message);
       }
@@ -1448,11 +1566,9 @@ export class AcLeveler {
         this.rampUntil.set(deviceId, Date.now() + AC_RAMP_MS);
         this.deps.setDevicePowerCache(deviceId, "on");
         sentAny = true;
-        void this.deps.broadcast({
-          title: "Smart AC Leveling",
-          body: `${name(deviceId)} restored at L${restoreLevel} — current headroom is available again.`,
-          type: "leveling",
-        });
+        this.pushLevelingNotice(
+          `${name(deviceId)} restored at L${restoreLevel} — current headroom is available again.`,
+        );
       } catch (err) {
         log.error(`[leveler] Restore failed for ${name(deviceId)}:`, (err as Error).message);
       }
@@ -1549,11 +1665,11 @@ export class AcLeveler {
     }
     if (didReduce) {
       // Fresh readings required before the next decision in either direction.
-      // Note: restore-with-reduction batches land here too — the next restore
-      // needs a fresh 6-reading headroom streak, which paces restores out.
-      this.overLimitStreak = 0;
-      this.severeOverLimitStreak = 0;
-      this.severeStreakReadings = [];
+      // Refill the bucket so the just-acted-on over-limit points don't re-fire
+      // before the cut lands. Note: restore-with-reduction batches land here too
+      // — the next restore needs a fresh 6-reading headroom streak.
+      this.overLimitBudget = OVER_LIMIT_BUDGET;
+      this.overLimitReadings = [];
       this.headroomStreak = 0;
     }
   }
@@ -1574,8 +1690,8 @@ export class AcLeveler {
       limitAmps: limit,
       budgetAmps: result?.budgetAmps ?? null,
       nonAcLoadAmps: result?.nonAcLoadAmps ?? null,
-      overLimitStreak: this.overLimitStreak,
-      severeOverLimitStreak: this.severeOverLimitStreak,
+      overLimitBudget: this.overLimitBudget,
+      overLimitBudgetMax: OVER_LIMIT_BUDGET,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
       raiseHoldRemainingMs: Math.max(0, (this.raiseHold?.until ?? 0) - Date.now()),
@@ -1638,8 +1754,8 @@ export class AcLeveler {
       limitAmps: null,
       budgetAmps: null,
       nonAcLoadAmps: null,
-      overLimitStreak: this.overLimitStreak,
-      severeOverLimitStreak: this.severeOverLimitStreak,
+      overLimitBudget: this.overLimitBudget,
+      overLimitBudgetMax: OVER_LIMIT_BUDGET,
       headroomStreak: this.headroomStreak,
       settleRemainingMs: Math.max(0, this.settleUntil - Date.now()),
       raiseHoldRemainingMs: Math.max(0, (this.raiseHold?.until ?? 0) - Date.now()),

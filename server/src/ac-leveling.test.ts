@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   computeAllocation,
   computeEmergencyReduction,
+  selectReduction,
   estimateAcDraw,
   determineSource,
   computeNeedTier,
@@ -10,6 +11,7 @@ import {
   REDUCE_STREAK,
   REDUCE_STREAK_SEVERE,
   RAISE_STREAK,
+  RESTORE_SHED_STREAK,
   type AllocatorInput,
   type EmergencyInput,
   type LevelerAcSnapshot,
@@ -532,16 +534,20 @@ describe("computeAllocation — shed by need", () => {
 });
 
 describe("computeAllocation — shedding", () => {
-  it("sheds lowest-priority ACs until the L1 base fits", () => {
+  it("sheds the single big AC over two small ones when one shed fits (fewer rooms off)", () => {
     const r = computeAllocation(input({
       limitAmps: 15,
       nonAcLoadAmps: 9,
       overLimitStreak: REDUCE_STREAK,
       headroomStreak: 0,
     }));
-    // budget 5: L1 sum 8 → shed abdullah (6 > 5) → shed abdu (2 ≤ 5)
-    expect(r.toShed).toEqual(["abdullah", "abdu"]);
+    // budget 5: L1 sum najat 2 + abdu 4 + abdullah 2 = 8, all equally needy.
+    // The cost-aware optimizer sheds ONLY abdu (4A) — remaining 4 ≤ 5 — keeping
+    // najat AND abdullah on. The old greedy shed abdullah + abdu (two rooms off,
+    // over-cut 3A); one big shed (over-cut 1A) is strictly less disruptive.
+    expect(r.toShed).toEqual(["abdu"]);
     expect(r.idealLevels.najat).toBe(1);
+    expect(r.idealLevels.abdullah).toBe(1);
   });
 
   it("does not shed before the streak / force gate", () => {
@@ -590,11 +596,14 @@ describe("computeAllocation — restore", () => {
     expect(r.desiredLevels).toEqual({});
   });
 
-  it("blocks restore without sustained headroom or during settle", () => {
+  it("blocks restore without the (shorter) sustained headroom or during settle", () => {
     const base = {
       acs: [ac("najat"), ac("abdu"), ac("abdullah", { on: false, shed: true })],
     };
-    expect(computeAllocation(input({ ...base, headroomStreak: RAISE_STREAK - 1 })).toRestore).toEqual([]);
+    // A shed restore uses RESTORE_SHED_STREAK (3); below it there is no restore…
+    expect(computeAllocation(input({ ...base, headroomStreak: RESTORE_SHED_STREAK - 1 })).toRestore).toEqual([]);
+    // …but it fires a streak earlier than a level raise would (RAISE_STREAK − 1).
+    expect(computeAllocation(input({ ...base, headroomStreak: RESTORE_SHED_STREAK })).toRestore).toEqual(["abdullah"]);
     expect(computeAllocation(input({ ...base, inSettle: true })).toRestore).toEqual([]);
   });
 
@@ -770,7 +779,7 @@ describe("computeAllocation — restore with reduction", () => {
       ac("abdullah", { on: false, shed: true }),
     ];
     const noHeadroom = computeAllocation(input({
-      limitAmps: 15, nonAcLoadAmps: 3, acs, headroomStreak: RAISE_STREAK - 1,
+      limitAmps: 15, nonAcLoadAmps: 3, acs, headroomStreak: RESTORE_SHED_STREAK - 1,
     }));
     expect(noHeadroom.toRestore).toEqual([]);
     expect(noHeadroom.desiredLevels).toEqual({});
@@ -897,9 +906,10 @@ describe("computeAllocation — fan reduction before shed", () => {
 
   it("sheds when every fan is already at minimum", () => {
     const r = computeAllocation(input(overLimit));
-    // ac() defaults to fanSpeed 1 — not reducible
+    // ac() defaults to fanSpeed 1 — not reducible. budget 5, floors sum 8, all
+    // equally needy → one big shed (abdu, 4A) fits and keeps two rooms on.
     expect(r.toFanReduce).toEqual([]);
-    expect(r.toShed).toEqual(["abdullah", "abdu"]);
+    expect(r.toShed).toEqual(["abdu"]);
   });
 
   it("is gated by the over-limit streak", () => {
@@ -1430,20 +1440,96 @@ describe("computeEmergencyReduction", () => {
     expect(noFan.toFanReduce).toEqual([]);
   });
 
-  it("does NOT shed when any level or fan cut shipped, even if unsatisfied", () => {
+  it("keeps cuts-only when the cut capacity exactly covers the target", () => {
     const r = computeEmergencyReduction(eInput({
-      requiredSavingsAmps: 10,
+      requiredSavingsAmps: 4,
       acs: [
-        ac("najat"),
-        ac("abdu"),
-        ac("abdullah", { currentLevel: 2, needDelta: 0.5 }),
+        ac("najat", { needDelta: 2 }),
+        ac("abdu", { currentLevel: 3, needDelta: 1 }),
+        ac("abdullah", { needDelta: 0.5 }),
       ],
     }));
-    // Only 1A of level cuts exists — ship it; the shed waits for its own
-    // fresh severe streak (user decision 2026-06-12).
-    expect(r.desiredLevels).toEqual({ abdullah: 1 });
+    // Abdu L3→L1 = exactly 4A — fixable with cuts alone, so no shed enters
+    // ("if it can be fixed with just reduce levels/fan, let it do").
+    expect(r.desiredLevels).toEqual({ abdu: 1 });
     expect(r.toShed).toEqual([]);
-    expect(r.satisfied).toBe(false);
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("incident regression: a sufficient shed rides in the SAME batch, skipping insufficient ACs", () => {
+    // The live 2026-06-12 18A gen incident shape: everyone at floors, only
+    // fans left (1.5A) against a 4.4A target. The old staging shipped the
+    // knowably-insufficient fans, waited a fresh streak, shed the least-needy
+    // AC (whose savings couldn't cover it either), waited again, then shed
+    // the right one — 3 batches where 1 sufficed.
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 4.4,
+      acs: [
+        ac("najat", { fanSpeed: 3, needDelta: 2 }),
+        ac("abdu", { fanSpeed: 3, needDelta: 1 }),
+        ac("abdullah", { fanSpeed: 3, needDelta: 0.5 }),
+      ],
+    }));
+    // Abdullah (least needy, 2A) can't cover 4.4A even with the others' fans
+    // (3A total) — skipped. Abdu (4A + 1A of fans) can — shed directly, in
+    // the same batch as the one fan drop that covers the 0.4A remainder.
+    expect(r.toShed).toEqual(["abdu"]);
+    expect(r.toFanReduce).toEqual(["abdullah"]);
+    expect(r.desiredLevels).toEqual({});
+    expect(r.estimatedSavingsAmps).toBe(4.5);
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("sub-fan shortfall still sheds — the user's any-shortfall rule", () => {
+    // 1.7A required vs 1.5A of fans: cuts knowably can't cover it, so the
+    // least-needy SUFFICIENT AC is shed instead (no staged escalation).
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 1.7,
+      acs: [
+        ac("najat", { fanSpeed: 3, needDelta: 2 }),
+        ac("abdu", { fanSpeed: 3, needDelta: 1 }),
+        ac("abdullah", { fanSpeed: 3, needDelta: 0.5 }),
+      ],
+    }));
+    // Abdullah (least needy, 2A ≥ 1.7A) suffices alone — no fan drops needed.
+    expect(r.toShed).toEqual(["abdullah"]);
+    expect(r.toFanReduce).toEqual([]);
+    expect(r.desiredLevels).toEqual({});
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("the top-priority AC is never single-picked while a non-top combination covers", () => {
+    // Abdu is top here (6A at L2 — alone sufficient for the 6A target), but
+    // protection wins: the non-top pair + abdu's level cut cover it instead.
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 6,
+      acs: [
+        ac("abdu", { currentLevel: 2, needDelta: 2 }),
+        ac("najat", { needDelta: 1 }),
+        ac("abdullah", { needDelta: 0.5 }),
+      ],
+    }));
+    expect(r.toShed).toEqual(["abdullah", "najat"]);
+    expect(r.desiredLevels).toEqual({ abdu: 1 });
+    expect(r.estimatedSavingsAmps).toBe(6);
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("counts a pre-pass level-0 AC's savings once at full draw when it is shed", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 12,
+      acs: [
+        ac("najat", { needDelta: 2 }),
+        ac("abdu", { currentLevel: 0, needDelta: 1 }),
+        ac("abdullah", { needDelta: 0.5 }),
+      ],
+    }));
+    // Abdu's never-level-0 pre-pass credited 2A (L0 10 → L3 8); shedding him
+    // must yield his full 10A observed draw, not 10+2 stacked. 2 + 10 = 12.
+    expect(r.toShed).toEqual(["abdullah", "abdu"]);
+    expect(r.desiredLevels).toEqual({}); // the pre-pass cap never ships for a shed AC
+    expect(r.estimatedSavingsAmps).toBe(12);
+    expect(r.satisfied).toBe(true);
   });
 
   it("sheds the least-needy AC when nothing else is reducible", () => {
@@ -1477,17 +1563,20 @@ describe("computeEmergencyReduction", () => {
     expect(all.toFanReduce).toEqual([]);
   });
 
-  it("never cuts below a boost floor via levels — only a shed goes below", () => {
+  it("never cuts below a boost floor via levels — the next AC continues instead", () => {
     const r = computeEmergencyReduction(eInput({
-      requiredSavingsAmps: 10,
+      requiredSavingsAmps: 3,
       acs: [
         ac("najat", { needDelta: 2 }),
-        ac("abdu", { needDelta: 1 }),
+        ac("abdu", { currentLevel: 2, needDelta: 1 }),
         ac("abdullah", { currentLevel: 3, minLevel: 2, needDelta: 0.5 }),
       ],
     }));
-    expect(r.desiredLevels.abdullah).toBe(2); // L3→L2 stops at the boost floor
+    // Abdullah (least needy) stops at his L2 boost floor with savings still
+    // owed — the remainder comes from abdu's level, never from below a floor.
+    expect(r.desiredLevels).toEqual({ abdullah: 2, abdu: 1 });
     expect(r.toShed).toEqual([]);
+    expect(r.satisfied).toBe(true);
   });
 
   it("caps a level-0 unrestricted AC with the smallest cut regardless of the savings target", () => {
@@ -1532,5 +1621,127 @@ describe("computeEmergencyReduction", () => {
     expect(r.toFanReduce).toEqual([]);
     expect(r.toShed).toEqual([]);
     expect(r.satisfied).toBe(false);
+  });
+});
+
+describe("selectReduction — cost-aware, need-based protection (the live complaint)", () => {
+  // acs are pre-sorted by priority, highest first. The live config protected the
+  // top-priority (cool) room and shed the user's hot AC. The optimizer is
+  // need-based: it sheds the rooms that need cooling LEAST, keeping the hot one.
+  it("sheds two cool rooms — incl. the top-priority one — before the hot user's AC", () => {
+    const acs = [
+      ac("abdullah", { needDelta: -0.5 }), // top priority but SATISFIED
+      ac("najat", { needDelta: -0.5 }),     // satisfied
+      ac("abdu", { needDelta: 2.5 }),        // HOT — the user's room (4A at L1)
+    ];
+    // All at L1 floors → only sheds available; budget shortfall ~4A.
+    const plan = selectReduction(acs, 4, { ampModels: MODELS });
+    expect(plan.toShed).not.toContain("abdu");          // hot room kept running
+    expect([...plan.toShed].sort()).toEqual(["abdullah", "najat"]);
+    expect(plan.satisfied).toBe(true);
+  });
+
+  it("levels a hot room down rather than turning any room off when leveling covers", () => {
+    const acs = [
+      ac("abdullah", { currentLevel: 1, needDelta: -0.5 }),
+      ac("najat", { currentLevel: 1, needDelta: -0.5 }),
+      ac("abdu", { currentLevel: 3, needDelta: 2.5 }), // hot at L3 (8A)
+    ];
+    // 2A needed → abdu L3→L2 saves 2A; no room is shed (prefer level over off).
+    const plan = selectReduction(acs, 2, { ampModels: MODELS });
+    expect(plan.toShed).toEqual([]);
+    expect(plan.desiredLevels).toEqual({ abdu: 2 });
+  });
+
+  it("sheds the big AC when it is the most SATISFIED room (need decides, not size)", () => {
+    const acs = [
+      ac("najat", { needDelta: 2 }),     // hot
+      ac("abdu", { needDelta: -1 }),     // big but SATISFIED → shed it
+      ac("abdullah", { needDelta: 1.5 }),
+    ];
+    const plan = selectReduction(acs, 3, { ampModels: MODELS });
+    expect(plan.toShed).toEqual(["abdu"]);
+  });
+
+  it("never leaves a managed AC at level 0 and never cuts below a boost floor", () => {
+    const acs = [
+      ac("najat", { currentLevel: 0, needDelta: 1 }),               // unrestricted → re-capped
+      ac("abdu", { currentLevel: 3, minLevel: 2, needDelta: 1 }),   // boost floor L2
+      ac("abdullah", { currentLevel: 2, needDelta: 1 }),
+    ];
+    const plan = selectReduction(acs, 1, { ampModels: MODELS });
+    expect(plan.toShed).not.toContain("najat");
+    expect(plan.idealLevels.najat).toBeGreaterThan(0);       // never level 0
+    if (plan.idealLevels.abdu != null) expect(plan.idealLevels.abdu).toBeGreaterThanOrEqual(2);
+  });
+
+  it("when even cutting everything falls short, reports unsatisfied with max savings", () => {
+    const acs = [ac("najat", { needDelta: 1 }), ac("abdu", { needDelta: 1 }), ac("abdullah", { needDelta: 1 })];
+    const plan = selectReduction(acs, 99, { ampModels: MODELS });
+    expect(plan.satisfied).toBe(false);
+    expect([...plan.toShed].sort()).toEqual(["abdu", "abdullah", "najat"]);
+  });
+});
+
+describe("one-step + surge-gated raises (gen)", () => {
+  it("maxRaiseStep paces the COMMAND to one level while the ideal stays the full target", () => {
+    const res = computeAllocation(input({
+      acs: [ac("abdu", { currentLevel: 1, needTier: "full", needDelta: 3 })],
+      nonAcLoadAmps: 0,
+      maxRaiseStep: 1,
+    }));
+    expect(res.idealLevels.abdu).toBe(3); // fitted equilibrium unchanged
+    expect(res.desiredLevels.abdu).toBe(2); // commanded one step at a time
+  });
+
+  it("without maxRaiseStep raises still command straight to the fitted ideal", () => {
+    const res = computeAllocation(input({
+      acs: [ac("abdu", { currentLevel: 1, needTier: "full", needDelta: 3 })],
+      nonAcLoadAmps: 0,
+    }));
+    expect(res.idealLevels.abdu).toBe(3);
+    expect(res.desiredLevels.abdu).toBe(3);
+  });
+
+  it("maxRaiseStep keeps an AC at its current top level (no spurious reduction)", () => {
+    const res = computeAllocation(input({
+      acs: [ac("abdu", { currentLevel: 3, needTier: "full", needDelta: 3 })],
+      nonAcLoadAmps: 0,
+      maxRaiseStep: 1,
+    }));
+    expect(res.idealLevels.abdu).toBe(3);
+    expect(res.desiredLevels.abdu).toBeUndefined();
+  });
+
+  it("maxRaiseStep does not stage reductions (reduces fully in one batch)", () => {
+    const res = computeAllocation(input({
+      acs: [ac("abdu", { currentLevel: 3, needTier: "full", needDelta: 3 })],
+      nonAcLoadAmps: 24,
+      forceEvaluate: true,
+      maxRaiseStep: 1,
+    }));
+    expect(res.idealLevels.abdu).toBe(1);
+    expect(res.desiredLevels.abdu).toBe(1);
+  });
+
+  it("raiseSurge blocks a raise the real surge would not fit, even when the model step would", () => {
+    const base = {
+      acs: [ac("abdu", { currentLevel: 1, needTier: "full" as const, needDelta: 3 })],
+      nonAcLoadAmps: 22, // budget = 30 - 1 - 22 = 7; abdu L1 = 4A → 3A headroom
+    };
+    const withModel = computeAllocation(input(base));
+    expect(withModel.idealLevels.abdu).toBe(2); // model step 2 ≤ 3 → raises
+    const withSurge = computeAllocation(input({ ...base, raiseSurge: { abdu: 5 } }));
+    expect(withSurge.idealLevels.abdu).toBe(1); // real surge 5 > 3 → holds
+  });
+
+  it("raiseSurge charges only above-current steps; re-fill to current uses the model", () => {
+    const res = computeAllocation(input({
+      acs: [ac("abdu", { currentLevel: 2, needTier: "full", needDelta: 3 })],
+      nonAcLoadAmps: 23, // budget = 30 - 1 - 23 = 6 = abdu L2 model cost exactly
+      raiseSurge: { abdu: 5 },
+    }));
+    expect(res.idealLevels.abdu).toBe(2); // holds at L2, not dropped
+    expect(res.desiredLevels.abdu).toBeUndefined();
   });
 });

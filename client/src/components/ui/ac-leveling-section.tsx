@@ -247,7 +247,7 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
       </div>
 
       {/* Gating hints */}
-      {draft.enabled && status && (status.overLimitStreak > 0 || status.settleRemainingMs > 0 || status.raiseHoldRemainingMs > 0 || status.expectedAmps != null || (status.lastEmergency != null && Date.now() - status.lastEmergency.at < 30 * 60_000)) && (
+      {draft.enabled && status && (status.overLimitBudget < status.overLimitBudgetMax || status.settleRemainingMs > 0 || status.raiseHoldRemainingMs > 0 || status.expectedAmps != null || (status.lastEmergency != null && Date.now() - status.lastEmergency.at < 30 * 60_000)) && (
         <div className="text-[0.65rem] text-dim -mt-1.5">
           {[
             status.lastEmergency != null && Date.now() - status.lastEmergency.at < 30 * 60_000 && (
@@ -255,12 +255,10 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
                 emergency cut {status.lastEmergency.savedAmps.toFixed(1)} A · {new Date(status.lastEmergency.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
               </span>
             ),
-            status.overLimitStreak > 0 && (
-              status.severeOverLimitStreak > 0 ? (
-                <span key="over" className="text-amber-400">severe over-limit {Math.min(status.severeOverLimitStreak, 2)}/2 readings</span>
-              ) : (
-                <span key="over" className="text-amber-400">over-limit {Math.min(status.overLimitStreak, 5)}/5 readings</span>
-              )
+            status.overLimitBudget < status.overLimitBudgetMax && (
+              <span key="over" className="text-amber-400" title="Over-limit leaky bucket — acts when the points run out (a reading >1A over costs 2, within 1A costs 1; sustained headroom refills it)">
+                over-limit {status.overLimitBudgetMax - status.overLimitBudget}/{status.overLimitBudgetMax} points
+              </span>
             ),
             status.settleRemainingMs > 0 && <span key="settle">settling {Math.ceil(status.settleRemainingMs / 1000)}s</span>,
             status.raiseHoldRemainingMs > 0 && (
