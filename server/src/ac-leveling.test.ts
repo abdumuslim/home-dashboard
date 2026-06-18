@@ -974,6 +974,33 @@ describe("computeAllocation — fan restore (one jump)", () => {
     expect(r.toFanRaise).toEqual({ deviceId: "najat", fan: 7 });
   });
 
+  it("restores only to the highest fan that fits — the sweet spot (2026-06-18)", () => {
+    // najat alone, floor 2A; budget = 15 − 1 − 9.5 = 4.5, so the fan's headroom
+    // is 4.5 − 2 = 2.5A. At the LEARNED 1A/step that's 2 steps → fan 1→3, NOT a
+    // phantom jump to 5 that would re-push the meter over and bounce.
+    const acs = [ac("najat", { fanSpeed: 1, fanRestoreTarget: 5 })];
+    expect(computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 9.5, acs, fanStepCost: { najat: 1 },
+    })).toFanRaise).toEqual({ deviceId: "najat", fan: 3 });
+    // Without a learned cost the 0.5A heuristic over-credits the headroom and
+    // jumps straight to full (the pre-fix, bounce-prone behavior).
+    expect(computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 9.5, acs,
+    })).toFanRaise).toEqual({ deviceId: "najat", fan: 5 });
+  });
+
+  it("restores an auto-fan hold only when the full auto cost fits (can't subdivide)", () => {
+    const acs = [ac("najat", { fanSpeed: 1, fanRestoreTarget: 0 })];
+    // headroom 4A ≥ 3A learned auto cost → restore to auto.
+    expect(computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 8, acs, fanStepCost: { najat: 3 },
+    })).toFanRaise).toEqual({ deviceId: "najat", fan: 0 });
+    // headroom 2A < 3A → hold at 1 (no intermediate for auto).
+    expect(computeAllocation(input({
+      limitAmps: 15, nonAcLoadAmps: 10, acs, fanStepCost: { najat: 3 },
+    })).toFanRaise).toBeNull();
+  });
+
   it("emits nothing when the hold is already complete", () => {
     const r = computeAllocation(input({
       acs: [ac("najat", { fanSpeed: 4, fanRestoreTarget: 4 }), ac("abdu"), ac("abdullah")],

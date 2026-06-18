@@ -313,6 +313,17 @@ export class AcLeveler {
    * source change (different voltage + amp models) and on a config save.
    */
   private observedRaiseCost = new Map<string, number>();
+  /**
+   * Learned per-AC amps per FAN-level step on the current source. Fans aren't in
+   * the amp model, so a held fan restored straight to its original on a flat
+   * guess overshot and bounced (1↔full). Learned from clean fan-only restore
+   * batches (meter delta ÷ steps) and fed to the allocator as `fanStepCost` so a
+   * restore climbs only to the highest level that fits. Per-source; cleared on
+   * source change (different voltage).
+   */
+  private observedFanStepCost = new Map<string, number>();
+  /** In-flight fan restore awaiting its effect, for per-step cost learning. */
+  private lastFanRaise: { deviceId: string; fromFan: number; toFan: number; preMeasured: number; at: number } | null = null;
   /** Last leveling push timestamp — throttles non-critical notices (see LEVELING_PUSH_THROTTLE_MS). */
   private lastLevelingPushAt = 0;
 
@@ -381,6 +392,8 @@ export class AcLeveler {
     // bounce evidence and learned raise surge no longer describe the world.
     this.bounce.clear();
     this.observedRaiseCost.clear();
+    this.observedFanStepCost.clear();
+    this.lastFanRaise = null;
     this.lastRaiseBatch = null;
     if (!cfg.enabled) {
       this.frozenNonAcLoad = null;
@@ -550,8 +563,10 @@ export class AcLeveler {
       this.lastEmergency = null;
       // Bounce evidence is per-source (different limit + amp models).
       this.bounce.clear();
-      // Learned raise surge is per-source too (lower gen voltage → more amps).
+      // Learned raise surge + fan-step cost are per-source too (different voltage).
       this.observedRaiseCost.clear();
+      this.observedFanStepCost.clear();
+      this.lastFanRaise = null;
       this.lastRaiseBatch = null;
       // Drift baselines are per-source too: a changeover restarts the
       // compressors and the firmware can come back at a different level — a
@@ -1234,6 +1249,27 @@ export class AcLeveler {
       this.expected = null;
     }
 
+    // Learn the real per-fan-step cost from a clean fan-only restore once its
+    // effect has settled (fans aren't modeled — this is what lets the restore
+    // climb to the highest fan that fits instead of jumping to full and
+    // bouncing). meter delta ÷ steps, light EWMA, gen only.
+    if (
+      source === "gen" &&
+      this.lastFanRaise &&
+      now >= this.lastFanRaise.at + FAN_SETTLE_MS &&
+      this.recentMeasured.length >= 4
+    ) {
+      const fr = this.lastFanRaise;
+      const steps = fr.toFan - fr.fromFan;
+      const observed = measured - fr.preMeasured;
+      if (steps > 0 && observed > 0) {
+        const perStep = observed / steps;
+        const prev = this.observedFanStepCost.get(fr.deviceId);
+        this.observedFanStepCost.set(fr.deviceId, prev == null ? perStep : prev * 0.5 + perStep * 0.5);
+      }
+      this.lastFanRaise = null;
+    }
+
     // Effect-confirmation hold: armed by every raise batch in execute(). The
     // next raise needs the last raise's amps to actually show up on the meter
     // (early release) — or the hold to time out (2 min level/fan, 3 min
@@ -1396,6 +1432,9 @@ export class AcLeveler {
       // gate self-corrects from observed overshoots instead of trusting the
       // static model that the user has already had to retune. Empty on grid.
       raiseSurge: source === "gen" ? Object.fromEntries(this.observedRaiseCost) : undefined,
+      // Learned per-fan-step cost so a held fan climbs only to the level that
+      // fits (the sweet spot) instead of jumping to full and bouncing. Gen only.
+      fanStepCost: source === "gen" ? Object.fromEntries(this.observedFanStepCost) : undefined,
     };
     const result = computeAllocation(input);
     this.forceEvaluate = false;
@@ -1633,6 +1672,7 @@ export class AcLeveler {
       const { deviceId, fan } = result.toFanRaise;
       const hold = this.fanHold.get(deviceId);
       if (hold) {
+        const fromFan = hold.lastSetFan;
         try {
           await tcl.sendControl(deviceId, "set_fan_speed", fan);
           this.deps.onLevelerFanCommand(deviceId, fan);
@@ -1640,6 +1680,13 @@ export class AcLeveler {
             await this.clearFanHold(deviceId, "restored");
           } else {
             await this.setFanHoldLastSet(deviceId, fan);
+          }
+          // Learn the real per-fan-step cost from this CLEAN fan-only restore
+          // (numeric upward step only — `auto` can't be attributed per step).
+          // Graded after the fan settle window in tick(); preMeasured is the
+          // pre-effect baseline (compressors/blower haven't responded yet).
+          if (!levelOrPowerSent && fan > 0 && fromFan > 0 && fan > fromFan) {
+            this.lastFanRaise = { deviceId, fromFan, toFan: fan, preMeasured: this.smoothedMeasured(), at: Date.now() };
           }
           // Raises must not reset streaks — the settle window paces the steps.
           sentAny = true;
@@ -1656,6 +1703,9 @@ export class AcLeveler {
       // Fan-only batches settle fast — a 30s pause per fan command crawled
       // through restores and blocked level raises the whole time.
       this.settleUntil = now + (levelOrPowerSent ? SETTLE_MS : FAN_SETTLE_MS);
+      // A level/power command this batch contaminates a pending fan-cost sample
+      // (its meter delta would mix in the level change) — drop it.
+      if (levelOrPowerSent) this.lastFanRaise = null;
       // Freeze the non-AC load the allocation was computed with — fresh
       // derivations are contaminated until compressors respond to the
       // commands just sent (see NON_AC_FREEZE_MS).

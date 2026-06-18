@@ -164,6 +164,16 @@ export interface AllocatorInput {
    * raises). Re-filling up to the current level and reductions are unaffected.
    */
   maxRaiseStep?: number;
+  /**
+   * Per-AC learned amps per FAN-level step (gen) — the real cost of raising the
+   * fan one speed. Fans aren't in the amp model, so a held fan used to restore
+   * straight to its original on a flat 0.5A guess; the real swing is bigger, so
+   * the full jump re-pushed the meter over → drop to 1 → bounce (no sweet spot).
+   * With the learned cost a restore climbs only to the highest level that fits
+   * the buffered budget and settles there. Absent → falls back to the 0.5A
+   * heuristic (FAN_REDUCE_SAVINGS_AMPS).
+   */
+  fanStepCost?: Record<string, number>;
 }
 
 export interface AllocationResult {
@@ -697,17 +707,30 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
     (a.fanRestoreTarget === 0 ? a.fanSpeed !== 0 : a.fanSpeed < a.fanRestoreTarget);
   const anyHoldPending = acs.some(holdPending);
   let toFanRaise: AllocationResult["toFanRaise"] = null;
-  // Buffer-gate the fan restore (2026-06-17, latent defect #1): the restored fan
-  // (~FAN_REDUCE_SAVINGS_AMPS) must fit the BUFFERED budget so jumping it back
-  // can't re-push the meter over near the limit (live: after an emergency fan
-  // cut, fans returned at measured ≤ limit−margin and re-crossed). With a 0
-  // buffer this is the old un-buffered behavior; with a buffer it leaves the fan
-  // a cushion below the breaker, like a gen raise.
-  const fanFitsBuffer = currentOnCost + FAN_REDUCE_SAVINGS_AMPS <= raiseBudgetAmps;
-  if (canRaise && !overBudget && toRestore.length === 0 && fanFitsBuffer) {
+  // Sweet-spot fan restore (2026-06-18 — "it keeps bouncing 1↔full, can't find
+  // the sweet spot"): a held fan climbs only to the HIGHEST level that fits the
+  // buffered budget, not straight to its original. Fans aren't modeled, so the
+  // restore is sized by the LEARNED per-step cost (fanStepCost; falls back to the
+  // 0.5A heuristic). The headroom available for the fan is the buffered budget
+  // minus the gen-level cost; the chosen level lands a buffer below the limit so
+  // it settles instead of re-pushing the meter over → drop to 1 → bounce. A
+  // numeric target climbs step-wise to its sweet spot; an `auto` target can't be
+  // subdivided, so it restores only when the full auto cost fits (else it holds).
+  if (canRaise && !overBudget && toRestore.length === 0) {
     const pick = acs.find(holdPending);
     if (pick) {
-      toFanRaise = { deviceId: pick.deviceId, fan: pick.fanRestoreTarget! };
+      const stepCost = Math.max(0.1, input.fanStepCost?.[pick.deviceId] ?? FAN_REDUCE_SAVINGS_AMPS);
+      const headroom = raiseBudgetAmps - currentOnCost; // amps free for the fan to climb into
+      const target = pick.fanRestoreTarget!;
+      const curFan = pick.fanSpeed!;
+      if (target === 0) {
+        // Auto: one indivisible cost — restore to auto only if it fully fits.
+        if (headroom >= stepCost) toFanRaise = { deviceId: pick.deviceId, fan: 0 };
+      } else {
+        const maxSteps = Math.max(0, Math.floor(headroom / stepCost));
+        const k = Math.min(target, curFan + maxSteps);
+        if (k > curFan) toFanRaise = { deviceId: pick.deviceId, fan: k };
+      }
     }
   }
 
