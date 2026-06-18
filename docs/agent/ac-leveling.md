@@ -135,7 +135,7 @@ Replaces the consecutive mild/severe **streaks** AND the grid-only `oscillationO
 
 **Verification:** **344 server tests green, server + client `tsc` clean.** New/updated tests: the one-step suite, leaky-bucket gating (mild 4-drain, severe 2-drain, 29↔31 grid accumulation, gen-fluctuation tolerance, single-blip-then-refill), sticky-bounce momentary-drop, and the push throttle.
 
-**Still to do at deploy (operational, not code):** re-apply the live `ac_leveling_config` gen step to ~3.5A as a better seed (via `PUT /api/ac/leveling`) — though the learned-surge EWMA + one-step now self-correct a wrong model, so this is no longer load-bearing. (Investigated the client `seedDraft` "clobber" — it only fills gaps and refreshes on non-dirty polls, so it is NOT the 06-14 revert vector; no client change made.)
+**Live config gen step (operational):** re-seeded to **3.5A for all three ACs** on 2026-06-18 via `PUT /api/ac/leveling` (matches observed raise cost; the learned-surge EWMA + one-step also self-correct a wrong model, so it's a seed, not load-bearing). The static gen **bases** are per-AC (`CA5IMhFAAAE`/Abdu 4.3, `Cy3aihFAAAE`/Abdullah 2.3, `DHihohFAAAE`/Najat 2.3). (Investigated the client `seedDraft` "clobber" — it only fills gaps and refreshes on non-dirty polls, so it is NOT the 06-14 revert vector; no client change made.)
 
 ### Raise-responsiveness retune (2026-06-18 — "raising too conservative since the one-step update; pushed toward turn-off over level-down")
 Diagnosed from 60h of gen logs: the one-step rewrite traded raise snappiness for trip-safety it did NOT deliver (~20 emergencies + 2 trips in the window) — slow raises AND still tripping. Three code fixes (one-step pacing KEPT as the hard trip guarantee):
@@ -143,8 +143,10 @@ Diagnosed from 60h of gen logs: the one-step rewrite traded raise snappiness for
 - **Two-way learned surge** (see "Learned surge") — the gate now self-corrects DOWN from clean raises, not just up from bounces.
 - **Reduction sizing by learned cost** (see "Cost-aware reduction optimizer") — a correctly-credited level-down beats a premature shed.
 - **Restores exempt from the raise buffer** (see "Faster shed restore" bullet) — a shed room auto-restores as soon as it fits under `limit − margin`, fixing "there was headroom and it didn't use it" (user had to turn the room back on by hand).
+- **Sweet-spot fan restore** (see "Sweet-spot fan restore" bullet under "Fan reduction before shed") — fans climb to the highest level that fits (learned per-step cost) instead of bouncing 1↔full.
 - **DEFERRED — scoping the 270s turn-on hold off plain post-source-flip level raises.** After a gen↔grid changeover all ON ACs get a re-armed `AC_RAMP_MS` window, so any level raise inside it inherits `RESTORE_HOLD_MS` (270s) not `RAISE_HOLD_MS` (120s). Shortening it is only safe if a changeover does NOT physically cold-restart compressors — but this doc (Turn-on ramp window) states it DOES (user-measured ~4-min ramp), which justifies the 270s. The provable-headroom release already lets these holds release early when there's room, so the benefit is captured safely; revisit shortening the duration only after live confirmation of the restart behaviour.
-- Tests: `ac-leveling.test.ts` Fix-D level-down-vs-shed (+ at-floor-still-sheds); `collector.test.ts` provable-headroom early release + two-way surge learning. 358 server tests green.
+- **Common thread (all five):** prefer USING available headroom over static deadbands, and SELF-CORRECT unmodeled/wrong costs by learning from the meter (`observedRaiseCost` per gen-level, `observedFanStepCost` per fan-step) — fans are NOT in the amp model (their amps land in `nonAcLoad`), which is why a flat fan-cost guess limit-cycled. Settle, never oscillate.
+- Tests: `ac-leveling.test.ts` Fix-D level-down-vs-shed, un-buffered restore, fan sweet-spot/auto-hold; `collector.test.ts` provable-headroom early release + two-way surge learning. **362 server tests green; server `tsc` clean.**
 
 ## Turn-on ramp window (`AC_RAMP_MS` 240s)
 
