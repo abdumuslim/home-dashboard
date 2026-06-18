@@ -553,6 +553,33 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     res.json({ ok: true });
   });
 
+  // Per-device opt-in for Smart AC Leveling notifications (off by default).
+  router.get("/api/push/leveling", async (req: Request, res: Response) => {
+    const endpoint = req.query.endpoint as string | undefined;
+    if (!endpoint) {
+      res.status(400).json({ error: "Missing endpoint" });
+      return;
+    }
+    const result = await pool.query(
+      "SELECT leveling_notifications FROM push_subscriptions WHERE endpoint = $1",
+      [endpoint]
+    );
+    res.json({ enabled: result.rows[0]?.leveling_notifications === true });
+  });
+
+  router.post("/api/push/leveling", async (req: Request, res: Response) => {
+    const { endpoint, enabled } = req.body as { endpoint?: string; enabled?: unknown };
+    if (!endpoint) {
+      res.status(400).json({ error: "Missing endpoint" });
+      return;
+    }
+    await pool.query(
+      "UPDATE push_subscriptions SET leveling_notifications = $2 WHERE endpoint = $1",
+      [endpoint, enabled === true]
+    );
+    res.json({ ok: true });
+  });
+
   // ---------- Alerts ----------
 
   router.get("/api/alerts", async (req: Request, res: Response) => {

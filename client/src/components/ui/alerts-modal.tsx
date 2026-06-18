@@ -4,6 +4,7 @@ import { X, Trash2, Pencil, Bell, BellOff, Plus, Loader2, Clock, Activity, Snowf
 import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import { cn } from "@/lib/utils";
 import { usePushNotifications } from "@/hooks/use-push-notifications";
+import { useLevelingNotifications } from "@/hooks/use-leveling-notifications";
 import { useAlerts } from "@/hooks/use-alerts";
 import { useAutomations } from "@/hooks/use-automations";
 import { useDevices } from "@/hooks/use-devices";
@@ -251,6 +252,7 @@ function describeTrigger(r: AutomationRule): string {
 
 export function AlertsModal({ onClose, isAdmin }: AlertsModalProps) {
   const { isSupported, isSubscribed, permission, endpoint, subscribe, unsubscribe } = usePushNotifications();
+  const { enabled: levelingEnabled, setEnabled: setLevelingEnabled } = useLevelingNotifications(endpoint);
   const { alerts, loading, createAlert, updateAlert, deleteAlert } = useAlerts(endpoint);
   const { automations, createAutomation, updateAutomation, deleteAutomation, toggleAutomation } = useAutomations();
   const { devices } = useDevices();
@@ -355,6 +357,25 @@ export function AlertsModal({ onClose, isAdmin }: AlertsModalProps) {
           {/* Subscribed — show alerts + form */}
           {isSupported && isSubscribed && (
             <div className="flex flex-col">
+              {/* Per-device Smart AC Leveling opt-in (off by default) */}
+              <div className="flex items-center justify-between px-5 py-3 border-b border-white/10">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Snowflake className="w-4 h-4 text-sky-400 shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm text-text">Smart AC Leveling alerts</p>
+                    <p className="text-xs text-dim">Shed / restore notices on this device</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => void setLevelingEnabled(!levelingEnabled)}
+                  className={cn("w-8 h-4 rounded-full relative transition-colors shrink-0", levelingEnabled ? "bg-cyan/30" : "bg-white/10")}
+                  role="switch"
+                  aria-checked={levelingEnabled}
+                  aria-label="Smart AC Leveling alerts on this device"
+                >
+                  <span className={cn("absolute top-0.5 w-3 h-3 rounded-full transition-all", levelingEnabled ? "left-4 bg-cyan" : "left-0.5 bg-dim")} />
+                </button>
+              </div>
               {/* Alert list */}
               <CollapsibleModalSection
                 id="alerts"

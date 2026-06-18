@@ -707,10 +707,15 @@ export class Collector {
     });
   }
 
-  /** Send a push notification to every subscription (leveling shed/restore events). */
+  /**
+   * Send a leveling push (shed/restore/calibration) to devices that opted in.
+   * Off by default for everyone — each device enables it via /api/push/leveling.
+   */
   private async broadcastPush(payload: Record<string, unknown>): Promise<void> {
     try {
-      const result = await this.pool.query("SELECT subscription FROM push_subscriptions");
+      const result = await this.pool.query(
+        "SELECT subscription FROM push_subscriptions WHERE leveling_notifications = true",
+      );
       for (const row of result.rows) {
         await this.sendPush(row.subscription, payload);
       }

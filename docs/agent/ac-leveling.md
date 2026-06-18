@@ -133,6 +133,9 @@ Replaces the consecutive mild/severe **streaks** AND the grid-only `oscillationO
 ### Notification throttle
 `pushLevelingNotice(body, critical)` rate-limits non-critical leveling pushes to ≤ 1 per `LEVELING_PUSH_THROTTLE_MS` (5 min); a **shed** (an AC turned OFF — actionable) is `critical` and always notifies. Cuts the ~40 pushes/day that trained the user to ignore them.
 
+### Per-device opt-in (default OFF)
+Leveling pushes are no longer broadcast to every subscribed device. `collector.broadcastPush()` sends only to rows where `push_subscriptions.leveling_notifications = true` (default `false` for all devices, including the admin's). The same flag gates **both** shed/restore notices and the "AC Calibration finished" broadcast (both flow through `broadcastPush` as `type: "leveling"`). Each device opts in via the "Smart AC Leveling alerts" toggle in the Alerts modal → `POST /api/push/leveling { endpoint, enabled }` (read with `GET /api/push/leveling?endpoint=…`). Even a `critical` shed respects the toggle — the opt-in is the master gate. Round-trip covered by `server/src/push-routes.test.ts`.
+
 **Verification:** **344 server tests green, server + client `tsc` clean.** New/updated tests: the one-step suite, leaky-bucket gating (mild 4-drain, severe 2-drain, 29↔31 grid accumulation, gen-fluctuation tolerance, single-blip-then-refill), sticky-bounce momentary-drop, and the push throttle.
 
 **Live config gen step (operational):** re-seeded to **3.5A for all three ACs** on 2026-06-18 via `PUT /api/ac/leveling` (matches observed raise cost; the learned-surge EWMA + one-step also self-correct a wrong model, so it's a seed, not load-bearing). The static gen **bases** are per-AC (`CA5IMhFAAAE`/Abdu 4.3, `Cy3aihFAAAE`/Abdullah 2.3, `DHihohFAAAE`/Najat 2.3). (Investigated the client `seedDraft` "clobber" — it only fills gaps and refreshes on non-dirty polls, so it is NOT the 06-14 revert vector; no client change made.)

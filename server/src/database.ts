@@ -187,6 +187,8 @@ const MIGRATIONS: string[] = [
     measured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (device_id, source, kind, step)
   )`,
+  // Per-device opt-in for Smart AC Leveling push notifications (off by default for everyone)
+  "ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS leveling_notifications BOOLEAN NOT NULL DEFAULT false",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

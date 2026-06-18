@@ -23,7 +23,7 @@ Main tables in the `home` database:
 - `ac_calibration_results` — Per-AC measured draw per step. Composite PK `(device_id, source, kind, step)`; `source` 'grid'|'gen', `kind` 'level'|'fan', `step` (level 1–3 since the 2026-06 TCL level removal / fan 1–7), `amps REAL` (median(samples) − all-off baseline), `voltage REAL`, `stddev REAL`, `samples SMALLINT`, `measured_at`. Upsert on re-run (latest measurement wins). Read by `GET /api/ac/calibration` which also derives `suggestedFit` (least-squares base/step per device+source).
 - `automations.smart_leveling BOOLEAN DEFAULT true` — per-automation opt-out from leveling (AC rules only).
 
-Other tables referenced elsewhere: `push_subscriptions` (Web Push subscriptions, synced on page load; `alert_rules` FKs to its `endpoint` — see the Push Notifications bullet in [architecture.md](architecture.md)).
+Other tables referenced elsewhere: `push_subscriptions` (Web Push subscriptions, synced on page load; `alert_rules` FKs to its `endpoint` — see the Push Notifications bullet in [architecture.md](architecture.md)). Columns: `endpoint TEXT UNIQUE`, `subscription JSONB`, `breakpoints INTEGER[]` (legacy), `created_at`, and `leveling_notifications BOOLEAN NOT NULL DEFAULT false` — per-device opt-in for Smart AC Leveling/calibration pushes; `broadcastPush` filters on it (`GET`/`POST /api/push/leveling`).
 
 ## Migrations & Conventions
 
