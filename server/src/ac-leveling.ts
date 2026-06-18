@@ -568,8 +568,8 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   if (!overBudget) {
     // Restoring a shed AC (a fully-OFF room) uses the shorter RESTORE_SHED_STREAK
     // — it's the single highest-value raise and the user wants it back the moment
-    // budget is free; the raise buffer below keeps it from settling in the
-    // re-shed deadband. Level raises still wait the full RAISE_STREAK.
+    // it genuinely fits under the limit (UN-buffered — see the feasibility note
+    // below). Level raises still wait the full RAISE_STREAK and keep the buffer.
     const canRestore = !input.inSettle && input.headroomStreak >= RESTORE_SHED_STREAK;
     const bufferedLimit = limitAmps - marginAmps - Math.max(0, input.raiseBufferAmps);
     // The restore batch pulls every raised AC down to the fitted ideal
@@ -587,10 +587,18 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       .sort((a, b) => b.needDelta - a.needDelta);
     for (const a of restoreOrder) {
       const floorDraw = draw(a, floorOf(a));
-      // Restore is the single largest raise (a whole floor + slow compressor
-      // ramp), so it honors the raise buffer too — a restored AC must settle
-      // below the limit, not in the deadband where it would be re-shed.
-      if (cost + floorDraw > raiseBudgetAmps) continue;
+      // A whole-room restore fits the UN-buffered budget (`limit − margin`), not
+      // a full raise-buffer below it (2026-06-18, user): the leveler sheds at the
+      // limit but used to only restore `limit − margin − raiseBuffer`, leaving a
+      // room shed in a ~1.2A deadband even though it ran fine — live, Abdu shed at
+      // 15A would not auto-restore though he was stable at 14.5A, so the user had
+      // to turn him on by hand. A room being OFF is worse than riding near the
+      // limit; the restore-bounce guard (restoreBlocked after a restore →
+      // over-limit → re-shed) is the oscillation safety net, not a static
+      // deadband. Level raises keep the buffer — their limit cycle is what it
+      // was built for. The hold-feasibility check below stays buffer-conservative
+      // (a pending raise's effect is still uncertain).
+      if (cost + floorDraw > budgetAmps) continue;
       const fitsHold =
         !input.raiseHold ||
         (input.raiseHoldExpectedAmps != null &&

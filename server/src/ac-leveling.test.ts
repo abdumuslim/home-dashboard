@@ -242,23 +242,19 @@ describe("computeAllocation — raise buffer (hysteresis)", () => {
     expect(r.desiredLevels).toEqual({ abdullah: 2 });
   });
 
-  it("honors the buffer for restore feasibility", () => {
-    // Najat (managed, shed, off) floor L1 = 2. One ON Abdullah at floor 2.
-    // budget = 15 − 1 − 9 = 5; cost so far 2 → restore needs 2 more = 4 ≤ 5 OK
-    // without buffer, but raiseBudget 5−2 = 3 < 4 → blocked with buffer 2.
+  it("does NOT apply the raise buffer to restores (2026-06-18 — restores fit the un-buffered limit)", () => {
+    // Abdullah ON at floor L2 (3A); Najat shed, floor L1 (2A). budget = 15−1−9 = 5;
+    // cost 3 + Najat 2 = 5 = budget → fits exactly at limit−margin. The buffer used
+    // to park restores below this (left a room shed in the deadband though it fit);
+    // now only LEVEL raises honor the buffer, so the restore fires whatever it is.
     const acs = [
       ac("abdullah", { on: true, currentLevel: 2, minLevel: 2, needTier: "satisfied" }),
       ac("najat", { on: false, shed: true, needTier: "full", needDelta: 3 }),
     ];
-    const blocked = computeAllocation(input({
-      limitAmps: 15, nonAcLoadAmps: 9, raiseBufferAmps: 2, acs,
-    }));
-    expect(blocked.toRestore).toEqual([]);
-    // Drop the buffer → restore fits.
-    const fits = computeAllocation(input({
-      limitAmps: 15, nonAcLoadAmps: 9, raiseBufferAmps: 0, acs,
-    }));
-    expect(fits.toRestore).toEqual(["najat"]);
+    expect(computeAllocation(input({ limitAmps: 15, nonAcLoadAmps: 9, raiseBufferAmps: 2, acs })).toRestore).toEqual(["najat"]);
+    expect(computeAllocation(input({ limitAmps: 15, nonAcLoadAmps: 9, raiseBufferAmps: 0, acs })).toRestore).toEqual(["najat"]);
+    // Still blocked when it genuinely won't fit under the limit (nonAcLoad 10 → budget 4 < 5).
+    expect(computeAllocation(input({ limitAmps: 15, nonAcLoadAmps: 10, raiseBufferAmps: 0, acs })).toRestore).toEqual([]);
   });
 
   it("still caps a level-0 (unrestricted) AC immediately under any buffer", () => {
@@ -644,6 +640,25 @@ describe("computeAllocation — restore", () => {
     }));
     // budget 6: najat 2 + abdu 4 = 6, no room for abdullah L1 (2)
     expect(r.toRestore).toEqual([]);
+  });
+
+  it("restores a shed AC that fits under the limit even with a raise buffer set (2026-06-18)", () => {
+    // raiseBuffer 1 + margin 1: abdu's floor (4A) brings the total to exactly
+    // limit − margin (budget 6A). The OLD code parked restores a full buffer
+    // below (needed ≤ 5A) and left the room shed in the deadband though it fit —
+    // the leveler shed at the limit but only restored limit−margin−buffer, so a
+    // room sat OFF until the user turned it on by hand. Restores now fit the
+    // UN-buffered budget; level raises keep the buffer.
+    const base = {
+      limitAmps: 15,
+      marginAmps: 1,
+      raiseBufferAmps: 1,
+      nonAcLoadAmps: 8,
+      acs: [ac("najat", { currentLevel: 1 }), ac("abdu", { on: false, shed: true })],
+    };
+    expect(computeAllocation(input(base)).toRestore).toEqual(["abdu"]);
+    // Still respects the real limit: at nonAcLoad 9 he genuinely doesn't fit.
+    expect(computeAllocation(input({ ...base, nonAcLoadAmps: 9 })).toRestore).toEqual([]);
   });
 });
 
