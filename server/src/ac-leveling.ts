@@ -874,6 +874,13 @@ export interface SelectReductionOptions {
   weights?: ReductionWeights;
   /** Reduce from each AC's floor (normal over-budget path): only shed is available. */
   fromFloor?: boolean;
+  /**
+   * Learned per-AC real per-level cost (gen). When it exceeds the static model
+   * step, the reduction sizing uses it so a level-down is credited at its REAL
+   * savings — otherwise an under-stating model makes a level-down look too small
+   * to cover the overshoot and the optimizer sheds (turns the AC OFF) instead.
+   */
+  raiseSurge?: Record<string, number>;
 }
 
 /** Never-level-0 re-entry ceiling: top commandable level, clamped by physics /
@@ -960,7 +967,13 @@ export function selectReduction(
   opts: SelectReductionOptions,
 ): ReductionPlan {
   const w = opts.weights ?? DEFAULT_REDUCTION_WEIGHTS;
-  const model = (id: string): AcAmpModel => opts.ampModels[id] ?? DEFAULT_AMP_MODEL;
+  // Use the learned per-level cost when it exceeds the static model step, so a
+  // level-down's estimated savings reflect reality (prefer level-down over shed).
+  const model = (id: string): AcAmpModel => {
+    const base = opts.ampModels[id] ?? DEFAULT_AMP_MODEL;
+    const surge = opts.raiseSurge?.[id];
+    return surge != null && surge > base.stepAmps ? { ...base, stepAmps: surge } : base;
+  };
   const draw = (ac: LevelerAcSnapshot, level: number): number =>
     estimateAcDraw(level, ac.maxLevel, model(ac.deviceId));
   const needWeight = (ac: LevelerAcSnapshot): number => 1 + w.needK * Math.max(0, ac.needDelta);
@@ -1085,6 +1098,8 @@ export interface EmergencyInput {
   /** Pre-sorted by priority, highest first (same as AllocatorInput). */
   acs: LevelerAcSnapshot[];
   ampModels: Record<string, AcAmpModel>;
+  /** Learned per-AC real per-level cost (gen) — see SelectReductionOptions.raiseSurge. */
+  raiseSurge?: Record<string, number>;
 }
 
 export interface EmergencyReductionResult extends AllocationResult {
@@ -1116,7 +1131,7 @@ export function computeEmergencyReduction(input: EmergencyInput): EmergencyReduc
   const onUnmanaged = acs.filter((a) => a.on && !a.managed);
   const candidates = acs.filter((a) => a.on && a.managed && !a.shed);
 
-  const plan = selectReduction(candidates, requiredSavingsAmps, { ampModels });
+  const plan = selectReduction(candidates, requiredSavingsAmps, { ampModels, raiseSurge: input.raiseSurge });
 
   const unmanagedDraw = onUnmanaged.reduce((sum, a) => sum + draw(a, a.currentLevel), 0);
   const budgetAmps = limitAmps - marginAmps - nonAcLoadAmps - unmanagedDraw;

@@ -264,7 +264,17 @@ export class AcLeveler {
   // records the steady-state total it expects so the model can be graded.
   private frozenNonAcLoad: number | null = null;
   private freezeUntil = 0;
-  private expected: { amps: number; raisedAmps: number; at: number; compareAfter: number } | null = null;
+  private expected: {
+    amps: number;
+    raisedAmps: number;
+    at: number;
+    compareAfter: number;
+    /** Set when this batch was a SINGLE-AC level raise — enables two-way surge
+     *  learning at grading (the meter delta IS that AC's real raise cost). */
+    raiseDeviceId?: string | null;
+    /** Smoothed measured at command time (pre-effect baseline for the delta). */
+    preMeasured?: number;
+  } | null = null;
   private lastPrediction: { expectedAmps: number; actualAmps: number; at: number } | null = null;
   /**
    * Armed by every raise batch: the next raise must either see the expected
@@ -1201,6 +1211,26 @@ export class AcLeveler {
           `consider tuning ampModels or running calibration`,
         );
       }
+      // Two-way surge self-correction (gen): a CLEAN single-AC raise that has now
+      // landed teaches the REAL cost of releasing that AC's cap — both up (the
+      // bounce path already learns overshoots) and crucially DOWN (it drew less
+      // than the static model feared, so the raise gate stops over-charging it
+      // into conservatism). Skipped if the raise already bounced — `lastRaiseBatch`
+      // is nulled on bounce, so a post-reduction meter can't undo the safety
+      // learning the bounce recorded.
+      if (
+        source === "gen" &&
+        this.expected.raiseDeviceId != null &&
+        this.expected.preMeasured != null &&
+        this.lastRaiseBatch != null
+      ) {
+        const observed = measured - this.expected.preMeasured;
+        if (observed > 0) {
+          const id = this.expected.raiseDeviceId;
+          const prev = this.observedRaiseCost.get(id);
+          this.observedRaiseCost.set(id, prev == null ? observed : prev * 0.5 + observed * 0.5);
+        }
+      }
       this.expected = null;
     }
 
@@ -1211,16 +1241,36 @@ export class AcLeveler {
     if (this.raiseHold) {
       if (now >= this.raiseHold.until) {
         this.raiseHold = null;
-      } else if (
-        now >= this.raiseHold.checkAfter &&
-        this.recentMeasured.length >= 4 &&
-        measured >= this.raiseHold.expectedAmps - this.raiseHold.threshold
-      ) {
-        log.info(
-          `[leveler] Raise effect confirmed (${measured.toFixed(1)}A ≈ ` +
-          `${this.raiseHold.expectedAmps.toFixed(1)}A expected) — raises unlocked`,
-        );
-        this.raiseHold = null;
+      } else if (now >= this.raiseHold.checkAfter && this.recentMeasured.length >= 4) {
+        // (1) Meter caught up to the predicted draw — the raise's amps arrived.
+        const arrived = measured >= this.raiseHold.expectedAmps - this.raiseHold.threshold;
+        // (2) Provable-headroom early release (fixes the under-delivery trap):
+        // even if the pending raise FULLY delivers its expected draw, one more
+        // one-step surge still fits under the buffered limit → the next step is
+        // safe to commit NOW. This is trip-safe regardless of ramp timing (the
+        // worst case is bounded), and stops an over-predicted raise from sitting
+        // the whole 2–3 min hold while the meter shows ample room. Requires a
+        // sustained genuine-headroom streak so a transient over-limit blip can't
+        // trigger it. `nextStepSurge` = the largest learned/model step among ON
+        // managed ACs (conservative — never under-states the next surge).
+        const bufferedLimit = limit - this.config.marginAmps - Math.max(0, this.config.raiseBufferAmps);
+        const nextStepSurge = Math.max(0, ...snapshots
+          .filter((s) => s.on && s.managed)
+          .map((s) => {
+            const m = this.ampModelFor(s.deviceId, source);
+            return Math.max(m.stepAmps, this.observedRaiseCost.get(s.deviceId) ?? 0);
+          }));
+        const provableHeadroom =
+          this.headroomStreak >= RAISE_STREAK &&
+          this.raiseHold.expectedAmps + nextStepSurge <= bufferedLimit;
+        if (arrived || provableHeadroom) {
+          log.info(arrived
+            ? `[leveler] Raise effect confirmed (${measured.toFixed(1)}A ≈ ` +
+              `${this.raiseHold.expectedAmps.toFixed(1)}A expected) — raises unlocked`
+            : `[leveler] Provable headroom (expected ${this.raiseHold.expectedAmps.toFixed(1)}A ` +
+              `+ next step ${nextStepSurge.toFixed(1)}A ≤ ${bufferedLimit.toFixed(1)}A buffered limit) — raises unlocked`);
+          this.raiseHold = null;
+        }
       }
     }
 
@@ -1287,6 +1337,11 @@ export class AcLeveler {
           requiredSavingsAmps: required,
           acs: snapshots,
           ampModels,
+          // Size level-downs with the REAL per-level cost (same learned signal
+          // the raise gate uses) so a single correctly-credited level-down beats
+          // a shed when it covers — the static gen model under-states the step,
+          // making the optimizer shed (turn OFF) instead of level down.
+          raiseSurge: source === "gen" ? Object.fromEntries(this.observedRaiseCost) : undefined,
         });
         log.warn(
           `[leveler] EMERGENCY: ~${overshoot.toFixed(1)}A over the ${limit}A ${source} limit ` +
@@ -1623,7 +1678,18 @@ export class AcLeveler {
         compareAfter = Math.max(compareAfter, this.rampUntil.get(s.deviceId) ?? 0);
       }
       const expectedAmps = result.nonAcLoadAmps + expectedDraw;
-      this.expected = { amps: expectedAmps, raisedAmps, at: now, compareAfter };
+      // A SINGLE-AC level raise (no restore/turn-on in the batch) lets grading
+      // attribute the whole meter delta to that AC → two-way surge learning.
+      const singleRaiseId =
+        raisedNow.size === 1 && restoredNow.size === 0 ? [...raisedNow.keys()][0] : null;
+      this.expected = {
+        amps: expectedAmps,
+        raisedAmps,
+        at: now,
+        compareAfter,
+        raiseDeviceId: singleRaiseId,
+        preMeasured: this.smoothedMeasured(),
+      };
       // Every LEVEL raise batch arms the effect-confirmation hold: the next
       // raise must either see this batch's amps arrive (early release in tick)
       // or wait the hold out. Turn-ons hold longest — compressor ramps are

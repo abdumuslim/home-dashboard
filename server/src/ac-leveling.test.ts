@@ -1360,6 +1360,31 @@ describe("computeEmergencyReduction", () => {
     expect(r.satisfied).toBe(true);
   });
 
+  it("prefers a level-down over a shed when the learned cost credits it (Fix D)", () => {
+    // Single abdu at L2. The static model step (2A) makes one L2→L1 look too
+    // small to cover the 3A target → the optimizer sheds (turns the AC OFF).
+    const acs = [ac("abdu", { currentLevel: 2, needDelta: 1 })];
+    const modelOnly = computeEmergencyReduction(eInput({ requiredSavingsAmps: 3, acs }));
+    expect(modelOnly.toShed).toEqual(["abdu"]);
+    expect(modelOnly.desiredLevels.abdu).toBeUndefined();
+    // With the learned REAL cost (3.5A/level) the level-down covers → no shed.
+    const learned = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 3, acs, raiseSurge: { abdu: 3.5 },
+    }));
+    expect(learned.toShed).toEqual([]);
+    expect(learned.desiredLevels).toEqual({ abdu: 1 });
+  });
+
+  it("still sheds when everyone is at floor and floors exceed the target (Fix D safe)", () => {
+    // At L1 floor there is no level-down to credit — a shed is genuinely the
+    // only lever, learned cost or not.
+    const acs = [ac("abdu", { currentLevel: 1, needDelta: 0 })];
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 3, acs, raiseSurge: { abdu: 3.5 },
+    }));
+    expect(r.toShed).toEqual(["abdu"]);
+  });
+
   it("moves to the next AC's levels when the first reaches its floor", () => {
     const r = computeEmergencyReduction(eInput({
       requiredSavingsAmps: 3,

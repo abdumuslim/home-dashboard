@@ -1397,6 +1397,71 @@ describe("Smart AC leveling — predictive control", () => {
     expect(tclCloud.sendControl).toHaveBeenLastCalledWith("ac2", "set_generator_mode", 3);
   });
 
+  it("releases the hold early on provable headroom even when the raise under-delivers (Fix A)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    // Single Najat (step 1A): a low-expected raise with ample room to the limit.
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // 10A on gen → nonAcLoad 8, Najat raised one step L1→L2 (expected 11A), hold armed.
+    genReadings(collector, 10, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+
+    // The cap rose but the draw didn't (meter even drifts down to 9A) — the
+    // expected 11A never "arrives" (9 < 11 − 1 threshold). Pre-fix this sat the
+    // full 2-min hold. Now: expected 11A + the next 1A step ≤ 14A buffered limit
+    // with a sustained headroom streak → provable-headroom release, next step fires.
+    const after = [{ ...devices[0], generatorMode: 2 }];
+    tclCloud.getDevices.mockReturnValue(after);
+    tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
+    vi.advanceTimersByTime(31_000);
+    genReadings(collector, 9, 6);
+    await checkAcLeveling(collector);
+    // The old hold released early on provable headroom and the next step fired
+    // well inside the 2-min window (which then re-arms its own fresh hold).
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(2);
+    expect(tclCloud.sendControl).toHaveBeenLastCalledWith("ac1", "set_generator_mode", 3);
+  });
+
+  it("learns a higher raise surge from a clean over-delivering raise and gates the next step (Fix C)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    // Single Najat (model step 1A). A clean raise (no over-limit, no bounce)
+    // whose real cost is 4A must teach the gate — the bounce path never sees it.
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // 8A on gen → nonAcLoad 6, Najat raised L1→L2 (model expects +1 → 9A), hold armed.
+    genReadings(collector, 8, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+
+    // The real cost was +4A (meter → 12A, still well under the 15A limit so no
+    // bounce). Grading learns observedRaiseCost[ac1] ≈ 4. The next step L2→L3 is
+    // now surge-charged 4A: nonAcLoad 9, budget 5 → 3 + 4 = 7 > 5 → BLOCKED.
+    // (With only the 1A model step it would have been 3 + 1 = 4 ≤ 5 and fired.)
+    const after = [{ ...devices[0], generatorMode: 2 }];
+    tclCloud.getDevices.mockReturnValue(after);
+    tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
+    vi.advanceTimersByTime(31_000);
+    genReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    // Hold released (12 ≥ 9 − 1 arrived), surge learned, next step held back.
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+  });
+
   it("holds raises for the 270s turn-on hold after an AC turn-on whose draw never arrives", async () => {
     const { collector, tclCloud, shed, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
