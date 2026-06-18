@@ -174,6 +174,10 @@ interface AcFanEnforcement {
   manual: boolean;                // user changed fan — stop enforcing until slot change or power cycle
 }
 
+interface AcSwingOverride {
+  slotId: string;                 // range slot active when the user took manual swing control
+}
+
 export class Collector {
   private pool: pg.Pool;
   private config: Config;
@@ -219,6 +223,9 @@ export class Collector {
   private readonly AC_MANUAL_OFF_CLEAR_GRACE_MS = 15_000;
   private acFanEnforcement = new Map<string, AcFanEnforcement>(); // key `${rule.id}:${deviceId}`
   private readonly AC_FAN_SETTLE_MS = 15_000;
+  // A manual UI vertical-swing change suspends swing enforcement until the active
+  // slot changes or the AC power-cycles (no shadow-drift detection — UI-driven only).
+  private acSwingOverrides = new Map<string, AcSwingOverride>(); // key `${rule.id}:${deviceId}`
   // Last automation-sent power-off per device — the shadow can lag past the 5s power
   // cache TTL, so off branches re-firing inside this grace are duplicates, not state.
   private acRangeOffAt = new Map<string, number>();
@@ -991,6 +998,15 @@ export class Collector {
     this.acFanEnforcement.delete(this.acFanKey(ruleId, deviceId));
   }
 
+  private acSwingKey(ruleId: number, deviceId: string): string {
+    return `${ruleId}:${deviceId}`;
+  }
+
+  /** Drops a manual swing override — call on any AC power cycle the rule owns. */
+  private clearAcSwingOverride(ruleId: number, deviceId: string): void {
+    this.acSwingOverrides.delete(this.acSwingKey(ruleId, deviceId));
+  }
+
   /**
    * The range fan is ALWAYS the delta-based smart level unless the active slot
    * explicitly fixes 1–7 (slot 0 or absent → smart auto). The preset's
@@ -1030,8 +1046,21 @@ export class Collector {
       const clamped = this.clampSlotGenLevel(deviceId, slot.gen_level);
       if (clamped != null) profile.generator_mode = clamped;
     }
-    // 0 (Off) is a real value — overrides the preset's swing; absent falls through.
-    if (slot.vertical_swing != null) profile.vertical_swing = slot.vertical_swing;
+    // Vertical swing: a manual UI change (noteUserAcSwingChange) suspends
+    // enforcement until the active slot changes or the AC power-cycles — same
+    // intent model as fan. The override is keyed to the slot it was made under,
+    // so a slot change naturally resumes enforcement.
+    const swingKey = this.acSwingKey(rule.id, deviceId);
+    const swingOverride = this.acSwingOverrides.get(swingKey);
+    if (swingOverride && swingOverride.slotId !== slot.id) {
+      this.acSwingOverrides.delete(swingKey); // active slot changed — resume swing enforcement
+    }
+    if (this.acSwingOverrides.has(swingKey)) {
+      delete profile.vertical_swing; // user took manual swing control — leave it untouched
+    } else if (slot.vertical_swing != null) {
+      // 0 (Off) is a real value — overrides the preset's swing; absent falls through.
+      profile.vertical_swing = slot.vertical_swing;
+    }
     const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, deviceId));
     if (entry?.manual) {
       // Non-Najat fan 7 == turbo — enforcing turbo would clobber a manual fan choice
@@ -1151,6 +1180,26 @@ export class Collector {
     }
   }
 
+  /**
+   * UI vertical-swing change — suspend swing enforcement for every range rule
+   * owning this device until the active slot changes or the AC power-cycles.
+   * Mirrors the fan manual-override intent model (UI-driven; no shadow drift).
+   */
+  noteUserAcSwingChange(deviceId: string): void {
+    for (const rule of this.automationRules) {
+      if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
+      if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
+      const slot = findActiveRangeSlot(
+        rule.range_slots ?? getLegacyRangeSlots(rule.threshold_low, rule.threshold),
+        getBaghdadMinutes(),
+        (prayer, offset) => this.resolvePrayerMinutes(prayer, offset),
+      );
+      if (!slot) continue;
+      this.acSwingOverrides.set(this.acSwingKey(rule.id, deviceId), { slotId: slot.id });
+      log.info(`[collector] AC ${deviceId}: user vertical-swing change — suspending swing enforcement for rule "${rule.name}" until slot change or power cycle`);
+    }
+  }
+
   private async checkAcRangeAutomation(rule: AutomationRule): Promise<void> {
     const now = Date.now();
     const def = ALERT_METRICS[rule.metric!];
@@ -1199,6 +1248,7 @@ export class Collector {
               if (power === "on" && !(await this.isAcManualOffLocked(did))) {
                 await this.tclCloud!.ensureDeviceCachePopulated();
                 this.clearAcFanEnforcement(rule.id, did); // user power-cycled — fan intent resets
+                this.clearAcSwingOverride(rule.id, did);  // and swing intent resets
                 const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
                 const diff = this.tclCloud!.computeAcDiff(did, this.stripLeveledControls(rule, profileOnly, did));
                 if (diff) {
@@ -1229,8 +1279,11 @@ export class Collector {
           );
           try {
             await this.tclCloud!.ensureDeviceCachePopulated();
-            // Automation power-on = power cycle: drop manual fan overrides, apply the slot fan
-            for (const did of unlockedDeviceIds) this.clearAcFanEnforcement(rule.id, did);
+            // Automation power-on = power cycle: drop manual fan + swing overrides, apply the slot fan/swing
+            for (const did of unlockedDeviceIds) {
+              this.clearAcFanEnforcement(rule.id, did);
+              this.clearAcSwingOverride(rule.id, did);
+            }
             const fan = this.resolveRangeFan(rule, activeSlot, unlockedDeviceIds[0], value);
             // Slot gen level overrides the preset's (clamped to the device max;
             // stripped again downstream when the leveler manages the device).
@@ -1304,6 +1357,7 @@ export class Collector {
           for (const did of deviceIds) {
             await this.acLeveler.clearShed(did, "range_turn_off");
             this.clearAcFanEnforcement(rule.id, did);
+            this.clearAcSwingOverride(rule.id, did);
             this.acRangeOffAt.set(did, now);
             this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
           }
@@ -1320,6 +1374,7 @@ export class Collector {
               log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, recording manual-off lock`);
               await this.recordAcManualOff(did, "observed_off");
               this.clearAcFanEnforcement(rule.id, did); // power cycle — fan intent resets
+              this.clearAcSwingOverride(rule.id, did);  // and swing intent resets
               this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
               return;
             }
@@ -1364,6 +1419,7 @@ export class Collector {
         // Outside the window the automation owns the OFF — drop any leveler shed
         await this.acLeveler.clearShed(did, "outside_range_off");
         this.clearAcFanEnforcement(rule.id, did);
+        this.clearAcSwingOverride(rule.id, did);
       } catch (err) {
         log.error(`[collector] AC range "${rule.name}" outside-range off failed for ${did}:`, (err as Error).message);
       }

@@ -2602,6 +2602,47 @@ describe("Per-range-slot vertical swing (vertical_swing)", () => {
     // Smart-auto fan: delta 27−22=5 → L7; slot pins vertical_swing 2.
     expect(actions).toEqual([{ deviceId: "ac1", action: { power: 1, mode: 1, temperature: 23, fan_speed: 7, vertical_swing: 2 } }]);
   });
+
+  it("suspends swing enforcement after a manual UI swing change", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    const rule = swingRule(11, {
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, vertical_swing: 1 },
+    });
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    collector.noteUserAcSwingChange("ac1"); // user changed swing from the AC card
+    await reenforce(collector, rule);
+
+    // Swing is left untouched — the enforced diff carries no vertical_swing at all.
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6 });
+  });
+
+  it("resumes swing enforcement when the active slot changes", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    // A manual override taken under a now-inactive slot must be ignored and cleared.
+    (collector as never as { acSwingOverrides: Map<string, { slotId: string }> }).acSwingOverrides.set("1:ac1", { slotId: "stale-morning" });
+    const rule = swingRule(11, {
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, vertical_swing: 1 },
+    });
+    await reenforce(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6, vertical_swing: 11 });
+    expect((collector as never as { acSwingOverrides: Map<string, unknown> }).acSwingOverrides.has("1:ac1")).toBe(false);
+  });
+
+  it("clears the swing override on a power cycle (turn-on)", async () => {
+    const { collector, actions } = createCollector();
+    const rule = swingRule(2);
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    collector.noteUserAcSwingChange("ac1");   // manual swing override active...
+    await setWeatherValue(collector, 27);     // ...then the AC power-cycles on turn-on
+    await checkAcRangeAutomation(collector, rule);
+
+    // Turn-on re-applies the slot swing (override dropped) and the override is gone.
+    expect(actions).toEqual([{ deviceId: "ac1", action: { power: 1, mode: 1, temperature: 23, fan_speed: 7, vertical_swing: 2 } }]);
+    expect((collector as never as { acSwingOverrides: Map<string, unknown> }).acSwingOverrides.has("1:ac1")).toBe(false);
+  });
 });
 
 describe("Smart AC leveling — calibration handoff (ramp re-arm)", () => {
