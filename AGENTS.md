@@ -20,6 +20,7 @@ Browser → Cloudflare → Traefik (VPS) → dashboard container (port 8000) →
 | Automations: purifier rules, AC range hysteresis, range slots, fan enforcement, manual-off locks, schedules, timers, presets (server side), beep enforcement | `docs/agent/ac-automations.md` |
 | Smart AC Leveling, power budget, shed/restore, calibration, amp models | `docs/agent/ac-leveling.md` |
 | Frontend: layout, cards, widgets, presets UI, charts, colors, hooks, sky/solar model | `docs/agent/frontend.md` |
+| Prayer times: calculation engine (astronomy-engine), method profiles, BaghdadYMA calibration, `/api/prayer-times`, client API-driven flow | `docs/PRAYER_TIMES_API.md` + `server/src/prayer-engine/README.md` |
 | Tests: what exists, fake-timer harness gotchas | `docs/agent/testing.md` |
 | Deploying, SSH/VPS, live API debugging, credentials, disk maintenance | `docs/agent/operations.md` ⚠️ local-only (gitignored); if absent, ask the user |
 
@@ -48,6 +49,7 @@ Deployment is a 3-step pipeline (tarball → scp/ssh rebuild → **regenerate mo
 7. **Smart-auto over built-in auto:** device built-in "auto" modes are replaced by server-computed delta logic (pure functions + tests); manual user changes always win over automation enforcement.
 8. **VPS clock is UTC, household is Baghdad (UTC+3, no DST)** — all time-window/prayer logic must convert; see the timezone gotcha in `docs/agent/architecture.md`.
 9. New columns/tables go through the `MIGRATIONS` list in `server/src/database.ts` (`docs/agent/database.md`).
+10. **Prayer times = `prayer-engine` (BaghdadYMA profile via `server/src/prayer.ts`); the client is API-driven (`/api/prayer-times`).** Never reintroduce `adhan` or client-side prayer math. Retune Baghdad only by editing angles/offsets in `prayer-engine/methods.ts`, then re-run `calibrate.ts` + `prayer-engine.test.ts` (keep ≤1 min vs the printed calendar). Engine loads astronomy-engine via `createRequire` (tsx/vitest CJS/ESM gotcha — do not switch to a named ESM import); details in `server/src/prayer-engine/README.md`.
 
 ## Project structure (compact — full per-file annotations in docs/agent/architecture.md)
 

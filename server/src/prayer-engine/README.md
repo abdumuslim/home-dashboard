@@ -8,7 +8,12 @@ Earth**, elevation-aware, with high-latitude handling and opt-in Sunnah times.
 > Self-contained and lift-and-shift: copy this folder into another project (it
 > only needs `astronomy-engine`), or publish it to npm. It currently lives under
 > `server/src/` so the dashboard's existing `tsc`/Docker build compiles it with
-> zero extra wiring.
+> zero extra wiring. **Why under `server/src/` and not a repo-root package:** the
+> Dockerfile builds `server/` and `client/` as fully independent stages (each
+> copies only its own dir, no repo-root `package.json`), so a shared root module
+> consumed by both would force a Docker/workspace rework. Keeping the engine
+> server-only + making the client API-driven avoids that. Don't "promote" it to a
+> root package without reworking the per-app Docker stages.
 
 ## Why astronomy-engine
 
