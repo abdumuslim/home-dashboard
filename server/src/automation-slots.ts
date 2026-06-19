@@ -1,15 +1,10 @@
-import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import { MAX_GENERATOR_LEVEL } from "./tcl-cloud.js";
+import { getBaghdadPrayerTimes, baghdadMinuteOfDay, prayerInstant } from "./prayer.js";
 
 const MINUTES_PER_DAY = 1440;
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const VALID_PRAYERS = new Set(["fajr", "dhuhr", "asr", "maghrib", "isha"]);
 const VALID_VERTICAL_SWING = new Set([0, 1, 2, 3, 9, 10, 11, 12, 13]);
-
-const BAGHDAD_COORDS = new Coordinates(33.321502, 44.358335);
-const PRAYER_PARAMS = CalculationMethod.Dubai();
-PRAYER_PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
-PRAYER_PARAMS.rounding = Rounding.None;
 
 export type RangeSlotType = "all_day" | "window";
 export type RangeSlotTimeMode = "exact" | "prayer";
@@ -71,30 +66,12 @@ export function getBaghdadMinutes(date = new Date()): number {
   return baghdadNow.getHours() * 60 + baghdadNow.getMinutes();
 }
 
-export function roundPrayerTime(date: Date, prayer: string): Date {
-  const d = new Date(date);
-  const s = d.getSeconds();
-  const ms = d.getMilliseconds();
-  if (prayer === "fajr") {
-    if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
-  } else {
-    if (s >= 30) d.setMinutes(d.getMinutes() + 1);
-  }
-  d.setSeconds(0, 0);
-  return d;
-}
-
 export function createBaghdadPrayerResolver(date = new Date()): PrayerResolver {
-  const dateKey = date.toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
-  const [y, m, d] = dateKey.split("-").map(Number);
-  const prayerTimes = new PrayerTimes(BAGHDAD_COORDS, new Date(y, m - 1, d, 12, 0, 0), PRAYER_PARAMS);
-
+  const times = getBaghdadPrayerTimes(date);
   return (prayer: string, offset: number): number | null => {
-    const raw = prayerTimes[prayer as keyof PrayerTimes] as Date | undefined;
-    if (!(raw instanceof Date)) return null;
-    const rounded = roundPrayerTime(raw, prayer);
-    const bd = new Date(rounded.toLocaleString("en-US", { timeZone: "Asia/Baghdad" }));
-    return normalizeMinute(bd.getHours() * 60 + bd.getMinutes() + offset);
+    const t = prayerInstant(times, prayer);
+    if (!t) return null;
+    return normalizeMinute(baghdadMinuteOfDay(t) + offset);
   };
 }
 

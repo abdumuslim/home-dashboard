@@ -55,6 +55,7 @@ Deployment is a 3-step pipeline (tarball → scp/ssh rebuild → **regenerate mo
 server/src/      Express app: index.ts (wiring), routes.ts (REST API), collector.ts (polling + automation loop),
                  tcl-cloud.ts / xiaomi-cloud.ts (device clouds), ac-leveling.ts + ac-leveler.ts (leveling),
                  ac-calibration.ts, ac-auto-fan.ts, automation-slots.ts, alert-metrics.ts, forecast.ts,
+                 prayer.ts (Baghdad wrapper) + prayer-engine/ (standalone GPS prayer-time engine),
                  auth.ts, database.ts, config.ts, logger.ts, calibrate.ts (offline bias-table script), *.test.ts
 client/src/      React app: components/ (cards, sections, widgets, ui/), hooks/, types/, constants/
 mosquitto/       MQTT broker config (passwd generated on VPS — see operations doc)

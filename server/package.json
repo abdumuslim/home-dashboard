@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-iot-data-plane": "^3.1004.0",
-    "adhan": "^4.4.3",
+    "astronomy-engine": "^2.1.19",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "mqtt": "^5.10.0",

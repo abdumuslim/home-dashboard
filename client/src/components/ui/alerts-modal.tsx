@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, Fragment } from "react";
 import { createPortal } from "react-dom";
 import { X, Trash2, Pencil, Bell, BellOff, Plus, Loader2, Clock, Activity, Snowflake } from "lucide-react";
-import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
 import { cn } from "@/lib/utils";
+import { loadPrayerMinutes, prayerMinute } from "@/lib/prayer-minutes";
 import { usePushNotifications } from "@/hooks/use-push-notifications";
 import { useLevelingNotifications } from "@/hooks/use-leveling-notifications";
 import { useAlerts } from "@/hooks/use-alerts";
@@ -69,10 +69,6 @@ const DEFAULT_RANGE_SLOT_PRAYERS = { start: "isha", end: "fajr" } as const;
 const DEFAULT_RANGE_SLOT_TIMES = { start: "08:00", end: "12:00" } as const;
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const MINUTES_PER_DAY = 1440;
-const BAGHDAD = new Coordinates(33.321502, 44.358335);
-const PRAYER_PARAMS = CalculationMethod.Dubai();
-PRAYER_PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
-PRAYER_PARAMS.rounding = Rounding.None;
 
 function createRangeSlot(overrides: Partial<AutomationRangeSlot> = {}): AutomationRangeSlot {
   return {
@@ -103,29 +99,11 @@ function parseTimeToMinutes(time: string): number {
   return h * 60 + m;
 }
 
-function roundPrayerTime(date: Date, prayer: string): Date {
-  const d = new Date(date);
-  const s = d.getSeconds();
-  const ms = d.getMilliseconds();
-  if (prayer === "fajr") {
-    if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
-  } else if (s >= 30) {
-    d.setMinutes(d.getMinutes() + 1);
-  }
-  d.setSeconds(0, 0);
-  return d;
-}
-
 function resolvePrayerMinutes(prayer: string, offset: number): number | null {
   if (!PRAYER_NAMES.includes(prayer as (typeof PRAYER_NAMES)[number])) return null;
-  const dateKey = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
-  const [y, m, d] = dateKey.split("-").map(Number);
-  const prayerTimes = new PrayerTimes(BAGHDAD, new Date(y, m - 1, d, 12, 0, 0), PRAYER_PARAMS);
-  const raw = prayerTimes[prayer as keyof PrayerTimes] as Date | undefined;
-  if (!(raw instanceof Date)) return null;
-  const rounded = roundPrayerTime(raw, prayer);
-  const bd = new Date(rounded.toLocaleString("en-US", { timeZone: "Asia/Baghdad" }));
-  return ((bd.getHours() * 60 + bd.getMinutes() + offset) % MINUTES_PER_DAY + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+  const base = prayerMinute(prayer);
+  if (base == null) return null;
+  return ((base + offset) % MINUTES_PER_DAY + MINUTES_PER_DAY) % MINUTES_PER_DAY;
 }
 
 function resolveSlotEndpoint(slot: AutomationRangeSlot, prefix: "start" | "end"): number | null {
@@ -144,6 +122,9 @@ function slotIntervals(slot: AutomationRangeSlot): Array<{ start: number; end: n
   if (slot.type === "all_day") return [];
   const start = resolveSlotEndpoint(slot, "start");
   const end = resolveSlotEndpoint(slot, "end");
+  // Prayer-relative endpoints may be unresolved until prayer times load — skip
+  // overlap detection (treat as valid); the server validates authoritatively on save.
+  if ((start == null && slot.start_mode === "prayer") || (end == null && slot.end_mode === "prayer")) return [];
   if (start == null || end == null || start === end) return null;
   return start < end ? [{ start, end }] : [{ start, end: MINUTES_PER_DAY }, { start: 0, end }];
 }
@@ -281,6 +262,11 @@ export function AlertsModal({ onClose, isAdmin }: AlertsModalProps) {
   useEffect(() => {
     document.body.style.overflow = "hidden";
     return () => { document.body.style.overflow = ""; };
+  }, []);
+
+  // Warm the prayer minute-of-day cache for prayer-relative range-slot overlap previews.
+  useEffect(() => {
+    loadPrayerMinutes();
   }, []);
 
   const handleSubscribe = async () => {

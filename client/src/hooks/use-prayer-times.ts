@@ -1,32 +1,12 @@
 import { useState, useEffect, useMemo } from "react";
-import {
-  Coordinates,
-  CalculationMethod,
-  PrayerTimes,
-  Prayer,
-  Rounding,
-} from "adhan";
 import { TZ } from "@/constants/thresholds";
 
-const BAGHDAD = new Coordinates(33.321502, 44.358335);
-const PARAMS = CalculationMethod.Dubai();
-PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
-PARAMS.rounding = Rounding.None;
-
-// Fajr uses ceiling rounding (matches Iraqi Awqaf — conservative for fasting start)
-// All other prayers use nearest rounding
-function roundPrayerTime(date: Date, prayer: string): Date {
-  const d = new Date(date);
-  const s = d.getSeconds();
-  const ms = d.getMilliseconds();
-  if (prayer === "fajr") {
-    if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
-  } else {
-    if (s >= 30) d.setMinutes(d.getMinutes() + 1);
-  }
-  d.setSeconds(0, 0);
-  return d;
-}
+// Prayer times are computed server-side by the prayer-engine (BaghdadYMA
+// profile) and served at /api/prayer-times with machine-readable timestamps.
+// This hook fetches them once per Baghdad civil day and ticks the live
+// countdown locally — the client no longer re-implements the calculation, so
+// it can never drift from the server / automations. Hijri date + Islamic events
+// stay local (Intl-based, no extra dependency).
 
 // Sorted by month/day — must stay in chronological order for lookup
 const ISLAMIC_EVENTS = [
@@ -103,14 +83,54 @@ export interface PrayerInfo {
   proximity: ProximityLevel | null;
 }
 
-const PRAYER_ORDER: { key: PrayerName; label: string }[] = [
-  { key: "fajr", label: "Fajr" },
-  { key: "sunrise", label: "Sunrise" },
-  { key: "dhuhr", label: "Dhuhr" },
-  { key: "asr", label: "Asr" },
-  { key: "maghrib", label: "Maghrib" },
-  { key: "isha", label: "Isha" },
-];
+const PRAYER_KEYS: PrayerName[] = ["fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha"];
+
+interface ApiPrayer {
+  name: string;
+  label: string;
+  timestamp: number;
+}
+
+interface FetchedPrayers {
+  prayers: { name: PrayerName; label: string; time: Date }[];
+  tomorrowFajr: Date;
+}
+
+// Module-level cache so the header + content instances of the hook share one
+// fetch per civil day (and stay perfectly in sync).
+let cache: { dateKey: string; data: FetchedPrayers } | null = null;
+let inflight: { dateKey: string; promise: Promise<FetchedPrayers> } | null = null;
+
+async function loadPrayers(dateKey: string): Promise<FetchedPrayers> {
+  if (cache && cache.dateKey === dateKey) return cache.data;
+  if (inflight && inflight.dateKey === dateKey) return inflight.promise;
+
+  const promise = fetch("/api/prayer-times")
+    .then((r) => {
+      if (!r.ok) throw new Error(`prayer-times ${r.status}`);
+      return r.json() as Promise<{ prayers: ApiPrayer[]; tomorrowFajr: number }>;
+    })
+    .then((json) => {
+      const order = (name: string) => PRAYER_KEYS.indexOf(name as PrayerName);
+      const data: FetchedPrayers = {
+        prayers: json.prayers
+          .filter((p) => order(p.name) !== -1)
+          .sort((a, b) => order(a.name) - order(b.name))
+          .map((p) => ({ name: p.name as PrayerName, label: p.label, time: new Date(p.timestamp) })),
+        tomorrowFajr: new Date(json.tomorrowFajr),
+      };
+      cache = { dateKey, data };
+      inflight = null;
+      return data;
+    })
+    .catch((err) => {
+      inflight = null;
+      throw err;
+    });
+
+  inflight = { dateKey, promise };
+  return promise;
+}
 
 function formatCountdown(diffMs: number): string {
   const totalSec = Math.max(0, Math.floor(diffMs / 1000));
@@ -151,6 +171,7 @@ function formatPrayerTime(date: Date): string {
 
 export function usePrayerTimes() {
   const [nowMs, setNowMs] = useState(Date.now());
+  const [fetched, setFetched] = useState<FetchedPrayers | null>(() => cache?.data ?? null);
 
   useEffect(() => {
     const id = setInterval(() => setNowMs(Date.now()), 1000);
@@ -159,15 +180,18 @@ export function usePrayerTimes() {
 
   const dateKey = getDateKey(nowMs);
 
-  const { todayPrayers, tomorrowPrayers } = useMemo(() => {
-    const today = new Date(nowMs);
-    const tomorrow = new Date(nowMs);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    return {
-      todayPrayers: new PrayerTimes(BAGHDAD, today, PARAMS),
-      tomorrowPrayers: new PrayerTimes(BAGHDAD, tomorrow, PARAMS),
+  useEffect(() => {
+    let cancelled = false;
+    loadPrayers(dateKey)
+      .then((data) => {
+        if (!cancelled) setFetched(data);
+      })
+      .catch(() => {
+        /* keep last good data; transient fetch errors are non-fatal */
+      });
+    return () => {
+      cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dateKey]);
 
   const hijriDate = useMemo(() => {
@@ -193,45 +217,44 @@ export function usePrayerTimes() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dateKey]);
 
-  const now = new Date(nowMs);
-  const nextPrayerEnum = todayPrayers.nextPrayer(now);
-  const allPassed = nextPrayerEnum === Prayer.None;
+  const prayers: PrayerInfo[] = useMemo(() => {
+    if (!fetched) return [];
+    const nextIdx = fetched.prayers.findIndex((p) => p.time.getTime() > nowMs);
+    return fetched.prayers.map((p, i) => {
+      const diffMs = p.time.getTime() - nowMs;
+      const isPassed = diffMs < 0;
+      return {
+        name: p.name,
+        label: p.label,
+        time: p.time,
+        formattedTime: formatPrayerTime(p.time),
+        isPassed,
+        isNext: i === nextIdx,
+        countdown: isPassed ? null : formatCountdown(diffMs),
+        proximity: isPassed ? null : getProximity(diffMs),
+      };
+    });
+  }, [fetched, nowMs]);
 
-  const prayers: PrayerInfo[] = PRAYER_ORDER.map(({ key, label }) => {
-    const time = roundPrayerTime(todayPrayers[key] as Date, key);
-    const diffMs = time.getTime() - nowMs;
-    const isPassed = diffMs < 0;
-    const isNext = !allPassed && nextPrayerEnum === key;
-
-    return {
-      name: key,
-      label,
-      time,
-      formattedTime: formatPrayerTime(time),
-      isPassed,
-      isNext,
-      countdown: isPassed ? null : formatCountdown(diffMs),
-      proximity: isPassed ? null : getProximity(diffMs),
-    };
-  });
-
-  // When all today's prayers have passed, provide tomorrow's Fajr as next
+  // When all of today's prayers have passed, surface tomorrow's Fajr as next.
   let nextPrayer: PrayerInfo | null = null;
-  if (allPassed) {
-    const fajrTime = roundPrayerTime(tomorrowPrayers.fajr, "fajr");
-    const diffMs = fajrTime.getTime() - nowMs;
-    nextPrayer = {
-      name: "fajr",
-      label: "Fajr",
-      time: fajrTime,
-      formattedTime: formatPrayerTime(fajrTime),
-      isPassed: false,
-      isNext: true,
-      countdown: formatCountdown(diffMs),
-      proximity: getProximity(diffMs),
-    };
-  } else {
-    nextPrayer = prayers.find((p) => p.isNext) ?? null;
+  if (fetched) {
+    const upcoming = prayers.find((p) => p.isNext);
+    if (upcoming) {
+      nextPrayer = upcoming;
+    } else {
+      const diffMs = fetched.tomorrowFajr.getTime() - nowMs;
+      nextPrayer = {
+        name: "fajr",
+        label: "Fajr",
+        time: fetched.tomorrowFajr,
+        formattedTime: formatPrayerTime(fetched.tomorrowFajr),
+        isPassed: false,
+        isNext: true,
+        countdown: formatCountdown(diffMs),
+        proximity: getProximity(diffMs),
+      };
+    }
   }
 
   return { prayers, hijriDate, nextPrayer, islamicEvent };

@@ -1,7 +1,8 @@
 import pg from "pg";
 import webpush from "web-push";
 import mqtt from "mqtt";
-import { Coordinates, CalculationMethod, PrayerTimes, Rounding } from "adhan";
+import { getBaghdadPrayerTimes, baghdadMinuteOfDay, baghdadDateKey, prayerInstant } from "./prayer.js";
+import type { PrayerTimesResult } from "./prayer-engine/index.js";
 import type { Config } from "./config.js";
 import { getMetricValue, powerConditionSustained, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS, type PowerReadingEntry } from "./alert-metrics.js";
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
@@ -87,24 +88,6 @@ type AWData = Record<string, any>;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-const BAGHDAD_COORDS = new Coordinates(33.321502, 44.358335);
-const PRAYER_PARAMS = CalculationMethod.Dubai();
-PRAYER_PARAMS.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
-PRAYER_PARAMS.rounding = Rounding.None;
-
-function roundPrayerTime(date: Date, prayer: string): Date {
-  const d = new Date(date);
-  const s = d.getSeconds();
-  const ms = d.getMilliseconds();
-  if (prayer === "fajr") {
-    if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
-  } else {
-    if (s >= 30) d.setMinutes(d.getMinutes() + 1);
-  }
-  d.setSeconds(0, 0);
-  return d;
 }
 
 const PRAYER_NAMES = VALID_PRAYER_NAMES;
@@ -202,7 +185,7 @@ export class Collector {
   private airBuffer: AirRow[] = [];
   private lastAirSave = 0;
   private readonly AIR_SAVE_INTERVAL = 60_000;
-  private cachedPrayerTimes: PrayerTimes | null = null;
+  private cachedPrayerTimes: PrayerTimesResult | null = null;
   private cachedPrayerDateKey = "";
   // Automation system
   xiaomiCloud: XiaomiCloud | null = null;
@@ -687,9 +670,8 @@ export class Collector {
       const bp = rule.prayer_timing === "at_time" ? 0 : (rule.prayer_minutes ?? 0);
 
       for (const name of rule.prayer_names) {
-        const rawPrayerTime = pt[name as keyof PrayerTimes] as Date | undefined;
-        if (!(rawPrayerTime instanceof Date)) continue;
-        const prayerTime = roundPrayerTime(rawPrayerTime, name);
+        const prayerTime = prayerInstant(pt, name);
+        if (!prayerTime) continue;
 
         const minutesLeft = (prayerTime.getTime() - nowMs) / 60000;
         const key = `alert-${rule.id}-${name}`;
@@ -774,13 +756,10 @@ export class Collector {
 
   // ---------- Prayer Time Helpers ----------
 
-  private ensurePrayerTimesForToday(): PrayerTimes {
-    const dateKey = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
+  private ensurePrayerTimesForToday(): PrayerTimesResult {
+    const dateKey = baghdadDateKey();
     if (dateKey !== this.cachedPrayerDateKey) {
-      // Parse Baghdad date so adhan's getFullYear/getMonth/getDate return the correct day
-      // regardless of server timezone (VPS is UTC, Baghdad is UTC+3)
-      const [y, m, d] = dateKey.split("-").map(Number);
-      this.cachedPrayerTimes = new PrayerTimes(BAGHDAD_COORDS, new Date(y, m - 1, d, 12, 0, 0), PRAYER_PARAMS);
+      this.cachedPrayerTimes = getBaghdadPrayerTimes();
       this.cachedPrayerDateKey = dateKey;
       log.debug(`[prayer-cache] Refreshed for ${dateKey}`);
     }
@@ -788,14 +767,9 @@ export class Collector {
   }
 
   private resolvePrayerMinutes(prayer: string, offset: number): number | null {
-    const pt = this.ensurePrayerTimesForToday();
-    const raw = pt[prayer as keyof PrayerTimes] as Date | undefined;
-    if (!(raw instanceof Date)) return null;
-    const rounded = roundPrayerTime(raw, prayer);
-    const bStr = rounded.toLocaleString("en-US", { timeZone: "Asia/Baghdad" });
-    const bd = new Date(bStr);
-    const mins = bd.getHours() * 60 + bd.getMinutes();
-    return ((mins + offset) % 1440 + 1440) % 1440;
+    const t = prayerInstant(this.ensurePrayerTimesForToday(), prayer);
+    if (!t) return null;
+    return ((baghdadMinuteOfDay(t) + offset) % 1440 + 1440) % 1440;
   }
 
   // ---------- Automations ----------

@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import pg from "pg";
-import { Coordinates, CalculationMethod, PrayerTimes, Prayer, Rounding } from "adhan";
+import { getBaghdadPrayerTimes } from "./prayer.js";
+import type { TimeName } from "./prayer-engine/index.js";
 import type { Config } from "./config.js";
 import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
@@ -129,12 +130,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     res.json(data);
   });
 
-  // Prayer times — public, computed server-side via adhan library
-  const BAGHDAD = new Coordinates(33.321502, 44.358335);
-  const PRAYER_CALC = CalculationMethod.Dubai();
-  PRAYER_CALC.adjustments = { fajr: 0, sunrise: 2, dhuhr: 2, asr: 0, maghrib: 0, isha: -6 };
-  PRAYER_CALC.rounding = Rounding.None;
-
+  // Prayer times — public, computed server-side via the prayer-engine
+  // (BaghdadYMA profile). All instants are already offset + rounded.
   const HIJRI_MONTH_DAYS = [30, 29, 30, 29, 30, 29, 30, 29, 30, 29, 30, 29];
   const HIJRI_YEAR_DAYS = HIJRI_MONTH_DAYS.reduce((a, b) => a + b, 0);
 
@@ -150,19 +147,6 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     { month: 12, day: 9, name: "Day of Arafah" },
     { month: 12, day: 10, name: "Eid al-Adha" },
   ];
-
-  function roundPrayer(date: Date, prayer: string): Date {
-    const d = new Date(date);
-    const s = d.getSeconds();
-    const ms = d.getMilliseconds();
-    if (prayer === "fajr") {
-      if (s > 0 || ms > 0) d.setMinutes(d.getMinutes() + 1);
-    } else {
-      if (s >= 30) d.setMinutes(d.getMinutes() + 1);
-    }
-    d.setSeconds(0, 0);
-    return d;
-  }
 
   function fmtTime(date: Date): string {
     return date.toLocaleTimeString("en-US", { timeZone: "Asia/Baghdad", hour: "numeric", minute: "2-digit", hour12: true });
@@ -180,14 +164,11 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   function getPrayerTimesPayload() {
     const now = new Date();
-    const dateKey = now.toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
-    const [y, m, d] = dateKey.split("-").map(Number);
-    const pt = new PrayerTimes(BAGHDAD, new Date(y, m - 1, d, 12, 0, 0), PRAYER_CALC);
+    const nowMs = now.getTime();
+    const today = getBaghdadPrayerTimes(now);
+    const tomorrow = getBaghdadPrayerTimes(new Date(nowMs + 24 * 60 * 60 * 1000));
 
-    const tomorrow = new Date(y, m - 1, d + 1, 12, 0, 0);
-    const ptTomorrow = new PrayerTimes(BAGHDAD, tomorrow, PRAYER_CALC);
-
-    const prayerOrder: { key: string; label: string }[] = [
+    const prayerOrder: { key: TimeName; label: string }[] = [
       { key: "fajr", label: "Fajr" },
       { key: "sunrise", label: "Sunrise" },
       { key: "dhuhr", label: "Dhuhr" },
@@ -196,34 +177,42 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       { key: "isha", label: "Isha" },
     ];
 
-    const nowMs = now.getTime();
-    const nextPrayerEnum = pt.nextPrayer(now);
-    const allPassed = nextPrayerEnum === Prayer.None;
+    // Next = first of today's times still ahead; null once all have passed.
+    const nextKey = prayerOrder.find(({ key }) => today[key].getTime() > nowMs)?.key ?? null;
 
     const prayers = prayerOrder.map(({ key, label }) => {
-      const raw = pt[key as keyof PrayerTimes] as Date;
-      const time = roundPrayer(raw, key);
-      const diffMs = time.getTime() - nowMs;
+      const time = today[key];
+      const ms = time.getTime();
+      const diffMs = ms - nowMs;
       const isPassed = diffMs < 0;
-      const isNext = !allPassed && nextPrayerEnum === key;
       return {
         name: key,
         label,
+        // Machine-readable epoch ms drives the client's live countdown locally.
+        timestamp: ms,
         time: fmtTime(time),
         isPassed,
-        isNext,
+        isNext: key === nextKey,
         countdown: isPassed ? null : fmtCountdown(diffMs),
       };
     });
 
-    let nextPrayer: { name: string; label: string; time: string; countdown: string } | null = null;
-    if (allPassed) {
-      const fajrTime = roundPrayer(ptTomorrow.fajr, "fajr");
+    let nextPrayer:
+      | { name: string; label: string; time: string; timestamp: number; countdown: string }
+      | null = null;
+    if (!nextKey) {
+      const fajrTime = tomorrow.fajr;
       const diffMs = fajrTime.getTime() - nowMs;
-      nextPrayer = { name: "fajr", label: "Fajr (tomorrow)", time: fmtTime(fajrTime), countdown: fmtCountdown(diffMs) };
+      nextPrayer = {
+        name: "fajr",
+        label: "Fajr (tomorrow)",
+        time: fmtTime(fajrTime),
+        timestamp: fajrTime.getTime(),
+        countdown: fmtCountdown(diffMs),
+      };
     } else {
-      const p = prayers.find((p) => p.isNext);
-      if (p) nextPrayer = { name: p.name, label: p.label, time: p.time, countdown: p.countdown! };
+      const p = prayers.find((pr) => pr.isNext);
+      if (p) nextPrayer = { name: p.name, label: p.label, time: p.time, timestamp: p.timestamp, countdown: p.countdown! };
     }
 
     // Hijri date
@@ -253,7 +242,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       }
     }
 
-    return { prayers, nextPrayer, hijriDate, nextEvent };
+    return { prayers, nextPrayer, hijriDate, nextEvent, tomorrowFajr: tomorrow.fajr.getTime() };
   }
 
   router.get("/api/prayer-times", (_req: Request, res: Response) => {

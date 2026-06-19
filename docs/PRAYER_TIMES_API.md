@@ -13,17 +13,18 @@ GET https://home.altijwal.com/api/prayer-times
 ```json
 {
   "prayers": [
-    { "name": "fajr",    "label": "Fajr",    "time": "3:50 AM",  "isPassed": true,  "isNext": false, "countdown": null },
-    { "name": "sunrise", "label": "Sunrise", "time": "5:19 AM",  "isPassed": true,  "isNext": false, "countdown": null },
-    { "name": "dhuhr",   "label": "Dhuhr",   "time": "12:05 PM", "isPassed": false, "isNext": true,  "countdown": "2h 5m" },
-    { "name": "asr",     "label": "Asr",     "time": "3:45 PM",  "isPassed": false, "isNext": false, "countdown": "5h 45m" },
-    { "name": "maghrib", "label": "Maghrib", "time": "6:44 PM",  "isPassed": false, "isNext": false, "countdown": "8h 44m" },
-    { "name": "isha",    "label": "Isha",    "time": "8:06 PM",  "isPassed": false, "isNext": false, "countdown": "10h 6m" }
+    { "name": "fajr",    "label": "Fajr",    "time": "3:50 AM",  "timestamp": 1779255000000, "isPassed": true,  "isNext": false, "countdown": null },
+    { "name": "sunrise", "label": "Sunrise", "time": "5:19 AM",  "timestamp": 1779260340000, "isPassed": true,  "isNext": false, "countdown": null },
+    { "name": "dhuhr",   "label": "Dhuhr",   "time": "12:05 PM", "timestamp": 1779284700000, "isPassed": false, "isNext": true,  "countdown": "2h 5m" },
+    { "name": "asr",     "label": "Asr",     "time": "3:45 PM",  "timestamp": 1779297900000, "isPassed": false, "isNext": false, "countdown": "5h 45m" },
+    { "name": "maghrib", "label": "Maghrib", "time": "6:44 PM",  "timestamp": 1779308640000, "isPassed": false, "isNext": false, "countdown": "8h 44m" },
+    { "name": "isha",    "label": "Isha",    "time": "8:06 PM",  "timestamp": 1779313560000, "isPassed": false, "isNext": false, "countdown": "10h 6m" }
   ],
   "nextPrayer": {
     "name": "dhuhr",
     "label": "Dhuhr",
     "time": "12:05 PM",
+    "timestamp": 1779284700000,
     "countdown": "2h 5m"
   },
   "hijriDate": "Dhul-Qi'dah 9, 1447 AH",
@@ -31,7 +32,8 @@ GET https://home.altijwal.com/api/prayer-times
     "name": "Day of Arafah",
     "isToday": false,
     "daysLeft": 30
-  }
+  },
+  "tomorrowFajr": 1779341400000
 }
 ```
 
@@ -43,6 +45,7 @@ GET https://home.altijwal.com/api/prayer-times
 | `prayers[].name` | string | Prayer key (`fajr`, `sunrise`, `dhuhr`, `asr`, `maghrib`, `isha`) |
 | `prayers[].label` | string | Display name |
 | `prayers[].time` | string | Formatted 12-hour time in Baghdad timezone (Asia/Baghdad, UTC+3) |
+| `prayers[].timestamp` | number | Epoch ms (UTC) of the prayer instant — drives the client's live local countdown |
 | `prayers[].isPassed` | boolean | Whether this prayer time has already passed today |
 | `prayers[].isNext` | boolean | Whether this is the next upcoming prayer |
 | `prayers[].countdown` | string\|null | Time remaining (e.g. `"2h 5m"`, `"45m 12s"`, `"30s"`), `null` if passed |
@@ -50,12 +53,14 @@ GET https://home.altijwal.com/api/prayer-times
 | `nextPrayer.name` | string | Prayer key |
 | `nextPrayer.label` | string | Display name. Shows `"Fajr (tomorrow)"` after all today's prayers have passed |
 | `nextPrayer.time` | string | Formatted 12-hour time |
+| `nextPrayer.timestamp` | number | Epoch ms (UTC) of the next prayer (tomorrow's Fajr once all of today's have passed) |
 | `nextPrayer.countdown` | string | Time remaining until this prayer |
 | `hijriDate` | string | Today's Hijri date using the Umm al-Qura calendar |
 | `nextEvent` | object\|null | Next upcoming Islamic event |
 | `nextEvent.name` | string | Event name |
 | `nextEvent.isToday` | boolean | `true` if the event is today |
 | `nextEvent.daysLeft` | number | Days until the event (0 = today) |
+| `tomorrowFajr` | number | Epoch ms (UTC) of tomorrow's Fajr — lets the client count down past the last prayer of the day |
 
 ## Tracked Islamic Events
 
@@ -74,11 +79,26 @@ GET https://home.altijwal.com/api/prayer-times
 
 ## Calculation Details
 
+Computed by the in-repo **`prayer-engine`** (`server/src/prayer-engine/`, see its
+README) on the [`astronomy-engine`](https://github.com/cosinekitty/astronomy)
+ephemeris (~1 arcminute solar accuracy, elevation-aware). The dashboard uses the
+`BaghdadYMA` profile via `server/src/prayer.ts`.
+
 | Parameter | Value |
 |-----------|-------|
 | Coordinates | 33.321502, 44.358335 (Baghdad) |
-| Method | Dubai (CalculationMethod.Dubai) |
-| Adjustments | Sunrise +2min, Dhuhr +2min, Isha -6min |
-| Rounding | Fajr: ceiling (conservative for fasting). Others: nearest minute |
-| Calendar | islamic-umalqura (Umm al-Qura) |
+| Elevation | ~34 m (used for horizon dip + refraction on sunrise/maghrib) |
+| Method | `BaghdadYMA` — جمعية الشبان المسلمين / Iraqi Sunni Endowment; MWL angles (Fajr 18°, Isha 17°) |
+| Asr | Standard (Shafi/Maliki/Hanbali) |
+| Adjustments | Dhuhr +5 min, Asr +3 min, Maghrib +2 min (calibrated; Fajr/Sunrise/Isha none) |
+| Rounding | Fajr floors to the minute; others round to nearest |
+| Fidelity | ≤1 min vs the printed 2026 جمعية الشبان المسلمين calendar (max 1, mean ≈ 0.12 over 38 dates); regression-tested in `server/src/prayer-engine/prayer-engine.test.ts` |
+| Calendar | islamic-umalqura (Umm al-Qura), via `Intl` |
 | Timezone | Asia/Baghdad (UTC+3) |
+
+The engine is location-agnostic and ships other presets (MWL, ISNA, Egyptian,
+Umm al-Qura, Karachi, Dubai, Qatar, Kuwait, Singapore, Diyanet, Tehran, Jafari)
+plus opt-in elevation, high-latitude rules, and Sunnah times (imsak, midnight,
+first/last third, duha) — see the engine README. The client no longer computes
+prayer times itself; it consumes this endpoint's `timestamp` fields and ticks the
+countdown locally, so the UI can never diverge from the server/automations.

@@ -88,7 +88,7 @@ Persistent device-level user intent stored in `ac_manual_off_locks` (`device_id 
 - **AC schedules respect manual-off locks**: if a locked AC is OFF during an active window, the schedule skips auto-on; if a triggered schedule later sees the AC manually off, it records the lock.
 - Both start and end times support two modes:
   - **Exact**: fixed HH:MM time (stored in `time_start`/`time_end`).
-  - **Prayer-relative**: dynamic time based on daily prayer calculation (e.g., "30 min before Fajr"). Uses `start_mode`/`end_mode` (`'exact'`|`'prayer'`), `start_prayer`/`end_prayer` (prayer name), `start_prayer_offset`/`end_prayer_offset` (signed minutes, -120 to +120). Prayer times are resolved via `resolvePrayerMinutes()` in the collector using cached `adhan` PrayerTimes (same Baghdad coords / Dubai method as alerts). `ensurePrayerTimesForToday()` caches prayer times per day, independently of alert subscriptions.
+  - **Prayer-relative**: dynamic time based on daily prayer calculation (e.g., "30 min before Fajr"). Uses `start_mode`/`end_mode` (`'exact'`|`'prayer'`), `start_prayer`/`end_prayer` (prayer name), `start_prayer_offset`/`end_prayer_offset` (signed minutes, -120 to +120). Prayer times are resolved via `resolvePrayerMinutes()` in the collector using cached prayer times from the `prayer-engine` (`getBaghdadPrayerTimes()` via `prayer.ts`, `BaghdadYMA` profile — same source as alerts and the public endpoint). `ensurePrayerTimesForToday()` caches prayer times per Baghdad day, independently of alert subscriptions.
 
 ## AC Timers
 

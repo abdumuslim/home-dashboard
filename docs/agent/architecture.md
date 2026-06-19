@@ -65,12 +65,14 @@ D:\dev\home\
 │   │   ├── xiaomi-cloud.ts # Wrapper for xmihome, protocol routing, device discovery, auth
 │   │   ├── tcl-cloud.ts    # TCL Home API client (auth chain, AWS IoT shadow, SigV4 signing)
 │   │   ├── alert-metrics.ts # Shared metrics catalog (weather/air/power sources + feels-like indoor metrics), getMetricValue (accepts weather, air, power rows), PRAYER_LABELS. Power metrics: voltage, power_grid, power_gen, power_total (computed), current_grid, current_gen.
+│   │   ├── prayer.ts        # Dashboard wrapper around prayer-engine: BAGHDAD_COORDS + "BaghdadYMA" profile, getBaghdadPrayerTimes(), baghdadMinuteOfDay(), baghdadDateKey(), prayerInstant(). Single place the household location/profile live.
+│   │   ├── prayer-engine/   # Standalone, GPS-portable prayer-time engine on astronomy-engine (MIT). index/astro/asr/high-latitude/rounding/methods/sunnah/timezone/types. Own package.json+README (lift-and-publish ready). calibrate.ts (one-off, build-excluded) fits the BaghdadYMA offsets; prayer-engine.test.ts is the ≤1-min regression vs the printed calendar.
 │   │   ├── forecast.ts     # ForecastService — Open-Meteo hourly forecast with bias correction (bias table loaded by index.ts from `<server root>/bias-data/bias-table.json`)
 │   │   ├── calibrate.ts    # Standalone bias-table generator (`npx tsx src/calibrate.ts` on dev PC) — parses docs/Backup-A.CSV + Open-Meteo archive → server/data/bias-table.json. Gotcha: runtime reads `bias-data/`, not `data/` — the Dockerfile COPY (`server/data/bias-table.json → ./bias-data/`) bridges the two paths
 │   │   ├── ac-leveling.ts  # Smart AC Leveling pure allocator (computeAllocation incl. restore-with-reduction, estimateAcDraw, determineSource, computeNeedTier) — no I/O
 │   │   ├── ac-leveler.ts   # Stateful AcLeveler (config/shed/fan-hold persistence, streaks, manual gen intents + fan exemptions, per-source ampModelFor, nonAcLoad freeze + expectation grading, command execution)
 │   │   ├── ac-calibration.ts # AcCalibrator state machine (one-by-one sweeps, baselines, sampling) + pure helpers (buildCalibrationSteps, fitAmpModel, calMedian/calStddev)
-│   │   ├── automation-slots.ts # AutomationRangeSlot type, normalizeRangeSlots (field whitelist!), validateRangeSlots, findActiveRangeSlot, Baghdad time/prayer window resolution
+│   │   ├── automation-slots.ts # AutomationRangeSlot type, normalizeRangeSlots (field whitelist!), validateRangeSlots, findActiveRangeSlot, Baghdad time/prayer window resolution (createBaghdadPrayerResolver now backed by prayer.ts/prayer-engine)
 │   │   ├── ac-auto-fan.ts  # computeAutoFanLevel — delta-based smart auto fan mapping (pure, no I/O)
 │   │   ├── database.ts     # pg pool, schema init, migrations (automations, power, AC presets, AC manual-off locks, AC leveling config/shed/fan-hold, AC calibration results)
 │   │   ├── logger.ts       # Structured logging via pino (childLogger factory, console-compatible API)
@@ -91,7 +93,7 @@ D:\dev\home\
 │   │   ├── main.tsx        # Entry point, Chart.js registration
 │   │   ├── App.tsx         # Root component with tabs
 │   │   ├── index.css       # Tailwind theme + custom wind/flash CSS
-│   │   ├── hooks/          # useCurrentData, useHistoryData, useClock, useFlash, useAlerts, usePushNotifications, useDevices, useAcDevices, useAutomations, useAuth, useForecast, useModalSections (bell-modal collapse state, localStorage), useAcLeveling (polls /api/ac/leveling 5s while expanded), useAcCalibration (polls /api/ac/calibration 3s while expanded), useUnits (unit-preference context + converters, localStorage), usePrayerTimes (client-side adhan prayer times + Hijri date/events), useSectionLayout (section order/collapse state, localStorage), useChartsVisible (global charts show/hide toggle, localStorage)
+│   │   ├── hooks/          # useCurrentData, useHistoryData, useClock, useFlash, useAlerts, usePushNotifications, useDevices, useAcDevices, useAutomations, useAuth, useForecast, useModalSections (bell-modal collapse state, localStorage), useAcLeveling (polls /api/ac/leveling 5s while expanded), useAcCalibration (polls /api/ac/calibration 3s while expanded), useUnits (unit-preference context + converters, localStorage), usePrayerTimes (fetches /api/prayer-times once per Baghdad day, ticks countdown locally from timestamps; Hijri date/events computed locally via Intl — no client-side prayer math), useSectionLayout (section order/collapse state, localStorage), useChartsVisible (global charts show/hide toggle, localStorage)
 │   │   ├── components/     # Header, sections, cards (devices-card, indoor-card, power-card), purifier-widget, ac-widget, charts, AlertsModal, ui/battery-indicator, ui/collapsible-modal-section (chevron + 0fr/1fr grid collapse), ui/ac-leveling-section (leveling config + live status), ui/ac-calibration-panel (calibration selection/progress/results/apply)
 │   │   ├── types/          # API type definitions (api.ts, alerts.ts, automations.ts, ac.ts, forecast.ts, leveling.ts)
 │   │   └── constants/      # Thresholds, directions, helpers, alert-metrics, solar-model, sky-condition, chart-utils, forecast-utils
@@ -252,25 +254,19 @@ How to apply: for frontend changes, always use React.memo for new card/section c
 
 Discovered 2026-03-29 while debugging prayer alerts that never fired.
 
-**The problem:** The VPS runs in **UTC**; the app targets **Baghdad (UTC+3)**. Between 21:00 UTC and 00:00 UTC (midnight–3am Baghdad), the UTC calendar date is one day behind Baghdad's. The `adhan` npm library extracts year/month/day from a Date using **local timezone methods** (`getFullYear()`, `getMonth()`, `getDate()`). Passing `new Date()` on a UTC server at midnight Baghdad gives the wrong day's prayer times. The cache gets poisoned at midnight Baghdad and stays wrong for 24 hours.
+**The problem:** The VPS runs in **UTC**; the app targets **Baghdad (UTC+3)**. Between 21:00 UTC and 00:00 UTC (midnight–3am Baghdad), the UTC calendar date is one day behind Baghdad's. A library that extracts year/month/day from a Date using **local timezone methods** (`getFullYear()`, `getMonth()`, `getDate()`) — as the old `adhan` library did — gets the wrong day's prayer times when passed `new Date()` on a UTC server at midnight Baghdad. The cache gets poisoned at midnight Baghdad and stays wrong for 24 hours.
 
-**Fix pattern** — parse the Baghdad date string and construct a Date at noon:
-```typescript
-const dateKey = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Baghdad" });
-const [y, m, d] = dateKey.split("-").map(Number);
-const baghdadDate = new Date(y, m - 1, d, 12, 0, 0);
-```
-Noon is safe regardless of server timezone (no DST flip risk).
+**Prayer times no longer hit this trap.** Since 2026-06-19 prayer calculation goes through the in-repo **`prayer-engine`** (`server/src/prayer-engine/`), pinned via `server/src/prayer.ts` with `{ method: "BaghdadYMA", timezone: "Asia/Baghdad" }`. The engine anchors "which civil day" itself (`zonedMidnightUtc` in `timezone.ts`), so the old noon-construction hack is gone from prayer code. Baghdad minute-of-day / date-key helpers (`baghdadMinuteOfDay`, `baghdadDateKey` in `prayer.ts`) use `Intl.DateTimeFormat(..., { timeZone })`, replacing the fragile `toLocaleString` re-parse for prayer paths.
 
-**The toLocaleString re-parse pattern**, used in `collector.ts` (`resolvePrayerMinutes`, `checkScheduleAutomation`) to get Baghdad hours/minutes:
+**The toLocaleString re-parse pattern** still appears elsewhere in `collector.ts` (e.g. `checkScheduleAutomation`, `getBaghdadMinutes` in `automation-slots.ts`) to get Baghdad hours/minutes:
 ```typescript
 const bStr = date.toLocaleString("en-US", { timeZone: "Asia/Baghdad" });
 const bd = new Date(bStr); // re-parsed as local (UTC) Date
 bd.getHours(); // returns Baghdad hours (works because string was Baghdad-formatted)
 ```
-This is fragile but works. It is used in multiple places — do NOT "fix" it unless it breaks.
+This is fragile but works. Do NOT "fix" it unless it breaks.
 
-**Rule:** any time a library needs a Date representing "today in Baghdad", use the noon-construction pattern above. Never pass raw `new Date()` when the library extracts local date components.
+**Rule:** any time a library extracts local date components, give it a Date that represents the right Baghdad day — pass an explicit IANA timezone (as the prayer-engine does), or use the noon-construction pattern (`new Date(y, m-1, d, 12, 0, 0)` from the Baghdad date string). Never pass raw `new Date()`.
 
 ## Known Bugs
 

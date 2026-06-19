@@ -166,7 +166,7 @@ Returns `503` if forecast data is not yet available.
 
 ### GET /api/prayer-times
 
-Today's prayer times, countdown to next prayer, Hijri date, and next Islamic event. Computed server-side using the `adhan` library (Dubai method, calibrated for Baghdad).
+Today's prayer times, countdown to next prayer, Hijri date, and next Islamic event. Computed server-side by the in-repo `prayer-engine` (astronomy-engine core, `BaghdadYMA` profile — MWL 18°/17°, Standard Asr, elevation-aware; ≤1 min vs the official جمعية الشبان المسلمين Baghdad calendar). See [PRAYER_TIMES_API.md](PRAYER_TIMES_API.md) for the full field list.
 
 **Response:**
 ```json
@@ -214,6 +214,8 @@ Today's prayer times, countdown to next prayer, Hijri date, and next Islamic eve
   }
 }
 ```
+
+Each prayer (and `nextPrayer`) also carries a `timestamp` (epoch ms, UTC), and the payload includes a top-level `tomorrowFajr` (epoch ms) — the client uses these to tick the countdown locally instead of recomputing prayer times in the browser.
 
 When all today's prayers have passed, `nextPrayer` returns tomorrow's Fajr with label `"Fajr (tomorrow)"`.
 
