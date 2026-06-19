@@ -26,6 +26,9 @@ export interface AcLevelingConfig {
   /** Optional per-AC draw model on generator — lower voltage means more amps. */
   genAmpModels?: Record<string, AcAmpModel>;
   levelBoosts: Record<string, AcLevelBoost>;
+  /** Levels an AC may be raised per batch on grid/gen (1 = one-step pacing). */
+  maxRaiseStepGrid?: number;
+  maxRaiseStepGen?: number;
 }
 
 export type NeedTier = "satisfied" | "mild" | "full";

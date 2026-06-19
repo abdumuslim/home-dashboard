@@ -45,6 +45,19 @@ export interface AcLevelingConfig {
   /** Optional per-AC draw model on generator — lower, fluctuating voltage means more amps. */
   genAmpModels?: Record<string, AcAmpModel>;
   levelBoosts: Record<string, AcLevelBoost>;
+  /**
+   * Max levels an AC may be raised in ONE allocation batch, per source. A gen/
+   * grid level is a CAP, not a setpoint: releasing it surges a hot/pinned
+   * compressor by more than the static model predicts, so a batch that jumps
+   * several levels (or all ACs at once) overshoots the breaker. One step (1)
+   * paces a raise so its real surge confirms on the meter — and the learned
+   * surge gate can block the next step — before climbing again. Production ACs
+   * are 3-level, so any value ≥ 2 is effectively NO pacing (L1→L3 fits in one
+   * batch). Optional/back-compat: absent → defaults to 1. Grid got these in
+   * 2026-06-19 after a 32A grid overshoot the gen-only pacing didn't cover.
+   */
+  maxRaiseStepGrid?: number;
+  maxRaiseStepGen?: number;
 }
 
 export const DEFAULT_LEVELING_CONFIG: AcLevelingConfig = {
@@ -59,6 +72,8 @@ export const DEFAULT_LEVELING_CONFIG: AcLevelingConfig = {
   ampModels: {},
   genAmpModels: {},
   levelBoosts: {},
+  maxRaiseStepGrid: 1,
+  maxRaiseStepGen: 1,
 };
 
 export interface LevelerAcSnapshot {
@@ -152,16 +167,18 @@ export interface AllocatorInput {
    * understates the surge on a hot/pinned compressor (live: observed 3.5A vs a
    * 2.0A model step), so model-based raises overshoot the breaker. The leveler
    * learns this per AC/source from observed raise effects + bounce costs.
-   * Absent (or below the model step) → the model step is used, so grid raises
-   * are unchanged (caps don't bind on the 28A budget).
+   * Absent (or below the model step) → the model step is used. Grid started
+   * passing this in 2026-06-19 (the model under-predicted by ~17A and three
+   * uncapped ACs reached 32A), so a wrong static model no longer admits an
+   * over-budget grid raise.
    */
   raiseSurge?: Record<string, number>;
   /**
    * Max levels an AC may be raised ABOVE its current level in ONE allocation.
-   * Set to 1 on generator (one step, confirm the surge on the meter, then the
+   * Set to 1 on BOTH sources (one step, confirm the surge on the meter, then the
    * next) so a single batch can never commit more than one step's surge —
-   * bounding overshoot. Undefined elsewhere (grid keeps straight-to-ideal batch
-   * raises). Re-filling up to the current level and reductions are unaffected.
+   * bounding overshoot. Grid joined gen in 2026-06-19. Re-filling up to the
+   * current level and reductions are unaffected.
    */
   maxRaiseStep?: number;
   /**

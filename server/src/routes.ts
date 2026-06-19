@@ -1283,6 +1283,11 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     if (!num(b.comfortTargetC) || b.comfortTargetC < 16 || b.comfortTargetC > 32) return "comfortTargetC must be 16–32";
     // Optional for backward compatibility (old clients omit it → defaults to 0.5).
     if (b.nearTargetBandC != null && (!num(b.nearTargetBandC) || b.nearTargetBandC < 0 || b.nearTargetBandC > 5)) return "nearTargetBandC must be 0–5";
+    // Optional (old clients omit → defaults to 1). Integer 1–3: levels an AC may
+    // be raised per batch on each source. 1 = one-step pacing; ≥2 is no pacing
+    // for 3-level ACs (L1→L3 fits in one batch).
+    if (b.maxRaiseStepGrid != null && (!Number.isInteger(b.maxRaiseStepGrid) || b.maxRaiseStepGrid < 1 || b.maxRaiseStepGrid > 3)) return "maxRaiseStepGrid must be an integer 1–3";
+    if (b.maxRaiseStepGen != null && (!Number.isInteger(b.maxRaiseStepGen) || b.maxRaiseStepGen < 1 || b.maxRaiseStepGen > 3)) return "maxRaiseStepGen must be an integer 1–3";
     if (!Array.isArray(b.priority) || b.priority.some((p) => typeof p !== "string")) return "priority must be a string array";
     if (!b.ampModels || typeof b.ampModels !== "object") return "ampModels required";
     for (const model of Object.values(b.ampModels as Record<string, AcAmpModel>)) {
@@ -1334,6 +1339,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         ampModels: body.ampModels as Record<string, AcAmpModel>,
         genAmpModels: (body.genAmpModels as Record<string, AcAmpModel>) ?? {},
         levelBoosts: (body.levelBoosts as Record<string, AcLevelBoost>) ?? {},
+        maxRaiseStepGrid: (body.maxRaiseStepGrid as number) ?? 1,
+        maxRaiseStepGen: (body.maxRaiseStepGen as number) ?? 1,
       });
       res.json({ config });
     } catch (err) {

@@ -45,7 +45,9 @@ function seedDraft(config: AcLevelingConfig, acDevices: AcDevice[]): AcLevelingC
   // input never renders uncontrolled. Seeding does NOT mark the draft dirty.
   const raiseBufferAmps = config.raiseBufferAmps ?? 1;
   const nearTargetBandC = config.nearTargetBandC ?? 0.5;
-  return { ...config, priority, ampModels, genAmpModels, levelBoosts, raiseBufferAmps, nearTargetBandC };
+  const maxRaiseStepGrid = config.maxRaiseStepGrid ?? 1;
+  const maxRaiseStepGen = config.maxRaiseStepGen ?? 1;
+  return { ...config, priority, ampModels, genAmpModels, levelBoosts, raiseBufferAmps, nearTargetBandC, maxRaiseStepGrid, maxRaiseStepGen };
 }
 
 function NumberField({ label, value, step, onChange }: {
@@ -292,13 +294,15 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
       })()}
 
       {/* Limits */}
-      <div className="grid grid-cols-6 gap-2">
+      <div className="grid grid-cols-4 gap-2">
         <NumberField label="Grid limit A" value={draft.gridLimitAmps} onChange={(v) => update({ gridLimitAmps: v })} />
         <NumberField label="Gen limit A" value={draft.genLimitAmps} onChange={(v) => update({ genLimitAmps: v })} />
         <NumberField label="Margin A" step={0.5} value={draft.marginAmps} onChange={(v) => update({ marginAmps: v })} />
         <NumberField label="Raise buffer A" step={0.5} value={draft.raiseBufferAmps} onChange={(v) => update({ raiseBufferAmps: v })} />
         <NumberField label="Comfort °C" step={0.5} value={draft.comfortTargetC} onChange={(v) => update({ comfortTargetC: v })} />
         <NumberField label="Near target °C" step={0.1} value={draft.nearTargetBandC ?? 0.5} onChange={(v) => update({ nearTargetBandC: v })} />
+        <NumberField label="Grid step" value={draft.maxRaiseStepGrid ?? 1} onChange={(v) => update({ maxRaiseStepGrid: v })} />
+        <NumberField label="Gen step" value={draft.maxRaiseStepGen ?? 1} onChange={(v) => update({ maxRaiseStepGen: v })} />
       </div>
 
       {/* Priority + per-AC amp model + live state */}

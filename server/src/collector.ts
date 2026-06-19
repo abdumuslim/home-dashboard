@@ -218,6 +218,10 @@ export class Collector {
   private devicePowerCache = new Map<string, { power: "on" | "off" | undefined; ts: number }>();
   private acManualOffLocks = new Set<string>();
   private acManualOffLockTimes = new Map<string, number>();
+  /** Locked AC ids whose OFF we have actually observed live since the lock — only
+   * then may an observed ON clear the lock. A stale/flappy TCL shadow that never
+   * reflected the off must not auto-undo a sacred manual-off lock (2026-06-19). */
+  private acManualOffSeenOff = new Set<string>();
   private acManualOffLocksLoaded = false;
   private readonly POWER_CACHE_TTL = 5_000;
   private readonly AC_MANUAL_OFF_CLEAR_GRACE_MS = 15_000;
@@ -263,11 +267,15 @@ export class Collector {
     const result = await this.pool.query("SELECT device_id, locked_at FROM ac_manual_off_locks");
     this.acManualOffLocks = new Set();
     this.acManualOffLockTimes = new Map();
+    this.acManualOffSeenOff = new Set();
     for (const row of result.rows) {
       const deviceId = String(row.device_id);
       const lockedAt = row.locked_at instanceof Date ? row.locked_at.getTime() : Date.now();
       this.acManualOffLocks.add(deviceId);
       this.acManualOffLockTimes.set(deviceId, lockedAt);
+      // Locks loaded from a previous session: the off long since settled, so a
+      // current ON reading is genuine (no fresh-off shadow race to defend).
+      this.acManualOffSeenOff.add(deviceId);
     }
     this.acManualOffLocksLoaded = true;
   }
@@ -277,6 +285,10 @@ export class Collector {
     const wasLocked = this.acManualOffLocks.has(deviceId);
     this.acManualOffLocks.add(deviceId);
     this.acManualOffLockTimes.set(deviceId, Date.now());
+    // Fresh lock: the off command was just issued, so the live shadow may still
+    // read ON for a while. Require a real observed-off before trusting an ON to
+    // clear it (a stale shadow must not auto-undo this lock).
+    this.acManualOffSeenOff.delete(deviceId);
     await this.pool.query(
       `INSERT INTO ac_manual_off_locks (device_id, locked_at, reason)
        VALUES ($1, NOW(), $2)
@@ -291,6 +303,7 @@ export class Collector {
     await this.ensureAcManualOffLocksLoaded();
     const wasLocked = this.acManualOffLocks.delete(deviceId);
     this.acManualOffLockTimes.delete(deviceId);
+    this.acManualOffSeenOff.delete(deviceId);
     if (wasLocked) {
       await this.pool.query("DELETE FROM ac_manual_off_locks WHERE device_id = $1", [deviceId]);
     }
@@ -311,13 +324,28 @@ export class Collector {
 
   private canClearAcManualOff(deviceId: string): boolean {
     const lockedAt = this.acManualOffLockTimes.get(deviceId);
-    return lockedAt == null || Date.now() - lockedAt >= this.AC_MANUAL_OFF_CLEAR_GRACE_MS;
+    if (lockedAt != null && Date.now() - lockedAt < this.AC_MANUAL_OFF_CLEAR_GRACE_MS) return false;
+    // Only an ON observed AFTER the off actually propagated to the shadow is a
+    // genuine manual-on. A stale/flappy shadow that reports ON without ever
+    // reflecting the off must NOT clear the sacred lock (2026-06-19: a 59s-stale
+    // ON cleared the lock and the range turned the user's AC back on).
+    return this.acManualOffSeenOff.has(deviceId);
+  }
+
+  /** Note a LIVE-observed power state for a locked AC: observing the OFF proves
+   * the lock took effect, which is the precondition for a later ON to clear it. */
+  private noteAcObservedPower(deviceId: string, power: "on" | "off" | undefined): void {
+    if (power === "off" && this.acManualOffLocks.has(deviceId)) {
+      this.acManualOffSeenOff.add(deviceId);
+    }
   }
 
   async reconcileAcManualOffLocks(devices: Pick<AcDevice, "id" | "power">[]): Promise<Set<string>> {
     await this.ensureAcManualOffLocksLoaded();
     for (const dev of devices) {
-      if (dev.power && this.acManualOffLocks.has(dev.id) && this.canClearAcManualOff(dev.id)) {
+      if (!this.acManualOffLocks.has(dev.id)) continue;
+      this.noteAcObservedPower(dev.id, dev.power ? "on" : "off");
+      if (dev.power && this.canClearAcManualOff(dev.id)) {
         await this.clearAcManualOff(dev.id);
       }
     }
@@ -981,6 +1009,7 @@ export class Collector {
       const devs = await this.tclCloud!.fetchDevicesLive();
       const dev = devs.find(d => d.id === deviceId);
       power = dev ? (dev.power ? "on" : "off") : undefined;
+      this.noteAcObservedPower(deviceId, power);
       if (power === "on") {
         if (this.canClearAcManualOff(deviceId)) {
           await this.clearAcManualOff(deviceId);

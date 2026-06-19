@@ -257,18 +257,45 @@ describe("AC manual-off locks", () => {
     expect(actions).toEqual([]);
   });
 
-  it("clears the lock when the collector observes the AC on and adopts the active range profile", async () => {
+  it("clears the lock only after the off is observed, then the AC is seen back on (genuine remote-on)", async () => {
     const { collector, tclCloud, actions } = createCollector();
     await (collector as never as { recordAcManualOff: (id: string, reason: string) => Promise<void> }).recordAcManualOff("ac1", "test");
     (collector as never as { acManualOffLockTimes: Map<string, number> }).acManualOffLockTimes.set("ac1", Date.now() - 20_000);
+
+    // 1) The off first propagates to the shadow — this confirms the lock took
+    //    effect but does NOT turn the AC on (lock holds, no command).
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }]);
+    await setWeatherValue(collector, 27);
+    await checkAcRangeAutomation(collector, acRangeRule());
+    await expect((collector as never as { isAcManualOffLocked: (id: string) => Promise<boolean> }).isAcManualOffLocked("ac1")).resolves.toBe(true);
+    expect(actions).toEqual([]);
+
+    // 2) Now the user turns it back on via the remote → the lock clears and the
+    //    active range profile is adopted.
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.computeAcDiff.mockReturnValue({ temperature: 23 });
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    await expect((collector as never as { isAcManualOffLocked: (id: string) => Promise<boolean> }).isAcManualOffLocked("ac1")).resolves.toBe(false);
+    expect(actions).toEqual([{ deviceId: "ac1", action: { temperature: 23 } }]);
+  });
+
+  it("does not clear a manual-off lock from an on-read when the off was never observed (stale/flappy shadow, 32A grid incident)", async () => {
+    const { collector, tclCloud, actions } = createCollector();
+    await (collector as never as { recordAcManualOff: (id: string, reason: string) => Promise<void> }).recordAcManualOff("ac1", "test");
+    // Grace has long elapsed, but the shadow reported "on" the WHOLE time — the
+    // user's off never propagated (or the TCL shadow flapped). The 15s grace
+    // alone used to let this clear the sacred lock, and the range then turned
+    // the AC back on ~60s after the user turned it off (2026-06-19 incident).
+    (collector as never as { acManualOffLockTimes: Map<string, number> }).acManualOffLockTimes.set("ac1", Date.now() - 60_000);
     tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
     tclCloud.computeAcDiff.mockReturnValue({ temperature: 23 });
 
     await setWeatherValue(collector, 27);
     await checkAcRangeAutomation(collector, acRangeRule());
 
-    await expect((collector as never as { isAcManualOffLocked: (id: string) => Promise<boolean> }).isAcManualOffLocked("ac1")).resolves.toBe(false);
-    expect(actions).toEqual([{ deviceId: "ac1", action: { temperature: 23 } }]);
+    await expect((collector as never as { isAcManualOffLocked: (id: string) => Promise<boolean> }).isAcManualOffLocked("ac1")).resolves.toBe(true);
+    expect(actions).toEqual([]);
   });
 
   it("does not clear a fresh lock from stale on-state reads", async () => {
@@ -886,9 +913,9 @@ describe("Smart AC leveling", () => {
     expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
   });
 
-  it("on grid still raises straight to the fitted ideal (no one-step cap)", async () => {
+  it("on grid also paces a raise one level per tick (2026-06-19: 32A grid overshoot)", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
-    setLevelingConfig(LEVELING_CONFIG);
+    setLevelingConfig(LEVELING_CONFIG); // maxRaiseStepGrid defaults to 1
     await collector.acLeveler.ensureLoaded();
     const devices = [
       { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
@@ -896,10 +923,47 @@ describe("Smart AC leveling", () => {
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
-    gridReadings(collector, 4, 6); // headroom on grid (30A) → fits L3 in one batch
+    gridReadings(collector, 4, 6); // budget fits L3, but grid now climbs one step first
+    await checkAcLeveling(collector);
+
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 2);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
+  });
+
+  it("grid raises straight to the fitted ideal when maxRaiseStepGrid is loosened", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig({ ...LEVELING_CONFIG, maxRaiseStepGrid: 3 });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 4, 6);
     await checkAcLeveling(collector);
 
     expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
+  });
+
+  it("grid does NOT jump both ACs straight to L3 in one batch (the 32A incident)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 6, 6); // plenty of grid headroom
+    await checkAcLeveling(collector);
+
+    // Each managed AC climbs at most one level this batch — neither reaches L3.
+    for (const id of ["ac1", "ac2"]) {
+      expect(tclCloud.sendControl).not.toHaveBeenCalledWith(id, "set_generator_mode", 3);
+    }
   });
 
   it("reduces levels instantly when an AC turns on near the limit", async () => {
@@ -1459,6 +1523,37 @@ describe("Smart AC leveling — predictive control", () => {
     genReadings(collector, 12, 6);
     await checkAcLeveling(collector);
     // Hold released (12 ≥ 9 − 1 arrived), surge learned, next step held back.
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+  });
+
+  it("on grid also learns a raise surge and gates the next step (2026-06-19)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    // Mirror the gen Fix-C surge-learning test on grid (gridLimitAmps lowered to
+    // 15 so the same arithmetic applies). Grid started learning observedRaiseCost
+    // on 2026-06-19 after the static grid model under-predicted by ~17A.
+    setLevelingConfig({ ...LEVELING_CONFIG, gridLimitAmps: 15 });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // 8A on grid → nonAcLoad 6, Najat raised one step L1→L2 (model expects +1 → 9A), hold armed.
+    gridReadings(collector, 8, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+
+    // Real cost +4A (meter → 12A, under 15A so no bounce). Grading learns
+    // observedRaiseCost[ac1] ≈ 4; the next step L2→L3 is surge-charged 4A and
+    // blocked (3 + 4 = 7 > budget 5). Pre-2026-06-19 grid ignored the surge.
+    const after = [{ ...devices[0], generatorMode: 2 }];
+    tclCloud.getDevices.mockReturnValue(after);
+    tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
+    vi.advanceTimersByTime(31_000);
+    gridReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
     expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
   });
 
@@ -2255,7 +2350,10 @@ describe("Smart AC leveling — unreachable levels (Najat L6 firmware)", () => {
 
   it("regression: a shadow snapping to 0 never records a manual target (31A grid incident)", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
-    setLevelingConfig(LEVELING_CONFIG);
+    // This 6-level firmware regression is about manual-target recording, not
+    // raise pacing — loosen the grid step cap so the L2→L6 setup raise still
+    // lands in one batch (one-step grid pacing arrived 2026-06-19).
+    setLevelingConfig({ ...LEVELING_CONFIG, maxRaiseStepGrid: 6 });
     await collector.acLeveler.ensureLoaded();
     const devices = [
       { id: "ac1", name: "Najat", power: true, generatorMode: 2, maxGeneratorLevel: 6, currentTemp: 28, mode: 1 },

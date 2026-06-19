@@ -1226,15 +1226,15 @@ export class AcLeveler {
           `consider tuning ampModels or running calibration`,
         );
       }
-      // Two-way surge self-correction (gen): a CLEAN single-AC raise that has now
+      // Two-way surge self-correction: a CLEAN single-AC raise that has now
       // landed teaches the REAL cost of releasing that AC's cap — both up (the
       // bounce path already learns overshoots) and crucially DOWN (it drew less
       // than the static model feared, so the raise gate stops over-charging it
       // into conservatism). Skipped if the raise already bounced — `lastRaiseBatch`
       // is nulled on bounce, so a post-reduction meter can't undo the safety
-      // learning the bounce recorded.
+      // learning the bounce recorded. Learned on both sources since 2026-06-19
+      // (one source active at a time; the map clears on changeover).
       if (
-        source === "gen" &&
         this.expected.raiseDeviceId != null &&
         this.expected.preMeasured != null &&
         this.lastRaiseBatch != null
@@ -1252,9 +1252,8 @@ export class AcLeveler {
     // Learn the real per-fan-step cost from a clean fan-only restore once its
     // effect has settled (fans aren't modeled — this is what lets the restore
     // climb to the highest fan that fits instead of jumping to full and
-    // bouncing). meter delta ÷ steps, light EWMA, gen only.
+    // bouncing). meter delta ÷ steps, light EWMA, both sources since 2026-06-19.
     if (
-      source === "gen" &&
       this.lastFanRaise &&
       now >= this.lastFanRaise.at + FAN_SETTLE_MS &&
       this.recentMeasured.length >= 4
@@ -1375,9 +1374,10 @@ export class AcLeveler {
           ampModels,
           // Size level-downs with the REAL per-level cost (same learned signal
           // the raise gate uses) so a single correctly-credited level-down beats
-          // a shed when it covers — the static gen model under-states the step,
-          // making the optimizer shed (turn OFF) instead of level down.
-          raiseSurge: source === "gen" ? Object.fromEntries(this.observedRaiseCost) : undefined,
+          // a shed when it covers — the static model under-states the step,
+          // making the optimizer shed (turn OFF) instead of level down. Applies
+          // on both sources since 2026-06-19 (grid model under-stated too).
+          raiseSurge: Object.fromEntries(this.observedRaiseCost),
         });
         log.warn(
           `[leveler] EMERGENCY: ~${overshoot.toFixed(1)}A over the ${limit}A ${source} limit ` +
@@ -1423,18 +1423,23 @@ export class AcLeveler {
       forceEvaluate: this.forceEvaluate,
       acs: snapshots,
       ampModels,
-      // One step per raise on the generator: a gen level is a CAP and releasing
-      // it surges a hot compressor unpredictably (live: 3.5A vs a 2A model step),
+      // One step per raise on BOTH sources: a level is a CAP and releasing it
+      // surges a hot compressor unpredictably (live: 3.5A vs a 2A model step),
       // so climb one level, confirm the surge on the meter, then the next. Grid
-      // (28A budget, caps don't bind) keeps straight-to-ideal batch raises.
-      maxRaiseStep: source === "gen" ? 1 : undefined,
+      // joined gen on 2026-06-19 after the grid model under-predicted by ~17A
+      // and three uncapped ACs jumped straight to L3 → 32A. Configurable per
+      // source (1 = pace; ≥2 = no pacing for 3-level ACs).
+      maxRaiseStep: source === "gen"
+        ? (this.config.maxRaiseStepGen ?? 1)
+        : (this.config.maxRaiseStepGrid ?? 1),
       // Learned per-AC raise surge (real cost of releasing a cap), so the raise
       // gate self-corrects from observed overshoots instead of trusting the
-      // static model that the user has already had to retune. Empty on grid.
-      raiseSurge: source === "gen" ? Object.fromEntries(this.observedRaiseCost) : undefined,
+      // static model that the user has already had to retune. Learned on both
+      // sources (one source is active at a time; the map clears on changeover).
+      raiseSurge: Object.fromEntries(this.observedRaiseCost),
       // Learned per-fan-step cost so a held fan climbs only to the level that
-      // fits (the sweet spot) instead of jumping to full and bouncing. Gen only.
-      fanStepCost: source === "gen" ? Object.fromEntries(this.observedFanStepCost) : undefined,
+      // fits (the sweet spot) instead of jumping to full and bouncing.
+      fanStepCost: Object.fromEntries(this.observedFanStepCost),
     };
     const result = computeAllocation(input);
     this.forceEvaluate = false;
