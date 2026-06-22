@@ -137,6 +137,31 @@ export interface AllocatorInput {
   nearTargetBandC: number;
   /** Estimated non-AC household draw (caller derives from measured − estimated AC draws). */
   nonAcLoadAmps: number;
+  /**
+   * Real smoothed measured household current (the meter). When provided AND
+   * `meterTrusted`, the raise fill is anchored to the METER instead of the
+   * model: re-filling an AC back up to its CURRENT level is free (its draw is
+   * already in `measured`) and a genuine raise ABOVE current must fit
+   * `measured + Σ surge ≤ raise budget`. This is the fix for the chronically
+   * wrong static model (grid over-predicts settled draw by +8…12A): the model
+   * sum refused to seat ACs the meter fits fine, and reduced ACs the meter would
+   * keep (the live "fight loop"). Absent → legacy model-space fill (tests).
+   */
+  measuredAmps?: number;
+  /**
+   * The meter currently reflects the true managed-AC load — NOT mid-ramp after a
+   * turn-on/changeover and not during a power-collapse latch, with ≥4 readings.
+   * Gates the meter-anchored fill: while an AC is ramping the meter under-reads
+   * its eventual draw, so proactive turn-on reductions must still use the model.
+   */
+  meterTrusted?: boolean;
+  /**
+   * First allocation after a source changeover: hold every ON managed AC at its
+   * FLOOR (skip the raise fill AND warm restore) so a grid→gen flip drops to L1
+   * and the meter-confirmed gate climbs back, instead of landing on the model-
+   * fitted gen ideal (L2) and surging a hot compressor into a trip.
+   */
+  startAtFloors?: boolean;
   /** Consecutive power readings with measured > limit. */
   overLimitStreak: number;
   /** Consecutive power readings with measured > limit + OVER_LIMIT_SEVERE_AMPS (badly over → act faster). */
@@ -541,8 +566,23 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
   // the safety side and must trigger only when genuinely over `limit − margin`.
   // Clamp the buffer ≥0 so a bad value can never raise ABOVE `limit − margin`.
   const raiseBudgetAmps = budgetAmps - Math.max(0, input.raiseBufferAmps);
+  // The real-meter raise ceiling: the measured TOTAL already includes non-AC
+  // load, so a meter-anchored raise compares `measured + surge` against the
+  // buffered LIMIT (not `raiseBudgetAmps`, which has non-AC load subtracted out
+  // — that would double-count it).
+  const bufferedLimitAmps = limitAmps - marginAmps - Math.max(0, input.raiseBufferAmps);
   const currentOnCost = onManaged.reduce((sum, a) => sum + draw(a, a.currentLevel), 0);
   const projectedAmps = nonAcLoadAmps + unmanagedDraw + currentOnCost;
+
+  // Meter-anchored fill is engaged only when the meter is trustworthy AND the
+  // real total is below the limit band. When measured is over `limit − margin`
+  // (genuine over-limit) we fall back to the model fill so a reduction still
+  // SIZES correctly (drops toward the fitted ideal) instead of all the way to
+  // floors. `measuredAmps` undefined (tests) → legacy model fill everywhere.
+  const meterRoom =
+    input.meterTrusted === true &&
+    input.measuredAmps != null &&
+    input.measuredAmps <= limitAmps - marginAmps;
 
   // Reductions/sheds need either a sustained over-limit streak (reactive) or a
   // structural change (proactive). They deliberately ignore the settle window —
@@ -658,7 +698,7 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       ideal.delete(id);
       shedWanted.push(id);
     }
-  } else if (!overBudget && !(restorePick != null && input.raiseHold)) {
+  } else if (!overBudget && !(restorePick != null && input.raiseHold) && !input.startAtFloors) {
     // Raise fill: spread level-by-level (everyone reaches L2 before anyone
     // gets L3); within a level the hottest-above-target room goes first;
     // priority order breaks delta ties. Two passes: need caps first, then
@@ -669,8 +709,21 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
     // the fill (whose nonAcLoad-based budget is optimistic while measured
     // lags the hold) raise them back would take back the very savings the
     // restore counted on. Everyone rides at floors for this batch; the fill
-    // resumes next tick.
+    // resumes next tick. Also skipped right after a changeover (`startAtFloors`)
+    // so a grid→gen flip lands on floors, not the model-fitted gen ideal.
+    //
+    // `meterProjected` tracks the REAL meter as raises commit: re-filling an AC
+    // back up to its current level adds nothing (already in `measured`); only a
+    // step ABOVE current charges its surge. Used by the meter-anchored admission
+    // (meterRoom) so the over-predicting model can't refuse a raise the meter
+    // fits, nor a re-fill the meter would keep.
     const nearBand = input.nearTargetBandC;
+    // During a restore the model fill is used (its feasibility was judged at
+    // FLOORS so the restored room fits — re-filling the others back up on the
+    // meter would take back the room the restore needs). Meter-anchoring resumes
+    // next tick once the restored AC is ON and reflected in `measured`.
+    const useMeterFill = meterRoom && restorePick == null;
+    let meterProjected = input.measuredAmps ?? 0;
     for (const ceiling of [
       (a: LevelerAcSnapshot): number => ceilOf(a, nearBand),
       (a: LevelerAcSnapshot): number => softCeilOf(a, nearBand),
@@ -683,12 +736,17 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
           if (level >= ceiling(a)) continue;
           // Raise admission uses the buffered budget AND the real step cost (the
           // learned surge for an above-current step) — never fill into the
-          // deadband, and never commit a raise the surge would push over. The
-          // one-step-per-batch pacing is applied to the COMMAND in desiredLevels
-          // (not here) so the fitted ideal still reflects the true equilibrium:
-          // reductions reach it at once (safety); only raises are paced.
+          // deadband, and never commit a raise the surge would push over.
           const stepCost = raiseStepCost(a, level);
-          if (cost + stepCost > raiseBudgetAmps) continue;
+          const aboveCurrent = level >= a.currentLevel;
+          if (useMeterFill) {
+            // Anchored to the meter: re-fill to current is free; a real raise
+            // above current must fit measured + its surge under the buffered LIMIT
+            // (measured already includes non-AC load).
+            if (aboveCurrent && meterProjected + stepCost > bufferedLimitAmps) continue;
+          } else if (cost + stepCost > raiseBudgetAmps) {
+            continue;
+          }
           if (!pick) {
             pick = a;
             pickCost = stepCost;
@@ -701,8 +759,10 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
           }
         }
         if (!pick) break;
-        ideal.set(pick.deviceId, ideal.get(pick.deviceId)! + 1);
+        const pickFrom = ideal.get(pick.deviceId)!;
+        ideal.set(pick.deviceId, pickFrom + 1);
         cost += pickCost;
+        if (useMeterFill && pickFrom >= pick.currentLevel) meterProjected += pickCost;
       }
     }
   }
@@ -783,11 +843,14 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
         desiredLevels[a.deviceId] = input.maxRaiseStep != null
           ? Math.min(target, a.currentLevel + input.maxRaiseStep)
           : target;
-      } else if (a.warmStartLevel != null && !input.inSettle && !input.raiseHold) {
+      } else if (a.warmStartLevel != null && !input.inSettle && !input.raiseHold && !input.startAtFloors) {
         // Warm restore: the AC just came back from a temperature cycle and we
         // remember the level it was stable at. Skip the slow headroom-streak
         // rediscovery and jump straight there — but only up to the remembered
         // level (going higher still needs a confirmed raise), still capped by
+        // the budget-fitted target. Suppressed right after a changeover
+        // (`startAtFloors`) so a warm AC doesn't jump back above floor before the
+        // meter confirms gen headroom.
         // the budget-fitted target, and still deferred during settle/raise-hold.
         const warm = Math.min(target, a.warmStartLevel);
         if (warm > a.currentLevel) desiredLevels[a.deviceId] = warm;

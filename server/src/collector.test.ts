@@ -736,6 +736,24 @@ describe("Smart AC leveling", () => {
     expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6, generator_mode: 2 });
   });
 
+  it("drops generator_mode from re-enforcement after a manual gen change on an opted-out AC (2026-06-21)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    const rule = { ...acRangeRule(), smart_leveling: false, action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 3, generator_mode: 2 } };
+
+    // User just set ac1's gen level by hand → manual wins: the opted-out range
+    // must NOT re-enforce its generator_mode (no slamming the manual level back).
+    void collector.onUserAcGenLevel("ac1", 3);
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 6 });
+  });
+
   it("strips generator_mode from turn-on timer presets for managed devices", async () => {
     const { collector, actions, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);
@@ -913,9 +931,9 @@ describe("Smart AC leveling", () => {
     expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
   });
 
-  it("on grid also paces a raise one level per tick (2026-06-19: 32A grid overshoot)", async () => {
+  it("on grid jumps straight to the meter-anchored ideal in one batch — no one-step pacing (2026-06-21)", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
-    setLevelingConfig(LEVELING_CONFIG); // maxRaiseStepGrid defaults to 1
+    setLevelingConfig(LEVELING_CONFIG);
     await collector.acLeveler.ensureLoaded();
     const devices = [
       { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
@@ -923,11 +941,14 @@ describe("Smart AC leveling", () => {
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
-    gridReadings(collector, 4, 6); // budget fits L3, but grid now climbs one step first
+    // 4A on a 30A grid → ~25A of real headroom on the meter → Abdu jumps L1→L3 in
+    // ONE batch. The 06-19 one-step grid cap is gone (user, 2026-06-21): the
+    // meter-anchored fill bounds the ideal to real headroom, so artificial pacing
+    // only made grid crawl while ~11A sat unused.
+    gridReadings(collector, 4, 6);
     await checkAcLeveling(collector);
 
-    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 2);
-    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
   });
 
   it("grid raises straight to the fitted ideal when maxRaiseStepGrid is loosened", async () => {
@@ -946,9 +967,12 @@ describe("Smart AC leveling", () => {
     expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
   });
 
-  it("grid does NOT jump both ACs straight to L3 in one batch (the 32A incident)", async () => {
+  it("on grid the meter-anchored fill self-limits near the limit — won't seat BOTH at L3 (32A guard, 2026-06-21)", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
-    setLevelingConfig(LEVELING_CONFIG);
+    // Grid limit lowered to 15 so the meter rides near it: the meter-anchored
+    // admission — not the retired one-step cap — is now the 32A guard. Seating
+    // both ACs at L3 would add ~4A and overshoot, so the fill must refuse.
+    setLevelingConfig({ ...LEVELING_CONFIG, gridLimitAmps: 15 });
     await collector.acLeveler.ensureLoaded();
     const devices = [
       { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
@@ -957,13 +981,17 @@ describe("Smart AC leveling", () => {
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
-    gridReadings(collector, 6, 6); // plenty of grid headroom
+    // 12A measured on a 15A grid (bufferedLimit 14) → only ~2A of room. The meter
+    // gate seats Najat at L3 but keeps Abdu at L1; the projected meter never tops
+    // the buffered limit, so the home can't overshoot the way it did at 32A.
+    gridReadings(collector, 12, 6);
     await checkAcLeveling(collector);
 
-    // Each managed AC climbs at most one level this batch — neither reaches L3.
-    for (const id of ["ac1", "ac2"]) {
-      expect(tclCloud.sendControl).not.toHaveBeenCalledWith(id, "set_generator_mode", 3);
-    }
+    const calls = tclCloud.sendControl.mock.calls as unknown as unknown[][];
+    const reachedL3 = ["ac1", "ac2"].filter((id) =>
+      calls.some((c) => c[0] === id && c[1] === "set_generator_mode" && c[2] === 3),
+    );
+    expect(reachedL3.length).toBeLessThan(2);
   });
 
   it("reduces levels instantly when an AC turns on near the limit", async () => {
@@ -1526,35 +1554,41 @@ describe("Smart AC leveling — predictive control", () => {
     expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
   });
 
-  it("on grid also learns a raise surge and gates the next step (2026-06-19)", async () => {
+  it("on grid a learned raise surge caps the meter-anchored ideal (2026-06-21)", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
-    // Mirror the gen Fix-C surge-learning test on grid (gridLimitAmps lowered to
-    // 15 so the same arithmetic applies). Grid started learning observedRaiseCost
-    // on 2026-06-19 after the static grid model under-predicted by ~17A.
+    // Grid limit lowered to 15 so the meter sits near it and a surge can bite.
+    // Abdu (model step 2A): a clean raise that really cost +2.5A teaches the gate
+    // so a later L2→L3 that the static 2A step WOULD admit is blocked.
     setLevelingConfig({ ...LEVELING_CONFIG, gridLimitAmps: 15 });
     await collector.acLeveler.ensureLoaded();
     const devices = [
-      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
     ];
     tclCloud.getDevices.mockReturnValue(devices);
     tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
 
-    // 8A on grid → nonAcLoad 6, Najat raised one step L1→L2 (model expects +1 → 9A), hold armed.
-    gridReadings(collector, 8, 6);
+    // 12A on a 15A grid (bufferedLimit 14): L1→L2 fits (12+2=14) but L2→L3 (16)
+    // does not → Abdu raised L1→L2 only, hold armed.
+    gridReadings(collector, 12, 6);
     await checkAcLeveling(collector);
-    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
-    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 2);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
 
-    // Real cost +4A (meter → 12A, under 15A so no bounce). Grading learns
-    // observedRaiseCost[ac1] ≈ 4; the next step L2→L3 is surge-charged 4A and
-    // blocked (3 + 4 = 7 > budget 5). Pre-2026-06-19 grid ignored the surge.
+    // The real cost was +2.5A (meter → 14.5A, still under 15A so no bounce).
+    // Grading learns observedRaiseCost[ac2] ≈ 2.5.
     const after = [{ ...devices[0], generatorMode: 2 }];
     tclCloud.getDevices.mockReturnValue(after);
     tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
     vi.advanceTimersByTime(31_000);
+    gridReadings(collector, 14.5, 6);
+    await checkAcLeveling(collector);
+
+    // Load drops back to 12A. With ONLY the 2A model step, L2→L3 (12+2=14) would
+    // fire; the learned 2.5A surge makes it 14.5 > 14 → BLOCKED. No further raise.
+    vi.advanceTimersByTime(35_000);
     gridReadings(collector, 12, 6);
     await checkAcLeveling(collector);
-    expect(tclCloud.sendControl).toHaveBeenCalledTimes(1);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
   });
 
   it("holds raises for the 270s turn-on hold after an AC turn-on whose draw never arrives", async () => {
@@ -1645,6 +1679,112 @@ describe("Smart AC leveling — predictive control", () => {
     const status = collector.acLeveler.getStatus();
     expect(status.expectedAmps).toBeNull();
     expect(status.lastPrediction).toBeNull();
+  });
+
+  it("on a grid→gen changeover drops managed ACs to FLOORS, not the model-fitted gen ideal (2026-06-21)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Establish on grid (both at L3, ample headroom) so the leveler's source = grid.
+    gridReadings(collector, 18, 6);
+    await checkAcLeveling(collector);
+    tclCloud.sendControl.mockClear();
+
+    // Changeover to gen: the first tick holds everyone at the FLOOR (L1) and lets
+    // the meter-confirmed gate climb back — instead of seating them at the
+    // gen-budget-fitted L2, whose hot-compressor surge tripped the generator live.
+    genReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 1);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 1);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 2);
+  });
+
+  it("does NOT revert a manual grid raise when the real meter has headroom (2026-06-21)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    // Grid limit 12: the model SUM of the two ACs (Najat L3 4A + Abdu L3 8A = 12A,
+    // with nonAcLoad clamped to 0) projects 12A > 11A and WOULD revert — but the
+    // real meter reads 8A, ~3A under the limit, so the meter projection (8+2=10)
+    // must let the raise through. Hard-pin the user's level.
+    setLevelingConfig({ ...LEVELING_CONFIG, gridLimitAmps: 12 });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 2, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // 4 readings → meter trusted for the projection, but streak < 6 so the leveler
+    // itself doesn't pre-raise Abdu (keeps the manual path the thing under test).
+    gridReadings(collector, 8, 4);
+    await checkAcLeveling(collector);
+
+    const result = await collector.acLeveler.onUserGenLevel("ac2", 3);
+    expect(result.reverted).toBe(false);
+  });
+
+  it("reverts a manual gen raise when the real meter would breach the limit", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Meter rides at 14A on a 15A gen (limit − margin = 14). Raising Abdu L1→L2
+    // adds its +2A model step → 16A > 14A → reverted.
+    genReadings(collector, 14, 6);
+    await checkAcLeveling(collector);
+
+    const result = await collector.acLeveler.onUserGenLevel("ac2", 2);
+    expect(result.reverted).toBe(true);
+    expect(result.level).toBe(1);
+  });
+
+  it("keeps a learned gen raise surge across a gen→grid→gen changeover (per-source, 2026-06-21)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig({ ...LEVELING_CONFIG, genLimitAmps: 15 });
+    await collector.acLeveler.ensureLoaded();
+    const abdu = { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 };
+    tclCloud.getDevices.mockReturnValue([abdu]);
+    tclCloud.fetchDevicesLive.mockResolvedValue([abdu] as never);
+
+    // Gen: Abdu L1→L2 (12+2=14 fits, 14+2=16 doesn't), real cost +2.5A → learns ~2.5.
+    genReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac2", "set_generator_mode", 2);
+    const atL2 = [{ ...abdu, generatorMode: 2 }];
+    tclCloud.getDevices.mockReturnValue(atL2);
+    tclCloud.fetchDevicesLive.mockResolvedValue(atL2 as never);
+    vi.advanceTimersByTime(31_000);
+    genReadings(collector, 14.5, 6);
+    await checkAcLeveling(collector);
+
+    // Round-trip the source (gen→grid→gen). Pre-2026-06-21 this WIPED the learned
+    // surge; now it persists per source.
+    gridReadings(collector, 10, 6);
+    await checkAcLeveling(collector);
+    genReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    tclCloud.sendControl.mockClear();
+
+    // Back on gen at 12A with Abdu at L2: the static 2A step would admit L2→L3
+    // (12+2=14) but the persisted ~2.5A surge (12+2.5=14.5 > 14) keeps it blocked.
+    vi.advanceTimersByTime(35_000);
+    genReadings(collector, 12, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
   });
 });
 

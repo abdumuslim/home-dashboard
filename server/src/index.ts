@@ -73,7 +73,7 @@ async function main(): Promise<void> {
       getStatus: () => collector.acLeveler.getStatus(),
       onUserPowerOff: (deviceId) => collector.acLeveler.onUserPowerOff(deviceId),
       onUserPowerOn: (deviceId) => collector.acLeveler.onUserPowerOn(deviceId),
-      onUserGenLevel: (deviceId, level) => collector.acLeveler.onUserGenLevel(deviceId, level),
+      onUserGenLevel: (deviceId, level) => collector.onUserAcGenLevel(deviceId, level),
     },
     {
       start: (deviceIds, includeFan) => collector.acCalibrator.start(deviceIds, includeFan),

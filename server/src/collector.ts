@@ -210,6 +210,14 @@ export class Collector {
   private readonly AC_MANUAL_OFF_CLEAR_GRACE_MS = 15_000;
   private acFanEnforcement = new Map<string, AcFanEnforcement>(); // key `${rule.id}:${deviceId}`
   private readonly AC_FAN_SETTLE_MS = 15_000;
+  // A manual UI gen-level change wins over range generator_mode re-enforcement
+  // when the AC is NOT leveler-managed (leveling off / opted out) — without this
+  // the active slot's gen_level (or preset generator_mode) is re-sent every ~5s
+  // and slams the user's manual level back within seconds (live 2026-06-21:
+  // "leveling off but Abdu still drops to L1"). Bounded grace so the automation
+  // eventually reclaims if the override is forgotten; resets on each manual change.
+  private lastUserGenChangeAt = new Map<string, number>();
+  private readonly AC_USER_GEN_OVERRIDE_MS = 30 * 60_000;
   // A manual UI vertical-swing change suspends swing enforcement until the active
   // slot changes or the AC power-cycles (no shadow-drift detection — UI-driven only).
   private acSwingOverrides = new Map<string, AcSwingOverride>(); // key `${rule.id}:${deviceId}`
@@ -1165,6 +1173,23 @@ export class Collector {
     if (resumed) log.info(`[collector] AC ${deviceId}: user fan Auto — resuming automation fan enforcement (smart auto)`);
   }
 
+  /**
+   * UI gen-level change → record + delegate to the leveler. For a leveler-managed
+   * AC the leveler owns the intent (manualCap/manualTarget); for an UNMANAGED AC
+   * (leveling off / opted out) the recorded timestamp suppresses range
+   * generator_mode re-enforcement so the manual level isn't slammed back.
+   */
+  onUserAcGenLevel(deviceId: string, level: number): Promise<{ reverted: boolean; level: number }> {
+    this.lastUserGenChangeAt.set(deviceId, Date.now());
+    return this.acLeveler.onUserGenLevel(deviceId, level);
+  }
+
+  /** A manual gen-level change is still "active" (suppresses range re-enforcement). */
+  private hasRecentUserGenChange(deviceId: string): boolean {
+    const at = this.lastUserGenChangeAt.get(deviceId);
+    return at != null && Date.now() - at < this.AC_USER_GEN_OVERRIDE_MS;
+  }
+
   /** UI fan/turbo change — suspend fan enforcement immediately (no settle-window race). */
   noteUserAcFanChange(deviceId: string): void {
     void this.acLeveler.onUserFanChange(deviceId);
@@ -1606,7 +1631,20 @@ export class Collector {
    * fan 7 == turbo — re-arming turbo would clobber the held fan).
    */
   private stripLeveledControls<T extends PurifierAction | AcAction>(rule: AutomationRule, action: T, deviceId: string): T {
-    const stripped = this.stripGenIfLeveled(rule, action);
+    let stripped = this.stripGenIfLeveled(rule, action);
+    // Manual gen change wins over range re-enforcement. If generator_mode SURVIVED
+    // stripGenIfLeveled, the leveler isn't managing this device's level (leveling
+    // off or the rule opted out) — so a recent manual change must drop it, or the
+    // active slot's cap re-sends every ~5s and slams the user's manual level back
+    // (live 2026-06-21: "leveling off but Abdu still drops to L1").
+    if (
+      rule.device_type === "ac" &&
+      (stripped as AcAction).generator_mode != null &&
+      this.hasRecentUserGenChange(deviceId)
+    ) {
+      const { generator_mode: _g, ...rest } = stripped as AcAction;
+      stripped = rest as T;
+    }
     if (rule.device_type !== "ac" || !this.acLeveler.hasFanHold(deviceId)) return stripped;
     const { fan_speed: _f, turbo: _t, ...rest } = stripped as AcAction;
     return rest as T;

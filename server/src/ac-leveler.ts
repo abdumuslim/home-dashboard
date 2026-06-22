@@ -309,19 +309,40 @@ export class AcLeveler {
    * the allocator's raise gate as `raiseSurge`. A gen level is a cap, not a
    * setpoint, so the static model understates this on a hot compressor (live:
    * 3.5A vs a 2A step) — learning it makes raises self-correct instead of
-   * trusting a model the user keeps having to retune. Per-source: cleared on a
-   * source change (different voltage + amp models) and on a config save.
+   * trusting a model the user keeps having to retune. Keyed PER SOURCE (grid vs
+   * gen have different voltage + amp models) and PERSISTED across changeovers
+   * (2026-06-21): the home flips source ~9×/day and clearing on every changeover
+   * meant the self-correction never accumulated — the controller permanently
+   * re-ran the wrong static model right when over/undershoots happen. Cleared
+   * only on a config save (the amp model itself changed). Use `learnedCostFor()`.
    */
-  private observedRaiseCost = new Map<string, number>();
+  private observedRaiseCost = new Map<PowerSource, Map<string, number>>();
   /**
-   * Learned per-AC amps per FAN-level step on the current source. Fans aren't in
-   * the amp model, so a held fan restored straight to its original on a flat
-   * guess overshot and bounced (1↔full). Learned from clean fan-only restore
-   * batches (meter delta ÷ steps) and fed to the allocator as `fanStepCost` so a
-   * restore climbs only to the highest level that fits. Per-source; cleared on
-   * source change (different voltage).
+   * Learned per-AC amps per FAN-level step, keyed PER SOURCE. Fans aren't in the
+   * amp model, so a held fan restored straight to its original on a flat guess
+   * overshot and bounced (1↔full). Learned from clean fan-only restore batches
+   * (meter delta ÷ steps) and fed to the allocator as `fanStepCost` so a restore
+   * climbs only to the highest level that fits. Persisted across changeovers,
+   * cleared on config save (2026-06-21). Use `learnedCostFor()`.
    */
-  private observedFanStepCost = new Map<string, number>();
+  private observedFanStepCost = new Map<PowerSource, Map<string, number>>();
+
+  /**
+   * Per-source sub-map of a learned-cost map (lazily created). One source is
+   * active at a time; keeping grid and gen separate prevents a grid surge from
+   * being applied on the tighter gen budget and vice-versa.
+   */
+  private learnedCostFor(
+    map: Map<PowerSource, Map<string, number>>,
+    source: PowerSource,
+  ): Map<string, number> {
+    let inner = map.get(source);
+    if (!inner) {
+      inner = new Map<string, number>();
+      map.set(source, inner);
+    }
+    return inner;
+  }
   /** In-flight fan restore awaiting its effect, for per-step cost learning. */
   private lastFanRaise: { deviceId: string; fromFan: number; toFan: number; preMeasured: number; at: number } | null = null;
   /** Last leveling push timestamp — throttles non-critical notices (see LEVELING_PUSH_THROTTLE_MS). */
@@ -563,9 +584,10 @@ export class AcLeveler {
       this.lastEmergency = null;
       // Bounce evidence is per-source (different limit + amp models).
       this.bounce.clear();
-      // Learned raise surge + fan-step cost are per-source too (different voltage).
-      this.observedRaiseCost.clear();
-      this.observedFanStepCost.clear();
+      // observedRaiseCost / observedFanStepCost are NO LONGER cleared here
+      // (2026-06-21): they are keyed per source and persist across changeovers
+      // so the learned self-correction accumulates instead of resetting on every
+      // ~9/day flip. They clear only on a config save.
       this.lastFanRaise = null;
       this.lastRaiseBatch = null;
       // Drift baselines are per-source too: a changeover restarts the
@@ -793,15 +815,31 @@ export class AcLeveler {
       return { reverted: false, level };
     }
 
-    // Manual increment — validate projection against the active source limit.
+    // Manual increment — validate against the active source limit. Project off
+    // the REAL meter, not a model sum: the meter already reflects every other
+    // AC's true draw, so adding only THIS device's marginal model step is far
+    // more accurate than summing the chronically-wrong per-AC model. The model
+    // sum reverted legitimate raises that had ~11A of real headroom (live
+    // 2026-06-21: "projects 29.9A > 28A" while the meter read 18.4A). Hard-pin
+    // the user's level — revert ONLY when the real current would actually breach
+    // the limit. Fall back to the model sum when the meter isn't trustworthy yet
+    // (<4 readings / a just-changed-over meter) so the tight gen budget is safe.
     const source = determineSource(this.lastReading, Date.now() - this.lastReadingAt);
     if (source !== "none" && tcl) {
       const limit = source === "grid" ? this.config.gridLimitAmps : this.config.genLimitAmps;
-      let projected = this.lastNonAcLoad;
-      for (const d of tcl.getDevices()) {
-        if (!d.power && d.id !== deviceId) continue;
-        const lvl = d.id === deviceId ? level : (this.lastSetLevel.get(d.id) ?? d.generatorMode);
-        projected += estimateAcDraw(lvl, d.maxGeneratorLevel || 3, this.ampModelFor(d.id, source));
+      let projected: number;
+      if (this.recentMeasured.length >= 4) {
+        const model = this.ampModelFor(deviceId, source);
+        const marginalStep =
+          estimateAcDraw(level, maxLevel, model) - estimateAcDraw(previous, maxLevel, model);
+        projected = this.smoothedMeasured() + Math.max(0, marginalStep);
+      } else {
+        projected = this.lastNonAcLoad;
+        for (const d of tcl.getDevices()) {
+          if (!d.power && d.id !== deviceId) continue;
+          const lvl = d.id === deviceId ? level : (this.lastSetLevel.get(d.id) ?? d.generatorMode);
+          projected += estimateAcDraw(lvl, d.maxGeneratorLevel || 3, this.ampModelFor(d.id, source));
+        }
       }
       if (projected > limit - this.config.marginAmps) {
         const revertTo = Math.max(1, rank(previous) > maxLevel ? maxLevel : Math.max(1, previous));
@@ -913,6 +951,9 @@ export class AcLeveler {
     // managed ACs — their estimated draw stays double-counted (out of the non-AC
     // load derivation) through the ~4-min transition, preventing phantom-headroom
     // raises and nonAcLoad miscalc as the compressors spin back up.
+    // Captured before the re-arm clears the flag; combined with the new source
+    // below to drive `startAtFloors` (gen changeovers only).
+    const wasChangeover = this.armRampOnSourceChange;
     if (this.armRampOnSourceChange || this.armRampOnCollapseRecovery) {
       const now = Date.now();
       for (const { device, managed } of ctx) {
@@ -1242,8 +1283,9 @@ export class AcLeveler {
         const observed = measured - this.expected.preMeasured;
         if (observed > 0) {
           const id = this.expected.raiseDeviceId;
-          const prev = this.observedRaiseCost.get(id);
-          this.observedRaiseCost.set(id, prev == null ? observed : prev * 0.5 + observed * 0.5);
+          const costs = this.learnedCostFor(this.observedRaiseCost, source);
+          const prev = costs.get(id);
+          costs.set(id, prev == null ? observed : prev * 0.5 + observed * 0.5);
         }
       }
       this.expected = null;
@@ -1263,8 +1305,9 @@ export class AcLeveler {
       const observed = measured - fr.preMeasured;
       if (steps > 0 && observed > 0) {
         const perStep = observed / steps;
-        const prev = this.observedFanStepCost.get(fr.deviceId);
-        this.observedFanStepCost.set(fr.deviceId, prev == null ? perStep : prev * 0.5 + perStep * 0.5);
+        const costs = this.learnedCostFor(this.observedFanStepCost, source);
+        const prev = costs.get(fr.deviceId);
+        costs.set(fr.deviceId, prev == null ? perStep : prev * 0.5 + perStep * 0.5);
       }
       this.lastFanRaise = null;
     }
@@ -1289,11 +1332,12 @@ export class AcLeveler {
         // trigger it. `nextStepSurge` = the largest learned/model step among ON
         // managed ACs (conservative — never under-states the next surge).
         const bufferedLimit = limit - this.config.marginAmps - Math.max(0, this.config.raiseBufferAmps);
+        const raiseCosts = this.learnedCostFor(this.observedRaiseCost, source);
         const nextStepSurge = Math.max(0, ...snapshots
           .filter((s) => s.on && s.managed)
           .map((s) => {
             const m = this.ampModelFor(s.deviceId, source);
-            return Math.max(m.stepAmps, this.observedRaiseCost.get(s.deviceId) ?? 0);
+            return Math.max(m.stepAmps, raiseCosts.get(s.deviceId) ?? 0);
           }));
         const provableHeadroom =
           this.headroomStreak >= RAISE_STREAK &&
@@ -1377,7 +1421,7 @@ export class AcLeveler {
           // a shed when it covers — the static model under-states the step,
           // making the optimizer shed (turn OFF) instead of level down. Applies
           // on both sources since 2026-06-19 (grid model under-stated too).
-          raiseSurge: Object.fromEntries(this.observedRaiseCost),
+          raiseSurge: Object.fromEntries(this.learnedCostFor(this.observedRaiseCost, source)),
         });
         log.warn(
           `[leveler] EMERGENCY: ~${overshoot.toFixed(1)}A over the ${limit}A ${source} limit ` +
@@ -1405,11 +1449,31 @@ export class AcLeveler {
       emergencyDeferred = true;
     }
 
+    // The meter reflects the true managed-AC load only when no AC is mid-ramp
+    // (a fresh compressor under-reads its eventual draw), no power-collapse latch
+    // is active, and we have a full smoothing window. Gates the allocator's
+    // meter-anchored fill — during a ramp the model fill keeps proactive turn-on
+    // reductions; once settled the meter drives raises.
+    const anyManagedRamping = ctx.some(
+      (c) => c.managed && c.device.power && (this.rampUntil.get(c.device.id) ?? 0) > Date.now(),
+    );
+    const meterTrusted =
+      this.recentMeasured.length >= 4 && this.powerCollapse == null && !anyManagedRamping;
+
     const input: AllocatorInput = {
       limitAmps: limit,
       marginAmps: this.config.marginAmps,
       raiseBufferAmps: this.config.raiseBufferAmps,
       nonAcLoadAmps: nonAcLoad,
+      // The real meter + trust flag drive the meter-anchored fill (2026-06-21).
+      measuredAmps: measured,
+      meterTrusted,
+      // First tick after a changeover TO GEN → hold everyone at floors so the
+      // meter-confirmed gate climbs from L1 ("start low, raise on headroom"),
+      // instead of landing on the model-fitted gen ideal (L2) and surging a hot
+      // compressor into a trip. Gen-only: a gen→grid flip should use the new
+      // headroom aggressively, not drop to floors first.
+      startAtFloors: wasChangeover && source === "gen",
       // An all-mild bucket-empty drives the allocator's gentler reduce (fitted
       // levels + fan-before-shed) via its REDUCE_STREAK gate. A severe empty is
       // handled by the meter-sized emergency path above (deferred → stay quiet).
@@ -1423,23 +1487,23 @@ export class AcLeveler {
       forceEvaluate: this.forceEvaluate,
       acs: snapshots,
       ampModels,
-      // One step per raise on BOTH sources: a level is a CAP and releasing it
-      // surges a hot compressor unpredictably (live: 3.5A vs a 2A model step),
-      // so climb one level, confirm the surge on the meter, then the next. Grid
-      // joined gen on 2026-06-19 after the grid model under-predicted by ~17A
-      // and three uncapped ACs jumped straight to L3 → 32A. Configurable per
-      // source (1 = pace; ≥2 = no pacing for 3-level ACs).
-      maxRaiseStep: source === "gen"
-        ? (this.config.maxRaiseStepGen ?? 1)
-        : (this.config.maxRaiseStepGrid ?? 1),
+      // GEN: one step per raise (a level is a CAP; releasing it surges a hot
+      // compressor unpredictably — live 3.5A vs a 2A model step — so climb one,
+      // confirm on the meter, then the next). GRID: NO pacing (2026-06-21, user)
+      // — jump straight to the meter-anchored ideal. The 06-19 one-step grid cap
+      // existed because the model under-predicted with no meter anchor; now the
+      // meter-anchored fill bounds the ideal to real headroom and the leaky
+      // bucket catches any overshoot, so the artificial cap only made grid raises
+      // crawl while ~11A sat unused.
+      maxRaiseStep: source === "gen" ? (this.config.maxRaiseStepGen ?? 1) : undefined,
       // Learned per-AC raise surge (real cost of releasing a cap), so the raise
       // gate self-corrects from observed overshoots instead of trusting the
-      // static model that the user has already had to retune. Learned on both
-      // sources (one source is active at a time; the map clears on changeover).
-      raiseSurge: Object.fromEntries(this.observedRaiseCost),
+      // static model that the user has already had to retune. Per source,
+      // persisted across changeovers (2026-06-21) so the learning accumulates.
+      raiseSurge: Object.fromEntries(this.learnedCostFor(this.observedRaiseCost, source)),
       // Learned per-fan-step cost so a held fan climbs only to the level that
       // fits (the sweet spot) instead of jumping to full and bouncing.
-      fanStepCost: Object.fromEntries(this.observedFanStepCost),
+      fanStepCost: Object.fromEntries(this.learnedCostFor(this.observedFanStepCost, source)),
     };
     const result = computeAllocation(input);
     this.forceEvaluate = false;
@@ -1498,8 +1562,9 @@ export class AcLeveler {
       // can't be attributed). Light EWMA so one noisy reading can't dominate;
       // feeds the allocator's raise gate so it stops over-raising this AC.
       if (kind === "level" && batch!.raised.size === 1 && observed > 0) {
-        const prev = this.observedRaiseCost.get(deviceId);
-        this.observedRaiseCost.set(deviceId, prev == null ? observed : prev * 0.5 + observed * 0.5);
+        const costs = this.learnedCostFor(this.observedRaiseCost, source);
+        const prev = costs.get(deviceId);
+        costs.set(deviceId, prev == null ? observed : prev * 0.5 + observed * 0.5);
       }
       this.bounce.set(deviceId, { kind, cap, requiredAmps, until: startedAt + BOUNCE_SAFETY_EXPIRY_MS });
       this.lastRaiseBatch = null; // consumed — one bounce attribution per batch
