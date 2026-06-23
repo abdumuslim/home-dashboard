@@ -384,6 +384,59 @@ describe("computeAllocation — need and manual caps", () => {
   });
 });
 
+describe("computeAllocation — startAtFloors re-asserts floor (ungated)", () => {
+  it("drops an above-floor AC to its floor even without canReduce", () => {
+    // Gen changeover: the fill is skipped so target IS the floor; the firmware can
+    // come back above the commanded floor, so the floor-down must re-send every
+    // tick the shadow still reads high — NOT gated behind the over-limit streak.
+    const r = computeAllocation(input({
+      acs: [ac("abdu", { currentLevel: 3 })],
+      nonAcLoadAmps: 5,
+      forceEvaluate: false,
+      overLimitStreak: 0,
+      headroomStreak: 0,
+      startAtFloors: true,
+    }));
+    expect(r.desiredLevels).toEqual({ abdu: 1 });
+  });
+
+  it("does NOT drop an above-floor AC without startAtFloors when canReduce is false (today's bug)", () => {
+    const r = computeAllocation(input({
+      acs: [ac("abdu", { currentLevel: 3 })],
+      nonAcLoadAmps: 5,
+      forceEvaluate: false,
+      overLimitStreak: 0,
+      headroomStreak: 0,
+      startAtFloors: false,
+    }));
+    expect(r.desiredLevels).toEqual({});
+  });
+
+  it("sends nothing once the AC is already at floor (re-send stops on confirm)", () => {
+    const r = computeAllocation(input({
+      acs: [ac("abdu", { currentLevel: 1 })],
+      nonAcLoadAmps: 5,
+      forceEvaluate: false,
+      overLimitStreak: 0,
+      headroomStreak: 0,
+      startAtFloors: true,
+    }));
+    expect(r.desiredLevels).toEqual({});
+  });
+
+  it("respects a boost floor (L2) instead of L1 under startAtFloors", () => {
+    const r = computeAllocation(input({
+      acs: [ac("abdullah", { currentLevel: 3, minLevel: 2 })],
+      nonAcLoadAmps: 5,
+      forceEvaluate: false,
+      overLimitStreak: 0,
+      headroomStreak: 0,
+      startAtFloors: true,
+    }));
+    expect(r.desiredLevels).toEqual({ abdullah: 2 });
+  });
+});
+
 describe("computeAllocation — reductions", () => {
   const highLevels = [
     ac("najat", { currentLevel: 6 }),

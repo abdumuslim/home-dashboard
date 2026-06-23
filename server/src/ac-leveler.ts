@@ -8,8 +8,10 @@ import {
   computeEmergencyReduction,
   determineSource,
   estimateAcDraw,
+  floorOf,
   nearTargetNeedCap,
   AC_RAMP_MS,
+  ENFORCE_GEN_FLOORS_MAX_MS,
   EMERGENCY_PENDING_MS,
   BOUNCE_MAX_EXTRA_AMPS,
   BOUNCE_MODEL_TOLERANCE_AMPS,
@@ -220,6 +222,17 @@ export class AcLeveler {
   private unreachableLevels = new Map<string, Map<number, number>>();
   /** Set on a source change so tick() re-arms the compressor ramp for ON ACs. */
   private armRampOnSourceChange = false;
+  /**
+   * Latched on a changeover TO GEN: hold + re-assert every managed ON AC at its
+   * floor until the real device shadow confirms it's there AND the compressor
+   * ramp has passed. A gen changeover restarts the compressors and the firmware
+   * frequently comes back ABOVE the floor we commanded; the old one-shot
+   * `startAtFloors` fired once (forceEvaluate) and went quiet, so the unit drifted
+   * over the breaker and emergency-thrashed (the user had to drop levels by hand).
+   */
+  private enforceGenFloors = false;
+  /** Backstop deadline for `enforceGenFloors` (ENFORCE_GEN_FLOORS_MAX_MS). */
+  private enforceGenFloorsUntil = 0;
   /**
    * Latched when measured current collapses (probable breaker trip / blackout):
    * raises/restores are frozen until measured recovers near `preMedian` or the
@@ -582,6 +595,9 @@ export class AcLeveler {
       this.raiseHold = null;
       // An emergency discount sized on the other source's readings is meaningless too.
       this.lastEmergency = null;
+      // Any in-flight floor enforcement is for the OLD source — clear it; tick()
+      // re-arms it (wasChangeover) when the NEW source is gen.
+      this.enforceGenFloors = false;
       // Bounce evidence is per-source (different limit + amp models).
       this.bounce.clear();
       // observedRaiseCost / observedFanStepCost are NO LONGER cleared here
@@ -799,6 +815,10 @@ export class AcLeveler {
     this.bounce.delete(deviceId);
     this.unreachableLevels.delete(deviceId);
     this.pendingSendCounts.delete(deviceId);
+    // The user touched a level during a post-changeover floor enforcement → they
+    // own the levels now; stop auto-flooring so manualTarget/manualCap win (AGENTS
+    // rule 7). Cleared for all ACs — a live intervention overrides the auto-drop.
+    this.enforceGenFloors = false;
     await this.clearRememberedLevel(deviceId, "manual_gen_change");
 
     if (rank(level) < rank(previous)) {
@@ -894,6 +914,7 @@ export class AcLeveler {
     await this.ensureLoaded();
     if (!this.config.enabled) {
       this.lastStatus = null;
+      this.enforceGenFloors = false;
       return;
     }
     const tcl = this.deps.getTclCloud();
@@ -1460,6 +1481,41 @@ export class AcLeveler {
     const meterTrusted =
       this.recentMeasured.length >= 4 && this.powerCollapse == null && !anyManagedRamping;
 
+    // Persistent floors-after-gen-changeover enforcement. Arm on the changeover
+    // tick, then HOLD + re-assert floors across ticks until every managed ON AC's
+    // real shadow confirms it's at/below floor AND the compressor ramp has passed.
+    // The firmware can come back ABOVE the floor we commanded after a changeover,
+    // and the old one-shot `wasChangeover && gen` fired once (forceEvaluate) and
+    // went quiet — the unit drifted over the breaker and emergency-thrashed. The
+    // backstop deadline stops a truly-stuck device from enforcing forever.
+    if (wasChangeover && source === "gen") {
+      this.enforceGenFloors = true;
+      this.enforceGenFloorsUntil = Date.now() + ENFORCE_GEN_FLOORS_MAX_MS;
+    }
+    if (this.enforceGenFloors) {
+      const onManagedFloor = snapshots.filter((s) => s.on && s.managed);
+      const nowFloor = Date.now();
+      const anyRamping = onManagedFloor.some(
+        (s) => (this.rampUntil.get(s.deviceId) ?? 0) > nowFloor,
+      );
+      // currentLevel is the REAL shadow only OUTSIDE settle (in-settle it reads
+      // lastSetLevel and would confirm the floor prematurely); 0 (unrestricted) is
+      // never "at floor". Holding through the ramp makes the climb wait for the
+      // compressors — "up after compressor start and there is room".
+      const allAtFloor =
+        !inSettle &&
+        onManagedFloor.every((s) => s.currentLevel >= 1 && s.currentLevel <= floorOf(s));
+      if (
+        source !== "gen" ||
+        onManagedFloor.length === 0 ||
+        nowFloor > this.enforceGenFloorsUntil ||
+        (allAtFloor && !anyRamping)
+      ) {
+        this.enforceGenFloors = false;
+      }
+    }
+    const startAtFloors = this.enforceGenFloors;
+
     const input: AllocatorInput = {
       limitAmps: limit,
       marginAmps: this.config.marginAmps,
@@ -1468,12 +1524,13 @@ export class AcLeveler {
       // The real meter + trust flag drive the meter-anchored fill (2026-06-21).
       measuredAmps: measured,
       meterTrusted,
-      // First tick after a changeover TO GEN → hold everyone at floors so the
-      // meter-confirmed gate climbs from L1 ("start low, raise on headroom"),
-      // instead of landing on the model-fitted gen ideal (L2) and surging a hot
-      // compressor into a trip. Gen-only: a gen→grid flip should use the new
-      // headroom aggressively, not drop to floors first.
-      startAtFloors: wasChangeover && source === "gen",
+      // Hold everyone at floors after a changeover TO GEN so the meter-confirmed
+      // gate climbs from L1 ("start low, raise on headroom") instead of landing on
+      // the model-fitted gen ideal (L2) and surging a hot compressor into a trip.
+      // Persists until the device shadow CONFIRMS floors + the ramp passes (above)
+      // — not one-shot, so a firmware level-reset on the changeover is re-corrected.
+      // Gen-only: a gen→grid flip uses the new headroom aggressively.
+      startAtFloors,
       // An all-mild bucket-empty drives the allocator's gentler reduce (fitted
       // levels + fan-before-shed) via its REDUCE_STREAK gate. A severe empty is
       // handled by the meter-sized emergency path above (deferred → stay quiet).

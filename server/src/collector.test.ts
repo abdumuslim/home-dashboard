@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import type { Config } from "./config.js";
 import { Collector } from "./collector.js";
 import { acTimers } from "./routes.js";
-import { UNREACHABLE_LEVEL_SENDS } from "./ac-leveling.js";
+import { UNREACHABLE_LEVEL_SENDS, SETTLE_MS, AC_RAMP_MS } from "./ac-leveling.js";
 import type { AutomationRangeSlot } from "./automation-slots.js";
 
 const config: Config = {
@@ -1208,6 +1208,97 @@ function gridReadings(collector: Collector, amps: number, count: number) {
     collector.setLatestPower({ ts: new Date().toISOString(), voltage: 220, current_1: amps, current_2: 0, power_1: amps * 220, power_2: 0 });
   }
 }
+
+describe("Smart AC leveling — gen changeover enforces floors until confirmed", () => {
+  // Crossing the 30s settle (to read the real shadow) and the 240s ramp needs
+  // controllable time. The Collector schedules no intervals in its constructor,
+  // so advancing the fake clock only bumps Date.now()/settle/ramp — no loops fire.
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-23T10:00:00.000Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const onGrid = (gen: number) => [
+    { id: "ac1", name: "Najat", power: true, generatorMode: gen, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    { id: "ac2", name: "Abdu", power: true, generatorMode: gen, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+  ];
+  const sentFloor = (tcl: { sendControl: { mock: { calls: unknown[][] } } }, id: string) =>
+    tcl.sendControl.mock.calls.some((c) => c[0] === id && c[1] === "set_generator_mode" && c[2] === 1);
+
+  it("re-asserts the floor-down each tick until the shadow confirms, then stops", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+
+    // Both managed ACs ON at L3, running on grid (establishes grid as prior source).
+    let devices = onGrid(3);
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+    gridReadings(collector, 10, 6);
+    await checkAcLeveling(collector);
+
+    // Direct grid→gen changeover. First gen tick floors BOTH to L1 (forceEvaluate)
+    // and must NOT climb (startAtFloors skips the fill).
+    tclCloud.sendControl.mockClear();
+    genReadings(collector, 12, 4);
+    await checkAcLeveling(collector);
+    expect(sentFloor(tclCloud, "ac1")).toBe(true);
+    expect(sentFloor(tclCloud, "ac2")).toBe(true);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac1", "set_generator_mode", 2);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 2);
+
+    // The firmware DIDN'T apply — the shadow still reads L3. Cross the settle window
+    // and tick again: the leveler must RE-ASSERT the floor (today it goes quiet).
+    tclCloud.sendControl.mockClear();
+    vi.advanceTimersByTime(SETTLE_MS + 1000);
+    genReadings(collector, 12, 4);
+    await checkAcLeveling(collector);
+    expect(sentFloor(tclCloud, "ac1")).toBe(true);
+    expect(sentFloor(tclCloud, "ac2")).toBe(true);
+
+    // Now the shadow confirms L1. Cross the ramp + settle: enforcement clears, so the
+    // floor is no longer re-sent (the units are genuinely at floor).
+    devices = onGrid(1);
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+    tclCloud.sendControl.mockClear();
+    vi.advanceTimersByTime(AC_RAMP_MS + SETTLE_MS + 1000);
+    genReadings(collector, 8, 4);
+    await checkAcLeveling(collector);
+    expect(sentFloor(tclCloud, "ac1")).toBe(false);
+    expect(sentFloor(tclCloud, "ac2")).toBe(false);
+  });
+
+  it("stops enforcing floors once the user changes a level manually (manual wins)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+
+    const devices = onGrid(3);
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+    gridReadings(collector, 10, 6);
+    await checkAcLeveling(collector);
+
+    // grid→gen → enforcement armed, floors issued.
+    genReadings(collector, 12, 4);
+    await checkAcLeveling(collector);
+
+    // User intervenes (manual gen change) → enforcement clears for all ACs. The
+    // shadow still reads L3 (not applied), but the leveler must NOT force the floor
+    // back down on ac1 after the manual override.
+    await collector.acLeveler.onUserGenLevel("ac2", 2);
+    tclCloud.sendControl.mockClear();
+    vi.advanceTimersByTime(SETTLE_MS + 1000);
+    genReadings(collector, 12, 4);
+    await checkAcLeveling(collector);
+    expect(sentFloor(tclCloud, "ac1")).toBe(false);
+  });
+});
 
 describe("Smart AC leveling — power-collapse (trip) guard", () => {
   beforeEach(() => {

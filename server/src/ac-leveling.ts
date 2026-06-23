@@ -366,6 +366,16 @@ export const UNREACHABLE_SAFETY_EXPIRY_MS = 60 * 60_000;
  * turn-on AND on a power-source change (a Gen↔Grid flip restarts the compressors).
  */
 export const AC_RAMP_MS = 240_000;
+/**
+ * Max time the leveler keeps re-asserting floors after a gen changeover before
+ * giving up (the firmware-never-applies backstop). A gen changeover restarts the
+ * compressors and the TCL firmware often comes back ABOVE the commanded floor; a
+ * single forceEvaluate tick fired once and went quiet, so the unit drifted over
+ * the breaker. We re-send the floor-down until the real shadow confirms it (and
+ * the ramp passes), bounded by this cap so a truly stuck device doesn't enforce
+ * forever — normal over-limit handling resumes after.
+ */
+export const ENFORCE_GEN_FLOORS_MAX_MS = 300_000;
 /** Grace before an observed-ON clears a shed flag (shadow lags the off command). */
 export const SHED_CLEAR_GRACE_MS = 15_000;
 /**
@@ -480,7 +490,7 @@ export function needCap(tier: NeedTier, maxLevel: number): number {
  * a range slot caps below it (explicit per-window intent beats the boost), or
  * the firmware can't reach it (reachableCap — physics beats every floor).
  */
-function floorOf(ac: LevelerAcSnapshot): number {
+export function floorOf(ac: LevelerAcSnapshot): number {
   let floor = Math.max(1, Math.min(ac.minLevel, ac.maxLevel));
   if (ac.manualCap != null) floor = Math.min(floor, Math.max(1, ac.manualCap));
   if (ac.slotCap != null) floor = Math.min(floor, Math.max(1, ac.slotCap));
@@ -827,9 +837,14 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       desiredLevels[a.deviceId] = canRaise ? target : floorOf(a);
       continue;
     }
-    if (target < a.currentLevel && (canReduce || toRestore.length > 0)) {
+    if (target < a.currentLevel && (canReduce || toRestore.length > 0 || input.startAtFloors)) {
       // Reductions accompanying a restore ride the raise gate — they only
       // make room (lower load), so the over-limit streak isn't required.
+      // `startAtFloors` (a gen changeover) ungates the floor-down the same way:
+      // the fill is skipped so `target` IS the floor, and the firmware can come
+      // back above it after a changeover, so the floor must be RE-ASSERTED every
+      // tick the shadow still reads high — not fired once and dropped when the
+      // over-limit streak (canReduce) is quiet.
       desiredLevels[a.deviceId] = target;
       continue;
     }
