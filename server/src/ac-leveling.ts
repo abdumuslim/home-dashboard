@@ -28,6 +28,10 @@ export interface AcLevelingConfig {
    * below the limit and ordinary source-current fluctuation can't trip the
    * over-limit reduce — killing the raise→over-limit→reduce→raise limit cycle.
    * Reductions/sheds ignore this and stay on `limit − margin` (safety side).
+   * Default 0 since 2026-06-25: the meter-anchored overhaul + the trip guards
+   * (leaky bucket, emergency fast-path, gen one-step pacing) replaced the static
+   * deadband, so the buffer defaults to "use the headroom"; raise it to restore
+   * the old hysteresis margin if a source ever limit-cycles near its breaker.
    */
   raiseBufferAmps: number;
   comfortTargetC: number;
@@ -65,7 +69,7 @@ export const DEFAULT_LEVELING_CONFIG: AcLevelingConfig = {
   gridLimitAmps: 30,
   genLimitAmps: 15,
   marginAmps: 1,
-  raiseBufferAmps: 1,
+  raiseBufferAmps: 0,
   comfortTargetC: 26,
   nearTargetBandC: 0.5,
   priority: [],

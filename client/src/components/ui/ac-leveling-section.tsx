@@ -43,7 +43,8 @@ function seedDraft(config: AcLevelingConfig, acDevices: AcDevice[]): AcLevelingC
   }
   // Prefill the raise buffer for configs saved before the field existed, so its
   // input never renders uncontrolled. Seeding does NOT mark the draft dirty.
-  const raiseBufferAmps = config.raiseBufferAmps ?? 1;
+  // Default 0 (see DEFAULT_LEVELING_CONFIG) — the trip guards replaced the deadband.
+  const raiseBufferAmps = config.raiseBufferAmps ?? 0;
   const nearTargetBandC = config.nearTargetBandC ?? 0.5;
   const maxRaiseStepGrid = config.maxRaiseStepGrid ?? 1;
   const maxRaiseStepGen = config.maxRaiseStepGen ?? 1;

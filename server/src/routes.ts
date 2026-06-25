@@ -1321,7 +1321,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         gridLimitAmps: body.gridLimitAmps as number,
         genLimitAmps: body.genLimitAmps as number,
         marginAmps: body.marginAmps as number,
-        raiseBufferAmps: (body.raiseBufferAmps as number) ?? 1,
+        raiseBufferAmps: (body.raiseBufferAmps as number) ?? 0,
         comfortTargetC: body.comfortTargetC as number,
         nearTargetBandC: (body.nearTargetBandC as number) ?? 0.5,
         priority: body.priority as string[],
