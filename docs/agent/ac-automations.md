@@ -136,6 +136,10 @@ Leveler internals (budgets, allocator, sheds, fan holds, warm restore mechanics)
 
 ## Fixed bugs (history)
 
+### Xiaomi 2FA re-auth froze the whole automation loop — FIXED 2026-07-02
+
+The in-loop Xiaomi re-auth in `checkAutomations()` was `await`ed. When the Xiaomi session expired (401) and re-login demanded a 2FA code, `xiaomiCloud.init()` blocked indefinitely (its `on2fa` callback resolves only via `POST /api/xiaomi/verify`), freezing the entire `collectAll` loop — weather, alerts/push, AC schedule/metric automations, timers, beep enforcement, and calibration all stopped for ~4h. Only air (MQTT), power (ESP `POST`), and urgent AC leveling (power-ingest triggered) kept running, masking it. **Fix**: the re-auth is now **fire-and-forget** (`void this.xiaomiCloud.init().catch(...)`, `xiaomiRetryAt` set before launch), so a pending 2FA prompt never blocks automations — purifiers simply stay unmanaged until the code is submitted. Guard `status !== "needs_2fa"/"needs_captcha"` prevents relaunch spam. Full write-up + the loop-must-never-block principle in `architecture.md` → Known Bugs. Regression test: `collector.test.ts` "in-loop Xiaomi re-auth does not block the collection loop".
+
 ### Dead-zone status clobber — FIXED 2026-06-10
 
 The **idle + dead-zone adoption** branch of `checkAcRangeAutomation()` set `status: "triggered"` inside the device loop, but a trailing `if (state.status === "idle")` write with the **stale local `state` object** clobbered it back to idle — so the adoption path re-ran every 5s tick (repeating "adopting with diff" logs; behavior converged since both paths diff-enforce).

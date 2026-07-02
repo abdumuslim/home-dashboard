@@ -3661,3 +3661,41 @@ describe("Smart AC leveling — emergency reduction fast path", () => {
     });
   });
 });
+
+// Regression: an expired Xiaomi session that triggers an in-loop re-auth must
+// NOT freeze the collection loop. xiaomiCloud.init() blocks until a 2FA/captcha
+// code is submitted (its on2fa callback returns a promise resolved only via
+// POST /api/xiaomi/verify), so it must be launched fire-and-forget, never
+// awaited inside checkAutomations. Awaiting it once froze weather/alerts/
+// automations for ~4h (2026-07-02).
+describe("in-loop Xiaomi re-auth does not block the collection loop", () => {
+  it("checkAutomations returns promptly even when init() parks on a 2FA prompt", async () => {
+    const { collector } = createCollector();
+
+    // Skip the DB refresh (throttle) and inject a rule so checkAutomations
+    // reaches the re-auth block instead of early-returning on empty rules.
+    (collector as never as { automationRulesLastFetch: number }).automationRulesLastFetch = Date.now();
+    (collector as never as { automationRules: unknown[] }).automationRules = [
+      { id: 1, enabled: true, device_type: "purifier", automation_type: "metric", device_ids: [] },
+    ];
+    (collector as never as { xiaomiRetryAt: number }).xiaomiRetryAt = 0;
+
+    let initCalls = 0;
+    const fakeXiaomi = {
+      isReady: () => false,
+      getAuthStatus: () => ({ status: "error" as const }),
+      // Simulates a login that parks on an un-answered 2FA prompt: never resolves.
+      init: () => { initCalls++; return new Promise<void>(() => { /* never resolves */ }); },
+    };
+    (collector as never as { xiaomiCloud: typeof fakeXiaomi }).xiaomiCloud = fakeXiaomi;
+
+    const hung = Symbol("hung");
+    const result = await Promise.race([
+      (collector as never as { checkAutomations: () => Promise<void> }).checkAutomations().then(() => "done"),
+      new Promise((resolve) => setTimeout(() => resolve(hung), 500)),
+    ]);
+
+    expect(result).toBe("done"); // did NOT hang on the blocking init()
+    expect(initCalls).toBe(1); // re-auth was still launched (fire-and-forget)
+  });
+});

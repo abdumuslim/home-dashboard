@@ -804,26 +804,34 @@ export class Collector {
     if (this.automationRules.length === 0) return;
 
     if (this.tclCloud && !this.tclCloud.isReady() && Date.now() >= this.tclRetryAt) {
-      try {
-        log.warn("[collector] TCL Cloud not ready, attempting re-auth");
-        await this.tclCloud.init();
-      } catch (err) {
-        log.error("[collector] TCL Cloud re-auth failed:", (err as Error).message);
-        this.tclRetryAt = Date.now() + 60_000;
-      }
+      // Fire-and-forget for the same reason as the Xiaomi re-auth below: nothing
+      // awaited inside the collection loop may block on an unbounded wait. TCL
+      // auto-refreshes (no human 2FA today), but a hung auth request must not
+      // freeze weather/alerts/automations. AC rules that need TCL just skip the
+      // tick until isReady() (see the device-loop guard below). Throttle set
+      // before launch so an in-flight init isn't relaunched next tick.
+      this.tclRetryAt = Date.now() + 60_000;
+      log.warn("[collector] TCL Cloud not ready, attempting re-auth");
+      void this.tclCloud.init().catch((err) =>
+        log.error("[collector] TCL Cloud re-auth failed:", (err as Error).message));
     }
 
     if (this.xiaomiCloud && !this.xiaomiCloud.isReady()) {
       const authInfo = this.xiaomiCloud.getAuthStatus();
       if (authInfo.status !== "needs_2fa" && authInfo.status !== "needs_captcha") {
         if (Date.now() >= this.xiaomiRetryAt) {
-          try {
-            log.warn("[collector] Xiaomi Cloud not ready, attempting re-auth");
-            await this.xiaomiCloud.init();
-          } catch (err) {
-            log.error("[collector] Xiaomi Cloud re-auth failed:", (err as Error).message);
-            this.xiaomiRetryAt = Date.now() + 60_000;
-          }
+          // Fire-and-forget: init() blocks until 2FA/captcha is answered — its
+          // on2fa/onCaptcha callbacks return promises that only resolve via
+          // POST /api/xiaomi/verify. Awaiting here would freeze the ENTIRE
+          // collection loop (weather, alerts, automations, timers, beep) until
+          // a human submits a code. Mirror the non-blocking startup path
+          // (see initXiaomiCloud call in runForever). Throttle set BEFORE the
+          // launch so a pending 2FA prompt (status not yet flipped) can't be
+          // relaunched on the next tick.
+          this.xiaomiRetryAt = Date.now() + 60_000;
+          log.warn("[collector] Xiaomi Cloud not ready, attempting re-auth");
+          void this.xiaomiCloud.init().catch((err) =>
+            log.error("[collector] Xiaomi Cloud re-auth failed:", (err as Error).message));
         }
       }
     }
