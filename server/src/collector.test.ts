@@ -3785,6 +3785,54 @@ describe("observed-off classification — power events vs manual (2026-07-06)", 
     expect(actions).toHaveLength(1);
     expect(actions[0].action.power).toBe(1);
   });
+
+  it("a dashboard off inside a power-event window keeps its lock and is never auto-resumed (Najat 2026-07-06)", async () => {
+    const { collector, tclCloud, actions, locks } = createCollector();
+    setTrig(collector, 1);
+    collector.notePowerEvent("power collapse on gen");
+    // The UI off records the lock BEFORE the shadow ever reports the off
+    await collector.recordAcManualOff("ac1", "ui");
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+
+    await setWeatherValue(collector, 27); // still hot — the automation wants it ON
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    expect(locks.has("ac1")).toBe(true); // the sacred lock survives
+    expect(actions).toEqual([]);         // no power-event re-on
+    const state = (collector as never as { automationState: Map<number, { status: string }> }).automationState.get(1);
+    expect(state?.status).toBe("idle");
+  });
+
+  it("a remote/TCL-app off inside the window locks when beep is still off (unit never lost power)", async () => {
+    const { collector, tclCloud, actions, locks, beepPrefs } = createCollector();
+    setTrig(collector, 1);
+    beepPrefs.add("ac1"); // beep-off enforced — a power-loss restart would have reset beep to ON
+    collector.notePowerEvent("source gen → grid");
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: false, fanSpeed: 3 }]);
+
+    await setWeatherValue(collector, 27);
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    expect(locks.has("ac1")).toBe(true); // beep=false proves no restart → manual off
+    expect(actions).toEqual([]);
+  });
+
+  it("a power-loss off inside the window (beep reset to ON) still auto-resumes", async () => {
+    const { collector, tclCloud, actions, locks, beepPrefs } = createCollector();
+    setTrig(collector, 1);
+    beepPrefs.add("ac1");
+    collector.notePowerEvent("source gen → grid");
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: true, fanSpeed: 0 }]);
+
+    await setWeatherValue(collector, 27);
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    expect(locks.size).toBe(0);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].action.power).toBe(1);
+  });
 });
 
 describe("collector loop watchdog + step deadlines (2026-07-06 stall)", () => {

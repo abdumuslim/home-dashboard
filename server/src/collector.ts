@@ -369,8 +369,13 @@ export class Collector {
    */
   private classifyObservedAcOff(deviceId: string): "power_event" | "manual" {
     if (!this.config.observedOffLocks) return "power_event";
-    if (Date.now() - this.lastPowerEventAt < this.AC_POWER_EVENT_GRACE_MS) return "power_event";
     const dev = this.tclCloud?.getDevices().find((d) => d.id === deviceId);
+    // Negative fingerprint beats the window: firmware resets beepSwitch to ON on
+    // EVERY power-loss restart, so an off still showing beep=false on a
+    // beep-off-enforced AC proves the unit never lost power — a by-hand off
+    // (remote / TCL app), even mid-changeover chaos.
+    if (dev && !dev.power && this.acBeepOffPrefs.has(deviceId) && dev.beep === false) return "manual";
+    if (Date.now() - this.lastPowerEventAt < this.AC_POWER_EVENT_GRACE_MS) return "power_event";
     if (dev && !dev.power) {
       if (this.acBeepOffPrefs.has(deviceId) && dev.beep) return "power_event";
       const commandedFan = [...this.acFanEnforcement.entries()].some(
@@ -388,6 +393,13 @@ export class Collector {
    * guess is a 10-second fix from the phone instead of a hot room at dawn.
    */
   private async handleObservedAcOff(context: string, deviceId: string, deviceName: string): Promise<boolean> {
+    // A commanded off (UI / turn-off timer) records its lock BEFORE the shadow
+    // ever shows the off — an already-locked device is the user's own off, never
+    // a power event. Keep the lock; no re-record, no push (the user acted).
+    if (await this.isAcManualOffLocked(deviceId)) {
+      log.info(`[collector] ${context}: device ${deviceId} observed OFF but already manual-off locked — keeping the lock`);
+      return false;
+    }
     await this.ensureAcBeepPrefsLoaded();
     if (this.classifyObservedAcOff(deviceId) === "power_event") {
       log.info(`[collector] ${context}: device ${deviceId} observed OFF near a power event — not a manual off, automation resumes`);
@@ -1121,7 +1133,12 @@ export class Collector {
                   this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
                   continue;
                 }
-                // Power-event off → fall through to the re-turn-on below.
+                // Power-event off → fall through to the re-turn-on below,
+                // unless a manual-off lock exists (locks beat ALL auto-on paths).
+                if (await this.isAcManualOffLocked(did)) {
+                  log.info(`[collector] Automation "${rule.name}": device ${did} is manual-off locked, skipping power-event re-on`);
+                  continue;
+                }
               }
               log.info(
                 `[collector] Automation "${rule.name}": device ${did} is OFF while ${rule.metric}=${value} still ${rule.condition} ${rule.threshold}, re-turning ON [${deviceNames}]`,
@@ -1582,6 +1599,12 @@ export class Collector {
               this.clearAcFanEnforcement(rule.id, did); // power cycle — fan intent resets
               this.clearAcSwingOverride(rule.id, did);  // and swing intent resets
               if (await this.handleObservedAcOff(`AC range "${rule.name}"`, did, deviceNames)) {
+                // Locks beat ALL auto-on paths — even the power-event resume.
+                if (await this.isAcManualOffLocked(did)) {
+                  log.info(`[collector] AC range "${rule.name}": device ${did} is manual-off locked, skipping power-event re-on`);
+                  this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
+                  return;
+                }
                 // Power-event off (blackout/changeover/brownout): bring it back
                 // with the full active profile — the restart reset the device.
                 const fan = this.resolveRangeFan(rule, activeSlot, did, value);
