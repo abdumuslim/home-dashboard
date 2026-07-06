@@ -22,6 +22,8 @@ export interface Config {
   adminUser: string;
   adminPassword: string;
   hermesApiToken: string;
+  /** Escape hatch: false = an OBSERVED (un-commanded) AC off never records a manual-off lock. */
+  observedOffLocks: boolean;
 }
 
 export const config: Config = {
@@ -46,4 +48,5 @@ export const config: Config = {
   adminUser: process.env.ADMIN_USER ?? "",
   adminPassword: process.env.ADMIN_PASSWORD ?? "",
   hermesApiToken: process.env.HERMES_API_TOKEN ?? "",
+  observedOffLocks: process.env.OBSERVED_OFF_LOCKS !== "false",
 };

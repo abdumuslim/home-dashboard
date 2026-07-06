@@ -140,7 +140,7 @@ export class ForecastService {
   private async fetchAndCache(): Promise<void> {
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&hourly=temperature_2m,relative_humidity_2m,dew_point_2m,apparent_temperature,surface_pressure,wind_speed_10m,wind_direction_10m,wind_gusts_10m,shortwave_radiation,uv_index,cloud_cover,precipitation_probability,precipitation,weather_code&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_sum,precipitation_probability_max,uv_index_max,wind_speed_10m_max,weather_code&timezone=${TZ}&forecast_days=7`;
 
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
     if (!res.ok) {
       log.error(`Open-Meteo forecast API error: ${res.status}`);
       return;

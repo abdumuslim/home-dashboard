@@ -107,14 +107,22 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers, acCalibration?: AcCalibrationHandlers): Router {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers, acCalibration?: AcCalibrationHandlers, getLoopAgeMs?: () => number): Router {
   const router = Router();
 
   // Health check — before auth middleware, no auth required
   router.get("/api/health", async (_req: Request, res: Response) => {
     try {
       await pool.query("SELECT 1");
-      res.json({ status: "ok", uptime: process.uptime() });
+      // A stale collector-loop heartbeat means automations are dead even
+      // though HTTP works — surface it (the in-process watchdog restarts the
+      // container; this makes the stall visible to `docker ps` / monitoring).
+      const loopAgeMs = getLoopAgeMs?.() ?? null;
+      if (loopAgeMs != null && loopAgeMs > 3 * 60_000) {
+        res.status(503).json({ status: "loop-stalled", uptime: process.uptime(), loopAgeMs });
+        return;
+      }
+      res.json({ status: "ok", uptime: process.uptime(), ...(loopAgeMs != null ? { loopAgeMs } : {}) });
     } catch {
       res.status(503).json({ status: "unhealthy", error: "database unreachable" });
     }

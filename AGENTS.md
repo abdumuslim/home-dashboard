@@ -41,7 +41,7 @@ Deployment is a 3-step pipeline (tarball → scp/ssh rebuild → **regenerate mo
 ## Hard rules (violating these has bitten us before)
 
 1. **Never commit secrets.** `CLAUDE.md` and `docs/agent/operations.md` are gitignored because they contain credentials/VPS details — never copy their contents into committed files, and never `git add -f` them.
-2. **AC manual-off locks are sacred:** never auto-clear a manual-off lock from temperature thresholds; only an explicit/observed manual-on clears it (`docs/agent/ac-automations.md`).
+2. **AC manual-off locks are sacred:** never auto-clear a manual-off lock from temperature thresholds; only an explicit/observed manual-on clears it. But **classification comes first**: an OBSERVED (un-commanded) off near a power event (changeover/blackout/collapse/ESP gap, or a power-loss shadow fingerprint) is a power-loss off and must NOT record a lock in the first place (`docs/agent/ac-automations.md` → Manual-off locks).
 3. **Range-slot fields:** any new field on automation range slots MUST be added to the `normalizeRangeSlots()` whitelist in `server/src/automation-slots.ts` or it is silently dropped on save.
 4. **Preset slots:** never hardcode preset slot arrays — derive from `PRESET_COUNT`/`PRESET_SLOTS` in `ac-widget.tsx` (slots are 1–10).
 5. **Managed ACs are never left at generator level 0** (unrestricted) — leveling invariants in `docs/agent/ac-leveling.md`.

@@ -27,6 +27,7 @@ const config: Config = {
   adminUser: "",
   adminPassword: "",
   hermesApiToken: "",
+  observedOffLocks: true,
 };
 
 function createPool() {
@@ -3697,5 +3698,222 @@ describe("in-loop Xiaomi re-auth does not block the collection loop", () => {
 
     expect(result).toBe("done"); // did NOT hang on the blocking init()
     expect(initCalls).toBe(1); // re-auth was still launched (fire-and-forget)
+  });
+});
+
+describe("observed-off classification — power events vs manual (2026-07-06)", () => {
+  beforeEach(() => {
+    acTimers.clear();
+  });
+
+  function setTrig(collector: Collector, ruleId: number) {
+    (collector as never as { automationState: Map<number, unknown> }).automationState.set(ruleId, {
+      status: "triggered", lastToggle: 0, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true,
+    });
+  }
+
+  it("does not lock an observed off inside the power-event window and re-turns the AC on (the 02:44 incident)", async () => {
+    const { collector, tclCloud, actions, locks } = createCollector();
+    setTrig(collector, 1);
+    collector.notePowerEvent("source grid → gen");
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+
+    await setWeatherValue(collector, 27); // still hot — the automation wants it ON
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    expect(locks.size).toBe(0);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].deviceId).toBe("ac1");
+    expect(actions[0].action.power).toBe(1);
+    const state = (collector as never as { automationState: Map<number, { status: string }> }).automationState.get(1);
+    expect(state?.status).toBe("triggered");
+  });
+
+  it("locks an observed off with no power-event context (genuine manual off unchanged)", async () => {
+    const { collector, tclCloud, actions, locks } = createCollector();
+    setTrig(collector, 1);
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+
+    await setWeatherValue(collector, 27);
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    expect(locks.has("ac1")).toBe(true);
+    expect(actions).toEqual([]);
+    const state = (collector as never as { automationState: Map<number, { status: string }> }).automationState.get(1);
+    expect(state?.status).toBe("idle");
+  });
+
+  it("reads a beep-reset fingerprint as a power-loss off (brownout outside the window)", async () => {
+    const { collector, tclCloud, actions, locks, beepPrefs } = createCollector();
+    setTrig(collector, 1);
+    beepPrefs.add("ac1"); // beep-off enforced — firmware resets it to ON only on a power-loss restart
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: true, fanSpeed: 3 }]);
+
+    await setWeatherValue(collector, 27);
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    expect(locks.size).toBe(0);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].action.power).toBe(1);
+  });
+
+  it("never locks on a fetch gap (power undefined is not an observation)", async () => {
+    const { collector, tclCloud, actions, locks } = createCollector();
+    setTrig(collector, 1);
+    tclCloud.fetchDevicesLive.mockResolvedValue([] as never);
+
+    await setWeatherValue(collector, 27);
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    expect(locks.size).toBe(0);
+    expect(actions).toEqual([]);
+    const state = (collector as never as { automationState: Map<number, { status: string }> }).automationState.get(1);
+    expect(state?.status).toBe("triggered");
+  });
+
+  it("schedule: a power-event off during the window is re-turned on instead of locked", async () => {
+    const { collector, tclCloud, actions, locks } = createCollector();
+    const rule = activeScheduleRule();
+    setTrig(collector, rule.id);
+    collector.notePowerEvent("ESP gap 23s");
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+
+    await checkScheduleAutomation(collector, rule);
+
+    expect(locks.size).toBe(0);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].action.power).toBe(1);
+  });
+});
+
+describe("collector loop watchdog + step deadlines (2026-07-06 stall)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("abandons a hung step at its deadline — later steps still run", async () => {
+    const { collector } = createCollector();
+    const c = collector as never as {
+      collectAmbientWeather: () => Promise<void>;
+      collectQingping: () => Promise<void>;
+      checkAlerts: () => Promise<void>;
+      checkAutomations: () => Promise<void>;
+      checkAcTimers: () => Promise<void>;
+      runLevelingCheck: () => Promise<void>;
+      checkAcBeepEnforcement: () => Promise<void>;
+      collectAll: () => Promise<void>;
+      acCalibrator: unknown;
+    };
+    c.collectAmbientWeather = async () => {};
+    c.collectQingping = async () => {};
+    c.checkAlerts = () => new Promise<void>(() => {}); // hangs forever (the stall)
+    c.acCalibrator = { tick: async () => {} };
+    c.checkAutomations = async () => {};
+    let timersRan = false;
+    c.checkAcTimers = async () => { timersRan = true; };
+    c.runLevelingCheck = async () => {};
+    c.checkAcBeepEnforcement = async () => {};
+
+    const cycle = c.collectAll();
+    await vi.advanceTimersByTimeAsync(90_001);
+    await cycle;
+
+    expect(timersRan).toBe(true);
+  });
+
+  it("watchdog warns below 3 min and exits the process past it (container restart self-heal)", () => {
+    const { collector } = createCollector();
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    try {
+      (collector as never as { startLoopWatchdog: () => void }).startLoopWatchdog();
+
+      (collector as never as { lastLoopTickAt: number }).lastLoopTickAt = Date.now() - 90_000;
+      vi.advanceTimersByTime(30_000);
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      (collector as never as { lastLoopTickAt: number }).lastLoopTickAt = Date.now() - 4 * 60_000;
+      vi.advanceTimersByTime(30_000);
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    } finally {
+      collector.stop();
+      exitSpy.mockRestore();
+    }
+  });
+});
+
+describe("shadow sanity gate — raises frozen while the meter can't see demanding shadow-ON ACs (P5)", () => {
+  it("skips raises on stale post-blackout shadows, resumes once meter and shadows converge", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    // Both rooms hot (demanding) — their compressors MUST draw at least the
+    // floor if they are really on. Floors: ac1 2A + ac2 4A = 6A.
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 29, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 29, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // 3A on gen: the meter can't carry even the 6A floor draw — the shadows
+    // are lying (post-blackout lag). No raise may fire into that.
+    genReadings(collector, 3, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).not.toHaveBeenCalled();
+
+    // The ACs really start drawing → gate self-expires, raises resume.
+    genReadings(collector, 8, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalled();
+  });
+});
+
+describe("raise-hold meter-anchored release (P6, 2026-07-06)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("releases on real meter headroom when the model expectation exceeds the limit (impossible arrival)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    // ac2's fat model claims 12A at L3 while its real draw is ~3A (cap above
+    // demand) — the model-sum expectation lands ABOVE the 15A limit, so the
+    // arrival/provable releases can never fire (live: "once ~29.9A is seen"
+    // on a 28A grid limit) and every hold ran its full timeout.
+    setLevelingConfig({
+      ...LEVELING_CONFIG,
+      gridLimitAmps: 15,
+      ampModels: { ac1: { baseAmps: 2, stepAmps: 1 }, ac2: { baseAmps: 8, stepAmps: 2 } },
+    });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 29, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 24, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // 5A on grid → ac1 raised straight to L3 (meter-anchored), hold armed with
+    // expectedAmps ≈ 16A — above the 15A limit.
+    gridReadings(collector, 5, 6);
+    await checkAcLeveling(collector);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 3);
+    expect(collector.acLeveler.getStatus().raiseHoldRemainingMs).toBeGreaterThan(0);
+
+    // The raise lands (+2A): pending is accounted for, the meter is far under
+    // the limit → meter-anchored release frees the hold well inside the 120s.
+    const after = [{ ...devices[0], generatorMode: 3 }, devices[1]];
+    tclCloud.getDevices.mockReturnValue(after);
+    tclCloud.fetchDevicesLive.mockResolvedValue(after as never);
+    vi.advanceTimersByTime(31_000);
+    gridReadings(collector, 7, 6);
+    await checkAcLeveling(collector);
+    expect(collector.acLeveler.getStatus().raiseHoldRemainingMs).toBe(0);
   });
 });

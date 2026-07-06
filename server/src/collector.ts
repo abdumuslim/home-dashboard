@@ -232,6 +232,24 @@ export class Collector {
   private lastBeepDevicesFetch = 0;
   private readonly AC_BEEP_RESEND_COOLDOWN_MS = 30_000;
   private readonly AC_BEEP_FETCH_INTERVAL_MS = 30_000;
+  /**
+   * Power-event context for observed-off classification (2026-07-06): blackouts,
+   * changeovers, collapses and gen brownouts turn ACs off, and their shadows can
+   * lag the event by MINUTES (13 min observed live) — an un-commanded OFF near a
+   * power event is a power-loss off, NOT the user's hand, and must never record
+   * a sacred manual-off lock (two bogus locks stranded a hot room overnight,
+   * live 2026-07-05/06). Stamped via the leveler's onPowerEvent dep.
+   */
+  private lastPowerEventAt = 0;
+  private readonly AC_POWER_EVENT_GRACE_MS = 15 * 60_000;
+  // Loop-liveness watchdog (2026-07-06 ~3h silent stall): heartbeat + per-step
+  // deadlines so one hung external call can never freeze every automation.
+  private lastLoopTickAt = Date.now();
+  private currentStep: string | null = null;
+  private loopWatchdog: NodeJS.Timeout | null = null;
+  private readonly STEP_TIMEOUT_MS = 90_000;
+  private readonly LOOP_STALL_WARN_MS = 60_000;
+  private readonly LOOP_STALL_FATAL_MS = 3 * 60_000;
 
   getLatestAir(): Record<string, unknown> | null {
     return this.latestAirRow;
@@ -329,6 +347,60 @@ export class Collector {
     if (power === "off" && this.acManualOffLocks.has(deviceId)) {
       this.acManualOffSeenOff.add(deviceId);
     }
+  }
+
+  /** Stamped by the leveler on source changes, collapses, and ESP dropouts. */
+  notePowerEvent(kind: string): void {
+    this.lastPowerEventAt = Date.now();
+    // Shadows go stale across power events (ACs restart, firmware republishes
+    // late) — force the next leveling tick to fetch live device state.
+    this.lastLevelerDevicesFetch = 0;
+    log.info(`[collector] Power event (${kind}) — observed AC offs read as power-loss for the next 15 min`);
+  }
+
+  /**
+   * Classify an OBSERVED (un-commanded) AC off: power event or genuine manual?
+   * Power-event evidence: a recent source change / blackout / collapse / ESP
+   * dropout (shadow lag means "recent" spans minutes), or a power-loss
+   * fingerprint in the shadow itself — TCL firmware resets beepSwitch to ON on
+   * every power-loss restart, so beep=true on a beep-off-enforced AC (or fan
+   * reset to 0 while we had commanded a fan) says the unit lost power. A remote
+   * off resets neither.
+   */
+  private classifyObservedAcOff(deviceId: string): "power_event" | "manual" {
+    if (!this.config.observedOffLocks) return "power_event";
+    if (Date.now() - this.lastPowerEventAt < this.AC_POWER_EVENT_GRACE_MS) return "power_event";
+    const dev = this.tclCloud?.getDevices().find((d) => d.id === deviceId);
+    if (dev && !dev.power) {
+      if (this.acBeepOffPrefs.has(deviceId) && dev.beep) return "power_event";
+      const commandedFan = [...this.acFanEnforcement.entries()].some(
+        ([key, e]) => key.endsWith(`:${deviceId}`) && (e.lastCommandedFan ?? 0) > 0,
+      );
+      if (commandedFan && dev.fanSpeed === 0) return "power_event";
+    }
+    return "manual";
+  }
+
+  /**
+   * Shared handler for the three observed-off automation sites. Returns true
+   * when the off was a power event — no lock, the caller resumes its auto-on.
+   * A genuine manual off locks as before, now with a critical push so a wrong
+   * guess is a 10-second fix from the phone instead of a hot room at dawn.
+   */
+  private async handleObservedAcOff(context: string, deviceId: string, deviceName: string): Promise<boolean> {
+    await this.ensureAcBeepPrefsLoaded();
+    if (this.classifyObservedAcOff(deviceId) === "power_event") {
+      log.info(`[collector] ${context}: device ${deviceId} observed OFF near a power event — not a manual off, automation resumes`);
+      return true;
+    }
+    log.info(`[collector] ${context}: device ${deviceId} manually turned OFF, recording manual-off lock`);
+    await this.recordAcManualOff(deviceId, "observed_off");
+    void this.broadcastPush({
+      title: "AC automation paused",
+      body: `${deviceName} was turned off by hand — automations stay off until it's turned back on from the dashboard.`,
+      type: "leveling",
+    });
+    return false;
   }
 
   async reconcileAcManualOffLocks(devices: Pick<AcDevice, "id" | "power">[]): Promise<Set<string>> {
@@ -432,6 +504,9 @@ export class Collector {
         void this.runLevelingCheck().catch((err) =>
           log.error("[collector] Urgent AC leveling check failed:", err));
       },
+      // Source change / collapse / ESP dropout — arm the observed-off
+      // power-event window so a lagging shadow's OFF isn't read as user intent.
+      onPowerEvent: (kind) => this.notePowerEvent(kind),
     });
     this.acCalibrator = new AcCalibrator(pool, {
       getTclCloud: () => this.tclCloud,
@@ -451,6 +526,10 @@ export class Collector {
 
   stop(): void {
     this.stopped = true;
+    if (this.loopWatchdog) {
+      clearInterval(this.loopWatchdog);
+      this.loopWatchdog = null;
+    }
     if (this.mqttClient) {
       this.mqttClient.end(true);
       log.info("[collector] MQTT client closed");
@@ -465,13 +544,78 @@ export class Collector {
     // Run backfills in background — don't block the main collection/automation loop
     this.runBackfills();
 
+    this.startLoopWatchdog();
     while (!this.stopped) {
+      const gap = Date.now() - this.lastLoopTickAt;
+      if (gap > this.LOOP_STALL_WARN_MS) {
+        log.warn(`[collector] Loop resumed after a ${Math.round(gap / 1000)}s gap`);
+      }
+      this.lastLoopTickAt = Date.now();
       try {
         await this.collectAll();
       } catch (err) {
         log.error("[collector] Collection cycle failed:", err);
       }
       await sleep(5000);
+    }
+  }
+
+  /** Age of the loop heartbeat — exposed on /api/health for observability. */
+  getLoopAgeMs(): number {
+    return Date.now() - this.lastLoopTickAt;
+  }
+
+  /**
+   * Loop-liveness watchdog, independent of the loop itself: a blocked
+   * collectAll await leaves the event loop idle, so this interval still fires.
+   * The heartbeat advances at the top of each cycle AND when each step
+   * finishes (or is abandoned at its deadline), so it only ever goes stale
+   * when the loop machinery itself is wedged — twice now a single hung
+   * external call silently killed every automation and all leveling
+   * trip-protection for hours (2026-07-02 Xiaomi 2FA, 2026-07-06 ~3h stall).
+   * Warn names the in-flight step (the 07-06 stall left no clue what hung);
+   * a hard stall self-heals via process exit + Docker `restart: unless-stopped`
+   * (locks/sheds/fan-holds/config are all DB-persisted by design).
+   */
+  private startLoopWatchdog(): void {
+    this.loopWatchdog = setInterval(() => {
+      if (this.stopped) return;
+      const age = Date.now() - this.lastLoopTickAt;
+      if (age > this.LOOP_STALL_FATAL_MS) {
+        log.error(`[collector] Loop stalled for ${Math.round(age / 1000)}s (step: ${this.currentStep ?? "between steps"}) — exiting for a container restart`);
+        process.exit(1);
+      }
+      if (age > this.LOOP_STALL_WARN_MS) {
+        log.warn(`[collector] Loop slow: ${Math.round(age / 1000)}s since the last heartbeat (step: ${this.currentStep ?? "between steps"})`);
+      }
+    }, 30_000);
+    this.loopWatchdog.unref?.();
+  }
+
+  /**
+   * Run one collectAll step under a hard deadline. A step that exceeds it is
+   * ABANDONED — its promise may still settle later; steps are per-tick
+   * idempotent so the next cycle simply retries — because one hung external
+   * call must never freeze the whole loop (the loop-never-blocks principle,
+   * architecture.md). The abandoned promise gets a no-op catch so a late
+   * rejection can't become an unhandled rejection.
+   */
+  private async runStep(name: string, fn: () => Promise<void>): Promise<void> {
+    this.currentStep = name;
+    let timer: NodeJS.Timeout | undefined;
+    const work = fn();
+    work.catch(() => { /* late failure of an abandoned step — already surfaced */ });
+    try {
+      await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`step "${name}" exceeded ${this.STEP_TIMEOUT_MS / 1000}s — abandoned until the next cycle`)), this.STEP_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      this.currentStep = null;
+      this.lastLoopTickAt = Date.now();
     }
   }
 
@@ -520,23 +664,29 @@ export class Collector {
   }
 
   private async collectAll(): Promise<void> {
-    const mqttActive = this.mqttClient?.connected &&
-      (Date.now() - this.lastMqttMessage < 120_000);
+    try {
+      await this.runStep("sensors", async () => {
+        const mqttActive = this.mqttClient?.connected &&
+          (Date.now() - this.lastMqttMessage < 120_000);
 
-    const tasks: Promise<void>[] = [this.collectAmbientWeather()];
-    if (!mqttActive) {
-      tasks.push(this.collectQingping());
-    }
+        const tasks: Promise<void>[] = [this.collectAmbientWeather()];
+        if (!mqttActive) {
+          tasks.push(this.collectQingping());
+        }
 
-    const results = await Promise.allSettled(tasks);
-    for (const r of results) {
-      if (r.status === "rejected") {
-        log.error("[collector] Collection error:", r.reason);
-      }
+        const results = await Promise.allSettled(tasks);
+        for (const r of results) {
+          if (r.status === "rejected") {
+            log.error("[collector] Collection error:", r.reason);
+          }
+        }
+      });
+    } catch (err) {
+      log.error("[collector] Sensor collection failed:", err);
     }
 
     try {
-      await this.checkAlerts();
+      await this.runStep("alerts", () => this.checkAlerts());
     } catch (err) {
       log.error("[collector] Alert check failed:", err);
     }
@@ -544,31 +694,31 @@ export class Collector {
     try {
       // Calibration owns the ACs while active — the AC automation/timer/
       // leveler checks below all stand down until it finishes.
-      await this.acCalibrator.tick();
+      await this.runStep("calibration", () => this.acCalibrator.tick());
     } catch (err) {
       log.error("[collector] AC calibration tick failed:", err);
     }
 
     try {
-      await this.checkAutomations();
+      await this.runStep("automations", () => this.checkAutomations());
     } catch (err) {
       log.error("[collector] Automation check failed:", err);
     }
 
     try {
-      await this.checkAcTimers();
+      await this.runStep("ac-timers", () => this.checkAcTimers());
     } catch (err) {
       log.error("[collector] AC timer check failed:", err);
     }
 
     try {
-      await this.runLevelingCheck();
+      await this.runStep("leveling", () => this.runLevelingCheck());
     } catch (err) {
       log.error("[collector] AC leveling check failed:", err);
     }
 
     try {
-      await this.checkAcBeepEnforcement();
+      await this.runStep("beep", () => this.checkAcBeepEnforcement());
     } catch (err) {
       log.error("[collector] AC beep enforcement failed:", err);
     }
@@ -577,14 +727,24 @@ export class Collector {
     if (!this.tclCloud && this.config.tclUsername && this.config.tclPassword && Date.now() >= this.tclRetryAt) {
       this.tclRetryAt = Date.now() + 5 * 60_000;
       log.info("[collector] Retrying TCL Cloud init...");
-      await this.initTclCloud();
+      try {
+        await this.runStep("tcl-init", () => this.initTclCloud());
+      } catch (err) {
+        log.error("[collector] TCL Cloud init retry failed:", err);
+      }
     }
 
-    // Retry Xiaomi Cloud init if it failed previously (every 5 minutes)
+    // Retry Xiaomi Cloud init if it failed previously (every 5 minutes).
+    // Deadline-wrapped: a pending 2FA prompt inside init() must never freeze
+    // the loop (the 2026-07-02 stall — same principle as the in-loop re-auth).
     if (!this.xiaomiCloud && this.config.miEmail && this.config.miPassword && Date.now() >= this.xiaomiRetryAt) {
       this.xiaomiRetryAt = Date.now() + 5 * 60_000;
       log.info("[collector] Retrying Xiaomi Cloud init...");
-      await this.initXiaomiCloud();
+      try {
+        await this.runStep("xiaomi-init", () => this.initXiaomiCloud());
+      } catch (err) {
+        log.error("[collector] Xiaomi Cloud init retry failed:", err);
+      }
     }
   }
 
@@ -955,10 +1115,13 @@ export class Collector {
             if (power === "off" || power === undefined) {
               if (rule.device_type === "ac") {
                 if (this.acLeveler.isShed(did)) continue; // leveler shed it — not a manual off
-                log.info(`[collector] Automation "${rule.name}": device ${did} manually turned OFF, recording manual-off lock`);
-                await this.recordAcManualOff(did, "observed_off");
-                this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
-                continue;
+                // A fetch gap is not an observation — never lock on undefined.
+                if (power === undefined) continue;
+                if (!(await this.handleObservedAcOff(`Automation "${rule.name}"`, did, deviceNames))) {
+                  this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
+                  continue;
+                }
+                // Power-event off → fall through to the re-turn-on below.
               }
               log.info(
                 `[collector] Automation "${rule.name}": device ${did} is OFF while ${rule.metric}=${value} still ${rule.condition} ${rule.threshold}, re-turning ON [${deviceNames}]`,
@@ -1412,10 +1575,30 @@ export class Collector {
             const power = await this.getDevicePowerCached(did, "ac");
             if (power === "off" || power === undefined) {
               if (this.acLeveler.isShed(did)) continue; // leveler shed it — not a manual off
-              log.info(`[collector] AC range "${rule.name}": device ${did} manually turned OFF, recording manual-off lock`);
-              await this.recordAcManualOff(did, "observed_off");
+              // A fetch gap is not an observation — never lock on undefined.
+              if (power === undefined) continue;
+              // Our own recent off still propagating is not an external off.
+              if (now - (this.acRangeOffAt.get(did) ?? 0) < this.AC_OFF_REFIRE_GRACE_MS) continue;
               this.clearAcFanEnforcement(rule.id, did); // power cycle — fan intent resets
               this.clearAcSwingOverride(rule.id, did);  // and swing intent resets
+              if (await this.handleObservedAcOff(`AC range "${rule.name}"`, did, deviceNames)) {
+                // Power-event off (blackout/changeover/brownout): bring it back
+                // with the full active profile — the restart reset the device.
+                const fan = this.resolveRangeFan(rule, activeSlot, did, value);
+                const slotGen = activeSlot.gen_level != null ? this.clampSlotGenLevel(did, activeSlot.gen_level) : null;
+                const slotSwing = activeSlot.vertical_swing != null ? activeSlot.vertical_swing : null;
+                const onAction = {
+                  ...(rule.action_on as AcAction),
+                  ...(fan != null ? { fan_speed: fan } : {}),
+                  ...(slotGen != null ? { generator_mode: slotGen } : {}),
+                  ...(slotSwing != null ? { vertical_swing: slotSwing } : {}),
+                };
+                log.info(`[collector] AC range "${rule.name}": re-turning ON ${did} after power-event off`);
+                await this.executeAutomationAction(rule, onAction, [did]);
+                this.noteAcFanCommanded(rule, activeSlot, did, onAction as AcAction);
+                this.automationState.set(rule.id, { status: "triggered", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
+                return;
+              }
               this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
               return;
             }
@@ -1511,10 +1694,13 @@ export class Collector {
           if (power === "off" || power === undefined) {
             if (rule.device_type === "ac" && this.acLeveler.isShed(did)) continue; // leveler shed it
             if (rule.device_type === "ac" && state.status === "triggered") {
-              log.info(`[collector] Schedule "${rule.name}": device ${did} manually turned OFF during active window, recording manual-off lock`);
-              await this.recordAcManualOff(did, "observed_off");
-              this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
-              continue;
+              // A fetch gap is not an observation — never lock on undefined.
+              if (power === undefined) continue;
+              if (!(await this.handleObservedAcOff(`Schedule "${rule.name}"`, did, deviceNames))) {
+                this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: false });
+                continue;
+              }
+              // Power-event off → fall through to the turn-on below.
             }
             if (locked && await this.isAcManualOffLocked(did)) {
               log.info(`[collector] Schedule "${rule.name}": device ${did} is manual-off locked, skipping auto-on`);
@@ -1733,7 +1919,24 @@ export class Collector {
       try {
         do {
           this.levelingCheckQueued = false;
-          await this.checkAcLeveling();
+          // Deadline: a hung TCL call in a pass must not wedge the in-flight
+          // promise — every later urgent (emergency) tick coalesces into it,
+          // so a wedged pass means NO trip protection at all (the 2026-07-06
+          // stall ran the gen unprotected for hours). An abandoned pass that
+          // un-sticks later can at worst send one stale, settle-guarded batch.
+          const pass = this.checkAcLeveling();
+          pass.catch(() => { /* late failure of an abandoned pass — logged by the thrower */ });
+          let timer: NodeJS.Timeout | undefined;
+          try {
+            await Promise.race([
+              pass,
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error("leveling pass exceeded 60s — abandoned")), 60_000);
+              }),
+            ]);
+          } finally {
+            clearTimeout(timer);
+          }
         } while (this.levelingCheckQueued);
       } finally {
         this.levelingCheckPromise = null;

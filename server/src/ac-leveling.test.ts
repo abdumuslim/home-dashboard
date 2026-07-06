@@ -1865,3 +1865,57 @@ describe("one-step + surge-gated raises (gen)", () => {
     expect(res.desiredLevels.abdu).toBeUndefined();
   });
 });
+
+describe("computeAllocation — ramp clamp (rampMeterFits, 2026-07-06)", () => {
+  // A peer's power flip forces evaluation mid-ramp, where the model fill (not
+  // the meter) computes targets — its chronic error then "reduced" ACs the
+  // meter had room for, bouncing Abdullah L3↔L2 on every Najat on/off cycle.
+  const acs = [
+    ac("najat", { currentLevel: 3 }),
+    ac("abdu", { currentLevel: 3 }),
+  ];
+
+  it("holds current levels when the ramp-projected meter fits (no over-limit evidence)", () => {
+    const r = computeAllocation(input({
+      acs,
+      nonAcLoadAmps: 20, // model fill wants najat 2 / abdu 2 — a phantom reduce
+      forceEvaluate: true,
+      headroomStreak: 0,
+      rampMeterFits: true,
+    }));
+    expect(r.desiredLevels).toEqual({});
+    expect(r.toShed).toEqual([]);
+  });
+
+  it("still reduces on the same inputs without the clamp (pre-fix behavior)", () => {
+    const r = computeAllocation(input({
+      acs,
+      nonAcLoadAmps: 20,
+      forceEvaluate: true,
+      headroomStreak: 0,
+    }));
+    expect(r.desiredLevels).toEqual({ najat: 2, abdu: 2 });
+  });
+
+  it("over-limit evidence overrides the clamp (safety net stays live)", () => {
+    const r = computeAllocation(input({
+      acs,
+      nonAcLoadAmps: 20,
+      overLimitStreak: REDUCE_STREAK,
+      headroomStreak: 0,
+      rampMeterFits: true,
+    }));
+    expect(r.desiredLevels).toEqual({ najat: 2, abdu: 2 });
+  });
+
+  it("cap-driven reductions (slot cap) still fire under the clamp", () => {
+    const r = computeAllocation(input({
+      acs: [ac("najat", { currentLevel: 3, slotCap: 1 })],
+      nonAcLoadAmps: 5,
+      forceEvaluate: true,
+      headroomStreak: 0,
+      rampMeterFits: true,
+    }));
+    expect(r.desiredLevels).toEqual({ najat: 1 });
+  });
+});

@@ -162,6 +162,18 @@ export interface AllocatorInput {
    */
   meterTrusted?: boolean;
   /**
+   * The meter is untrusted ONLY because a managed AC is mid-ramp, and the
+   * ramp-projected total (measured + each ramping AC's remaining growth up to
+   * its current level) still fits `limit − margin`. While true, PURE
+   * budget-driven reductions below current are skipped — the model fill runs
+   * during ramps and its chronic error otherwise "reduces" ACs the meter has
+   * room for, bouncing a peer's level on EVERY automation on/off cycle (live
+   * 2026-07-05: Abdullah L3↔L2 on each of Najat's temperature cycles).
+   * Cap-driven reductions (slot/manual/reachable), floors, restores-with-
+   * reduction, startAtFloors, and every over-limit path are unaffected.
+   */
+  rampMeterFits?: boolean;
+  /**
    * First allocation after a source changeover: hold every ON managed AC at its
    * FLOOR (skip the raise fill AND warm restore) so a grid→gen flip drops to L1
    * and the meter-confirmed gate climbs back, instead of landing on the model-
@@ -851,6 +863,31 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
       // back above it after a changeover, so the floor must be RE-ASSERTED every
       // tick the shadow still reads high — not fired once and dropped when the
       // over-limit streak (canReduce) is quiet.
+      //
+      // Ramp clamp (2026-07-06): a peer's power flip forces evaluation mid-ramp,
+      // where the model fill (not the meter) computes targets — its chronic
+      // error then "reduces" ACs the real meter has room for. With zero
+      // over-limit evidence and the ramp-projected meter total fitting the
+      // band, hold the current level; the leaky bucket / emergency path remain
+      // the safety net if the projection is wrong. Explicit-intent caps
+      // (slot/manual/reachable/max) still reduce immediately.
+      const hardCeil = Math.min(
+        a.maxLevel,
+        a.manualCap ?? a.maxLevel,
+        a.slotCap ?? a.maxLevel,
+        a.reachableCap ?? a.maxLevel,
+      );
+      const capDriven = a.currentLevel > hardCeil;
+      if (
+        input.rampMeterFits === true &&
+        !capDriven &&
+        input.overLimitStreak === 0 &&
+        input.severeOverLimitStreak === 0 &&
+        toRestore.length === 0 &&
+        !input.startAtFloors
+      ) {
+        continue;
+      }
       desiredLevels[a.deviceId] = target;
       continue;
     }

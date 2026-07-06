@@ -829,13 +829,19 @@ export class TclCloud {
       clientToken: `mobile_${Date.now()}`,
     });
 
-    await client.send(new PublishCommand({
-      topic,
-      qos: 1,
-      payload: new TextEncoder().encode(payload),
-    }));
-
-    client.destroy();
+    // Hard deadline: the SDK ships with NO request timeout, so a half-open
+    // connection hangs this await forever — and because the collector loop is
+    // sequential, ONE hung publish silently freezes every automation and all
+    // leveling trip-protection (the 2026-07-06 ~3h stall). Never block.
+    try {
+      await client.send(new PublishCommand({
+        topic,
+        qos: 1,
+        payload: new TextEncoder().encode(payload),
+      }), { abortSignal: AbortSignal.timeout(15_000) });
+    } finally {
+      client.destroy();
+    }
   }
 
   // ---------- AWS SigV4 Signing ----------

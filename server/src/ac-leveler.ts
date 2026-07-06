@@ -63,6 +63,10 @@ const FAN_RESEND_SPACING_MS = 15_000;
  * user (live: ~40 pushes/day trained the user to ignore them). 2026-06-17.
  */
 const LEVELING_PUSH_THROTTLE_MS = 5 * 60_000;
+/** ESP readings arrive every ~3-5s — a gap this long means the monitor lost power (blackout). */
+const ESP_GAP_EVENT_MS = 20_000;
+/** Meter slack for the shadow sanity gate (model floor draws over-state slightly when cool). */
+const SHADOW_SUSPECT_SLACK_AMPS = 0.5;
 
 export interface AcLevelerDeps {
   getTclCloud: () => TclCloud | null;
@@ -78,6 +82,12 @@ export interface AcLevelerDeps {
    * in seconds. Fired per qualifying reading; the collector coalesces.
    */
   onUrgentLevelingNeeded?: () => void;
+  /**
+   * Fired on power events (source change, probable collapse/trip, ESP reading
+   * dropout) so the collector's observed-off classifier reads an un-commanded
+   * AC OFF near the event as a power-loss off, not a manual off (2026-07-06).
+   */
+  onPowerEvent?: (kind: string) => void;
 }
 
 export interface LevelerDeviceContext {
@@ -222,6 +232,8 @@ export class AcLeveler {
   private unreachableLevels = new Map<string, Map<number, number>>();
   /** Set on a source change so tick() re-arms the compressor ramp for ON ACs. */
   private armRampOnSourceChange = false;
+  /** Shadow-sanity warn dedup — logs once per suspect episode. */
+  private shadowsSuspectLogged = false;
   /**
    * Latched on a changeover TO GEN: hold + re-assert every managed ON AC at its
    * floor until the real device shadow confirms it's there AND the compressor
@@ -294,7 +306,16 @@ export class AcLeveler {
    * effect on the total draw (released once measured ≥ expectedAmps − threshold)
    * or wait until `until` (2 min for fan/level raises, 3 min for turn-ons).
    */
-  private raiseHold: { until: number; expectedAmps: number; threshold: number; checkAfter: number } | null = null;
+  private raiseHold: {
+    until: number;
+    expectedAmps: number;
+    threshold: number;
+    checkAfter: number;
+    /** The batch's expected meter DELTA (learned-cost-sized) — what hasn't landed yet still counts against release (3). */
+    pendingAmps: number;
+    /** Smoothed measured at command time — the baseline `landed` is judged from. */
+    preMeasured: number;
+  } | null = null;
   /**
    * Last raise batch — the bounce attribution window. A reactive over-limit
    * reduction that undoes one of these raises (or re-sheds one of these
@@ -574,7 +595,13 @@ export class AcLeveler {
 
   onPowerReading(data: { current_1: number; current_2: number }): void {
     this.lastReading = { current_1: data.current_1, current_2: data.current_2 };
+    const prevReadingAt = this.lastReadingAt;
     this.lastReadingAt = Date.now();
+    // A gap in the ESP reading stream is a blackout signature (the monitor lost
+    // power too) — ACs restart around it and their shadows lag by minutes.
+    if (prevReadingAt > 0 && this.lastReadingAt - prevReadingAt > ESP_GAP_EVENT_MS) {
+      this.deps.onPowerEvent?.(`ESP gap ${Math.round((this.lastReadingAt - prevReadingAt) / 1000)}s`);
+    }
     const source = determineSource(this.lastReading, 0);
     if (source !== this.lastSource) {
       const prevSource = this.lastSource;
@@ -627,6 +654,7 @@ export class AcLeveler {
         this.manualTarget.clear();
       }
       log.info(`[leveler] Power source changed → ${source}`);
+      this.deps.onPowerEvent?.(`source ${prevSource} → ${source}`);
     }
     if (source === "none") return;
 
@@ -672,6 +700,7 @@ export class AcLeveler {
         `[leveler] Power collapse ${priorMedian.toFixed(1)}A → ${measured.toFixed(1)}A on ` +
         `${source} — probable trip/blackout; freezing raises until recovery`,
       );
+      this.deps.onPowerEvent?.(`power collapse on ${source}`);
     }
 
     this.recentMeasured.push(measured);
@@ -1363,12 +1392,29 @@ export class AcLeveler {
         const provableHeadroom =
           this.headroomStreak >= RAISE_STREAK &&
           this.raiseHold.expectedAmps + nextStepSurge <= bufferedLimit;
-        if (arrived || provableHeadroom) {
+        // (3) Meter-anchored release (2026-07-06): the REAL meter — plus the
+        // part of THIS batch's raise that hasn't landed yet — fits one more
+        // surge under the buffered limit. (1) and (2) both anchor on
+        // `expectedAmps`, the MODEL SUM, which the grid model inflates by
+        // +8..12A: live holds armed "until ~29.9A is seen" on a 28A limit —
+        // impossible — so every grid raise paced at the full 120s timeout
+        // while the meter showed 11A of room. The un-landed remainder
+        // (`pendingAmps` is learned-cost-sized) keeps this trip-safe: a raise
+        // whose amps are still coming counts as if it fully lands.
+        const landed = Math.max(0, measured - this.raiseHold.preMeasured);
+        const pendingRemaining = Math.max(0, this.raiseHold.pendingAmps - landed);
+        const meterHeadroom =
+          this.headroomStreak >= RAISE_STREAK &&
+          measured + pendingRemaining + nextStepSurge <= bufferedLimit;
+        if (arrived || provableHeadroom || meterHeadroom) {
           log.info(arrived
             ? `[leveler] Raise effect confirmed (${measured.toFixed(1)}A ≈ ` +
               `${this.raiseHold.expectedAmps.toFixed(1)}A expected) — raises unlocked`
-            : `[leveler] Provable headroom (expected ${this.raiseHold.expectedAmps.toFixed(1)}A ` +
-              `+ next step ${nextStepSurge.toFixed(1)}A ≤ ${bufferedLimit.toFixed(1)}A buffered limit) — raises unlocked`);
+            : provableHeadroom
+              ? `[leveler] Provable headroom (expected ${this.raiseHold.expectedAmps.toFixed(1)}A ` +
+                `+ next step ${nextStepSurge.toFixed(1)}A ≤ ${bufferedLimit.toFixed(1)}A buffered limit) — raises unlocked`
+              : `[leveler] Meter headroom (${measured.toFixed(1)}A + ${pendingRemaining.toFixed(1)}A pending ` +
+                `+ next step ${nextStepSurge.toFixed(1)}A ≤ ${bufferedLimit.toFixed(1)}A buffered limit) — raises unlocked`);
           this.raiseHold = null;
         }
       }
@@ -1480,6 +1526,57 @@ export class AcLeveler {
     );
     const meterTrusted =
       this.recentMeasured.length >= 4 && this.powerCollapse == null && !anyManagedRamping;
+    // Ramp-projected meter check (2026-07-06): while an AC ramps, the model
+    // fill drives targets and its chronic error "reduces" peers the meter has
+    // room for (live: Abdullah bounced L3↔L2 on every Najat on/off cycle).
+    // Project the settled total as measured + each ramping AC's REMAINING
+    // growth (full estimate at its current level minus the floor draw the
+    // meter already carries — same convention as the nonAcLoad ramp credit);
+    // if it fits `limit − margin`, the allocator skips pure budget-driven
+    // reductions below current for this tick.
+    const rampGrowthAmps = snapshots.reduce((sum, s) => {
+      if (!s.on || !s.managed) return sum;
+      if ((this.rampUntil.get(s.deviceId) ?? 0) <= now) return sum;
+      const model = this.ampModelFor(s.deviceId, source);
+      const full = estimateAcDraw(s.currentLevel, s.maxLevel, model);
+      const floorDraw = estimateAcDraw(
+        s.currentLevel >= 1 ? Math.min(floorOf(s), s.currentLevel) : floorOf(s),
+        s.maxLevel,
+        model,
+      );
+      return sum + Math.max(0, full - floorDraw);
+    }, 0);
+    const rampMeterFits =
+      anyManagedRamping &&
+      this.recentMeasured.length >= 4 &&
+      this.powerCollapse == null &&
+      measured + rampGrowthAmps <= limit - this.config.marginAmps;
+
+    // Shadow sanity gate (2026-07-06): when the meter can't even carry the
+    // FLOOR draw of the ACs the shadow claims are ON, the shadows are stale
+    // (a post-blackout shadow reported ON for 13 min while the AC sat dead,
+    // and the leveler raised it to L3 reading 3.7A as headroom — model error
+    // −9.9A). Raises/restores wait until meter and shadows converge;
+    // reductions are never blocked. Self-expires as shadows refresh.
+    // Only clearly-DEMANDING rooms count: a satisfied room's compressor idles
+    // well below the model floor (a cap above demand is invisible), so a low
+    // meter with satisfied shadow-ON ACs is normal, not a lie.
+    const shadowOnFloorsDraw = snapshots
+      .filter((s) => s.on && s.managed && s.needDelta > 0.5)
+      .reduce(
+        (sum, s) => sum + estimateAcDraw(floorOf(s), s.maxLevel, this.ampModelFor(s.deviceId, source)),
+        0,
+      );
+    const shadowsSuspect =
+      this.recentMeasured.length >= 4 &&
+      measured + SHADOW_SUSPECT_SLACK_AMPS < shadowOnFloorsDraw;
+    if (shadowsSuspect && !this.shadowsSuspectLogged) {
+      log.warn(
+        `[leveler] Shadows suspect: measured ${measured.toFixed(1)}A can't carry the ` +
+        `${shadowOnFloorsDraw.toFixed(1)}A floor draw of shadow-ON ACs — raises frozen until they converge`,
+      );
+    }
+    this.shadowsSuspectLogged = shadowsSuspect;
 
     // Persistent floors-after-gen-changeover enforcement. Arm on the changeover
     // tick, then HOLD + re-assert floors across ticks until every managed ON AC's
@@ -1524,6 +1621,7 @@ export class AcLeveler {
       // The real meter + trust flag drive the meter-anchored fill (2026-06-21).
       measuredAmps: measured,
       meterTrusted,
+      rampMeterFits,
       // Hold everyone at floors after a changeover TO GEN so the meter-confirmed
       // gate climbs from L1 ("start low, raise on headroom") instead of landing on
       // the model-fitted gen ideal (L2) and surging a hot compressor into a trip.
@@ -1536,7 +1634,9 @@ export class AcLeveler {
       // handled by the meter-sized emergency path above (deferred → stay quiet).
       overLimitStreak: bucketEmpty && !recentSevere && !emergencyDeferred ? REDUCE_STREAK : 0,
       severeOverLimitStreak: 0,
-      headroomStreak: this.headroomStreak,
+      // Suspect shadows zero the streak the allocator sees (raises + restores
+      // blocked); the real counter keeps building for the bucket refill.
+      headroomStreak: shadowsSuspect ? 0 : this.headroomStreak,
       inSettle,
       raiseHold: this.raiseHold != null,
       raiseHoldExpectedAmps: this.raiseHold?.expectedAmps ?? null,
@@ -1880,11 +1980,27 @@ export class AcLeveler {
         const isTurnOn = restoredNow.size > 0 ||
           [...raisedNow.keys()].some((id) => (this.rampUntil.get(id) ?? 0) > now);
         const holdMs = isTurnOn ? RESTORE_HOLD_MS : RAISE_HOLD_MS;
+        // Pending meter delta for the meter-anchored release: size each level
+        // raise by the LEARNED cost when it exceeds the model (the gen model
+        // under-states surges) so release (3) can't fire on amps still coming.
+        const raiseCostsNow = this.learnedCostFor(this.observedRaiseCost, source);
+        let pendingAmps = raisedAmps;
+        for (const [id, level] of raisedNow) {
+          const snap = snapshots.find((s) => s.deviceId === id);
+          if (!snap || snap.currentLevel < 1) continue;
+          const m = this.ampModelFor(id, source);
+          const modelDelta = estimateAcDraw(level, snap.maxLevel, m)
+            - estimateAcDraw(snap.currentLevel, snap.maxLevel, m);
+          const learned = (raiseCostsNow.get(id) ?? 0) * (level - snap.currentLevel);
+          if (learned > modelDelta) pendingAmps += learned - modelDelta;
+        }
         this.raiseHold = {
           until: now + holdMs,
           expectedAmps,
           threshold: Math.max(1, raisedAmps / 2),
           checkAfter: now + RAISE_HOLD_CHECK_AFTER_MS,
+          pendingAmps,
+          preMeasured: this.smoothedMeasured(),
         };
         if (raisedNow.size > 0 || restoredNow.size > 0) {
           // Bounce attribution window: a reactive reduction that undoes one of
@@ -1901,8 +2017,9 @@ export class AcLeveler {
           };
         }
         log.info(
-          `[leveler] Raise hold armed for ${holdMs / 1000}s — next raise once ` +
-          `~${expectedAmps.toFixed(1)}A is seen on ${source} or the hold expires`,
+          `[leveler] Raise hold armed for ${holdMs / 1000}s — releases when ` +
+          `~${pendingAmps.toFixed(1)}A of raise lands on the meter, on provable ` +
+          `${source} headroom, or when the hold expires`,
         );
       }
     }

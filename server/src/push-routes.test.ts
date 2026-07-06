@@ -12,6 +12,7 @@ const TEST_CONFIG: Config = {
   tclUsername: "", tclPassword: "",
   authSecret: "auth-secret", adminUser: "admin", adminPassword: "password",
   hermesApiToken: "",
+  observedOffLocks: true,
 };
 
 /** Stateful fake pool: stores leveling_notifications per endpoint so set→read round-trips. */

@@ -27,6 +27,7 @@ const TEST_CONFIG: Config = {
   adminUser: "admin",
   adminPassword: "password",
   hermesApiToken: "hermes-secret",
+  observedOffLocks: true,
 };
 
 function createMockPool(rowsBySql: Array<{ match: string; rows: unknown[] }> = []) {

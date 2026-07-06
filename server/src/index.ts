@@ -82,6 +82,7 @@ async function main(): Promise<void> {
       getResults: () => collector.acCalibrator.getResults(),
       requestAbort: (reason) => collector.acCalibrator.requestAbort(reason),
     },
+    () => collector.getLoopAgeMs(),
   ));
 
   // Serve static files from ../static (relative to dist/ or src/)
