@@ -4,12 +4,14 @@ import { Zap, Maximize2 } from "lucide-react";
 import { MetricCard } from "@/components/ui/metric-card";
 import { useFlash } from "@/hooks/use-flash";
 import { useChartsVisible } from "@/hooks/use-charts-visible";
-import { fmt } from "@/constants/thresholds";
+import { fmt, fmtDur, fmtHoursCompact } from "@/constants/thresholds";
 import { getBucketMs, bucketAverage, expandedChartOptions } from "@/constants/chart-utils";
+import { usePowerStats } from "@/hooks/use-power-stats";
+import { PowerBreakdownPanel } from "@/components/cards/power-breakdown-panel";
 import type { PowerReading, OpenOverlayFn, TimeRange } from "@/types/api";
 
-const GRID_COLOR = "#38bdf8";
-const GEN_COLOR = "#fb923c";
+export const GRID_COLOR = "#38bdf8";
+export const GEN_COLOR = "#fb923c";
 const NOISE_THRESHOLD = 0.1;
 
 interface PowerCardProps {
@@ -161,7 +163,12 @@ function ExpandedPowerChart({ range }: { range: TimeRange }) {
   };
 
   // Chart.js mixed charts use the Chart component via Bar with type overrides
-  return <div className="h-full"><Bar data={data as any} options={options} /></div>;
+  return (
+    <div className="h-full flex flex-col sm:flex-row gap-3">
+      <div className="flex-1 min-w-0"><Bar data={data as any} options={options} /></div>
+      <PowerBreakdownPanel range={range} />
+    </div>
+  );
 }
 
 export const PowerCard = memo(function PowerCard({ power, powerHistory, openOverlay }: PowerCardProps) {
@@ -182,6 +189,17 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
 
   // Only flash on source change, not on every wattage fluctuation
   const flash = useFlash(activeSource);
+
+  // Derived source stats (24h grid hours, 7-day avgs, session + prediction).
+  const liveSource = activeSource ?? "none";
+  const stats = usePowerStats(liveSource);
+  const statsFresh = stats != null && stats.source === liveSource;
+  // Session duration ticks live: the card re-renders every 1s via the power poll.
+  const displaySessionMinutes = statsFresh
+    ? (stats.sessionStartTs ? (Date.now() - Date.parse(stats.sessionStartTs)) / 60_000 : stats.sessionMinutes)
+    : null;
+  // Hide the estimate across a source switch until the refetch lands.
+  const remaining = statsFresh ? stats.expectedRemainingMinutes : null;
 
   // 30-min buckets, single bar colored by dominant source
   const BUCKET_MS = 30 * 60_000;
@@ -293,10 +311,26 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
           </div>
         </div>
 
-        {/* Source indicators */}
-        <div className="flex items-center gap-x-3 text-xs mt-2">
-          <SourcePill label="Grid" active={gridActive} color={GRID_COLOR} />
-          <SourcePill label="Gen" active={genActive} color={GEN_COLOR} />
+        {/* Source + stats line (single row, never wraps). Compact sizing keeps
+            all four groups on one line down to ~1280px card widths — measured. */}
+        <div className="flex items-center gap-x-1.5 text-[0.6rem] whitespace-nowrap mt-2 min-w-0 overflow-hidden tabular-nums">
+          <SourcePill
+            label={liveSource === "grid" ? "Grid" : liveSource === "gen" ? "Gen" : "Off"}
+            active={liveSource !== "none"}
+            color={liveSource === "gen" ? GEN_COLOR : GRID_COLOR}
+          />
+          <span className="text-dim shrink-0" title="Grid hours, last 24h">
+            24h <span className="text-text font-medium">{fmtHoursCompact(stats?.gridHours24h)}</span>
+          </span>
+          <span className="text-dim shrink-0" title="7-day daily avg, grid/gen">
+            <span style={{ color: GRID_COLOR }}>{fmtHoursCompact(stats?.avgGridHoursPerDay)}</span>
+            /
+            <span style={{ color: GEN_COLOR }}>{fmtHoursCompact(stats?.avgGenHoursPerDay)}</span>
+          </span>
+          <span className="text-dim shrink-0" title="Current session · expected remaining">
+            <span className="text-text font-medium">{fmtDur(displaySessionMinutes)}</span>
+            {remaining != null && <span> ·~{fmtDur(remaining)}</span>}
+          </span>
         </div>
       </div>
 

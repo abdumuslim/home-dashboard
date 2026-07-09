@@ -69,6 +69,23 @@ export function fmt(v: number | null | undefined, decimals: number): string {
   return Number(v).toFixed(decimals);
 }
 
+// Duration in minutes -> compact "45m" / "1h20m" / "3h".
+export function fmtDur(minutes: number | null | undefined): string {
+  if (minutes == null || !isFinite(minutes)) return "--";
+  const m = Math.max(0, Math.round(minutes));
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return rem === 0 ? `${h}h` : `${h}h${String(rem).padStart(2, "0")}m`;
+}
+
+// Hours -> compact "2h" / "5.1h" / "12h" (1 decimal only when it adds info).
+export function fmtHoursCompact(hours: number | null | undefined): string {
+  if (hours == null || !isFinite(hours)) return "--";
+  const r = Math.round(hours * 10) / 10;
+  return r >= 10 || r === Math.round(r) ? `${Math.round(r)}h` : `${r.toFixed(1)}h`;
+}
+
 const TEMP_RANGES: { max: number; from: string; to: string }[] = [
   { max: -23.3, from: "#F141DA", to: "#D61CC0" }, // Magenta
   { max: -17.8, from: "#9F33F2", to: "#7F11D0" }, // Purple

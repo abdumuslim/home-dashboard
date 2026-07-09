@@ -58,6 +58,34 @@ export interface CurrentData {
   power: PowerReading | null;
 }
 
+export type PowerSource = "grid" | "gen" | "none";
+
+export interface PowerStats {
+  generatedAt: string;
+  source: PowerSource;
+  sessionStartTs: string | null;
+  sessionMinutes: number;
+  expectedRemainingMinutes: number | null;
+  predictionSampleDays: number;
+  gridHours24h: number;
+  avgGridHoursPerDay: number | null;
+  avgGenHoursPerDay: number | null;
+}
+
+export interface PowerDayBreakdownEntry {
+  date: string;
+  gridHours: number;
+  genHours: number;
+  offHours: number;
+  partial: boolean;
+}
+
+export interface PowerDayBreakdownResponse {
+  range: TimeRange;
+  days: PowerDayBreakdownEntry[];
+  totals: { gridHours: number; genHours: number; offHours: number };
+}
+
 export type TimeRange = "6h" | "24h" | "25h" | "48h" | "1w" | "30d";
 
 export type StatusLevel = "good" | "moderate" | "poor" | "severe" | "extreme" | "normal" | "slightly_high" | "high" | "very_high" | "excellent" | "low";

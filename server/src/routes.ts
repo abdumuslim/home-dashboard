@@ -11,6 +11,7 @@ import type { ForecastResponse } from "./forecast.js";
 import type { AcLevelingConfig, AcAmpModel, AcLevelBoost } from "./ac-leveling.js";
 import type { AcLevelingStatus } from "./ac-leveler.js";
 import type { AcCalibrationStatus, CalibrationResultRow, CalibrationFit } from "./ac-calibration.js";
+import { PowerStatsService } from "./power-stats-service.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession } from "./auth.js";
 import {
   createBaghdadPrayerResolver,
@@ -372,6 +373,25 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       }
     }
     res.json(latestPower);
+  });
+
+  // Derived power-source stats (session duration, 24h grid hours, 7-day
+  // averages, temp-weighted time-remaining prediction) + per-day history
+  // breakdown. Constructed here because `latestPower` is closure-local.
+  const powerStatsService = new PowerStatsService(pool, () => latestPower);
+
+  router.get("/api/power/stats", async (_req: Request, res: Response) => {
+    res.json(await powerStatsService.getStats());
+  });
+
+  router.get("/api/power/day-breakdown", async (req: Request, res: Response) => {
+    const range = (req.query.range as string) || "24h";
+    const interval = RANGE_MAP[range];
+    if (!interval) {
+      res.status(400).json({ error: `Invalid range: ${range}` });
+      return;
+    }
+    res.json(await powerStatsService.getDayBreakdown(range, interval));
   });
 
   router.get("/api/history", async (req: Request, res: Response) => {
