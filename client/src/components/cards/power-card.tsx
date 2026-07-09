@@ -200,6 +200,8 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
     : null;
   // Hide the estimate across a source switch until the refetch lands.
   const remaining = statsFresh ? stats.expectedRemainingMinutes : null;
+  // Color the current session by its source (never white); grid metrics stay sky.
+  const sourceColor = liveSource === "grid" ? GRID_COLOR : liveSource === "gen" ? GEN_COLOR : "#7a8ba8";
 
   // 30-min buckets, single bar colored by dominant source
   const BUCKET_MS = 30 * 60_000;
@@ -320,7 +322,7 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
             color={liveSource === "gen" ? GEN_COLOR : GRID_COLOR}
           />
           <span className="text-dim shrink-0" title="Grid hours, last 24h">
-            24h <span className="text-text font-medium">{fmtHoursCompact(stats?.gridHours24h)}</span>
+            24h <span className="font-medium" style={{ color: GRID_COLOR }}>{fmtHoursCompact(stats?.gridHours24h)}</span>
           </span>
           <span className="text-dim shrink-0" title="Avg time per stretch (7d), grid/gen">
             <span style={{ color: GRID_COLOR }}>{fmtHoursCompact(stats?.avgGridSessionHours)}</span>
@@ -328,8 +330,8 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
             <span style={{ color: GEN_COLOR }}>{fmtHoursCompact(stats?.avgGenSessionHours)}</span>
           </span>
           <span className="text-dim shrink-0" title="Current session · expected remaining">
-            <span className="text-text font-medium">{fmtDur(displaySessionMinutes)}</span>
-            {remaining != null && <span> ·~{fmtDur(remaining)}</span>}
+            <span className="font-medium" style={{ color: sourceColor }}>{fmtDur(displaySessionMinutes)}</span>
+            {remaining != null && <span> ·~<span style={{ color: sourceColor }}>{fmtDur(remaining)}</span></span>}
           </span>
         </div>
       </div>
