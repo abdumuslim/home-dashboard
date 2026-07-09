@@ -9,8 +9,7 @@ import {
   gridMinutesInWindow,
   baghdadDateKey,
   baghdadHourKey,
-  dailyTotals,
-  averageDailyHours,
+  averageSessionHours,
   weightedMedian,
   predictRemainingMinutes,
   dayBreakdownForWindow,
@@ -19,7 +18,6 @@ import {
   MISSING_TEMP_WEIGHT,
   type Session,
   type PowerMinuteRow,
-  type DayTotal,
 } from "./power-stats.js";
 
 const GRID = { current_1: 5, current_2: 0 };
@@ -169,17 +167,6 @@ describe("baghdadDateKey / baghdadHourKey", () => {
   });
 });
 
-describe("dailyTotals", () => {
-  it("splits at Baghdad midnight (21:00 UTC)", () => {
-    const start = Date.UTC(2026, 6, 1, 20, 58); // 23:58 Baghdad Jul 1
-    const totals = dailyTotals(["grid", "grid", "grid", "grid", "grid"], start); // 20:58..21:03
-    expect(totals).toEqual([
-      { date: "2026-07-01", gridMinutes: 2, genMinutes: 0, noneMinutes: 0 },
-      { date: "2026-07-02", gridMinutes: 3, genMinutes: 0, noneMinutes: 0 },
-    ]);
-  });
-});
-
 describe("gridMinutesInWindow", () => {
   const start = Date.UTC(2026, 6, 1, 0, 0);
 
@@ -194,31 +181,44 @@ describe("gridMinutesInWindow", () => {
   });
 });
 
-describe("averageDailyHours", () => {
-  it("excludes today and averages complete days", () => {
-    const days: DayTotal[] = [
-      { date: "d1", gridMinutes: 120, genMinutes: 60, noneMinutes: 1260 },
-      { date: "d2", gridMinutes: 180, genMinutes: 0, noneMinutes: 1260 },
-      { date: "d3", gridMinutes: 240, genMinutes: 0, noneMinutes: 1200 },
-      { date: "today", gridMinutes: 60, genMinutes: 0, noneMinutes: 100 },
+describe("averageSessionHours", () => {
+  const t0 = Date.UTC(2026, 6, 1, 0, 0);
+  const H = 60 * MINUTE_MS;
+
+  it("averages the duration of complete grid/gen stretches", () => {
+    // grid 2h, gen 4h, grid 4h, gen 6h, then a running grid tail (excluded).
+    const sessions: Session[] = [
+      sess("grid", t0, t0 + 2 * H),
+      sess("gen", t0 + 2 * H, t0 + 6 * H),
+      sess("grid", t0 + 6 * H, t0 + 10 * H),
+      sess("gen", t0 + 10 * H, t0 + 16 * H),
+      sess("grid", t0 + 16 * H, t0 + 17 * H), // running tail — excluded
     ];
-    expect(averageDailyHours(days, "today")).toEqual({ avgGridHoursPerDay: 3, avgGenHoursPerDay: 0.3 });
+    expect(averageSessionHours(sessions, t0)).toEqual({ avgGridSessionHours: 3, avgGenSessionHours: 5 });
   });
 
-  it("drops a leading window-clamped partial day", () => {
-    const days: DayTotal[] = [
-      { date: "d0", gridMinutes: 60, genMinutes: 0, noneMinutes: 60 }, // 120 min total -> partial
-      { date: "d1", gridMinutes: 120, genMinutes: 0, noneMinutes: 1320 },
-      { date: "d2", gridMinutes: 240, genMinutes: 0, noneMinutes: 1200 },
-      { date: "today", gridMinutes: 30, genMinutes: 0, noneMinutes: 30 },
+  it("ignores none/blackout stretches and the running tail", () => {
+    const sessions: Session[] = [
+      sess("grid", t0, t0 + 3 * H),
+      sess("none", t0 + 3 * H, t0 + 4 * H), // blackout ignored
+      sess("gen", t0 + 4 * H, t0 + 9 * H),
+      sess("grid", t0 + 9 * H, t0 + 10 * H), // running tail — excluded
     ];
-    // window = d1, d2 -> avg grid = (120+240)/2/60 = 3
-    expect(averageDailyHours(days, "today")).toEqual({ avgGridHoursPerDay: 3, avgGenHoursPerDay: 0 });
+    expect(averageSessionHours(sessions, t0)).toEqual({ avgGridSessionHours: 3, avgGenSessionHours: 5 });
   });
 
-  it("returns nulls when nothing usable", () => {
-    expect(averageDailyHours([{ date: "today", gridMinutes: 60, genMinutes: 0, noneMinutes: 0 }], "today"))
-      .toEqual({ avgGridHoursPerDay: null, avgGenHoursPerDay: null });
+  it("excludes stretches that switched before the window", () => {
+    const sessions: Session[] = [
+      sess("grid", t0, t0 + 2 * H), // ends at t0+2h — before window start t0+3h
+      sess("gen", t0 + 2 * H, t0 + 8 * H), // ends in window
+      sess("grid", t0 + 8 * H, t0 + 9 * H), // running tail — excluded
+    ];
+    expect(averageSessionHours(sessions, t0 + 3 * H)).toEqual({ avgGridSessionHours: null, avgGenSessionHours: 6 });
+  });
+
+  it("returns nulls when only a running session exists", () => {
+    expect(averageSessionHours([sess("grid", t0, t0 + H)], t0))
+      .toEqual({ avgGridSessionHours: null, avgGenSessionHours: null });
   });
 });
 

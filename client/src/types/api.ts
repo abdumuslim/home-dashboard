@@ -68,8 +68,8 @@ export interface PowerStats {
   expectedRemainingMinutes: number | null;
   predictionSampleDays: number;
   gridHours24h: number;
-  avgGridHoursPerDay: number | null;
-  avgGenHoursPerDay: number | null;
+  avgGridSessionHours: number | null;
+  avgGenSessionHours: number | null;
 }
 
 export interface PowerDayBreakdownEntry {

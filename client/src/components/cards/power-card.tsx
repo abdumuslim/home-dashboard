@@ -322,10 +322,10 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
           <span className="text-dim shrink-0" title="Grid hours, last 24h">
             24h <span className="text-text font-medium">{fmtHoursCompact(stats?.gridHours24h)}</span>
           </span>
-          <span className="text-dim shrink-0" title="7-day daily avg, grid/gen">
-            <span style={{ color: GRID_COLOR }}>{fmtHoursCompact(stats?.avgGridHoursPerDay)}</span>
+          <span className="text-dim shrink-0" title="Avg time per stretch (7d), grid/gen">
+            <span style={{ color: GRID_COLOR }}>{fmtHoursCompact(stats?.avgGridSessionHours)}</span>
             /
-            <span style={{ color: GEN_COLOR }}>{fmtHoursCompact(stats?.avgGenHoursPerDay)}</span>
+            <span style={{ color: GEN_COLOR }}>{fmtHoursCompact(stats?.avgGenSessionHours)}</span>
           </span>
           <span className="text-dim shrink-0" title="Current session · expected remaining">
             <span className="text-text font-medium">{fmtDur(displaySessionMinutes)}</span>

@@ -32,13 +32,6 @@ export interface Session {
   minutes: number;
 }
 
-export interface DayTotal {
-  date: string; // Baghdad YYYY-MM-DD
-  gridMinutes: number;
-  genMinutes: number;
-  noneMinutes: number;
-}
-
 export interface DayBreakdownEntry {
   date: string;
   gridHours: number;
@@ -161,48 +154,28 @@ export function baghdadHourKey(ms: number): string {
   return new Date(ms + BAGHDAD_UTC_OFFSET_MS).toISOString().slice(0, 13); // YYYY-MM-DDTHH
 }
 
-/** Group every minute by its Baghdad calendar day, ascending. */
-export function dailyTotals(series: PowerSource[], seriesStartMs: number): DayTotal[] {
-  const byDay = new Map<string, DayTotal>();
-  const order: string[] = [];
-  for (let i = 0; i < series.length; i++) {
-    const key = baghdadDateKey(seriesStartMs + i * MINUTE_MS);
-    let day = byDay.get(key);
-    if (!day) {
-      day = { date: key, gridMinutes: 0, genMinutes: 0, noneMinutes: 0 };
-      byDay.set(key, day);
-      order.push(key);
-    }
-    const s = series[i];
-    if (s === "grid") day.gridMinutes++;
-    else if (s === "gen") day.genMinutes++;
-    else day.noneMinutes++;
-  }
-  return order.map((k) => byDay.get(k)!);
-}
-
 /**
- * Average grid/gen hours over the last `n` COMPLETE Baghdad days. Excludes today
- * (partial → biases low). Also drops a leading window-clamped partial day (the
- * first entry when it has < 1440 minutes counted). Fewer available → average
- * what remains; none → nulls. Rounded to 1 decimal.
+ * Average duration of a single grid/gen stretch — the typical "time between
+ * switches" — over sessions that ended within [windowStartMs, now). The final
+ * session is excluded (still running → its length is censored); "none"/blackout
+ * sessions are ignored (we only average powered stretches). Hours, 1 decimal;
+ * no completed session for a source → null.
  */
-export function averageDailyHours(
-  days: DayTotal[],
-  todayKey: string,
-  n = 7,
-): { avgGridHoursPerDay: number | null; avgGenHoursPerDay: number | null } {
-  let usable = days.filter((d) => d.date !== todayKey);
-  if (usable.length > 0) {
-    const first = usable[0];
-    if (first.gridMinutes + first.genMinutes + first.noneMinutes < 1440) usable = usable.slice(1);
+export function averageSessionHours(
+  sessions: Session[],
+  windowStartMs: number,
+): { avgGridSessionHours: number | null; avgGenSessionHours: number | null } {
+  const gridMins: number[] = [];
+  const genMins: number[] = [];
+  for (let i = 0; i < sessions.length - 1; i++) {
+    const s = sessions[i];
+    if (s.endMs < windowStartMs) continue; // the switch happened before the window
+    if (s.source === "grid") gridMins.push(s.minutes);
+    else if (s.source === "gen") genMins.push(s.minutes);
   }
-  const window = usable.slice(-n);
-  if (window.length === 0) return { avgGridHoursPerDay: null, avgGenHoursPerDay: null };
-  const round1 = (x: number) => Math.round(x * 10) / 10;
-  const avgGrid = window.reduce((s, d) => s + d.gridMinutes, 0) / window.length / 60;
-  const avgGen = window.reduce((s, d) => s + d.genMinutes, 0) / window.length / 60;
-  return { avgGridHoursPerDay: round1(avgGrid), avgGenHoursPerDay: round1(avgGen) };
+  const avg = (arr: number[]): number | null =>
+    arr.length === 0 ? null : Math.round((arr.reduce((a, b) => a + b, 0) / arr.length / 60) * 10) / 10;
+  return { avgGridSessionHours: avg(gridMins), avgGenSessionHours: avg(genMins) };
 }
 
 /** Weighted median: first value whose cumulative weight reaches half the total. */

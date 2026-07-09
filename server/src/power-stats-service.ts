@@ -12,9 +12,7 @@ import {
   buildSessions,
   resolveCurrentSession,
   gridMinutesInWindow,
-  dailyTotals,
-  averageDailyHours,
-  baghdadDateKey,
+  averageSessionHours,
   predictRemainingMinutes,
   dayBreakdownForWindow,
   MINUTE_MS,
@@ -36,8 +34,8 @@ export interface PowerStatsPayload {
   expectedRemainingMinutes: number | null;
   predictionSampleDays: number;
   gridHours24h: number;
-  avgGridHoursPerDay: number | null;
-  avgGenHoursPerDay: number | null;
+  avgGridSessionHours: number | null; // avg length of one grid stretch (time between switches), 7d
+  avgGenSessionHours: number | null;
 }
 
 export interface DayBreakdownPayload {
@@ -100,10 +98,7 @@ export class PowerStatsService {
     const cur = resolveCurrentSession(sessions, source, nowMs);
     const pred = predictRemainingMinutes({ sessions, nowMs, liveSource: source, hourlyTempByKey, nowTempC });
     const gridHours24h = round1(gridMinutesInWindow(series, startMs, nowMs - DAY_MS, nowMs) / 60);
-    const { avgGridHoursPerDay, avgGenHoursPerDay } = averageDailyHours(
-      dailyTotals(series, startMs),
-      baghdadDateKey(nowMs),
-    );
+    const { avgGridSessionHours, avgGenSessionHours } = averageSessionHours(sessions, nowMs - 7 * DAY_MS);
 
     const payload: PowerStatsPayload = {
       generatedAt: new Date(nowMs).toISOString(),
@@ -113,8 +108,8 @@ export class PowerStatsService {
       expectedRemainingMinutes: pred?.remainingMinutes ?? null,
       predictionSampleDays: pred?.sampleDays ?? 0,
       gridHours24h,
-      avgGridHoursPerDay,
-      avgGenHoursPerDay,
+      avgGridSessionHours,
+      avgGenSessionHours,
     };
     this.statsCache = { at: nowMs, payload };
     return payload;

@@ -79,8 +79,8 @@ describe("GET /api/power/stats", () => {
     expect(body).toHaveProperty("sessionStartTs");
     expect(body).toHaveProperty("expectedRemainingMinutes");
     expect(typeof body.predictionSampleDays).toBe("number");
-    expect(body).toHaveProperty("avgGridHoursPerDay");
-    expect(body).toHaveProperty("avgGenHoursPerDay");
+    expect(body).toHaveProperty("avgGridSessionHours");
+    expect(body).toHaveProperty("avgGenSessionHours");
   });
 });
 
