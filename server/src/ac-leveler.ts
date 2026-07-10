@@ -232,6 +232,16 @@ export class AcLeveler {
   private unreachableLevels = new Map<string, Map<number, number>>();
   /** Set on a source change so tick() re-arms the compressor ramp for ON ACs. */
   private armRampOnSourceChange = false;
+  /**
+   * Set on ANY source transition INTO gen (including none→gen at process
+   * start/deploy-mid-gen, and blackout→gen); consumed by tick() to arm
+   * `enforceGenFloors`. Deliberately DECOUPLED from `armRampOnSourceChange`,
+   * which excludes "none" (2026-06-09 — arming the ramp from "none" inflates
+   * nonAcLoad). A deploy while the house was on generator used to skip floors-
+   * first entirely (prevSource "none" ⇒ no changeover) and adopt an AC at its
+   * old L3 cap → the compressor surged past the breaker (2026-07-10 trip).
+   */
+  private armGenFloorsOnSourceChange = false;
   /** Shadow-sanity warn dedup — logs once per suspect episode. */
   private shadowsSuspectLogged = false;
   /**
@@ -623,8 +633,11 @@ export class AcLeveler {
       // An emergency discount sized on the other source's readings is meaningless too.
       this.lastEmergency = null;
       // Any in-flight floor enforcement is for the OLD source — clear it; tick()
-      // re-arms it (wasChangeover) when the NEW source is gen.
+      // re-arms it (via armGenFloorsOnSourceChange) when the NEW source is gen.
+      // The unconditional assignment also auto-clears a stale arm when the next
+      // transition is to grid/none before any tick consumed it.
       this.enforceGenFloors = false;
+      this.armGenFloorsOnSourceChange = source === "gen";
       // Bounce evidence is per-source (different limit + amp models).
       this.bounce.clear();
       // observedRaiseCost / observedFanStepCost are NO LONGER cleared here
@@ -847,7 +860,10 @@ export class AcLeveler {
     // The user touched a level during a post-changeover floor enforcement → they
     // own the levels now; stop auto-flooring so manualTarget/manualCap win (AGENTS
     // rule 7). Cleared for all ACs — a live intervention overrides the auto-drop.
+    // Drop a not-yet-consumed floor arm too, or the next tick would re-floor over
+    // the manual pin.
     this.enforceGenFloors = false;
+    this.armGenFloorsOnSourceChange = false;
     await this.clearRememberedLevel(deviceId, "manual_gen_change");
 
     if (rank(level) < rank(previous)) {
@@ -944,6 +960,9 @@ export class AcLeveler {
     if (!this.config.enabled) {
       this.lastStatus = null;
       this.enforceGenFloors = false;
+      // Drop a pending floor-arm too, so a transition-into-gen observed while
+      // disabled can't floor everything if the master switch is re-enabled later.
+      this.armGenFloorsOnSourceChange = false;
       return;
     }
     const tcl = this.deps.getTclCloud();
@@ -1001,9 +1020,8 @@ export class AcLeveler {
     // managed ACs — their estimated draw stays double-counted (out of the non-AC
     // load derivation) through the ~4-min transition, preventing phantom-headroom
     // raises and nonAcLoad miscalc as the compressors spin back up.
-    // Captured before the re-arm clears the flag; combined with the new source
-    // below to drive `startAtFloors` (gen changeovers only).
-    const wasChangeover = this.armRampOnSourceChange;
+    // (Gen floors-first is armed separately via armGenFloorsOnSourceChange, which
+    // also covers "none"→gen — see the enforcement block below.)
     if (this.armRampOnSourceChange || this.armRampOnCollapseRecovery) {
       const now = Date.now();
       for (const { device, managed } of ctx) {
@@ -1127,6 +1145,19 @@ export class AcLeveler {
         this.pendingSendCounts.delete(device.id);
         this.forceEvaluate = true;
         log.info(`[leveler] ${device.name}: L${obs} confirmed late — unreachable mark cleared, re-adopting`);
+        continue;
+      }
+      if (this.powerCollapse != null) {
+        // A collapse is latched (probable breaker trip / blackout): the shadow is
+        // a dead device's last word, not user intent. Live 2026-07-10 the
+        // emergency's L3→L2 command never landed on the tripped line, so the
+        // stuck L3 shadow read as an "external gen increment → target L3" — a
+        // false manualTarget minted from a corpse. Re-adopt the observation
+        // silently (mirrors the obs-0 branch); intent minting resumes on
+        // recovery. KEEP pendingLevel: if our in-flight command lands after the
+        // line recovers, obs === pending confirms it with no intent — deleting it
+        // would make our own late-landing command read as a manual change.
+        this.confirmedLevel.set(device.id, obs);
         continue;
       }
       // The observed level moved off the confirmed baseline to something we did
@@ -1578,16 +1609,24 @@ export class AcLeveler {
     }
     this.shadowsSuspectLogged = shadowsSuspect;
 
-    // Persistent floors-after-gen-changeover enforcement. Arm on the changeover
-    // tick, then HOLD + re-assert floors across ticks until every managed ON AC's
-    // real shadow confirms it's at/below floor AND the compressor ramp has passed.
-    // The firmware can come back ABOVE the floor we commanded after a changeover,
-    // and the old one-shot `wasChangeover && gen` fired once (forceEvaluate) and
-    // went quiet — the unit drifted over the breaker and emergency-thrashed. The
+    // Persistent floors-after-transition-into-gen enforcement. Arm on ANY tick
+    // that entered gen (changeover OR a deploy/blackout that started us on gen —
+    // armGenFloorsOnSourceChange covers "none"→gen, which armRampOnSourceChange
+    // deliberately does not), then HOLD + re-assert floors across ticks until
+    // every managed ON AC's real shadow confirms it's at/below floor AND the
+    // compressor ramp has passed. The firmware can come back ABOVE the floor we
+    // commanded after a changeover, and a one-shot arm that fired once and went
+    // quiet let the unit drift over the breaker and emergency-thrash. The
     // backstop deadline stops a truly-stuck device from enforcing forever.
-    if (wasChangeover && source === "gen") {
+    //
+    // The flag is CONSUMED here (at the arming site), not at capture time near
+    // the ramp re-arm: an emergency fast-path or stale-reading early return can
+    // exit tick() before this line, and consuming here keeps the arm pending
+    // until a tick actually reaches it.
+    if (this.armGenFloorsOnSourceChange && source === "gen") {
       this.enforceGenFloors = true;
       this.enforceGenFloorsUntil = Date.now() + ENFORCE_GEN_FLOORS_MAX_MS;
+      this.armGenFloorsOnSourceChange = false;
     }
     if (this.enforceGenFloors) {
       const onManagedFloor = snapshots.filter((s) => s.on && s.managed);

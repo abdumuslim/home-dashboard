@@ -1480,6 +1480,51 @@ describe("computeEmergencyReduction", () => {
     expect(r.toShed).toEqual(["abdu"]);
   });
 
+  it("extreme overshoot forces at least one shed even when level cuts nominally cover (breaker-race regression, 2026-07-10)", () => {
+    // At ~40% overload a level cut only lowers a firmware CAP the compressor
+    // throttles down to over seconds — too slow for the breaker. A compressor
+    // OFF is immediate and certain, so ≥ max(3A, 20%·limit) forces a shed.
+    const acs = [
+      ac("abdu", { currentLevel: 3, needDelta: 2 }),
+      ac("abdullah", { currentLevel: 3, needDelta: 2 }),
+      ac("najat", { currentLevel: 3, needDelta: 0.5 }), // most satisfied + lowest priority
+    ];
+    // Level cuts ALONE could cover 6.2A (najat 2 + abdu 4 + abdullah 2 = 8A), so
+    // pre-fix this shipped only level cuts. On the 15A gen (threshold 3A) the
+    // 6.2A overshoot must now shed.
+    const r = computeEmergencyReduction(eInput({ limitAmps: 15, requiredSavingsAmps: 6.2, acs }));
+    expect(r.toShed.length).toBeGreaterThanOrEqual(1);
+    expect(r.toShed).toContain("najat"); // most-satisfied room sheds first
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("stays cuts-only just below the extreme-shed threshold", () => {
+    const acs = [
+      ac("abdu", { currentLevel: 3, needDelta: 2 }),
+      ac("abdullah", { currentLevel: 3, needDelta: 2 }),
+      ac("najat", { currentLevel: 3, needDelta: 0.5 }),
+    ];
+    // 2.9A required < the 3A gen threshold → no forced shed; level cuts cover it.
+    const r = computeEmergencyReduction(eInput({ limitAmps: 15, requiredSavingsAmps: 2.9, acs }));
+    expect(r.toShed).toEqual([]);
+    expect(r.satisfied).toBe(true);
+  });
+
+  it("the extreme-shed threshold scales with the limit (20% on grid)", () => {
+    const acs = [
+      ac("abdu", { currentLevel: 3, needDelta: 2 }),
+      ac("abdullah", { currentLevel: 3, needDelta: 2 }),
+      ac("najat", { currentLevel: 3, needDelta: 0.5 }),
+    ];
+    // On the 30A grid the threshold is 20%·30 = 6A. 5A required → cuts only…
+    const below = computeEmergencyReduction(eInput({ limitAmps: 30, requiredSavingsAmps: 5, acs }));
+    expect(below.toShed).toEqual([]);
+    // …6A required → forced shed (breaker race applies on grid too).
+    const at = computeEmergencyReduction(eInput({ limitAmps: 30, requiredSavingsAmps: 6, acs }));
+    expect(at.toShed.length).toBeGreaterThanOrEqual(1);
+    expect(at.toShed).toContain("najat");
+  });
+
   it("moves to the next AC's levels when the first reaches its floor", () => {
     const r = computeEmergencyReduction(eInput({
       requiredSavingsAmps: 3,

@@ -956,6 +956,23 @@ export const FAN_REDUCE_SAVINGS_AMPS = 0.5;
  * Same physics as the post-command nonAcLoad freeze.
  */
 export const EMERGENCY_PENDING_MS = NON_AC_FREEZE_MS;
+/**
+ * Extreme-overshoot shed escalation (2026-07-10). When the meter-sized emergency
+ * `required` is at least `max(EMERGENCY_SHED_OVERSHOOT_AMPS, EMERGENCY_SHED_OVERSHOOT_FRACTION × limit)`,
+ * the emergency batch MUST turn at least one AC OFF even if level cuts alone
+ * nominally cover the target — a compressor OFF removes its draw with certainty
+ * and near-instantly, whereas a level cut only lowers a firmware CAP the
+ * compressor throttles down to over seconds. At ~40% overload (the 2026-07-10
+ * gen trip: ~21A on a 15A breaker) the breaker's thermal curve beats the
+ * cloud→firmware→throttle latency, so two level cuts "covering" 6.2A on paper
+ * still tripped. The fraction keeps the threshold proportional: 3A / ~20% on the
+ * 15A gen, 6A / 20% on the 30A grid (a flat 3A would force sheds at 10% overload
+ * on grid, contradicting the 2026-06-18 "a level-down beats a premature shed"
+ * rule). The most-satisfied sufficient room is chosen by the existing shedNeed
+ * ordering — comfort is preserved as much as a forced shed allows.
+ */
+export const EMERGENCY_SHED_OVERSHOOT_AMPS = 3;
+export const EMERGENCY_SHED_OVERSHOOT_FRACTION = 0.2;
 
 // ---------------------------------------------------------------------------
 // Cost-aware reduction optimizer (2026-06-13) — replaces the greedy shed/cut
@@ -1050,6 +1067,15 @@ export interface SelectReductionOptions {
    * to cover the overshoot and the optimizer sheds (turns the AC OFF) instead.
    */
   raiseSurge?: Record<string, number>;
+  /**
+   * Force at least one shed (extreme-overshoot escalation, 2026-07-10). A plan
+   * of level/fan cuts that nominally covers the target is treated as INFEASIBLE
+   * when it sheds nothing, so the search picks the least-disruptive plan that
+   * turns ≥1 AC OFF. Set by the emergency caller when the overshoot is large
+   * enough that a firmware cap-throttle can't beat the breaker (see
+   * EMERGENCY_SHED_OVERSHOOT_AMPS). Never set on the normal over-budget path.
+   */
+  requireShed?: boolean;
 }
 
 /** Never-level-0 re-entry ceiling: top commandable level, clamped by physics /
@@ -1205,12 +1231,15 @@ export function selectReduction(
   const combo: AcMove[] = new Array(perAc.length);
   const recurse = (
     i: number, savings: number, cost: number, commands: number, disturbed: number, shedNeed: number,
+    sheds: number,
   ): void => {
     if (i === perAc.length) {
       const candidate: ComboScore = {
         combo: combo.slice(),
         savings, cost, commands, disturbed, shedNeed,
-        feasible: savings >= requiredSavingsAmps - EPS,
+        // Extreme overshoot: a covering plan that sheds nothing is infeasible, so
+        // the search escalates to the least-disruptive plan with ≥1 AC off.
+        feasible: savings >= requiredSavingsAmps - EPS && (!opts.requireShed || sheds > 0),
       };
       if (best == null || reductionBetter(candidate, best, requiredSavingsAmps)) best = candidate;
       return;
@@ -1220,10 +1249,11 @@ export function selectReduction(
       recurse(
         i + 1, savings + mv.savings, cost + mv.cost, commands + mv.commands,
         disturbed + (mv.disturbed ? 1 : 0), shedNeed + mv.shedNeed,
+        sheds + (mv.level == null ? 1 : 0),
       );
     }
   };
-  recurse(0, 0, 0, 0, 0, 0);
+  recurse(0, 0, 0, 0, 0, 0, 0);
 
   const chosen = best ?? { combo: [], savings: 0, cost: 0, commands: 0, disturbed: 0, shedNeed: 0, feasible: requiredSavingsAmps <= EPS };
   const moveOf = new Map<string, AcMove>();
@@ -1300,7 +1330,17 @@ export function computeEmergencyReduction(input: EmergencyInput): EmergencyReduc
   const onUnmanaged = acs.filter((a) => a.on && !a.managed);
   const candidates = acs.filter((a) => a.on && a.managed && !a.shed);
 
-  const plan = selectReduction(candidates, requiredSavingsAmps, { ampModels, raiseSurge: input.raiseSurge });
+  // Extreme overshoot → force a shed even if level cuts nominally cover: a
+  // compressor OFF beats a firmware cap-throttle to the breaker (2026-07-10).
+  const requireShed =
+    requiredSavingsAmps >=
+    Math.max(EMERGENCY_SHED_OVERSHOOT_AMPS, EMERGENCY_SHED_OVERSHOOT_FRACTION * limitAmps);
+
+  const plan = selectReduction(candidates, requiredSavingsAmps, {
+    ampModels,
+    raiseSurge: input.raiseSurge,
+    requireShed,
+  });
 
   const unmanagedDraw = onUnmanaged.reduce((sum, a) => sum + draw(a, a.currentLevel), 0);
   const budgetAmps = limitAmps - marginAmps - nonAcLoadAmps - unmanagedDraw;
