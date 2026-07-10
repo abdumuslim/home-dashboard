@@ -313,9 +313,11 @@ export const PowerCard = memo(function PowerCard({ power, powerHistory, openOver
           </div>
         </div>
 
-        {/* Source + stats line (single row, never wraps). Compact sizing keeps
-            all four groups on one line down to ~1280px card widths — measured. */}
-        <div className="flex items-center gap-x-1.5 text-[0.6rem] whitespace-nowrap mt-2 min-w-0 overflow-hidden tabular-nums">
+        {/* Source + stats line. Compact sizing keeps all four groups on one
+            line down to ~1280px card widths (measured); on narrower cards it
+            wraps a whole group to the next line rather than clipping.
+            whitespace-nowrap keeps each group atomic; flex-wrap does the wrap. */}
+        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[0.6rem] whitespace-nowrap mt-2 tabular-nums">
           <SourcePill
             label={liveSource === "grid" ? "Grid" : liveSource === "gen" ? "Gen" : "Off"}
             active={liveSource !== "none"}
