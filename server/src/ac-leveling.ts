@@ -243,8 +243,10 @@ export interface AllocationResult {
   toShed: string[];
   /** Power ON at the floor level + clear shed (at most one per call, most-needy first). */
   toRestore: string[];
-  /** Last try before shedding: set ALL these ACs' fans to 1 instead of powering one off. */
+  /** Fan-reduction commands (targets live in fanTargets). */
   toFanReduce: string[];
+  /** Target fan for each toFanReduce device; normal mild reductions use 1. */
+  fanTargets: Record<string, number>;
   /** One staged fan-restore step (highest-priority pending hold first). */
   toFanRaise: { deviceId: string; fan: number } | null;
   /**
@@ -921,6 +923,7 @@ export function computeAllocation(input: AllocatorInput): AllocationResult {
     toShed,
     toRestore,
     toFanReduce,
+    fanTargets: Object.fromEntries(toFanReduce.map((deviceId) => [deviceId, 1])),
     toFanRaise,
     idealLevels: Object.fromEntries(ideal),
     nonAcLoadAmps,
@@ -1045,8 +1048,10 @@ export interface ReductionPlan {
   desiredLevels: Record<string, number>;
   /** Power OFF — emitted least-needy first, top-priority last. */
   toShed: string[];
-  /** Drop to fan 1 — same ordering. */
+  /** Reduce these fans — exact targets are in fanTargets, same ordering. */
   toFanReduce: string[];
+  /** Exact fan target for each reduction (allows learned-cost partial cuts). */
+  fanTargets: Record<string, number>;
   /** End-state level of every non-shed AC (for status / projected-amps parity). */
   idealLevels: Record<string, number>;
   estimatedSavingsAmps: number;
@@ -1067,6 +1072,8 @@ export interface SelectReductionOptions {
    * to cover the overshoot and the optimizer sheds (turns the AC OFF) instead.
    */
   raiseSurge?: Record<string, number>;
+  /** Learned real amps per numeric fan step; enables intermediate fan cuts. */
+  fanStepCost?: Record<string, number>;
   /**
    * Force at least one shed (extreme-overshoot escalation, 2026-07-10). A plan
    * of level/fan cuts that nominally covers the target is treated as INFEASIBLE
@@ -1094,7 +1101,8 @@ function ceilCapOf(ac: LevelerAcSnapshot): number {
 
 interface AcMove {
   level: number | null; // end level, or null = shed/off
-  fanDrop: boolean;
+  /** Numeric fan target, or null = leave fan unchanged. Auto can only target 1. */
+  fanTarget: number | null;
   savings: number;
   cost: number;
   commands: number;
@@ -1180,6 +1188,31 @@ export function selectReduction(
     const baselineDraw = draw(ac, fromLevel);
     const reducibleFan =
       !ac.fanExempt && ac.fanSpeed != null && (ac.fanSpeed === 0 || ac.fanSpeed > 1);
+    const learnedFanStep = opts.fanStepCost?.[ac.deviceId];
+    const fanChoices: Array<{ target: number | null; savings: number }> = [
+      { target: null, savings: 0 },
+    ];
+    if (reducibleFan && ac.fanSpeed != null) {
+      const currentFan = ac.fanSpeed;
+      if (currentFan === 0 || learnedFanStep == null) {
+        // Built-in auto is indivisible. Without a learned numeric step cost,
+        // preserve the historical conservative binary estimate/command.
+        fanChoices.push({
+          target: 1,
+          savings: learnedFanStep == null
+            ? FAN_REDUCE_SAVINGS_AMPS
+            : Math.max(0.1, learnedFanStep),
+        });
+      } else {
+        // Numeric fans can land directly at an intermediate speed. Enumerate
+        // every lower target so the optimizer can cover a small overload with
+        // only the required number of learned-cost steps instead of 7→1.
+        const perStep = Math.max(0.1, learnedFanStep);
+        for (let target = currentFan - 1; target >= 1; target--) {
+          fanChoices.push({ target, savings: (currentFan - target) * perStep });
+        }
+      }
+    }
     // Upper candidate level: the observed level, except an unrestricted (0) AC
     // re-enters at its top commandable level (never-level-0), and the floor
     // path only ever sheds.
@@ -1197,15 +1230,16 @@ export function selectReduction(
       const steps = Math.max(0, effFrom - level);
       const levelChanged = level !== ac.currentLevel;
       const levelSavings = baselineDraw - draw(ac, level);
-      for (const fanDrop of reducibleFan ? [false, true] : [false]) {
+      for (const fanChoice of fanChoices) {
+        const fanDrop = fanChoice.target != null;
         const disturbed = levelChanged || fanDrop;
         let cost = steps * w.levelStep * needWeight(ac);
         if (fanDrop) cost += w.fan * needWeight(ac);
         if (levelChanged && isTop) cost += w.topPriority; // fan drops of top stay cheap
         moves.push({
           level,
-          fanDrop,
-          savings: levelSavings + (fanDrop ? FAN_REDUCE_SAVINGS_AMPS : 0),
+          fanTarget: fanChoice.target,
+          savings: levelSavings + fanChoice.savings,
           cost,
           commands: (levelChanged ? 1 : 0) + (fanDrop ? 1 : 0),
           disturbed,
@@ -1219,7 +1253,7 @@ export function selectReduction(
     let shedCost = w.shed * needWeight(ac) + (acs.length - 1 - index) * 1e-3;
     if (ac.restoreBlocked) shedCost += w.bounceShed;
     moves.push({
-      level: null, fanDrop: false, savings: baselineDraw, cost: shedCost,
+      level: null, fanTarget: null, savings: baselineDraw, cost: shedCost,
       commands: 1, disturbed: true, shedNeed: Math.max(0, ac.needDelta),
     });
     return { ac, moves };
@@ -1262,6 +1296,7 @@ export function selectReduction(
   const idealLevels: Record<string, number> = {};
   const toShed: string[] = [];
   const toFanReduce: string[] = [];
+  const fanTargets: Record<string, number> = {};
   for (const ac of reductionOutputOrder(acs)) {
     const mv = moveOf.get(ac.deviceId);
     if (!mv) continue;
@@ -1274,12 +1309,16 @@ export function selectReduction(
     if (mv.level !== ac.currentLevel && !(opts.fromFloor && mv.level > ac.currentLevel)) {
       desiredLevels[ac.deviceId] = mv.level;
     }
-    if (mv.fanDrop) toFanReduce.push(ac.deviceId);
+    if (mv.fanTarget != null) {
+      toFanReduce.push(ac.deviceId);
+      fanTargets[ac.deviceId] = mv.fanTarget;
+    }
   }
   return {
     desiredLevels,
     toShed,
     toFanReduce,
+    fanTargets,
     idealLevels,
     estimatedSavingsAmps: chosen.savings,
     overCutAmps: Math.max(0, chosen.savings - requiredSavingsAmps),
@@ -1299,6 +1338,8 @@ export interface EmergencyInput {
   ampModels: Record<string, AcAmpModel>;
   /** Learned per-AC real per-level cost (gen) — see SelectReductionOptions.raiseSurge. */
   raiseSurge?: Record<string, number>;
+  /** Learned real amps per numeric fan step — enables intermediate fan cuts. */
+  fanStepCost?: Record<string, number>;
 }
 
 export interface EmergencyReductionResult extends AllocationResult {
@@ -1339,6 +1380,7 @@ export function computeEmergencyReduction(input: EmergencyInput): EmergencyReduc
   const plan = selectReduction(candidates, requiredSavingsAmps, {
     ampModels,
     raiseSurge: input.raiseSurge,
+    fanStepCost: input.fanStepCost,
     requireShed,
   });
 
@@ -1355,6 +1397,7 @@ export function computeEmergencyReduction(input: EmergencyInput): EmergencyReduc
     toShed: plan.toShed,
     toRestore: [],
     toFanReduce: plan.toFanReduce,
+    fanTargets: plan.fanTargets,
     toFanRaise: null,
     idealLevels: plan.idealLevels,
     nonAcLoadAmps,

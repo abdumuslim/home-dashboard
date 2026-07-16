@@ -3585,6 +3585,38 @@ describe("Smart AC leveling — emergency reduction fast path", () => {
     expect(actions).toEqual([{ deviceId: "ac2", action: { power: 0 } }]);
   });
 
+  it("regression: a sub-amp emergency uses learned fan cost to cut 7→4, not bounce 7→1", async () => {
+    const { collector, tclCloud, actions, fanHolds, setLevelingConfig } = createCollector();
+    setLevelingConfig({ ...LEVELING_CONFIG, marginAmps: 0.1 });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 1, maxGeneratorLevel: 3,
+        currentTemp: 26, mode: 1, fanSpeed: 7 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+    await primeGen(collector);
+
+    // Seed the cost that the live controller learned from clean fan restores.
+    // The old emergency planner ignored this map and treated the whole 7→1
+    // drop as one binary 0.5A move.
+    (collector.acLeveler as never as {
+      observedFanStepCost: Map<string, Map<string, number>>;
+    }).observedFanStepCost = new Map([["gen", new Map([["ac1", 0.2]])]]);
+
+    // Two mild points + one severe 3-point reading empty the 5-point bucket.
+    // Median overshoot 0.5A + 0.1A margin = 0.6A required: exactly 3 fan steps.
+    genReadings(collector, 15.5, 2);
+    genReadings(collector, 17, 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await checkAcLeveling(collector);
+
+    expect(actions).toEqual([]);
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_fan_speed", 4);
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac1", "set_fan_speed", 1);
+    expect(fanHolds.get("ac1")).toEqual({ original_fan: 7, last_set_fan: 4 });
+  });
+
   it("oscillation: 29↔31 around the 30A grid limit accumulates in the bucket and acts (31A-incident regression)", async () => {
     const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);

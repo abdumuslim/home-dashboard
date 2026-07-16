@@ -1572,6 +1572,22 @@ describe("computeEmergencyReduction", () => {
     expect(r.satisfied).toBe(true);
   });
 
+  it("regression: an emergency fan cut lands at the intermediate sweet spot instead of 7→1", () => {
+    const r = computeEmergencyReduction(eInput({
+      requiredSavingsAmps: 0.6,
+      acs: [ac("abdu", { fanSpeed: 7, needDelta: 1 })],
+      fanStepCost: { abdu: 0.2 },
+    }));
+
+    // Live 2026-07-16: a sub-amp overload treated a whole 7→1 drop as one
+    // 0.5A binary move, then restored 1→7 and repeated. With the learned
+    // 0.2A/step cost, three steps cover 0.6A exactly: stop at fan 4.
+    expect(r.toFanReduce).toEqual(["abdu"]);
+    expect(r.fanTargets).toEqual({ abdu: 4 });
+    expect(r.estimatedSavingsAmps).toBeCloseTo(0.6);
+    expect(r.toShed).toEqual([]);
+  });
+
   it("skips fan-exempt, fan-unknown, and fan-already-1 ACs in the fan phase", () => {
     const r = computeEmergencyReduction(eInput({
       requiredSavingsAmps: 0.5,

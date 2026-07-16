@@ -1520,6 +1520,10 @@ export class AcLeveler {
           // making the optimizer shed (turn OFF) instead of level down. Applies
           // on both sources since 2026-06-19 (grid model under-stated too).
           raiseSurge: Object.fromEntries(this.learnedCostFor(this.observedRaiseCost, source)),
+          // Use the same learned per-step fan cost as the restore side so a
+          // small overload can land at an intermediate fan target instead of
+          // repeatedly commanding full→1→full.
+          fanStepCost: Object.fromEntries(this.learnedCostFor(this.observedFanStepCost, source)),
         });
         log.warn(
           `[leveler] EMERGENCY: ~${overshoot.toFixed(1)}A over the ${limit}A ${source} limit ` +
@@ -1836,32 +1840,36 @@ export class AcLeveler {
       }
     }
 
-    // Last try before shedding: drop every reducible fan to minimum in one
-    // batch. didReduce resets the streaks, so the shed only fires if a fresh
-    // 4-reading over-limit window builds with fans already at minimum.
+    // Last try before shedding: reduce the selected fans in one batch. Normal
+    // mild reductions target minimum; the emergency optimizer may choose an
+    // intermediate learned-cost target (the fan sweet spot).
     if (result.toFanReduce.length > 0) {
       let fanReduced = false;
       for (const deviceId of result.toFanReduce) {
         const snap = snapshots.find((s) => s.deviceId === deviceId);
         if (snap?.fanSpeed == null) continue;
+        const targetFan = result.fanTargets[deviceId] ?? 1;
         try {
           if (!this.fanHold.has(deviceId)) {
             await this.recordFanHold(deviceId, snap.fanSpeed);
           }
-          await tcl.sendControl(deviceId, "set_fan_speed", 1);
-          await this.setFanHoldLastSet(deviceId, 1);
-          this.deps.onLevelerFanCommand(deviceId, 1);
+          await tcl.sendControl(deviceId, "set_fan_speed", targetFan);
+          await this.setFanHoldLastSet(deviceId, targetFan);
+          this.deps.onLevelerFanCommand(deviceId, targetFan);
           sentAny = true;
           didReduce = true;
           fanReduced = true;
-          log.info(`[leveler] ${name(deviceId)}: fan ${snap.fanSpeed === 0 ? "auto" : snap.fanSpeed} → 1 (last try before shed)`);
+          log.info(
+            `[leveler] ${name(deviceId)}: fan ${snap.fanSpeed === 0 ? "auto" : snap.fanSpeed} → ${targetFan} ` +
+            `(last try before shed)`,
+          );
         } catch (err) {
           log.error(`[leveler] Fan reduce failed for ${name(deviceId)}:`, (err as Error).message);
         }
       }
       if (fanReduced) {
         this.pushLevelingNotice(
-          `Fan speeds reduced to minimum to stay under the ${limit}A ${source === "grid" ? "Grid" : "Generator"} limit — they'll be restored when there is room.`,
+          `Fan speeds reduced to stay under the ${limit}A ${source === "grid" ? "Grid" : "Generator"} limit — they'll be restored when there is room.`,
         );
       }
     }
