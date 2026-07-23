@@ -68,12 +68,20 @@ async function main(): Promise<void> {
       onUserBeep: (deviceId, beepOn) => collector.noteUserAcBeep(deviceId, beepOn),
     },
     {
-      getConfig: () => collector.acLeveler.getConfig(),
-      updateConfig: (cfg) => collector.acLeveler.updateConfig(cfg),
-      getStatus: () => collector.acLeveler.getStatus(),
-      onUserPowerOff: (deviceId) => collector.acLeveler.onUserPowerOff(deviceId),
-      onUserPowerOn: (deviceId) => collector.acLeveler.onUserPowerOn(deviceId),
+      // Route through the ACTIVE controller (v1 unless the v2 flag says v2);
+      // v2-specific handlers always hit the v2 instance.
+      getConfig: async () => {
+        const config = await collector.leveling().getConfig();
+        return { ...(config as Record<string, unknown>), controller: collector.acLeveler2.controllerFlavor() };
+      },
+      updateConfig: (cfg) => collector.leveling().updateConfig(cfg as never),
+      getStatus: () => collector.leveling().getStatus(),
+      onUserPowerOff: (deviceId) => collector.leveling().onUserPowerOff(deviceId),
+      onUserPowerOn: (deviceId) => collector.leveling().onUserPowerOn(deviceId),
       onUserGenLevel: (deviceId, level) => collector.onUserAcGenLevel(deviceId, level),
+      updateV2Config: (cfg) => collector.acLeveler2.updateConfig(cfg),
+      getJournal: (hours) => collector.acLeveler2.recentJournal(hours),
+      resetCosts: () => collector.acLeveler2.resetLearnedCosts(),
     },
     {
       start: (deviceIds, includeFan) => collector.acCalibrator.start(deviceIds, includeFan),

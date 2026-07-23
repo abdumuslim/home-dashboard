@@ -111,6 +111,8 @@ The backend resolves property names per device model (e.g., `set_fan_speed` → 
 
 ## AC Models & Shadow Properties
 
+> **⚠ Capacity correction (2026-07-23):** the `model` strings below are PROTOCOL-FAMILY labels inferred from shadow properties — their capacity digits are WRONG for this household. Nameplate reality (user-verified + meter evidence): **Abdu = 2-ton** (advertised 4–8A; calibration fan sweep hit 7.94A; likely a TAC-24-class CHSD unit), **Abdullah & Najat = 1-ton** (2–6A; never observed above ~4.5A). Najat's "TAC-24CHSA" label just means she speaks the CHSA protocol (7-gear fan, `autoGeneratorMode`). All protocol forks stay keyed on the `model` field (correct for BEHAVIOR); never use it to infer capacity/amps — capacity lives in the leveling amp models and `ac_leveling_costs`.
+
 Two AC hardware models with different shadow properties. Detection: presence of `autoGeneratorMode` in the shadow → Najat (TAC-24CHSA); absence → Abdu/Abdullah (TAC-12CHSD). The result is stored as an explicit `model: "TAC-24CHSA" | "TAC-12CHSD"` field on `AcDevice` (server + client) — **all protocol forks (`isNajatModel()`, client fan labels) key on `model`, never on `maxGeneratorLevel`** (they used to check `=== 6`, which broke when TCL changed the level count in 2026-06).
 
 ### Common properties (shadow `state.reported`)

@@ -9,6 +9,7 @@ import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
 import { TclCloud, type AcAction, type AcDevice } from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
 import { AcLeveler, type LevelerDeviceContext } from "./ac-leveler.js";
+import { LevelingControllerV2 } from "./leveling/controller.js";
 import { AcCalibrator } from "./ac-calibration.js";
 import { computeNeedTier, type NeedTier } from "./ac-leveling.js";
 import { computeAutoFanLevel } from "./ac-auto-fan.js";
@@ -191,6 +192,16 @@ export class Collector {
   xiaomiCloud: XiaomiCloud | null = null;
   tclCloud: TclCloud | null = null;
   acLeveler: AcLeveler;
+  acLeveler2: LevelingControllerV2;
+
+  /**
+   * The controller that ACTS right now. v1 unless the v2 flag (config row
+   * id=2) says "v2". In "shadow", v1 acts here while checkAcLeveling also
+   * shadow-ticks v2 (journal-only). Both satisfy the same call surface.
+   */
+  leveling(): AcLeveler | LevelingControllerV2 {
+    return this.acLeveler2.controllerFlavor() === "v2" ? this.acLeveler2 : this.acLeveler;
+  }
   acCalibrator: AcCalibrator;
   private lastLevelerDevicesFetch = 0;
   private tclRetryAt = 0;
@@ -263,7 +274,10 @@ export class Collector {
       { tsMs: this.latestPowerTs.getTime(), row: this.latestPowerRow },
     ];
     // Streaks are counted per ESP reading, not per collector tick
+    // Both controllers always ingest readings: the shadow/idle one keeps its
+    // meter state warm so a live flag flip needs no warm-up.
     this.acLeveler.onPowerReading(data);
+    this.acLeveler2.onPowerReading(data);
     this.acCalibrator.onPowerReading(data);
   }
 
@@ -500,14 +514,14 @@ export class Collector {
   constructor(pool: pg.Pool, config: Config) {
     this.pool = pool;
     this.config = config;
-    this.acLeveler = new AcLeveler(pool, {
+    const levelerDeps = {
       getTclCloud: () => this.tclCloud,
-      broadcast: (payload) => this.broadcastPush(payload),
-      setDevicePowerCache: (deviceId, power) => {
+      broadcast: (payload: Record<string, unknown>) => this.broadcastPush(payload),
+      setDevicePowerCache: (deviceId: string, power: "on" | "off") => {
         this.devicePowerCache.set(deviceId, { power, ts: Date.now() });
       },
-      isManualOffLocked: (deviceId) => this.isAcManualOffLocked(deviceId),
-      onLevelerFanCommand: (deviceId, fan) => this.refreshAcFanBaseline(deviceId, fan),
+      isManualOffLocked: (deviceId: string) => this.isAcManualOffLocked(deviceId),
+      onLevelerFanCommand: (deviceId: string, fan: number) => this.refreshAcFanBaseline(deviceId, fan),
       // Emergency trigger confirmed (severe streak / grid oscillation): run a
       // leveling check NOW — waiting up to 5s for the loop tick costs seconds
       // we don't have before the breaker trips. Errors are logged, never thrown
@@ -518,16 +532,21 @@ export class Collector {
       },
       // Source change / collapse / ESP dropout — arm the observed-off
       // power-event window so a lagging shadow's OFF isn't read as user intent.
-      onPowerEvent: (kind) => this.notePowerEvent(kind),
-    });
+      onPowerEvent: (kind: string) => this.notePowerEvent(kind),
+    };
+    this.acLeveler = new AcLeveler(pool, levelerDeps);
+    // v2 controller (server/src/leveling/) — selected via the `controller`
+    // flag in ac_leveling_config row id=2: "v1" (default), "shadow" (v2
+    // journals its decisions, v1 acts), "v2" (v2 acts, v1 idle).
+    this.acLeveler2 = new LevelingControllerV2(pool, levelerDeps);
     this.acCalibrator = new AcCalibrator(pool, {
       getTclCloud: () => this.tclCloud,
-      getLimits: () => this.acLeveler.getLimits(),
+      getLimits: () => this.leveling().getLimits(),
       broadcast: (payload) => this.broadcastPush(payload),
       // Calibration power-cycled these ACs while leveling was suspended —
       // re-arm their compressor ramps so the first post-run tick doesn't
       // misread the restart as established draw (phantom headroom).
-      onDevicesRestored: (deviceIds) => this.acLeveler.rearmRamp(deviceIds),
+      onDevicesRestored: (deviceIds) => this.leveling().rearmRamp(deviceIds),
     });
 
     if (config.vapidPublicKey && config.vapidPrivateKey) {
@@ -972,7 +991,7 @@ export class Collector {
   private async checkAutomations(): Promise<void> {
     await this.refreshAutomationRules();
     // Load leveler state early so shed guards and gen-strip checks see DB state
-    await this.acLeveler.ensureLoaded();
+    await this.leveling().ensureLoaded();
     if (this.automationRules.length === 0) return;
 
     if (this.tclCloud && !this.tclCloud.isReady() && Date.now() >= this.tclRetryAt) {
@@ -1104,7 +1123,7 @@ export class Collector {
             targetDeviceIds = deviceIds.filter((did) => !this.acManualOffLocks.has(did));
           }
           // Shed devices are leveler-owned — only the leveler restores them
-          targetDeviceIds = targetDeviceIds.filter((did) => !this.acLeveler.isShed(did));
+          targetDeviceIds = targetDeviceIds.filter((did) => !this.leveling().isShed(did));
           if (targetDeviceIds.length === 0) return;
         }
         // First trigger — turn on all devices
@@ -1126,7 +1145,7 @@ export class Collector {
             const power = await this.getDevicePowerCached(did, rule.device_type);
             if (power === "off" || power === undefined) {
               if (rule.device_type === "ac") {
-                if (this.acLeveler.isShed(did)) continue; // leveler shed it — not a manual off
+                if (this.leveling().isShed(did)) continue; // leveler shed it — not a manual off
                 // A fetch gap is not an observation — never lock on undefined.
                 if (power === undefined) continue;
                 if (!(await this.handleObservedAcOff(`Automation "${rule.name}"`, did, deviceNames))) {
@@ -1160,7 +1179,7 @@ export class Collector {
           try {
             await this.executeAutomationAction(rule, offAction, [did]);
             this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
-            if (rule.device_type === "ac") await this.acLeveler.clearShed(did, "metric_turn_off");
+            if (rule.device_type === "ac") await this.leveling().clearShed(did, "metric_turn_off");
           } catch (err) {
             log.error(`Automation "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
           }
@@ -1184,7 +1203,7 @@ export class Collector {
         if (this.canClearAcManualOff(deviceId)) {
           await this.clearAcManualOff(deviceId);
         }
-        await this.acLeveler.reconcileObservedOn(deviceId);
+        await this.leveling().reconcileObservedOn(deviceId);
       }
     } else {
       power = await this.xiaomiCloud!.getDevicePower(deviceId);
@@ -1284,7 +1303,7 @@ export class Collector {
   private updateAcFanTracking(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, value: number, now: number): void {
     // While the leveler holds the fan down (last try before a shed), the drift
     // is ours — don't misread it as a manual change.
-    if (this.acLeveler.hasFanHold(deviceId)) return;
+    if (this.leveling().hasFanHold(deviceId)) return;
     const key = this.acFanKey(rule.id, deviceId);
     let entry = this.acFanEnforcement.get(key);
     if (entry && entry.slotId !== slot.id) {
@@ -1350,7 +1369,7 @@ export class Collector {
    */
   noteUserAcFanAuto(deviceId: string): void {
     // The physical fan changed — release any leveler fan hold, same as a manual change
-    void this.acLeveler.onUserFanChange(deviceId);
+    void this.leveling().onUserFanChange(deviceId);
     let resumed = false;
     for (const key of this.acFanEnforcement.keys()) {
       if (key.endsWith(`:${deviceId}`)) {
@@ -1369,7 +1388,7 @@ export class Collector {
    */
   onUserAcGenLevel(deviceId: string, level: number): Promise<{ reverted: boolean; level: number }> {
     this.lastUserGenChangeAt.set(deviceId, Date.now());
-    return this.acLeveler.onUserGenLevel(deviceId, level);
+    return this.leveling().onUserGenLevel(deviceId, level);
   }
 
   /** A manual gen-level change is still "active" (suppresses range re-enforcement). */
@@ -1380,7 +1399,7 @@ export class Collector {
 
   /** UI fan/turbo change — suspend fan enforcement immediately (no settle-window race). */
   noteUserAcFanChange(deviceId: string): void {
-    void this.acLeveler.onUserFanChange(deviceId);
+    void this.leveling().onUserFanChange(deviceId);
     for (const rule of this.automationRules) {
       if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
       if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
@@ -1460,7 +1479,7 @@ export class Collector {
     if (state.status === "idle") {
       if (shouldTurnOn) {
         const lockedIds = await this.getAcManualOffLockedIds(deviceIds);
-        let unlockedDeviceIds = deviceIds.filter((did) => !lockedIds.has(did) && !this.acLeveler.isShed(did));
+        let unlockedDeviceIds = deviceIds.filter((did) => !lockedIds.has(did) && !this.leveling().isShed(did));
         if (lockedIds.size > 0 && now - state.lastToggle >= cooldownMs) {
           for (const did of deviceIds) {
             if (!lockedIds.has(did)) continue;
@@ -1485,7 +1504,7 @@ export class Collector {
               log.error(`[collector] AC range "${rule.name}" lock-check failed for ${did}:`, (err as Error).message);
             }
           }
-          unlockedDeviceIds = deviceIds.filter((did) => !this.acManualOffLocks.has(did) && !this.acLeveler.isShed(did));
+          unlockedDeviceIds = deviceIds.filter((did) => !this.acManualOffLocks.has(did) && !this.leveling().isShed(did));
         }
         if (unlockedDeviceIds.length === 0) {
           this.automationState.set(rule.id, { ...state, conditionSince: null });
@@ -1538,7 +1557,7 @@ export class Collector {
                 if (now - (this.acRangeOffAt.get(did) ?? 0) < this.AC_OFF_REFIRE_GRACE_MS) continue; // off already sent — shadow lagging
                 log.info(`[collector] AC range "${rule.name}": device ${did} is ON past turn-off limit (${rule.metric}=${value}), turning OFF`);
                 // Temperature-cycling off — remember the stable level for warm restore.
-                await this.acLeveler.rememberStableLevel(did);
+                await this.leveling().rememberStableLevel(did);
                 await this.executeAutomationAction(rule, { power: 0 } as AcAction, [did]);
                 this.acRangeOffAt.set(did, now);
                 this.devicePowerCache.set(did, { power: "off", ts: Date.now() });
@@ -1572,11 +1591,11 @@ export class Collector {
         try {
           // Temperature-cycling off: remember each AC's stable level so the next
           // turn-on warm-restores straight to it instead of slow re-climbing.
-          for (const did of deviceIds) await this.acLeveler.rememberStableLevel(did);
+          for (const did of deviceIds) await this.leveling().rememberStableLevel(did);
           await this.executeAutomationAction(rule, { power: 0 } as AcAction, deviceIds);
           // The automation owns the OFF now — a leveler shed must not restore it
           for (const did of deviceIds) {
-            await this.acLeveler.clearShed(did, "range_turn_off");
+            await this.leveling().clearShed(did, "range_turn_off");
             this.clearAcFanEnforcement(rule.id, did);
             this.clearAcSwingOverride(rule.id, did);
             this.acRangeOffAt.set(did, now);
@@ -1591,7 +1610,7 @@ export class Collector {
           try {
             const power = await this.getDevicePowerCached(did, "ac");
             if (power === "off" || power === undefined) {
-              if (this.acLeveler.isShed(did)) continue; // leveler shed it — not a manual off
+              if (this.leveling().isShed(did)) continue; // leveler shed it — not a manual off
               // A fetch gap is not an observation — never lock on undefined.
               if (power === undefined) continue;
               // Our own recent off still propagating is not an external off.
@@ -1664,7 +1683,7 @@ export class Collector {
           sentOff = true;
         }
         // Outside the window the automation owns the OFF — drop any leveler shed
-        await this.acLeveler.clearShed(did, "outside_range_off");
+        await this.leveling().clearShed(did, "outside_range_off");
         this.clearAcFanEnforcement(rule.id, did);
         this.clearAcSwingOverride(rule.id, did);
       } catch (err) {
@@ -1715,7 +1734,7 @@ export class Collector {
           const locked = rule.device_type === "ac" && await this.isAcManualOffLocked(did);
           const power = await this.getDevicePowerCached(did, rule.device_type, locked);
           if (power === "off" || power === undefined) {
-            if (rule.device_type === "ac" && this.acLeveler.isShed(did)) continue; // leveler shed it
+            if (rule.device_type === "ac" && this.leveling().isShed(did)) continue; // leveler shed it
             if (rule.device_type === "ac" && state.status === "triggered") {
               // A fetch gap is not an observation — never lock on undefined.
               if (power === undefined) continue;
@@ -1751,7 +1770,7 @@ export class Collector {
           for (const did of deviceIds) {
             try {
               await this.executeAutomationAction(rule, rule.action_off ?? offAction, [did]);
-              if (rule.device_type === "ac") await this.acLeveler.clearShed(did, "schedule_turn_off");
+              if (rule.device_type === "ac") await this.leveling().clearShed(did, "schedule_turn_off");
             } catch (err) {
               log.error(`[collector] Schedule "${rule.name}" turn-off failed for ${did}:`, (err as Error).message);
             }
@@ -1774,10 +1793,10 @@ export class Collector {
         if (timer.action === "off") {
           await this.tclCloud.executeAcAction(deviceId, { power: 0 });
           await this.recordAcManualOff(deviceId, "timer_off");
-          await this.acLeveler.clearShed(deviceId, "timer_off");
+          await this.leveling().clearShed(deviceId, "timer_off");
           log.info(`[collector] AC timer: turned OFF device ${deviceId}`);
         } else {
-          if (this.acLeveler.isShed(deviceId)) {
+          if (this.leveling().isShed(deviceId)) {
             log.info(`[collector] AC timer: device ${deviceId} is shed by the leveler, skipping turn-on timer`);
             continue;
           }
@@ -1818,7 +1837,7 @@ export class Collector {
 
   /** True when the leveler controls this device's generator level. */
   private isAcLevelingManaged(deviceId: string): boolean {
-    return this.acLeveler.isEnabled() && !this.acRuleOptsOutOfLeveling(deviceId);
+    return this.leveling().isEnabled() && !this.acRuleOptsOutOfLeveling(deviceId);
   }
 
   /** An enabled AC automation with smart_leveling=false opts its devices out. */
@@ -1833,7 +1852,7 @@ export class Collector {
 
   /** Removes generator_mode from rule actions when the leveler owns the level. */
   private stripGenIfLeveled<T extends PurifierAction | AcAction>(rule: AutomationRule, action: T): T {
-    if (rule.device_type !== "ac" || rule.smart_leveling === false || !this.acLeveler.isEnabled()) {
+    if (rule.device_type !== "ac" || rule.smart_leveling === false || !this.leveling().isEnabled()) {
       return action;
     }
     const acAction = action as AcAction;
@@ -1862,7 +1881,7 @@ export class Collector {
       const { generator_mode: _g, ...rest } = stripped as AcAction;
       stripped = rest as T;
     }
-    if (rule.device_type !== "ac" || !this.acLeveler.hasFanHold(deviceId)) return stripped;
+    if (rule.device_type !== "ac" || !this.leveling().hasFanHold(deviceId)) return stripped;
     const { fan_speed: _f, turbo: _t, ...rest } = stripped as AcAction;
     return rest as T;
   }
@@ -1904,7 +1923,7 @@ export class Collector {
       };
     }
     if (!device.currentTemp || device.currentTemp <= 0) return { tier: "mild", delta: 1, slotGenCap: null };
-    const target = this.acLeveler.getComfortTarget();
+    const target = this.leveling().getComfortTarget();
     if (device.mode === 4) {
       // Heat mode: deviation is how far the room is below the comfort target
       return {
@@ -1970,7 +1989,10 @@ export class Collector {
 
   private async checkAcLeveling(): Promise<void> {
     await this.acLeveler.ensureLoaded();
-    if (!this.acLeveler.isEnabled()) return;
+    // v2 load failures must never take the acting v1 controller down with them.
+    await this.acLeveler2.ensureLoaded().catch((err) =>
+      log.warn(`[collector] v2 leveler load failed: ${(err as Error).message}`));
+    if (!this.leveling().isEnabled()) return;
     if (!this.tclCloud || !this.tclCloud.isReady()) return;
     // Calibration drives the ACs single-handedly — don't fight its sweeps.
     if (this.acCalibrator.isActive()) return;
@@ -2003,7 +2025,13 @@ export class Collector {
         slotGenCap: need.slotGenCap,
       };
     });
-    await this.acLeveler.tick(ctx, outdoorTempC);
+    await this.leveling().tick(ctx, outdoorTempC);
+    // Shadow phase: v2 also evaluates (journal-only, no commands) so its
+    // decisions can be compared against v1's before cutover.
+    if (this.acLeveler2.controllerFlavor() === "shadow") {
+      await this.acLeveler2.tick(ctx, outdoorTempC).catch((err) =>
+        log.warn(`[collector] v2 shadow tick failed: ${(err as Error).message}`));
+    }
   }
 
   // ---------- Ambient Weather ----------

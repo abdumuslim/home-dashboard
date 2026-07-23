@@ -46,12 +46,16 @@ export interface AcManualOffLockHandlers {
 }
 
 export interface AcLevelingHandlers {
-  getConfig(): Promise<AcLevelingConfig>;
-  updateConfig(cfg: AcLevelingConfig): Promise<AcLevelingConfig>;
+  getConfig(): Promise<unknown>;
+  updateConfig(cfg: AcLevelingConfig): Promise<unknown>;
   getStatus(): AcLevelingStatus;
   onUserPowerOff(deviceId: string): Promise<void>;
   onUserPowerOn(deviceId: string): Promise<void>;
   onUserGenLevel(deviceId: string, level: number): Promise<{ reverted: boolean; level: number }>;
+  /** v2 controller extras (absent while only v1 is wired). */
+  updateV2Config?(cfg: Record<string, unknown>): Promise<unknown>;
+  getJournal?(hours: number): Promise<unknown[]>;
+  resetCosts?(): Promise<void>;
 }
 
 export interface AcCalibrationHandlers {
@@ -1359,7 +1363,49 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         maxRaiseStepGrid: (body.maxRaiseStepGrid as number) ?? 1,
         maxRaiseStepGen: (body.maxRaiseStepGen as number) ?? 1,
       });
+      // Forward v2-owned fields (controller flag, resting buffer, calm gates,
+      // fan trim) to the v2 controller's own config row when present.
+      const v2Body = req.body as Record<string, unknown>;
+      const v2Keys = ["controller", "restingBufferAmps", "raiseCalmSeconds", "restoreCalmSeconds", "fanTrimEnabled"];
+      if (acLeveling.updateV2Config && v2Keys.some((k) => k in v2Body)) {
+        const flavor = v2Body.controller;
+        if (flavor != null && flavor !== "v1" && flavor !== "shadow" && flavor !== "v2") {
+          res.status(400).json({ error: "controller must be v1|shadow|v2" });
+          return;
+        }
+        const num = (key: string, min: number, max: number): boolean => {
+          const v = v2Body[key];
+          return v == null || (typeof v === "number" && v >= min && v <= max);
+        };
+        if (!num("restingBufferAmps", 0, 10) || !num("raiseCalmSeconds", 5, 600) || !num("restoreCalmSeconds", 5, 600)) {
+          res.status(400).json({ error: "invalid v2 leveling field" });
+          return;
+        }
+        await acLeveling.updateV2Config(Object.fromEntries(v2Keys.filter((k) => k in v2Body).map((k) => [k, v2Body[k]])));
+      }
       res.json({ config });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // v2 decision journal — durable forensics (docker logs rotate in ~1.5 days).
+  router.get("/api/ac/leveling/journal", requireAuth, async (req: Request, res: Response) => {
+    if (!acLeveling?.getJournal) { res.status(503).json({ error: "journal not available" }); return; }
+    const hours = Math.max(1, Math.min(24 * 60, Number(req.query.hours) || 24));
+    try {
+      res.json({ hours, entries: (await acLeveling.getJournal(hours)).map((r) => rowToDict(r as Record<string, unknown>)) });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Explicit learned-cost reset (config saves no longer wipe them in v2).
+  router.post("/api/ac/leveling/costs/reset", requireAuth, async (_req: Request, res: Response) => {
+    if (!acLeveling?.resetCosts) { res.status(503).json({ error: "not available" }); return; }
+    try {
+      await acLeveling.resetCosts();
+      res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
