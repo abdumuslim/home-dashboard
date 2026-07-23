@@ -189,6 +189,11 @@ const MIGRATIONS: string[] = [
   )`,
   // Per-device opt-in for Smart AC Leveling push notifications (off by default for everyone)
   "ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS leveling_notifications BOOLEAN NOT NULL DEFAULT false",
+  // Leveling v2 config row (id=2) — widen the original CHECK (id = 1) so the v2
+  // controller can own its own row (v1's save path would clobber unknown fields
+  // in row 1). Paired idempotent entries per the CHECK-constraint change pattern.
+  "ALTER TABLE ac_leveling_config DROP CONSTRAINT IF EXISTS ac_leveling_config_id_check",
+  "ALTER TABLE ac_leveling_config ADD CONSTRAINT ac_leveling_config_id_check CHECK (id IN (1, 2))",
   // Leveling v2: persistent learned per-transition costs (survive deploys/config
   // saves — the v1 in-memory maps were wiped on both, so the self-correction
   // never accumulated). Keyed per device × source × transition (e.g. "level:1>2",
