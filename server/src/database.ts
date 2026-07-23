@@ -189,6 +189,41 @@ const MIGRATIONS: string[] = [
   )`,
   // Per-device opt-in for Smart AC Leveling push notifications (off by default for everyone)
   "ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS leveling_notifications BOOLEAN NOT NULL DEFAULT false",
+  // Leveling v2: persistent learned per-transition costs (survive deploys/config
+  // saves — the v1 in-memory maps were wiped on both, so the self-correction
+  // never accumulated). Keyed per device × source × transition (e.g. "level:1>2",
+  // "on@L1", "fan:step").
+  `CREATE TABLE IF NOT EXISTS ac_leveling_costs (
+    device_id  TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    transition TEXT NOT NULL,
+    ewma_amps  REAL NOT NULL,
+    samples    INTEGER NOT NULL DEFAULT 1,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (device_id, source, transition)
+  )`,
+  // Leveling v2: command-outcome journal — every planned batch (shadow rows have
+  // executed=false) with its pre-meter, expectation and graded outcome. Docker
+  // logs rotate away in ~1.5 days; this is the durable forensics + the input for
+  // continuous cost learning. ~250 rows/day.
+  `CREATE TABLE IF NOT EXISTS ac_leveling_journal (
+    id             BIGSERIAL PRIMARY KEY,
+    at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source         TEXT NOT NULL,
+    mode           TEXT NOT NULL,
+    severity       TEXT,
+    reason         TEXT NOT NULL,
+    required_amps  REAL,
+    pre_amps       REAL,
+    commands       JSONB NOT NULL,
+    decisions      JSONB,
+    expected_delta REAL,
+    executed       BOOLEAN NOT NULL DEFAULT true,
+    graded_at      TIMESTAMPTZ,
+    post_amps      REAL,
+    observed_delta REAL
+  )`,
+  "CREATE INDEX IF NOT EXISTS ac_leveling_journal_at_brin ON ac_leveling_journal USING BRIN (at)",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

@@ -1,0 +1,101 @@
+// The public leveling surface the collector/routes program against. Both the
+// v1 AcLeveler and the v2 controller satisfy this structurally, so the
+// controller flag can swap them without touching call sites. Field shapes are
+// v1-compatible (the client reads this payload); v2 adds optional extras.
+
+import type { TclCloud, AcDevice } from "../tcl-cloud.js";
+import type { PowerSource } from "./types.js";
+
+export type NeedTier = "satisfied" | "mild" | "full";
+
+export interface LevelingDeps {
+  getTclCloud: () => TclCloud | null;
+  broadcast: (payload: Record<string, unknown>) => Promise<void>;
+  setDevicePowerCache: (deviceId: string, power: "on" | "off") => void;
+  isManualOffLocked: (deviceId: string) => Promise<boolean>;
+  onLevelerFanCommand: (deviceId: string, fan: number) => void;
+  onUrgentLevelingNeeded?: () => void;
+  onPowerEvent?: (kind: string) => void;
+}
+
+export interface LevelerDeviceContext {
+  device: AcDevice;
+  managed: boolean;
+  needTier: NeedTier;
+  needDelta: number;
+  slotGenCap: number | null;
+}
+
+export interface LevelingAcStatusV2 {
+  deviceId: string;
+  name: string;
+  on: boolean;
+  managed: boolean;
+  shed: boolean;
+  level: number;
+  maxLevel: number;
+  minLevel: number;
+  estAmps: number;
+  needTier: NeedTier;
+  needCap: number;
+  needDelta: number;
+  manualCap: number | null;
+  manualTarget: number | null;
+  idealLevel: number | null;
+  heldFan: number | null;
+  fanOriginal: number | null;
+  bounceCap: number | null;
+  bounceRetryBelowAmps: number | null;
+  restoreBlocked: boolean;
+  slotCap: number | null;
+  unreachableLevels: number[];
+  /** v2 extras */
+  raiseCooldownMs?: number;
+  restoreCooldownMs?: number;
+}
+
+export interface LevelingStatusV2 {
+  enabled: boolean;
+  source: PowerSource;
+  measuredAmps: number | null;
+  limitAmps: number | null;
+  budgetAmps: number | null;
+  nonAcLoadAmps: number | null;
+  overLimitBudget: number;
+  overLimitBudgetMax: number;
+  headroomStreak: number;
+  settleRemainingMs: number;
+  raiseHoldRemainingMs: number;
+  expectedAmps: number | null;
+  lastPrediction: { expectedAmps: number; actualAmps: number; at: number } | null;
+  lastEmergency: { at: number; requiredAmps: number; savedAmps: number } | null;
+  acs: LevelingAcStatusV2[];
+  /** v2 extras */
+  mode?: string;
+  calmMs?: number;
+  controller?: string;
+  decisions?: Array<{ at: number; deviceId?: string; action: string; blockedBy?: string; detail?: string }>;
+}
+
+/** The call surface collector.ts and routes.ts use (structural — v1 satisfies it). */
+export interface LevelingApi {
+  ensureLoaded(): Promise<void>;
+  getConfig(): Promise<unknown>;
+  updateConfig(cfg: never): Promise<unknown>;
+  isEnabled(): boolean;
+  getComfortTarget(): number;
+  getLimits(): { gridLimitAmps: number; genLimitAmps: number; marginAmps: number };
+  isShed(deviceId: string): boolean;
+  clearShed(deviceId: string, reason: string): Promise<void>;
+  hasFanHold(deviceId: string): boolean;
+  rememberStableLevel(deviceId: string): Promise<void>;
+  reconcileObservedOn(deviceId: string): Promise<void>;
+  onPowerReading(data: { current_1: number; current_2: number }): void;
+  onUserPowerOff(deviceId: string): Promise<void>;
+  onUserPowerOn(deviceId: string): Promise<void>;
+  onUserFanChange(deviceId: string): Promise<void>;
+  onUserGenLevel(deviceId: string, level: number): Promise<{ reverted: boolean; level: number }>;
+  rearmRamp(deviceIds: string[]): void;
+  tick(ctx: LevelerDeviceContext[], outdoorTempC: number | null): Promise<void>;
+  getStatus(): LevelingStatusV2;
+}
