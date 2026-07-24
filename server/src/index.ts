@@ -66,6 +66,7 @@ async function main(): Promise<void> {
       onUserFanAuto: (deviceId) => collector.noteUserAcFanAuto(deviceId),
       onUserSwingChange: (deviceId) => collector.noteUserAcSwingChange(deviceId),
       onUserBeep: (deviceId, beepOn) => collector.noteUserAcBeep(deviceId, beepOn),
+      notifyLockCleared: (deviceId, authKind, ip) => collector.notifyAcLockCleared(deviceId, authKind, ip),
     },
     {
       // Route through the ACTIVE controller (v1 unless the v2 flag says v2);

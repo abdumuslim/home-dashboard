@@ -12,13 +12,16 @@ import type { AcLevelingConfig, AcAmpModel, AcLevelBoost } from "./ac-leveling.j
 import type { AcLevelingStatus } from "./ac-leveler.js";
 import type { AcCalibrationStatus, CalibrationResultRow, CalibrationFit } from "./ac-calibration.js";
 import { PowerStatsService } from "./power-stats-service.js";
-import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession } from "./auth.js";
+import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession, clientIp, type AuthKind } from "./auth.js";
+import { childLogger } from "./logger.js";
 import {
   createBaghdadPrayerResolver,
   getLegacyRangeSlots,
   validateRangeSlots,
   type AutomationRangeSlot,
 } from "./automation-slots.js";
+
+const log = childLogger("routes");
 
 export interface AcTimer {
   deviceId: string;
@@ -31,7 +34,8 @@ export const acTimers = new Map<string, AcTimer>();
 
 export interface AcManualOffLockHandlers {
   record(deviceId: string, reason: string): Promise<void>;
-  clear(deviceId: string): Promise<void>;
+  /** Resolves true when THIS call released a lock (false when none was held). */
+  clear(deviceId: string): Promise<boolean>;
   isLocked(deviceId: string): Promise<boolean>;
   getLockedIds(deviceIds?: string[]): Promise<Set<string>>;
   reconcileDevices(devices: Array<{ id: string; power: boolean }>): Promise<Set<string>>;
@@ -43,6 +47,8 @@ export interface AcManualOffLockHandlers {
   onUserSwingChange?(deviceId: string): void;
   /** UI beep toggle — beep off becomes a persistent enforced preference, beep on releases it. */
   onUserBeep?(deviceId: string, beepOn: boolean): void;
+  /** A commanded power-ON released a manual-off lock — push so a turn-on the user did not make is visible immediately. */
+  notifyLockCleared?(deviceId: string, authKind: AuthKind, ip: string): void;
 }
 
 export interface AcLevelingHandlers {
@@ -1212,6 +1218,40 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   const ALLOWED_AC_COMMANDS = ["set_power", "set_mode", "set_temperature", "set_fan_speed", "set_eco", "set_screen", "set_sleep", "set_vertical_swing", "set_horizontal_swing", "set_turbo", "set_fresh_air", "set_generator_mode", "set_beep"];
 
+  const AC_AUDIT_RETENTION_DAYS = 30;
+  let lastAcAuditPruneAt = 0;
+
+  /**
+   * Durable record of who commanded an AC. Docker logs rotate in ~1.5 days, so
+   * "which client turned this AC back on?" was unanswerable after the fact
+   * (2026-07-24 Najat incident) — this table outlives them. Fire-and-forget:
+   * an audit failure must never block the user's command.
+   */
+  function auditAcControl(req: Request, deviceId: string, command: string, value: unknown): void {
+    const authKind: AuthKind = req.authKind ?? "user";
+    const ip = clientIp(req);
+    const uaHeader = req.headers["user-agent"];
+    const userAgent = (Array.isArray(uaHeader) ? uaHeader[0] : uaHeader)?.slice(0, 300) ?? null;
+    log.info(`[routes] AC control ${command}=${JSON.stringify(value)} → ${deviceId} (${authKind}, ip=${ip})`);
+    void pool
+      .query(
+        `INSERT INTO ac_control_audit (device_id, command, value, auth_kind, ip, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [deviceId, command, JSON.stringify(value ?? null), authKind, ip, userAgent],
+      )
+      .catch((err) => log.error("[routes] AC control audit insert failed:", err));
+
+    const now = Date.now();
+    if (now - lastAcAuditPruneAt > 24 * 3_600_000) {
+      lastAcAuditPruneAt = now;
+      void pool
+        .query("DELETE FROM ac_control_audit WHERE at < NOW() - ($1 || ' days')::interval", [
+          String(AC_AUDIT_RETENTION_DAYS),
+        ])
+        .catch((err) => log.error("[routes] AC control audit prune failed:", err));
+    }
+  }
+
   router.post("/api/ac/devices/:id/control", requireAuth, async (req: Request, res: Response) => {
     const cloud = getTclCloud?.();
     if (!cloud || !cloud.isReady()) {
@@ -1231,6 +1271,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       return;
     }
     try {
+      auditAcControl(req, id, command, value);
       // A user touching any AC mid-calibration aborts the run — their intent wins
       acCalibration?.requestAbort("user_control");
       // Verified send: the firmware (Najat especially) sometimes accepts a
@@ -1243,8 +1284,14 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
           await acManualOffLocks?.record(id, "ui");
           await acLeveling?.onUserPowerOff(id);
         } else if (value === 1) {
-          await acManualOffLocks?.clear(id);
+          // Releasing a manual-off lock is the one command that undoes the
+          // user's sacred off — notify so an ON nobody at home made surfaces
+          // within seconds instead of being found in rotated logs. The release
+          // is reported by clear() itself, so two concurrent turn-ons can't both
+          // claim it and double-push.
+          const released = await acManualOffLocks?.clear(id);
           await acLeveling?.onUserPowerOn(id);
+          if (released) acManualOffLocks?.notifyLockCleared?.(id, req.authKind ?? "user", clientIp(req));
         }
       } else if (command === "set_generator_mode" && typeof value === "number") {
         const result = await acLeveling?.onUserGenLevel(id, value);

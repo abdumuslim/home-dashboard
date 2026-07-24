@@ -2,9 +2,13 @@ import { createHmac, timingSafeEqual } from "crypto";
 import type { Request, Response, NextFunction } from "express";
 import type { Config } from "./config.js";
 
+/** Who is behind an authenticated request: a human dashboard session or the Hermes agent. */
+export type AuthKind = "user" | "agent";
+
 declare module "express" {
   interface Request {
     authenticated?: boolean;
+    authKind?: AuthKind;
   }
 }
 
@@ -68,12 +72,30 @@ export function isHermesBearerRequest(req: Request, config: Config): boolean {
   return !!token && safeCompare(token, config.hermesApiToken);
 }
 
+/**
+ * Caller IP through the Cloudflare → Traefik chain. Express `req.ip` only ever
+ * sees Traefik, so `cf-connecting-ip` — which Cloudflare overwrites on every
+ * request, making it unspoofable for traffic that actually transits CF — is the
+ * trusted source. `x-forwarded-for` is deliberately NOT used: its leftmost entry
+ * is whatever the client claimed, and this value is an audit record. Falling
+ * back to the socket peer means a request that bypassed Cloudflare records as
+ * the proxy address rather than as an attacker-chosen one, which is itself the
+ * signal worth having.
+ */
+export function clientIp(req: Request): string {
+  const cf = req.headers["cf-connecting-ip"];
+  if (typeof cf === "string" && cf.trim()) return cf.trim();
+  return req.socket.remoteAddress || req.ip || "unknown";
+}
+
 export function createAuthMiddleware(config: Config) {
   return (req: Request, _res: Response, next: NextFunction) => {
     req.authenticated = false;
+    req.authKind = undefined;
     if (!config.authSecret) {
       if (isHermesBearerRequest(req, config)) {
         req.authenticated = true;
+        req.authKind = "agent";
       }
       next();
       return;
@@ -84,10 +106,14 @@ export function createAuthMiddleware(config: Config) {
       const payload = verifyToken(token, config.authSecret);
       if (payload && payload.user === config.adminUser) {
         req.authenticated = true;
+        // Sessions minted by /api/agent/session carry the agent claim; a human
+        // dashboard login does not.
+        req.authKind = payload.agent === true ? "agent" : "user";
       }
     }
     if (!req.authenticated && isHermesBearerRequest(req, config)) {
       req.authenticated = true;
+      req.authKind = "agent";
     }
     next();
   };
@@ -127,7 +153,9 @@ setInterval(() => {
 
 export function handleLogin(config: Config) {
   return (req: Request, res: Response) => {
-    const ip = req.ip || req.socket.remoteAddress || "unknown";
+    // Behind Cloudflare → Traefik every request shares one socket peer, which
+    // bucketed all login attempts into a single global 5/15min limit.
+    const ip = clientIp(req);
     if (!checkRateLimit(ip)) {
       res.status(429).json({ error: "Too many login attempts. Try again later." });
       return;
@@ -172,8 +200,10 @@ export function handleAgentSession(config: Config) {
       return;
     }
 
+    // `agent: true` is what makes an agent-issued session distinguishable from a
+    // human dashboard login for the rest of the app (audit trail, push bodies).
     const token = signToken(
-      { user: config.adminUser, exp: Date.now() + 30 * 24 * 60 * 60 * 1000 },
+      { user: config.adminUser, agent: true, exp: Date.now() + 30 * 24 * 60 * 60 * 1000 },
       config.authSecret,
     );
 

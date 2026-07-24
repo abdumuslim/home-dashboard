@@ -229,6 +229,21 @@ const MIGRATIONS: string[] = [
     observed_delta REAL
   )`,
   "CREATE INDEX IF NOT EXISTS ac_leveling_journal_at_brin ON ac_leveling_journal USING BRIN (at)",
+  // Who commanded each AC control — the 2026-07-24 "Najat keeps turning back on"
+  // incident was authenticated set_power=1 calls the server could not attribute
+  // (agent and human sessions were indistinguishable, and docker logs rotate in
+  // ~1.5 days). Kept 30 days.
+  `CREATE TABLE IF NOT EXISTS ac_control_audit (
+    id         BIGSERIAL PRIMARY KEY,
+    at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_id  TEXT NOT NULL,
+    command    TEXT NOT NULL,
+    value      TEXT,
+    auth_kind  TEXT NOT NULL,
+    ip         TEXT,
+    user_agent TEXT
+  )`,
+  "CREATE INDEX IF NOT EXISTS ac_control_audit_at_brin ON ac_control_audit USING BRIN (at)",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

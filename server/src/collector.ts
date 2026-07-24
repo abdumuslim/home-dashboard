@@ -14,6 +14,7 @@ import { AcCalibrator } from "./ac-calibration.js";
 import { computeNeedTier, type NeedTier } from "./ac-leveling.js";
 import { computeAutoFanLevel } from "./ac-auto-fan.js";
 import { childLogger } from "./logger.js";
+import type { AuthKind } from "./auth.js";
 import {
   findActiveRangeSlot,
   getBaghdadMinutes,
@@ -322,7 +323,10 @@ export class Collector {
     if (!wasLocked) log.info(`[collector] AC ${deviceId}: manual-off lock recorded (${reason})`);
   }
 
-  async clearAcManualOff(deviceId: string): Promise<void> {
+  /** Returns whether THIS call is the one that released a lock — `Set.delete`
+   * is atomic, so concurrent turn-ons can't both claim the release (which would
+   * double-notify). */
+  async clearAcManualOff(deviceId: string): Promise<boolean> {
     await this.ensureAcManualOffLocksLoaded();
     const wasLocked = this.acManualOffLocks.delete(deviceId);
     this.acManualOffLockTimes.delete(deviceId);
@@ -332,11 +336,31 @@ export class Collector {
     }
     this.devicePowerCache.set(deviceId, { power: "on", ts: Date.now() });
     if (wasLocked) log.info(`[collector] AC ${deviceId}: manual-off lock cleared`);
+    return wasLocked;
   }
 
   async isAcManualOffLocked(deviceId: string): Promise<boolean> {
     await this.ensureAcManualOffLocksLoaded();
     return this.acManualOffLocks.has(deviceId);
+  }
+
+  /**
+   * A commanded power-ON released a manual-off lock. That is the ONLY path that
+   * undoes a user's sacred off, so it is announced: on 2026-07-24 four
+   * authenticated set_power=1 calls re-armed Najat's automation overnight and
+   * nobody at home had pressed anything (see docs/agent/ac-automations.md).
+   * Critical, so it beats the leveling push throttle — the opt-in toggle still
+   * gates it.
+   */
+  notifyAcLockCleared(deviceId: string, authKind: AuthKind, ip: string): void {
+    const name = this.tclCloud?.getDevices().find((d) => d.id === deviceId)?.name ?? deviceId;
+    const source = authKind === "agent" ? "the Hermes agent" : "the dashboard";
+    log.info(`[collector] AC ${deviceId}: manual-off lock released by a power-ON from ${source} (ip=${ip})`);
+    void this.broadcastPush({
+      title: "AC manual-off released",
+      body: `${name} was turned ON from ${source} (${ip}) — the manual-off lock is cleared and automations resume.`,
+      type: "leveling",
+    });
   }
 
   async getAcManualOffLockedIds(deviceIds?: string[]): Promise<Set<string>> {
