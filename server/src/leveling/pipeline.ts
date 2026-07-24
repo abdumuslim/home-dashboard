@@ -15,7 +15,7 @@ import type { CostBook } from "./costs.js";
 import { assessPressure } from "./pressure.js";
 import { planReduction } from "./reduce.js";
 import { invariantCorrections, planRaise } from "./raise.js";
-import { planFanRestore, recordFanCut, type FanHolds } from "./fan-trim.js";
+import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
 import { ceilOf, floorOf } from "./needs.js";
 import { canAttempt, type PacingState } from "./pacing.js";
 
@@ -223,6 +223,14 @@ export function plan(input: PlanInput): PlanOutput {
       pacing,
     });
     if (raisePlan.commands.length > 0 || corrections.commands.length > 0) {
+      // A gentle restore (power_on carrying a pinned fan) records a fan hold so
+      // the range automation can't slam the fan back up before the room settles.
+      let fanHolds = input.fanHolds;
+      for (const cmd of raisePlan.commands) {
+        if (cmd.kind === "power_on" && cmd.fan != null) {
+          fanHolds = recordGentleRestoreHold(fanHolds, cmd.deviceId, now);
+        }
+      }
       return {
         commands: [...corrections.commands, ...raisePlan.commands],
         expectedDeltaAmps: 0, // graded per-command by the journal, not batch-summed here
@@ -231,7 +239,7 @@ export function plan(input: PlanInput): PlanOutput {
         reason: raisePlan.isTurnOn ? "restore" : "raise",
         severity: null,
         requiredAmps: null,
-        fanHolds: input.fanHolds,
+        fanHolds,
         attempts: raisePlan.attempts,
         fanOnly: false,
       };

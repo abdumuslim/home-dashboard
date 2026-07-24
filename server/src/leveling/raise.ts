@@ -201,9 +201,18 @@ export function planRaise(input: RaiseInput): RaisePlan {
     }
 
     // Calm-clear and feasible → ship it now. Plain if it fits alone; otherwise
-    // pull every raised peer down to its floor in the same batch.
+    // pull every raised peer down to its floor in the same batch. On gen the
+    // room comes back GENTLE — fan pinned to 1 — so the range automation's
+    // hot-room fan-slam (3–7, un-modeled) can't re-push the meter over; grid is
+    // roomy enough to restore plain. `turnOnAmps` is left fan-slam-sized (its
+    // on@L1 EWMA was learned WITH slams): over-estimating a gentle restore errs
+    // trip-safe, and graded gentle restores drift the estimate down over time.
+    const restoreCmd = (): Command =>
+      source === "gen"
+        ? { deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore", fan: 1 }
+        : { deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" };
     if (fitsPlain) {
-      commands.push({ deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" });
+      commands.push(restoreCmd());
       attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
       decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}` });
       return { commands, decisions, attempts, isTurnOn: true, reservedAmps };
@@ -212,7 +221,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       const f = floorOf(a);
       if (a.currentLevel > f) commands.push({ deviceId: a.deviceId, kind: "set_level", level: f });
     }
-    commands.push({ deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" });
+    commands.push(restoreCmd());
     attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
     decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor} with peer floor-downs` });
     return { commands, decisions, attempts, isTurnOn: true, reservedAmps };

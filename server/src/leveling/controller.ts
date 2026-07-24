@@ -669,13 +669,29 @@ export class LevelingControllerV2 {
             break;
           }
           case "power_on": {
-            await tcl.executeAcAction(cmd.deviceId, { power: 1, generator_mode: cmd.level });
+            await tcl.executeAcAction(cmd.deviceId, {
+              power: 1,
+              generator_mode: cmd.level,
+              ...(cmd.fan != null ? { fan_speed: cmd.fan } : {}),
+            });
             await this.clearShed(cmd.deviceId, "restored");
             this.deps.setDevicePowerCache(cmd.deviceId, "on");
             this.recon = noteLevelSend(this.recon, cmd.deviceId, cmd.level, now).state;
+            if (cmd.fan != null) {
+              // Gentle restore: the room came back with its fan pinned. A hold is
+              // already in this.fanHolds (tick() assigned out.fanHolds before this
+              // call). Register the fan send with the reconciler + collector so the
+              // range automation treats it as ours, not a user change, and persist.
+              this.recon = noteFanSend(this.recon, cmd.deviceId, cmd.fan, now);
+              this.deps.onLevelerFanCommand(cmd.deviceId, cmd.fan);
+              await this.persistFanHold(cmd.deviceId);
+            }
             this.rearmRamp([cmd.deviceId]);
-            await this.pushNotice(`AC ${name} restored at gen level ${cmd.level}`, false);
-            log.info(`[leveler2] Restored shed AC ${name} @L${cmd.level}`);
+            await this.pushNotice(
+              `AC ${name} restored at gen level ${cmd.level}${cmd.fan != null ? ` (fan ${cmd.fan})` : ""}`,
+              false,
+            );
+            log.info(`[leveler2] Restored shed AC ${name} @L${cmd.level}${cmd.fan != null ? ` fan ${cmd.fan}` : ""}`);
             fanOnly = false;
             break;
           }
@@ -684,6 +700,11 @@ export class LevelingControllerV2 {
             this.recon = noteFanSend(this.recon, cmd.deviceId, cmd.fan, now);
             this.deps.onLevelerFanCommand(cmd.deviceId, cmd.fan);
             await this.persistFanHold(cmd.deviceId);
+            // Accepted: the hold releases on SEND of the original-fan restore,
+            // not on shadow confirm. The reconciler keeps re-sending an
+            // unconfirmed fan while the hold lives, so an ignored final send is
+            // recovered by at most one resend cycle; a confirm-gated release is
+            // a deferred post-cutover cleanup (not worth the extra state here).
             if (cmd.reason === "trim_restore" && this.fanHolds[cmd.deviceId]?.originalFan === cmd.fan) {
               await this.releaseHold(cmd.deviceId, "restored");
             }

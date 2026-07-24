@@ -63,10 +63,20 @@ function raise(acs: AcView[], overrides: Partial<RaiseInput> = {}) {
 }
 
 describe("restore outranks raises", () => {
-  it("a feasible shed restore ships alone at its floor", () => {
+  it("a feasible shed restore ships alone at its floor (gentle — fan pinned on gen)", () => {
     const p = raise([ac("a", { needDelta: 3 }), ac("b", { on: false, shed: true, needDelta: 4 })]);
-    expect(p.commands).toEqual([{ deviceId: "b", kind: "power_on", level: 1, reason: "restore" }]);
+    expect(p.commands).toEqual([{ deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 }]);
     expect(p.isTurnOn).toBe(true);
+  });
+
+  it("gen restores ship gentle (fan 1); grid restores are plain", () => {
+    const shed = ac("b", { on: false, shed: true, needDelta: 4 });
+    const gen = raise([ac("a"), shed]);
+    expect(gen.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 });
+    const gridCfg = { ...cfg, gridLimitAmps: 27 };
+    const grid = raise([ac("a"), shed], { source: "grid", config: gridCfg, smoothedAmps: 10, headroomAmps: 10 });
+    expect(grid.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore" });
+    expect(grid.commands.find((c) => c.kind === "power_on" && "fan" in c && c.fan != null)).toBeUndefined();
   });
 
   it("restores are exempt from the resting buffer (fit under limit − margin)", () => {
@@ -76,7 +86,7 @@ describe("restore outranks raises", () => {
     const blocked = raise([ac("a"), shed], { smoothedAmps: 13.2, headroomAmps: 1.5 });
     expect(blocked.commands.every((c) => c.kind !== "power_on")).toBe(true);
     const fits = raise([ac("a"), shed], { smoothedAmps: 12.8, headroomAmps: 1.9 });
-    expect(fits.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore" });
+    expect(fits.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 });
   });
 
   it("a backoff-blocked candidate does not strand the next one (v1 49m strand)", () => {
@@ -85,7 +95,7 @@ describe("restore outranks raises", () => {
       [ac("a"), ac("b", { on: false, shed: true, needDelta: 4 }), ac("c", { on: false, shed: true, needDelta: 2 })],
       { pacing },
     );
-    expect(p.commands).toContainEqual({ deviceId: "c", kind: "power_on", level: 1, reason: "restore" });
+    expect(p.commands).toContainEqual({ deviceId: "c", kind: "power_on", level: 1, reason: "restore", fan: 1 });
   });
 
   it("a calm-gated feasible restore reserves its amps and parks the raise phase", () => {
@@ -149,7 +159,7 @@ describe("restore outranks raises", () => {
     });
     expect(p.commands).toEqual([
       { deviceId: "a", kind: "set_level", level: 1 },
-      { deviceId: "b", kind: "power_on", level: 1, reason: "restore" },
+      { deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 },
     ]);
   });
 });
@@ -323,7 +333,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
     expect(p.commands).toEqual([
       { deviceId: "abdu", kind: "set_level", level: 1 },
       { deviceId: "najat", kind: "set_level", level: 1 },
-      { deviceId: "c", kind: "power_on", level: 1, reason: "restore" },
+      { deviceId: "c", kind: "power_on", level: 1, reason: "restore", fan: 1 },
     ]);
   });
 

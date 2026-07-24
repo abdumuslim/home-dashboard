@@ -39,6 +39,22 @@ export function recordFanCut(holds: FanHolds, ac: AcView, target: number, now: n
   };
 }
 
+/**
+ * Record a fan hold for a GENTLE restore. A shed room comes back with its fan
+ * pinned to 1 (the `fan` field on the power_on command) instead of letting the
+ * range automation slam it to a hot-room smart-auto 3–7. That fan-slam is the
+ * bulk of a restore's un-modeled surge (fans aren't in the amp model), so
+ * pinning it lets a shed room fit next to a running AC on the tight gen budget.
+ * The original is 0 (auto): hand the fan back to the automation once a long
+ * sustained calm lets `planFanRestore` climb it back in one jump.
+ */
+export function recordGentleRestoreHold(holds: FanHolds, deviceId: string, now: number): FanHolds {
+  return {
+    ...holds,
+    [deviceId]: { deviceId, originalFan: 0, lastSetFan: 1, heldAt: now },
+  };
+}
+
 export function releaseFanHold(holds: FanHolds, deviceId: string): FanHolds {
   if (holds[deviceId] == null) return holds;
   const next = { ...holds } as Record<string, FanHold>;

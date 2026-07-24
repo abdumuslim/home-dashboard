@@ -96,7 +96,7 @@ export interface MeterView {
 export type Command =
   | { deviceId: string; kind: "set_level"; level: number }
   | { deviceId: string; kind: "power_off"; reason: "shed" }
-  | { deviceId: string; kind: "power_on"; level: number; reason: "restore" }
+  | { deviceId: string; kind: "power_on"; level: number; reason: "restore"; fan?: number }
   | { deviceId: string; kind: "set_fan"; fan: number; reason: "trim" | "trim_restore" };
 
 /**
@@ -176,7 +176,12 @@ export interface AcView {
   manualTarget: number | null;
   slotCap: number | null;
   reachableCap: number | null;
-  /** Remembered stable level for a warm restore, else null. */
+  /**
+   * Remembered stable level, consumed by the RAISE phase to jump an already-ON
+   * AC back to its proven level. A shed restore deliberately ignores it: a shed
+   * is an over-limit event, so the room comes back gently at its floor (fan
+   * pinned) and re-climbs from there.
+   */
   warmStartLevel: number | null;
   /** Compressor still inside its ~4-min post-start ramp window. */
   ramping: boolean;

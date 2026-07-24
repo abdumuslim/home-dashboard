@@ -293,6 +293,9 @@ export class Scenario {
           ac.shadowLevel = cmd.level;
           ac.shadowLevelAt = 0;
           ac.turnedOnAt = this.now;
+          // Gentle restore pins the fan; the hold itself rides in out.fanHolds
+          // (recorded by the pipeline, assigned in step()).
+          if (cmd.fan != null) ac.fan = cmd.fan;
           break;
         case "set_fan":
           ac.fan = cmd.fan;
