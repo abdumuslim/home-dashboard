@@ -181,7 +181,15 @@ describe("AC control attribution (2026-07-24 'Najat keeps turning back on')", ()
     servers.push(server);
 
     const cookie = loginCookie();
-    const resp = await control(url, { Cookie: cookie, "cf-connecting-ip": "5.6.7.8", "user-agent": "iPhone" }, "set_power", 1);
+    // Production shape: Cloudflare sets cf-connecting-ip, and Traefik appends its
+    // immediate peer (a Cloudflare edge IP) as the rightmost X-Forwarded-For hop —
+    // which is what proves the request transited CF, so cf-connecting-ip is trusted.
+    const resp = await control(
+      url,
+      { Cookie: cookie, "cf-connecting-ip": "5.6.7.8", "x-forwarded-for": "5.6.7.8, 162.158.1.1", "user-agent": "iPhone" },
+      "set_power",
+      1,
+    );
 
     expect(resp.status).toBe(200);
     const audits = pool.audits();
@@ -228,7 +236,14 @@ describe("AC control attribution (2026-07-24 'Najat keeps turning back on')", ()
     servers.push(server);
 
     const cookie = agentCookie();
-    const resp = await control(url, { Cookie: cookie, "cf-connecting-ip": "9.9.9.9" }, "set_power", 1);
+    // cf-connecting-ip trusted because the request transited CF (Traefik appended
+    // a Cloudflare edge IP as the rightmost X-Forwarded-For hop).
+    const resp = await control(
+      url,
+      { Cookie: cookie, "cf-connecting-ip": "9.9.9.9", "x-forwarded-for": "9.9.9.9, 162.158.1.1" },
+      "set_power",
+      1,
+    );
 
     expect(resp.status).toBe(200);
     expect(locks.cleared).toEqual(["DHihohFAAAE"]);
@@ -318,14 +333,23 @@ describe("AC control attribution (2026-07-24 'Najat keeps turning back on')", ()
     expect(prunes[0].params).toEqual(["30"]);
   });
 
-  it("records the socket peer rather than a client-supplied X-Forwarded-For", async () => {
+  it("ignores a client-supplied X-Forwarded-For and a non-Cloudflare cf-connecting-ip", async () => {
     const pool = createRecordingPool();
     const tcl = createTclMock();
     const { server, url } = await startServer({ pool, tcl: tcl.cloud });
     servers.push(server);
 
-    await control(url, { Cookie: loginCookie(), "x-forwarded-for": "1.2.3.4" }, "set_power", 1);
+    // No Cloudflare hop → both the client-supplied XFF and a forged cf-connecting-ip
+    // are untrusted; the audit records the real socket peer, not the attacker's value.
+    await control(
+      url,
+      { Cookie: loginCookie(), "x-forwarded-for": "1.2.3.4", "cf-connecting-ip": "9.9.9.9" },
+      "set_power",
+      1,
+    );
 
-    expect((pool.audits()[0].params as string[])[4]).not.toBe("1.2.3.4");
+    const ip = (pool.audits()[0].params as string[])[4];
+    expect(ip).not.toBe("1.2.3.4");
+    expect(ip).not.toBe("9.9.9.9");
   });
 });
