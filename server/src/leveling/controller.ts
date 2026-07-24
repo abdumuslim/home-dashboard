@@ -10,7 +10,7 @@
 import pg from "pg";
 import { childLogger } from "../logger.js";
 import type { LevelerDeviceContext, LevelingDeps, LevelingStatusV2 } from "./api.js";
-import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, limitFor, type LevelingConfigV2 } from "./config.js";
+import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, limitFor, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
 import { ingestReading, initialMeterState, meterView, refillBucket, resetCalm } from "./sensing.js";
 import {
   applyMeterEvent,
@@ -104,6 +104,8 @@ export class LevelingControllerV2 {
   private lastStatus: LevelingStatusV2 | null = null;
   private lastPruneAt = 0;
   private lastConfigReloadAt = 0;
+  /** Controller flavor at the last reload — detects a live flip to acting v2. */
+  private prevFlavor: ControllerFlavor | null = null;
 
   constructor(
     private pool: pg.Pool,
@@ -117,15 +119,31 @@ export class LevelingControllerV2 {
   async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
     await this.reloadConfig();
+    await this.loadPersistedState();
+    await this.store.seedCostsIfEmpty(Date.now());
+    this.book = await this.store.loadCosts();
+    this.loaded = true;
+  }
+
+  /**
+   * (Re)load the write-through persisted state — shed set, fan holds, remembered
+   * levels — from the DB, CLEARING the in-memory copies first. Called at boot,
+   * and again when this instance becomes the acting controller (v1 may have
+   * written these rows while it was acting and we only snapshot them once).
+   */
+  private async loadPersistedState(): Promise<{ sheds: number; holds: number; remembered: number }> {
     const shedRes = await this.pool.query("SELECT device_id, shed_at FROM ac_leveling_shed");
+    this.shedIds = new Set<string>();
+    this.shedTimes = new Map<string, number>();
     for (const row of shedRes?.rows ?? []) {
       this.shedIds.add(row.device_id);
       this.shedTimes.set(row.device_id, new Date(row.shed_at).getTime());
     }
     const holdRes = await this.pool.query("SELECT device_id, original_fan, last_set_fan, held_at FROM ac_leveling_fan_hold");
+    let holds: FanHolds = {};
     for (const row of holdRes?.rows ?? []) {
-      this.fanHolds = {
-        ...this.fanHolds,
+      holds = {
+        ...holds,
         [row.device_id]: {
           deviceId: row.device_id,
           originalFan: Number(row.original_fan),
@@ -134,11 +152,11 @@ export class LevelingControllerV2 {
         },
       };
     }
+    this.fanHolds = holds;
+    this.rememberedLevel = new Map<string, number>();
     const remRes = await this.pool.query("SELECT device_id, level FROM ac_leveling_remembered_level");
     for (const row of remRes?.rows ?? []) this.rememberedLevel.set(row.device_id, Number(row.level));
-    await this.store.seedCostsIfEmpty(Date.now());
-    this.book = await this.store.loadCosts();
-    this.loaded = true;
+    return { sheds: this.shedIds.size, holds: Object.keys(this.fanHolds).length, remembered: this.rememberedLevel.size };
   }
 
   /**
@@ -157,6 +175,21 @@ export class LevelingControllerV2 {
     this.rawConfig = { ...row1, ...row2 };
     this.config = mergeLevelingConfigV2(this.rawConfig);
     this.lastConfigReloadAt = Date.now();
+
+    // Became the ACTING controller (v1/shadow → v2) without a restart: our
+    // persisted book (sheds, fan holds, remembered levels) may be stale — v1
+    // wrote those rows while it was acting and we only snapshot them at boot.
+    // Re-sync from the DB and reload learned costs so v2 acts on reality, not a
+    // startup snapshot. Flip via the API (this reload path): a direct-SQL flip
+    // isn't noticed until a restart, because in "v1"/"shadow" v2 never ticks.
+    if (this.loaded && this.prevFlavor != null && this.prevFlavor !== "v2" && this.config.controller === "v2") {
+      const counts = await this.loadPersistedState();
+      this.book = await this.store.loadCosts();
+      log.info(
+        `[leveler2] Became acting controller — resynced ${counts.sheds} shed(s), ${counts.holds} fan hold(s), ${counts.remembered} remembered level(s)`,
+      );
+    }
+    this.prevFlavor = this.config.controller;
   }
 
   async getConfig(): Promise<Record<string, unknown>> {
@@ -752,6 +785,9 @@ export class LevelingControllerV2 {
     for (const attempt of out.attempts) this.pacing = noteAttempt(this.pacing, attempt.deviceId, attempt.kind, now);
 
     // Arm outcome grading; single-actuator batches feed the cost model.
+    // Single-actuator meter batches feed the cost model. Fan-only batches are
+    // not graded online (fan:step learning isn't implemented — the 0.2A grading
+    // threshold would swallow a ~0.1A fan step — so fan costs stay seed-only).
     const meterCmds = commands.filter((c) => c.kind !== "set_fan");
     let single: PendingGrade["single"] = null;
     if (meterCmds.length === 1 && view.source !== "none") {
@@ -764,8 +800,6 @@ export class LevelingControllerV2 {
       } else if (cmd.kind === "power_on") {
         single = { deviceId: cmd.deviceId, transition: `on@L${cmd.level}` };
       }
-    } else if (meterCmds.length === 0 && commands.length === 1 && commands[0].kind === "set_fan") {
-      single = null; // fan grading handled via fan:step when a single-step restore lands
     }
     this.pendingGrade = {
       journalId,
