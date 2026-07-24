@@ -2345,8 +2345,9 @@ describe("Smart AC leveling — bounce detection", () => {
     expect(actions).toEqual([{ deviceId: "ac2", action: { power: 1, generator_mode: 1 } }]);
 
     // Past the 240s compressor ramp the real draw breaches the limit → re-shed
-    // within the restore's bounce window = restore bounce (observed cost 16−8=8,
-    // clamped to floor 4 + 3 = 7A → retry below 15−1−7 = 7A).
+    // within the restore's bounce window = restore bounce. A restore reserves the
+    // floor draw + the fan/ramp surge allowance (4A): observed 16−8=8 ≥ floor
+    // 4+4=8 → requiredAmps 8A → retry below 15−1−8 = 6A.
     const on = [devices[0], { ...devices[1], power: true }];
     tclCloud.getDevices.mockReturnValue(on);
     tclCloud.fetchDevicesLive.mockResolvedValue(on as never);
@@ -2356,7 +2357,7 @@ describe("Smart AC leveling — bounce detection", () => {
     expect(actions).toHaveLength(2);
     expect(actions[1]).toEqual({ deviceId: "ac2", action: { power: 0 } });
     expect(shed.has("ac2")).toBe(true);
-    expect(acStatus(collector, "ac2")).toMatchObject({ restoreBlocked: true, bounceRetryBelowAmps: 7 });
+    expect(acStatus(collector, "ac2")).toMatchObject({ restoreBlocked: true, bounceRetryBelowAmps: 6 });
 
     // The same headroom that triggered the first restore returns — blocked now
     tclCloud.getDevices.mockReturnValue(devices);
@@ -2366,12 +2367,66 @@ describe("Smart AC leveling — bounce detection", () => {
     await checkAcLeveling(collector);
     expect(actions).toHaveLength(2);
 
-    // Load drops below the observed-cost threshold (6+7 ≤ 14) → restore retried
+    // Load drops below the observed-cost threshold (6+8 ≤ 14) → restore retried
     genReadings(collector, 6, 6);
     await checkAcLeveling(collector);
     expect(acStatus(collector, "ac2")?.restoreBlocked).toBe(false);
     expect(actions).toHaveLength(3);
     expect(actions[2]).toEqual({ deviceId: "ac2", action: { power: 1, generator_mode: 1 } });
+  });
+
+  it("keeps a restore-bounced AC shed on a load the raw incremental cost would re-admit (fan/ramp surge allowance)", async () => {
+    // The live Najat gen bounce (2026-07-24): restored from an already-loaded
+    // baseline, the raw incremental "observed cost" reads tiny (the surge spikes
+    // then the smoothed median subsides), so the pre-fix retry re-admitted her on
+    // the momentary post-shed dip and she power-cycled (flap opening/closing "on
+    // its own"). A restore now reserves floor + the fan/ramp surge allowance.
+    const { collector, tclCloud, actions, shed, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    shed.add("ac2");
+    await collector.acLeveler.ensureLoaded();
+    // Only ac2 is in play (ac1 off) so a single floor fits at a high baseline.
+    const devices = [
+      { id: "ac1", name: "Najat", power: false, generatorMode: 1, maxGeneratorLevel: 6, currentTemp: 23, mode: 1 },
+      { id: "ac2", name: "Abdu", power: false, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 23, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Restore ac2 at an already-loaded 9.5A baseline (nonAcLoad 9.5, budget 4.5 → floor 4 fits).
+    genReadings(collector, 9.5, 6);
+    await checkAcLeveling(collector);
+    expect(actions).toEqual([{ deviceId: "ac2", action: { power: 1, generator_mode: 1 } }]);
+
+    // Past the ramp it breaches by a hair → re-shed. The raw incremental cost is
+    // small (peak 16 − pre 9.5 = 6.5A), but a RESTORE reserves floor 4 + the
+    // fan/ramp surge allowance 4 = 8A → retry waits for load below 15−1−8 = 6A,
+    // NOT the 15−1−6.5 = 7.5A the raw increment alone would have set.
+    const on = [devices[0], { ...devices[1], power: true }];
+    tclCloud.getDevices.mockReturnValue(on);
+    tclCloud.fetchDevicesLive.mockResolvedValue(on as never);
+    vi.advanceTimersByTime(241_000);
+    genReadings(collector, 16, 5);
+    await checkAcLeveling(collector);
+    expect(actions[actions.length - 1]).toEqual({ deviceId: "ac2", action: { power: 0 } });
+    expect(acStatus(collector, "ac2")).toMatchObject({ restoreBlocked: true, bounceRetryBelowAmps: 6 });
+    const shedActionCount = actions.length;
+
+    // A SUSTAINED 7A — under the old 7.5A threshold — must NOT re-admit her
+    // (7 + 8 > 14). The pre-fix sizing (requiredAmps 6.5) would have restored here.
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+    vi.advanceTimersByTime(31_000);
+    genReadings(collector, 7, 6);
+    await checkAcLeveling(collector);
+    expect(actions).toHaveLength(shedActionCount);
+    expect(acStatus(collector, "ac2")?.restoreBlocked).toBe(true);
+
+    // Only when the load really drops (6A: 6 + 8 ≤ 14) does she come back.
+    genReadings(collector, 6, 6);
+    await checkAcLeveling(collector);
+    expect(acStatus(collector, "ac2")?.restoreBlocked).toBe(false);
+    expect(actions[actions.length - 1]).toEqual({ deviceId: "ac2", action: { power: 1, generator_mode: 1 } });
   });
 });
 

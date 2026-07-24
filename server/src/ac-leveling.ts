@@ -439,6 +439,27 @@ export const RAISE_HOLD_CHECK_AFTER_MS = 20_000;
  */
 export const BOUNCE_MAX_EXTRA_AMPS = 3;
 /**
+ * A RESTORE bounce (an OFF→ON room re-shed inside its bounce window) is sized
+ * more generously than a level bounce, for two physical reasons the level path
+ * doesn't face:
+ *   1. A restore surge is the whole compressor ramp from a dead stop PLUS the
+ *      range automation's smart-auto fan spin-up (a hot room jumps the fan to
+ *      3–7 the instant it comes back) — fans are NOT in the amp model, so the
+ *      real added draw sits well above the model floor.
+ *   2. `smoothedMeasured()` at re-shed time medians away the very surge peak
+ *      that tripped the shed, and the pre-restore baseline already carries the
+ *      other rooms — so the raw incremental "observed cost" reads far too small.
+ * The retry then re-admits the room before the load has really dropped and it
+ * power-cycles (Najat on the 15A gen, 2026-07-24 — flap opening/closing "on its
+ * own"). So a restore bounce takes its cost from the PEAK of recent readings and
+ * reserves at least the floor draw + this fan/ramp allowance (tuning knob: raise
+ * if a room still bounces once, lower if a room strands off too long — it also
+ * self-clears on sustained headroom, a source change, or the 60-min safety net).
+ */
+export const BOUNCE_RESTORE_SURGE_ALLOWANCE = 4;
+/** A restore surge can exceed a level step by a lot — cap wider than BOUNCE_MAX_EXTRA_AMPS. */
+export const BOUNCE_RESTORE_MAX_EXTRA_AMPS = 7;
+/**
  * A raise is only CAPPED as a bounce when the measured cost overshot the amp
  * model by more than this. An accurate model that still tipped over the limit
  * was raised into a thin budget (a transient nonAcLoad misread), not a wrong

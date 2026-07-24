@@ -14,6 +14,8 @@ import {
   ENFORCE_GEN_FLOORS_MAX_MS,
   EMERGENCY_PENDING_MS,
   BOUNCE_MAX_EXTRA_AMPS,
+  BOUNCE_RESTORE_SURGE_ALLOWANCE,
+  BOUNCE_RESTORE_MAX_EXTRA_AMPS,
   BOUNCE_MODEL_TOLERANCE_AMPS,
   BOUNCE_SAFETY_EXPIRY_MS,
   BOUNCE_WINDOW_MS,
@@ -1754,9 +1756,21 @@ export class AcLeveler {
       ? this.lastRaiseBatch
       : null;
     const peakMeasured = batch ? this.smoothedMeasured() : 0;
+    // A restore surge spikes and subsides fast, so the smoothed median above
+    // medians it away — take the true PEAK of recent readings for a restore.
+    const restorePeakMeasured = batch && this.recentMeasured.length > 0
+      ? Math.max(...this.recentMeasured)
+      : peakMeasured;
     const recordBounce = (deviceId: string, kind: "level" | "restore", cap: number | null, anchorAmps: number): void => {
-      const observed = peakMeasured - batch!.preMeasured;
-      const requiredAmps = Math.min(Math.max(observed, anchorAmps), anchorAmps + BOUNCE_MAX_EXTRA_AMPS);
+      const isRestore = kind === "restore";
+      const observed = (isRestore ? restorePeakMeasured : peakMeasured) - batch!.preMeasured;
+      // A restore re-admits a fully-OFF room: reserve at least its floor draw plus
+      // the un-modeled fan/ramp surge (BOUNCE_RESTORE_SURGE_ALLOWANCE), and allow a
+      // wider cap, so the retry only fires once the load has REALLY dropped enough
+      // to fit the room when it comes back — not on the momentary post-shed dip.
+      const floorAmps = isRestore ? anchorAmps + BOUNCE_RESTORE_SURGE_ALLOWANCE : anchorAmps;
+      const extraCap = isRestore ? BOUNCE_RESTORE_MAX_EXTRA_AMPS : BOUNCE_MAX_EXTRA_AMPS;
+      const requiredAmps = Math.min(Math.max(observed, floorAmps), anchorAmps + extraCap);
       // Learn the real raise cost for a single-AC level bounce (the meter delta
       // IS this AC's surge — a multi-AC batch's delta sums several raises and
       // can't be attributed). Light EWMA so one noisy reading can't dominate;
