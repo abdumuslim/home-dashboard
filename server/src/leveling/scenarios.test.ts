@@ -359,6 +359,76 @@ describe("grid entry starts FULL, then drops on evidence (2026-07-23 directive)"
   });
 });
 
+describe("the 2026-07-24 restore-vs-raise incident (15A gen)", () => {
+  // Live: the leveler shed Najat, she restore-bounced (backoff armed), the user
+  // then turned a PEER off to free budget — and 11s later the leveler raised a
+  // running AC into that headroom instead of restoring the shed room. The fix:
+  // a feasible-but-gated shed restore reserves its amps and PARKS raises, a peer
+  // power-off resets calm so the meter settles first, and the room returns
+  // gently (fan pinned) so its surge fits.
+  it("freed headroom goes to the pending shed room, not a peer's raise", () => {
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, fan: 1, demandAmps: 7, needDelta: 3 }, // hot, wants to climb
+        { ...ABDULLAH, level: 1, fan: 1, demandAmps: 3.5, needDelta: 1 }, // the peer the user turns off
+        { ...NAJAT, shed: true, fan: 1, demandAmps: 4.5, needDelta: 0.8, surgeFactor: 2, rampSeconds: 60 },
+      ],
+      { nonAcAmps: 5.7, source: "gen" }, // peers + nonAc ≈ 12.0 with Najat off
+    );
+    const t0 = s.now;
+    // Najat restore-bounces once or twice → restore backoff arms. While that
+    // feasible restore is pending, the fix parks Abdu's raise.
+    s.advance(150);
+    expect(s.plans.some((p) => p.decisions.some((d) => d.blockedBy === "restore reservation"))).toBe(true);
+    expect(setLevels(s, t0).filter((c) => c.cmd.deviceId === "abdu" && c.cmd.level > 1)).toHaveLength(0);
+
+    // The user frees real headroom by turning the peer off.
+    s.turnOff("abdullah");
+    s.advance(20 * 60); // outlast the backoff ladder
+
+    const najatRestores = s
+      .commandsSince(t0, "power_on")
+      .filter((c) => c.cmd.deviceId === "najat");
+    expect(najatRestores.length).toBeGreaterThanOrEqual(1);
+    // Gentle: every Najat restore pinned the fan to 1.
+    expect(
+      najatRestores.every((c) => (c.cmd as Extract<Command, { kind: "power_on" }>).fan === 1),
+    ).toBe(true);
+    // Abdu never grabbed a raise before the shed room came back.
+    const lastRestoreAt = najatRestores[najatRestores.length - 1].at;
+    const abduRaisesBeforeRestore = setLevels(s, t0).filter(
+      (c) => c.cmd.deviceId === "abdu" && c.cmd.level > 1 && c.at <= lastRestoreAt,
+    );
+    expect(abduRaisesBeforeRestore).toHaveLength(0);
+    // Najat is back on and stable, and the meter never crossed the breaker.
+    expect(s.sim("najat").on).toBe(true);
+    expect(s.totalAmps()).toBeLessThanOrEqual(14.9);
+  });
+
+  it("a gentle restore holds the fan at 1, then climbs back to auto after the long calm", () => {
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, demandAmps: 4, needDelta: 0.3 },
+        { ...NAJAT, shed: true, demandAmps: 3, needDelta: 0.3, rampSeconds: 30 },
+      ],
+      { nonAcAmps: 3, source: "gen" }, // ample room — Najat restores and stays
+    );
+    const t0 = s.now;
+    s.advance(30); // calm builds → gentle restore
+    const restore = s.commandsSince(t0, "power_on").find((c) => c.cmd.deviceId === "najat");
+    expect(restore).toBeDefined();
+    expect((restore!.cmd as Extract<Command, { kind: "power_on" }>).fan).toBe(1);
+    // Fan stays pinned through the short term (< 5-min calm gate)…
+    s.advance(240);
+    expect(s.commandsSince(restore!.at, "set_fan")).toHaveLength(0);
+    // …and climbs back toward auto once the long calm passes.
+    s.advance(120);
+    expect(s.commandsSince(restore!.at, "set_fan").length).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe("proactive near-limit turn-on (instant reduce, no bucket wait)", () => {
   it("an automation turn-on that projects over the limit triggers a cut within one evaluation", () => {
     const s = new Scenario(

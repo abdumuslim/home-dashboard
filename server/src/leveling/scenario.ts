@@ -183,6 +183,18 @@ export class Scenario {
     this.pendingProjection = turnOnAmps(this.book, this.cfg, deviceId, source, level, 3, this.now).amps;
   }
 
+  /**
+   * User/automation turns an AC OFF (frees budget) — a plain off, NOT a leveler
+   * shed. Mirrors the shell: a managed off resets calm so the falling meter
+   * settles before any raise spends the freed headroom.
+   */
+  turnOff(deviceId: string): void {
+    const ac = this.sim(deviceId);
+    ac.on = false;
+    ac.shed = false;
+    this.meterState = resetCalm(this.meterState);
+  }
+
   /** Skip readings entirely (ESP offline / blackout) — devices keep their state. */
   blackout(seconds: number): void {
     this.now += seconds * 1000;
