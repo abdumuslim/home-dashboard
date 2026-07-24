@@ -16,6 +16,7 @@ import {
   applyMeterEvent,
   clearFloorsIfDone,
   clearFloorsOnManual,
+  clearGridFullIfDone,
   deriveMode,
   initialModeState,
   noteBatch,
@@ -50,7 +51,7 @@ import {
   sweepExpiredMarks,
   type ReconcilerState,
 } from "./reconciler.js";
-import { boostFloor, floorOf, nearTargetNeedCap } from "./needs.js";
+import { boostFloor, ceilOf, floorOf, nearTargetNeedCap } from "./needs.js";
 import { raiseJumpAmps, steadyDraw, modelFor, turnOnAmps, updateCost, type CostBook } from "./costs.js";
 import { LevelingStore } from "./store.js";
 import type { AcView, Command, MeterState, Mode, PowerSource } from "./types.js";
@@ -303,6 +304,26 @@ export class LevelingControllerV2 {
         case "esp_gap":
           this.deps.onPowerEvent?.(`ESP gap ${Math.round(event.gapMs / 1000)}s`);
           break;
+        case "meter_frozen":
+          // 2026-07-23: the ESP hung showing ~14.8A for 17.5 min. A frozen
+          // value is not evidence — sensing already blocks calm (no raises);
+          // tell the user loudly because automation is effectively suspended.
+          log.warn(
+            `[leveler2] Power meter FROZEN — no micro-change for ${Math.round(event.frozenForMs / 1000)}s ` +
+              `(stuck at ${event.amps.toFixed(2)}A). Raises suspended until the reading moves.`,
+          );
+          this.deps.onPowerEvent?.("meter frozen");
+          void this.pushNotice(
+            `Power meter frozen at ${event.amps.toFixed(1)}A — readings unchanged for ` +
+              `${Math.round(event.frozenForMs / 60_000)} min. AC raises suspended; check the ESP monitor.`,
+            true,
+          );
+          break;
+        case "meter_unfrozen":
+          log.info(
+            `[leveler2] Power meter recovered after ${Math.round(event.frozenForMs / 1000)}s frozen — readings live again`,
+          );
+          break;
         case "bucket_empty":
           this.deps.onUrgentLevelingNeeded?.();
           break;
@@ -495,6 +516,12 @@ export class LevelingControllerV2 {
     this.modeState = clearFloorsIfDone(this.modeState, {
       allConfirmedAtFloor: onManaged.every((a) => a.currentLevel > 0 && a.currentLevel <= floorOf(a)),
       anyRamping: onManaged.some((a) => a.ramping),
+    });
+    this.modeState = clearGridFullIfDone(this.modeState, {
+      allConfirmedAtCeil: onManaged.every(
+        (a) => a.currentLevel > 0 && a.currentLevel >= ceilOf(a, this.config.nearTargetBandC),
+      ),
+      anyShedPending: acs.some((a) => a.managed && a.shed && !a.on),
     });
     this.modeState = { ...this.modeState, collapsed: this.meterState.collapse != null };
     const mode = deriveMode(this.modeState, now);
@@ -826,6 +853,7 @@ export class LevelingControllerV2 {
       calmMs: view.calmMs,
       controller: this.config.controller,
       decisions: out.decisions.slice(-20),
+      meterFrozen: view.frozen,
     };
   }
 

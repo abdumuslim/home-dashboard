@@ -16,8 +16,8 @@ import { assessPressure } from "./pressure.js";
 import { planReduction } from "./reduce.js";
 import { invariantCorrections, planRaise } from "./raise.js";
 import { planFanRestore, recordFanCut, type FanHolds } from "./fan-trim.js";
-import { floorOf } from "./needs.js";
-import type { PacingState } from "./pacing.js";
+import { ceilOf, floorOf } from "./needs.js";
+import { canAttempt, type PacingState } from "./pacing.js";
 
 /** Outcome-grading delays: when the batch's meter effect is judged. */
 export const GRADE_LEVEL_MS = 45_000;
@@ -161,6 +161,40 @@ export function plan(input: PlanInput): PlanOutput {
       ]),
       commands,
       compareAfter: commands.length > 0 ? now + GRADE_LEVEL_MS : 0,
+    };
+  }
+
+  // ---- GRID_FULL (no over-pressure): grid entry — drive every ON managed AC
+  // to its ceiling in one batch and restore sheds at theirs ("on grid, start
+  // all to full, then drop when needed" — user 2026-07-23). The over-limit
+  // branch above still wins whenever the meter objects, and a bucket_empty
+  // ends the window entirely (modes.ts) so entry policy never fights the
+  // reducer. Deliberately NOT envelope-guarded: grid is the roomy source and
+  // full-start is an explicit user directive; the reducer is the safety.
+  if (mode === "GRID_FULL") {
+    const commands: Command[] = [];
+    const attempts: Array<{ deviceId: string; kind: "raise" | "restore" }> = [];
+    let isTurnOn = false;
+    for (const ac of acs) {
+      if (!ac.managed) continue;
+      const ceil = ceilOf(ac, config.nearTargetBandC);
+      if (ac.shed && !ac.on) {
+        // Restores ride the pacing backoff so a dead cloud can't be hammered.
+        if (!canAttempt(pacing, ac.deviceId, "restore", now)) continue;
+        commands.push({ deviceId: ac.deviceId, kind: "power_on", level: ceil, reason: "restore" });
+        attempts.push({ deviceId: ac.deviceId, kind: "restore" });
+        isTurnOn = true;
+      } else if (ac.on && !ac.shed && (ac.currentLevel === 0 || ac.currentLevel < ceil)) {
+        commands.push({ deviceId: ac.deviceId, kind: "set_level", level: ceil });
+      }
+    }
+    return {
+      ...emptyPlan(input, "grid_full", [
+        { at: now, action: "grid-entry full start", detail: "all managed ACs → ceiling; reduce on evidence" },
+      ]),
+      commands,
+      attempts,
+      compareAfter: commands.length > 0 ? now + (isTurnOn ? GRADE_TURN_ON_MS : GRADE_LEVEL_MS) : 0,
     };
   }
 

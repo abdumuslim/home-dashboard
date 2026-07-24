@@ -45,6 +45,14 @@ export const CALM_REFILL_MS = 30_000;
 const SMOOTH_WINDOW = 4;
 /** Bounded ring of recent measured readings (trend + collapse baseline). */
 const RECENT_RING = 8;
+/**
+ * Frozen-meter detection (2026-07-23 incident: ESP hung showing ~14.8A for
+ * 17.5 min): a live CT always micro-jitters between readings; when NEITHER
+ * channel moves by ≥ this across consecutive readings the payload is a repeat.
+ */
+export const FROZEN_EPSILON_AMPS = 0.005;
+/** Readings with no micro-change on either channel for this long = frozen sensor. */
+export const METER_FROZEN_AFTER_MS = 60_000;
 
 export function initialMeterState(): MeterState {
   return {
@@ -55,6 +63,9 @@ export function initialMeterState(): MeterState {
     overLimitReadings: [],
     calmSince: null,
     collapse: null,
+    lastRaw: null,
+    lastMicroChangeAt: 0,
+    frozen: false,
   };
 }
 
@@ -102,15 +113,41 @@ export function ingestReading(
 ): IngestResult {
   const events: MeterEvent[] = [];
 
-  if (prev.lastReadingAt > 0 && now - prev.lastReadingAt > ESP_GAP_EVENT_MS) {
+  const gapped = prev.lastReadingAt > 0 && now - prev.lastReadingAt > ESP_GAP_EVENT_MS;
+  if (gapped) {
     events.push({ kind: "esp_gap", gapMs: now - prev.lastReadingAt });
   }
 
+  // Frozen-meter tracking (device-level — survives source changes): a live CT
+  // always micro-jitters, so a stream of payloads where NEITHER channel moves
+  // is a hung sensor reporting a stale value, not a flat load. A gap breaks
+  // the clock (a fresh stream after silence starts a new judgment window).
+  const moved =
+    prev.lastRaw == null ||
+    Math.abs(reading.gridAmps - prev.lastRaw.gridAmps) >= FROZEN_EPSILON_AMPS ||
+    Math.abs(reading.genAmps - prev.lastRaw.genAmps) >= FROZEN_EPSILON_AMPS;
+  let lastMicroChangeAt = prev.lastMicroChangeAt > 0 ? prev.lastMicroChangeAt : now;
+  let frozen = prev.frozen;
+  if (gapped || moved) {
+    if (frozen) events.push({ kind: "meter_unfrozen", frozenForMs: now - lastMicroChangeAt });
+    frozen = false;
+    lastMicroChangeAt = now;
+  } else if (!frozen && now - lastMicroChangeAt >= METER_FROZEN_AFTER_MS) {
+    frozen = true;
+    events.push({
+      kind: "meter_frozen",
+      frozenForMs: now - lastMicroChangeAt,
+      amps: Math.max(reading.gridAmps, reading.genAmps),
+    });
+  }
+  const lastRaw = { gridAmps: reading.gridAmps, genAmps: reading.genAmps };
+
   const source = determineSource(reading, 0);
-  let state: MeterState = { ...prev, lastReadingAt: now };
+  let state: MeterState = { ...prev, lastReadingAt: now, lastRaw, lastMicroChangeAt, frozen };
 
   if (source !== prev.source) {
     // Episodic state is per-source: bucket, calm, smoothing ring, collapse latch.
+    // Frozen tracking is device-level and rides through.
     events.push({ kind: "source_changed", from: prev.source, to: source });
     state = {
       source,
@@ -120,6 +157,9 @@ export function ingestReading(
       overLimitReadings: [],
       calmSince: null,
       collapse: null,
+      lastRaw,
+      lastMicroChangeAt,
+      frozen,
     };
   }
 
@@ -175,8 +215,10 @@ export function ingestReading(
       events.push({ kind: "bucket_empty", severity: severe ? "severe" : "mild" });
     }
   } else if (measured <= limit - config.marginAmps) {
-    if (collapse != null) {
-      // Probable trip in progress — this low reading is lost AC load, not headroom.
+    if (collapse != null || frozen) {
+      // Probable trip in progress — this low reading is lost AC load, not
+      // headroom. A FROZEN value is equally not evidence of headroom: calm
+      // built on repeats of a stale number must never admit a raise.
       calmSince = null;
     } else {
       calmSince = calmSince ?? now;
@@ -195,7 +237,18 @@ export function ingestReading(
   }
 
   return {
-    state: { source, lastReadingAt: now, recent, overLimitBudget, overLimitReadings, calmSince, collapse },
+    state: {
+      source,
+      lastReadingAt: now,
+      recent,
+      overLimitBudget,
+      overLimitReadings,
+      calmSince,
+      collapse,
+      lastRaw,
+      lastMicroChangeAt,
+      frozen,
+    },
     events,
   };
 }
@@ -222,5 +275,6 @@ export function meterView(state: MeterState, now: number): MeterView {
     overLimitBudget: state.overLimitBudget,
     overLimitReadings: state.overLimitReadings,
     collapsed: state.collapse != null,
+    frozen: state.frozen,
   };
 }

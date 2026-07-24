@@ -7,15 +7,19 @@ export type PowerSource = "grid" | "gen" | "none";
 
 /**
  * Effective controller mode, derived each evaluation from ModeState.
- * Priority when several conditions overlap: COLLAPSED > FLOORS > SETTLING > NORMAL.
+ * Priority when several conditions overlap: COLLAPSED > FLOORS > GRID_FULL > SETTLING > NORMAL.
  * - NORMAL:    free to reduce and raise (subject to pacing).
  * - SETTLING:  a recent command batch hasn't settled — reductions allowed, raises paced.
  * - FLOORS:    entering gen (changeover OR cold start): hold every ON managed AC at its
  *              floor, re-asserting until the shadow confirms and the compressor ramp passes.
+ * - GRID_FULL: entering grid: drive every ON managed AC to its ceiling in one batch and
+ *              restore sheds ("start all to full, then drop when needed" — user 2026-07-23);
+ *              the graduated reducer trims if the meter objects. Ends on confirmation,
+ *              over-limit action, manual change, or its backstop.
  * - COLLAPSED: probable breaker trip / blackout — raises and restores frozen, manual-intent
  *              minting suppressed; reductions still allowed.
  */
-export type Mode = "NORMAL" | "SETTLING" | "FLOORS" | "COLLAPSED";
+export type Mode = "NORMAL" | "SETTLING" | "FLOORS" | "GRID_FULL" | "COLLAPSED";
 
 export type Severity = "mild" | "severe" | "extreme";
 
@@ -35,7 +39,9 @@ export type MeterEvent =
   | { kind: "esp_gap"; gapMs: number }
   | { kind: "collapse"; fromAmps: number; toAmps: number; source: PowerSource }
   | { kind: "collapse_recovered"; source: PowerSource }
-  | { kind: "bucket_empty"; severity: "mild" | "severe" };
+  | { kind: "bucket_empty"; severity: "mild" | "severe" }
+  | { kind: "meter_frozen"; frozenForMs: number; amps: number }
+  | { kind: "meter_unfrozen"; frozenForMs: number };
 
 /** Latched probable-trip/blackout state. */
 export interface CollapseLatch {
@@ -58,6 +64,14 @@ export interface MeterState {
   /** Timestamp when the current uninterrupted genuine-headroom stretch began, or null. */
   calmSince: number | null;
   collapse: CollapseLatch | null;
+  /**
+   * Frozen-meter tracking (device-level, survives source changes): the last
+   * RAW channel pair and when it last showed a micro-change. A live CT always
+   * jitters; a stream of bit-identical payloads is a hung ESP, not a flat load.
+   */
+  lastRaw: { gridAmps: number; genAmps: number } | null;
+  lastMicroChangeAt: number;
+  frozen: boolean;
 }
 
 /** What the decision pipeline needs to know about the meter, per evaluation. */
@@ -74,6 +88,8 @@ export interface MeterView {
   overLimitBudget: number;
   overLimitReadings: readonly number[];
   collapsed: boolean;
+  /** Readings arrive but carry no micro-variation — hung sensor, value is a lie. */
+  frozen: boolean;
 }
 
 /** A single device command the pipeline wants executed. */

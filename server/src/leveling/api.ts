@@ -75,6 +75,8 @@ export interface LevelingStatusV2 {
   calmMs?: number;
   controller?: string;
   decisions?: Array<{ at: number; deviceId?: string; action: string; blockedBy?: string; detail?: string }>;
+  /** ESP readings arrive but carry no micro-variation — value untrusted, raises suspended. */
+  meterFrozen?: boolean;
 }
 
 /** The call surface collector.ts and routes.ts use (structural — v1 satisfies it). */

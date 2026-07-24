@@ -12,6 +12,52 @@ A ground-up rewrite lives in **`server/src/leveling/`** (17 small modules, pure 
 
 **Tests:** `server/src/leveling/*.test.ts` (127) incl. `scenarios.test.ts` — 10 incident regressions replayed against the physics harness (`scenario.ts`). **Rollout:** deploy → `controller:"shadow"` 2–4 days (compare via journal) → `"v2"` → ≥1 week soak → delete v1 (`ac-leveler.ts`, `ac-leveling.ts`, their tests) and rewrite this doc. Everything below this line documents **v1**, still the acting controller until cutover.
 
+### 2026-07-23 evening gen trip → physics envelope + frozen-meter detection + grid full-start
+
+**The incident (16:24–16:52 UTC, v1 acting, shadow day 1):** grid→gen changeover 16:24; the ESP went
+**silent 16:28:45→16:46:08** (17.5-min gap in `power_readings`; the dashboard sat frozen at ~14.8A —
+what the user reported as "the ESP froze on 14 A"; both controllers correctly idled on staleness).
+After readings resumed, v1 climbed one step at a time on a live but **thermally-lagging** meter
+(compressor draw follows a released cap by ~4 min): 16:46:27 Abdu L1→L2 · 16:47:57 Najat L1→L2 **+
+Abdu L2→L3 in one batch** · 16:50:37 Najat L2→L3 — every admission passed the meter gate at 5.6→12.9A
+while the static model already predicted **16.9A > 15A** (logged only as an "Amp model off" warning).
+16:51:45: collapse 13.9→4.9A = **breaker trip**, 68s after the last raise. Root cause: **no veto
+existed on a commanded end-state the model knows exceeds the breaker** — meter-anchored admission is
+blind to ramp lag and to frozen/false readings.
+
+**Fixes (deployed 2026-07-23 eve; server suite 620 green):**
+1. **Physics-envelope veto (v2 `raise.ts` `envelopeTotalAmps`, GEN only):** a raise/restore is
+   refused when the worst-case cap-model total of the commanded end-state (Σ `steadyDraw` over ON
+   managed ACs; non-AC load deliberately excluded — the models over-state cool draw and the meter
+   gate stays primary) exceeds `limit − margin`, no matter what the meter shows. Warm-restore targets
+   degrade to the highest envelope-safe level (no stranding); the restore-with-peer-floor-downs batch
+   is envelope-checked at floors. Grid is deliberately NOT envelope-guarded (grid starts FULL by
+   directive; the reducer is the safety). **v1 got the same guard surgically** (`ac-leveler.ts
+   execute()`): on gen, the RAISE side of a batch is stripped when the model-projected steady-state
+   total (same recipe as the expectation block) exceeds the raw limit — reductions/sheds/fans/restores
+   always pass. Live numbers: Abdu@L3 9.3 + Najat@L3 6.3 = 15.6 > 15 → the 16:50:37 batch is exactly
+   what it strips.
+2. **Frozen-meter detection (v2 `sensing.ts`):** a live CT always micro-jitters; when NEITHER raw
+   channel moves ≥ `FROZEN_EPSILON_AMPS` (0.005) across consecutive readings for
+   `METER_FROZEN_AFTER_MS` (60s), the meter is **frozen** — `meter_frozen` event (warn log + critical
+   push "check the ESP monitor" + collector power-event guard), `MeterView.frozen`/status
+   `meterFrozen`, and **calm is killed** so no raise/restore can spend on repeats of a stale value
+   (reduces still act — safe direction). Device-level (survives source changes); an ESP gap >20s
+   resets the judgment window; `meter_unfrozen` on the first real change. The scenario harness adds
+   ±0.005 jitter (a live CT) + `freezeEsp()` to simulate the hang.
+3. **Grid entry starts FULL (v2, user directive "on gen start L1 for all; on grid start all to full
+   then drop"):** new mode **GRID_FULL** (priority COLLAPSED > FLOORS > GRID_FULL > SETTLING >
+   NORMAL) arms on ANY entry into grid, drives every ON managed AC to its `ceilOf` ceiling in one
+   batch and restores sheds at theirs (pacing-gated), then exits on shadow confirmation, its 5-min
+   backstop, a manual change, or **any bucket_empty** (the reducer's judgment beats the entry
+   policy — no fight). The gen side of the directive was already v2's FLOORS mode (and v1's
+   persistent floors). Note: v1 has no grid full-start — that behavior arrives with cutover.
+
+New regressions: `scenarios.test.ts` "2026-07-23 double-L3 gen trip" (cool-meter climb → heat surge
+stays under the breaker), frozen-ESP suspend/resume, grid-entry full-start ×2; `raise.test.ts`
+envelope suite (7); `sensing.test.ts` frozen suite (7); `modes.test.ts` GRID_FULL suite (7);
+`collector.test.ts` v1 envelope strip + not-a-blanket-freeze.
+
 ---
 
 **TL;DR (v1):** A closed-loop controller (built 2026-06-06) in the collector keeps total household current within the active power source's limit (Grid 30A / Generator 15A, editable) by adjusting TCL AC **generator-mode levels** (per-unit current caps). It can also reduce fans, emergency-shed ACs, and auto-restore them. A pure allocator (`ac-leveling.ts`) decides targets; a stateful layer (`ac-leveler.ts`) handles gating, persistence, manual intents, prediction, and command execution; a severe over-limit (≥ limit+1A ×2 readings, or the grid oscillation pattern) bypasses the budget fit entirely via the **emergency reduction fast-path** (meter-sized cut, urgent tick — own section below). A separate calibration runner (`ac-calibration.ts`) measures each AC's real draw per level/fan to tune the amp models.

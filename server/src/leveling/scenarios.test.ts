@@ -248,6 +248,117 @@ describe("fans are last-resort trim (57% of v1 fan cuts fired with level cuts av
   });
 });
 
+describe("2026-07-23 double-L3 gen trip (physics-envelope regression)", () => {
+  // The live incident: the meter showed room (cool compressors / lagging ramp /
+  // frozen ESP), the controller climbed BOTH big rooms to L3 on the 15A gen,
+  // and when demand arrived the caps entitled 15.6A → breaker trip 68s later.
+  // The envelope veto must refuse the second L3 END-STATE regardless of meter.
+  it("never lands abdu AND najat on L3 together; the later heat surge stays under the breaker", () => {
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, demandAmps: 5, needDelta: 3.4 }, // cool now — draws under cap
+        { ...NAJAT, level: 1, demandAmps: 3, needDelta: 2.7 },
+      ],
+      { nonAcAmps: 1.3, source: "gen" },
+    );
+    s.advance(600); // let it climb as far as it wants
+    // The meter never objected (cool draws), so only the envelope can have
+    // stopped the last step: najat must never be COMMANDED to L3 while abdu
+    // holds L3 (worst case 9.3 + 5.9 = 15.2 > 14.8 ceiling).
+    const najatL3 = s.commandsSince(0, "set_level").filter(
+      (e) => e.cmd.deviceId === "najat" && (e.cmd as Extract<Command, { kind: "set_level" }>).level === 3,
+    );
+    expect(najatL3).toHaveLength(0);
+    expect(s.plans.some((p) => p.decisions.some((d) => d.blockedBy === "physics envelope"))).toBe(true);
+    // Now the afternoon heat arrives — compressors go cap-bound. The commanded
+    // end-state must still fit under the breaker (this is what tripped live).
+    s.setDemand("abdu", 9, 3.4);
+    s.setDemand("najat", 5.3, 2.7);
+    s.advance(120);
+    expect(s.totalAmps()).toBeLessThanOrEqual(14.9);
+  });
+});
+
+describe("frozen ESP (2026-07-23: readings stuck at ~14.8A for 17.5 min)", () => {
+  it("flags the freeze, suspends raises on the stale value, and recovers when readings move", () => {
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, demandAmps: 4, needDelta: 0.3 },
+        { ...NAJAT, level: 1, demandAmps: 2, needDelta: 0.3 },
+      ],
+      { nonAcAmps: 2, source: "gen" },
+    );
+    s.advance(90); // settled, satisfied rooms — nothing to raise
+    s.freezeEsp(true);
+    s.advance(70); // > METER_FROZEN_AFTER_MS of identical payloads
+    expect(s.events.some((e) => e.event.kind === "meter_frozen")).toBe(true);
+    // Rooms heat up — but the meter is a lie; no raise may spend on it.
+    s.setDemand("abdu", 6, 3);
+    s.setDemand("najat", 3.5, 2);
+    const t0 = s.now;
+    s.advance(180);
+    expect(setLevels(s, t0).filter((c) => c.cmd.level > 1)).toHaveLength(0);
+    // Readings come back alive → unfreeze, calm rebuilds, the climb resumes.
+    s.freezeEsp(false);
+    s.advance(120);
+    expect(s.events.some((e) => e.event.kind === "meter_unfrozen")).toBe(true);
+    expect(setLevels(s, t0).filter((c) => c.cmd.level > 1).length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("grid entry starts FULL, then drops on evidence (2026-07-23 directive)", () => {
+  it("gen→grid drives every ON managed AC to its ceiling in one batch", () => {
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, demandAmps: 5, needDelta: 3 },
+        { ...ABDULLAH, level: 1, demandAmps: 3, needDelta: 2 },
+        { ...NAJAT, level: 1, demandAmps: 3, needDelta: 2 },
+      ],
+      { nonAcAmps: 3, source: "gen" },
+    );
+    s.advance(30);
+    const flip = s.now;
+    s.setSource("grid");
+    s.advance(10);
+    const fulls = setLevels(s, flip).filter((c) => c.cmd.level === 3);
+    expect(new Set(fulls.map((c) => c.cmd.deviceId))).toEqual(new Set(["abdu", "abdullah", "najat"]));
+    // All three ride in the FIRST batch (one evaluation) — full-start, not a
+    // climb. (Later same-level re-asserts until the shadow confirms are fine —
+    // the controller shell dedupes sends; the harness records them raw.)
+    const firstAt = fulls[0].at;
+    expect(new Set(fulls.filter((c) => c.at === firstAt).map((c) => c.cmd.deviceId)).size).toBe(3);
+  });
+
+  it("when full doesn't fit, the reducer trims and the entry window stops fighting it", () => {
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, demandAmps: 11, needDelta: 3, rampSeconds: 5 },
+        { ...ABDULLAH, level: 1, demandAmps: 6.5, needDelta: 2, rampSeconds: 5 },
+        { ...NAJAT, level: 1, demandAmps: 6.5, needDelta: 2, rampSeconds: 5 },
+      ],
+      { nonAcAmps: 2, source: "gen" },
+    );
+    s.advance(30);
+    const flip = s.now;
+    s.setSource("grid");
+    s.setNonAc(8); // grid household load joins
+    s.advance(120); // full-start → caps release → 9 + 5.3 + 5.3 + 8 ≈ 27.9 > 27 → bucket → cut
+    const cuts = setLevels(s, flip).filter((c) => c.cmd.level < 3);
+    expect(cuts.length).toBeGreaterThanOrEqual(1);
+    // After the reducer acted, GRID_FULL must NOT re-push the cut level back up.
+    const firstCutAt = cuts[0].at;
+    const rePush = setLevels(s, firstCutAt + 1).filter(
+      (c) => c.cmd.level === 3 && cuts.some((k) => k.cmd.deviceId === c.cmd.deviceId),
+    );
+    expect(rePush).toHaveLength(0);
+    expect(s.totalAmps()).toBeLessThanOrEqual(27);
+  });
+});
+
 describe("proactive near-limit turn-on (instant reduce, no bucket wait)", () => {
   it("an automation turn-on that projects over the limit triggers a cut within one evaluation", () => {
     const s = new Scenario(

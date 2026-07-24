@@ -932,6 +932,53 @@ describe("Smart AC leveling", () => {
     expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac2", "set_generator_mode", 3);
   });
 
+  it("strips a gen raise whose model-projected total exceeds the limit (2026-07-23 double-L3 trip)", async () => {
+    // The live incident: Abdu at L3, Najat L2→L3 admitted on a lagging meter
+    // reading ~10A while the model already predicted 16.9A on the 15A gen —
+    // shipped anyway, breaker tripped 68s later. The physics envelope must
+    // strip the raise the meter cannot veto.
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig({
+      ...LEVELING_CONFIG,
+      // Live-shaped gen models: ac1 (1-ton) 2.3+2 → 6.3 @L3; ac2 (2-ton) 4.3+2.5 → 9.3 @L3.
+      ampModels: { ac1: { baseAmps: 2.3, stepAmps: 2 }, ac2: { baseAmps: 4.3, stepAmps: 2.5 } },
+    });
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 2, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    // Meter shows plenty of room (10A on 15A) — the surge gate would admit the
+    // raise (10 + 2 ≤ 14), but 9.3 + 6.3 = 15.6 > 15 projected steady state.
+    primeGenSource(collector); // steady-state gen (not a cold-start floors entry)
+    genReadings(collector, 10, 6);
+    await checkAcLeveling(collector);
+
+    expect(tclCloud.sendControl).not.toHaveBeenCalledWith("ac1", "set_generator_mode", 3);
+  });
+
+  it("the same raise ships once the projected total fits (envelope is not a blanket freeze)", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    // Small models: ac1 4 @L3 + ac2 8 @L3 = 12 ≤ 15 — projection fits, raise proceeds.
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Najat", power: true, generatorMode: 2, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+      { id: "ac2", name: "Abdu", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    primeGenSource(collector);
+    genReadings(collector, 10, 6);
+    await checkAcLeveling(collector);
+
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 3);
+  });
+
   it("on grid jumps straight to the meter-anchored ideal in one batch — no one-step pacing (2026-06-21)", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);

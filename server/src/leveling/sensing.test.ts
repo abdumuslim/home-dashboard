@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   CALM_REFILL_MS,
+  METER_FROZEN_AFTER_MS,
   OVER_LIMIT_BUDGET,
   POWER_COLLAPSE_MAX_MS,
   determineSource,
@@ -192,6 +193,90 @@ describe("calm tracking & view", () => {
     const { state, now } = feedGen([10, 11, 12, 13, 100]);
     // window = [11,12,13,100] → median 12.5
     expect(meterView(state, now).smoothedAmps).toBe(12.5);
+  });
+});
+
+describe("frozen-meter detection (2026-07-23: ESP hung at ~14.8A for 17.5 min)", () => {
+  /** 5s cadence: n readings span (n−1)×5s; 14 identical readings = 65s ≥ 60s. */
+  const frozenFeed = (amps: number, n = 14): number[] => new Array(n).fill(amps);
+
+  it("flags frozen after METER_FROZEN_AFTER_MS of bit-identical readings", () => {
+    const { state, events, now } = feedGen(frozenFeed(12));
+    const frozenEvents = events.filter((e) => e.kind === "meter_frozen");
+    expect(frozenEvents).toHaveLength(1);
+    expect(frozenEvents[0]).toMatchObject({ amps: 12 });
+    expect(state.frozen).toBe(true);
+    expect(meterView(state, now).frozen).toBe(true);
+  });
+
+  it("frozen kills calm — repeats of a stale value are not headroom evidence", () => {
+    const { state, now } = feedGen(frozenFeed(12));
+    expect(meterView(state, now).calmMs).toBe(0);
+  });
+
+  it("micro-changes keep the meter trusted (no event, calm accumulates)", () => {
+    // Alternating ±0.01 — ordinary CT jitter.
+    const readings = Array.from({ length: 20 }, (_, i) => (i % 2 === 0 ? 12 : 12.01));
+    const { state, events, now } = feedGen(readings);
+    expect(events.some((e) => e.kind === "meter_frozen")).toBe(false);
+    expect(state.frozen).toBe(false);
+    expect(meterView(state, now).calmMs).toBeGreaterThan(0);
+  });
+
+  it("a change on EITHER channel unfreezes and reports the frozen span", () => {
+    const frozen = feedGen(frozenFeed(12));
+    const r = ingestReading(frozen.state, { gridAmps: 0.02, genAmps: 12 }, cfg, frozen.now + 5_000);
+    const unfrozen = r.events.filter((e) => e.kind === "meter_unfrozen");
+    expect(unfrozen).toHaveLength(1);
+    expect(unfrozen[0]).toMatchObject({ frozenForMs: METER_FROZEN_AFTER_MS + 10_000 });
+    expect(r.state.frozen).toBe(false);
+  });
+
+  it("calm resumes accumulating after the meter unfreezes", () => {
+    const frozen = feedGen(frozenFeed(12));
+    const live = feedGen([12.02, 12, 12.03, 12.01], { state: frozen.state, startAt: frozen.now + 5_000 });
+    expect(live.state.frozen).toBe(false);
+    expect(meterView(live.state, live.now).calmMs).toBeGreaterThan(0);
+  });
+
+  it("an ESP gap resets the frozen clock — a fresh stream is judged anew", () => {
+    // 9 identical readings (40s — under the threshold), a 25s gap, then more
+    // identical readings: the clock restarts at the gap, so no false flag
+    // until the POST-gap stream itself runs 60s frozen.
+    const before = feedGen(frozenFeed(12, 9));
+    const after = feedGen(frozenFeed(12, 9), { state: before.state, startAt: before.now + 25_000 });
+    expect(after.events.some((e) => e.kind === "meter_frozen")).toBe(false);
+    // …and a post-gap stream that DOES run long enough still flags.
+    const later = feedGen(frozenFeed(12, 6), { state: after.state, startAt: after.now + 5_000 });
+    expect(later.events.some((e) => e.kind === "meter_frozen")).toBe(true);
+  });
+
+  it("frozen tracking survives a source change", () => {
+    // Freeze accumulates 40s on gen, source flips to grid with the SAME stuck
+    // pair continuing — the device-level clock keeps counting.
+    const onGen = feedGen(frozenFeed(12, 9));
+    let state = onGen.state;
+    let now = onGen.now + 5_000;
+    const events: MeterEvent[] = [];
+    for (let i = 0; i < 6; i++) {
+      const r = ingestReading(state, { gridAmps: 18, genAmps: 0 }, cfg, now);
+      state = r.state;
+      events.push(...r.events);
+      now += 5_000;
+    }
+    // The grid flip itself is a micro-change (pair moved), so the clock reset
+    // at the changeover — but the stuck 18/0 pair then accumulates its own 60s.
+    const more = Array.from({ length: 9 }, () => 18);
+    let s2 = state;
+    let n2 = now;
+    for (const amps of more) {
+      const r = ingestReading(s2, { gridAmps: amps, genAmps: 0 }, cfg, n2);
+      s2 = r.state;
+      events.push(...r.events);
+      n2 += 5_000;
+    }
+    expect(events.some((e) => e.kind === "meter_frozen")).toBe(true);
+    expect(s2.frozen).toBe(true);
   });
 });
 

@@ -11,6 +11,7 @@ import { ingestReading, initialMeterState, meterView, refillBucket, resetCalm } 
 import {
   applyMeterEvent,
   clearFloorsIfDone,
+  clearGridFullIfDone,
   deriveMode,
   initialModeState,
   noteBatch,
@@ -31,7 +32,7 @@ import {
 import type { FanHolds } from "./fan-trim.js";
 import type { CostBook } from "./costs.js";
 import { turnOnAmps } from "./costs.js";
-import { floorOf } from "./needs.js";
+import { ceilOf, floorOf } from "./needs.js";
 
 export interface SimAcSetup {
   deviceId: string;
@@ -95,6 +96,8 @@ export class Scenario {
   private residualAmps: number;
   private noise = 0;
   private noiseFlip = 1;
+  private espFrozen = false;
+  private lastSentReading: { gridAmps: number; genAmps: number } | null = null;
   private pendingProjection: number | null = null;
   private attempts: Array<{ deviceId: string; kind: AttemptKind; at: number }> = [];
 
@@ -187,6 +190,15 @@ export class Scenario {
 
   setNoise(amplitude: number): void {
     this.noise = amplitude;
+  }
+
+  /**
+   * Hang the ESP: readings keep ARRIVING but repeat the last payload exactly
+   * (the 2026-07-23 failure mode — the meter showed ~14.8A while reality moved).
+   */
+  freezeEsp(frozen: boolean): void {
+    this.espFrozen = frozen;
+    if (!frozen) this.lastSentReading = null;
   }
 
   // ---- introspection ----
@@ -294,13 +306,18 @@ export class Scenario {
     this.now += STEP_MS;
     const total = this.lineDead ? Math.min(this.nonAcAmps, this.residualAmps) : this.totalAmps();
     this.noiseFlip = -this.noiseFlip;
-    const measured = Math.max(0, total + this.noise * this.noiseFlip);
-    const reading =
+    // A live CT always micro-jitters (±0.005 here) — without it every steady
+    // sim would read as a frozen sensor to the sensing reducer.
+    const measured = Math.max(0, total + (this.noise + 0.005) * this.noiseFlip);
+    const live =
       this.line === "grid"
         ? { gridAmps: measured, genAmps: 0 }
         : this.line === "gen"
           ? { gridAmps: 0, genAmps: measured }
           : { gridAmps: 0, genAmps: 0 };
+    // A hung ESP repeats its last payload exactly, whatever reality does.
+    const reading = this.espFrozen && this.lastSentReading != null ? this.lastSentReading : live;
+    this.lastSentReading = reading;
 
     const { state, events } = ingestReading(this.meterState, reading, this.cfg, this.now);
     this.meterState = state;
@@ -310,12 +327,18 @@ export class Scenario {
       if (event.kind === "source_changed") this.pacing = resetPacing(this.pacing, event.to);
     }
 
-    // FLOORS exit check against confirmed shadows + ramps.
+    // FLOORS / GRID_FULL exit checks against confirmed shadows + ramps.
     const views = this.buildViews();
     const onManaged = views.filter((v) => v.on && v.managed && !v.shed);
     this.modeState = clearFloorsIfDone(this.modeState, {
       allConfirmedAtFloor: onManaged.every((v) => v.currentLevel > 0 && v.currentLevel <= floorOf(v)),
       anyRamping: onManaged.some((v) => v.ramping),
+    });
+    this.modeState = clearGridFullIfDone(this.modeState, {
+      allConfirmedAtCeil: onManaged.every(
+        (v) => v.currentLevel > 0 && v.currentLevel >= ceilOf(v, this.cfg.nearTargetBandC),
+      ),
+      anyShedPending: views.some((v) => v.managed && v.shed && !v.on),
     });
     this.modeState = { ...this.modeState, collapsed: this.meterState.collapse != null };
 
