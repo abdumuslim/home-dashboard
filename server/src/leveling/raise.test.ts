@@ -79,6 +79,19 @@ describe("restore outranks raises", () => {
     expect(grid.commands.find((c) => c.kind === "power_on" && "fan" in c && c.fan != null)).toBeUndefined();
   });
 
+  it("sizes a gen restore by the steady model draw, not the fan-slam-inflated learned on-cost", () => {
+    // Learned on@L1 is 4A (measured from the OLD fan-slam restores), but a gentle
+    // restore pins the fan and really draws the ~2A model floor. smoothed 12.5 +
+    // 2 = 14.5 ≤ 14.9 fits; the phantom 12.5 + 4 = 16.5 would have blocked it.
+    const book = updateCost({}, "b", "gen", "on@L1", 4, T);
+    const p = raise([ac("a"), ac("b", { on: false, shed: true, needDelta: 4 })], {
+      smoothedAmps: 12.5,
+      headroomAmps: 2.2,
+      book,
+    });
+    expect(p.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 });
+  });
+
   it("restores are exempt from the resting buffer (fit under limit − margin)", () => {
     // smoothed 13.2 + cost 2 = 15.2 > 14.9 → blocked; smoothed 12.8 + 2 = 14.8 ≤ 14.9 → fits,
     // even though the resting-ceiling headroom (14.7 − 12.8 = 1.9) is < cost.

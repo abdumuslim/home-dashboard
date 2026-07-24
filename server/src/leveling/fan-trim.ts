@@ -11,8 +11,13 @@ import type { AcView, Command, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
 import { fanTrimSavings } from "./costs.js";
 
-/** Sustained calm required before a held fan starts climbing back. */
-export const FAN_RESTORE_CALM_MS = 300_000;
+/**
+ * Sustained calm required before a held fan starts climbing back. Kept short
+ * (2026-07-24, user "make the fan restoration faster") — the sweet-spot climb
+ * only advances to a target whose learned cost fits the headroom, so a fast
+ * gate can't 1↔full bounce; it just returns comfort sooner once the meter is calm.
+ */
+export const FAN_RESTORE_CALM_MS = 60_000;
 
 export interface FanHold {
   deviceId: string;

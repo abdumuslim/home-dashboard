@@ -9,7 +9,7 @@
 // one-step, most-needy room first; on gen only ONE raise command per batch
 // (the 07-23 double-raise landed 16.6A on a 14.9A limit).
 
-import type { AcView, Command, Decision, PowerSource } from "./types.js";
+import type { AcView, Command, CostEstimate, Decision, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
 import { levelCutSavings, modelFor, raiseJumpAmps, steadyDraw, turnOnAmps } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
@@ -134,7 +134,18 @@ export function planRaise(input: RaiseInput): RaisePlan {
 
   for (const candidate of shedCandidates) {
     const floor = floorOf(candidate);
-    const cost = turnOnAmps(book, config, candidate.deviceId, source, floor, candidate.maxLevel, now);
+    // On gen a restore is GENTLE (fan pinned to 1), so the fan-slam that inflated
+    // the learned/seed on-cost (e.g. Najat's on@L1 3.7A, measured from the old
+    // fan-slam restores) no longer applies — size it at the calibrated steady
+    // floor draw (~2.3A) instead, or a room that really fits on ~2.3A stays shed
+    // behind a 3.7A phantom (live 2026-07-24: peer freed budget, restore still
+    // blocked "no headroom"). The physics-envelope veto still guards the end-
+    // state, and the compressor inrush is transient (ramp credit + emergency
+    // reducer catch a real breach). Grid restores stay plain → fan-slam-sized.
+    const cost: CostEstimate =
+      source === "gen"
+        ? { amps: steadyDraw(floor, candidate.maxLevel, modelFor(config, candidate.deviceId, source)), confidence: "seed" }
+        : turnOnAmps(book, config, candidate.deviceId, source, floor, candidate.maxLevel, now);
     const candidateEntry = { deviceId: candidate.deviceId, level: floor, maxLevel: candidate.maxLevel };
 
     // Both feasibilities up front, BEFORE any gate — the reservation decision

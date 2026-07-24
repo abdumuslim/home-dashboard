@@ -86,9 +86,14 @@ peer-off was decaying the meter — so an ordinary raise grabbed the budget firs
    smart-auto 3–7. The fan-slam is the bulk of a restore's un-modeled surge (fans aren't in the amp
    model), so pinning it lets a shed room fit next to a running AC on the tight gen budget. A fan
    hold is recorded (automation enforcement stands down via the collector's existing `hasFanHold`
-   guards); the fan climbs back to auto after the 5-min `FAN_RESTORE_CALM_MS`. Grid restores stay
-   plain. `turnOnAmps` is left fan-slam-sized (trip-safe over-estimate; graded gentle restores drift
-   it down). Warm-start level is deliberately NOT used for shed restores (they land at the floor).
+   guards); the fan climbs back to auto after `FAN_RESTORE_CALM_MS` (**60s** since 2026-07-24 — the
+   sweet-spot climb only advances what fits, so a short gate can't bounce). Grid restores stay plain.
+   **Restore cost is sized at the calibrated steady floor draw on gen** (`steadyDraw`), NOT the
+   fan-slam-inflated learned/seed `on@L1` (Najat's was 3.7A): a gentle restore pins the fan, so the
+   fan-slam is gone and a room that really fits on ~2.3A was otherwise stranded behind a 3.7A phantom
+   (live 2026-07-24 — a peer was turned off, freeing budget, yet the restore stayed "no headroom").
+   The physics-envelope veto still guards the end-state; grid restores stay fan-slam-sized. Warm-start
+   level is deliberately NOT used for shed restores (they land at the floor).
 4. **Post-peer-off calm reset (`controller.ts`):** an observed managed power-off (in `tick()`'s
    structural-off branch) AND `onUserPowerOff` now `resetCalm()` — a decaying meter is not settled
    evidence, so raises wait out a fresh settle and the freed headroom is available to the pending

@@ -237,14 +237,14 @@ describe("fans are last-resort trim (57% of v1 fan cuts fired with level cuts av
     expect(s.commandsSince(t0, "power_off")).toHaveLength(0);
     expect(s.commandsSince(t0, "set_level")).toHaveLength(0); // everyone already at floor
     expect(s.commandsSince(t0, "set_fan").length).toBeGreaterThanOrEqual(1);
-    // Restore side: drop the load, then verify the held fan does NOT bounce
-    // back within v1's 61s median — it waits out the 5-minute calm gate.
+    // Restore side: drop the load, then verify the held fan waits out the calm
+    // gate (no v1-style 61s bounce) before climbing back.
     s.setNonAc(4.0);
     const t1 = s.now;
-    s.advance(240);
-    expect(s.commandsSince(t1, "set_fan")).toHaveLength(0); // 4 min < 5 min gate
-    s.advance(120);
-    expect(s.commandsSince(t1, "set_fan").length).toBeGreaterThanOrEqual(1); // climbed after 5 min
+    s.advance(40);
+    expect(s.commandsSince(t1, "set_fan")).toHaveLength(0); // < FAN_RESTORE_CALM_MS
+    s.advance(60);
+    expect(s.commandsSince(t1, "set_fan").length).toBeGreaterThanOrEqual(1); // climbed after the gate
   });
 });
 
@@ -420,11 +420,11 @@ describe("the 2026-07-24 restore-vs-raise incident (15A gen)", () => {
     const restore = s.commandsSince(t0, "power_on").find((c) => c.cmd.deviceId === "najat");
     expect(restore).toBeDefined();
     expect((restore!.cmd as Extract<Command, { kind: "power_on" }>).fan).toBe(1);
-    // Fan stays pinned through the short term (< 5-min calm gate)…
-    s.advance(240);
+    // Fan stays pinned through the short term (< the calm gate)…
+    s.advance(40);
     expect(s.commandsSince(restore!.at, "set_fan")).toHaveLength(0);
-    // …and climbs back toward auto once the long calm passes.
-    s.advance(120);
+    // …and climbs back toward auto once the calm gate passes.
+    s.advance(60);
     expect(s.commandsSince(restore!.at, "set_fan").length).toBeGreaterThanOrEqual(1);
   });
 });
