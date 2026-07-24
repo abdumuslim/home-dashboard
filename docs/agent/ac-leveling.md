@@ -2,7 +2,9 @@
 
 # Smart AC Leveling & Per-AC Calibration
 
-## ⚡ LEVELING v2 (2026-07-23 — full rewrite, rollout in progress)
+## ⚡ LEVELING v2 (ACTING since 2026-07-24 cutover)
+
+> **Status:** v2 is the **acting controller** (config `controller: "v2"` in `ac_leveling_config` row id=2). v1 (`ac-leveler.ts` + `ac-leveling.ts`) is kept only as the **instant rollback target** — flip the flag back to `"v1"` via `PUT /api/ac/leveling` and `docker compose restart` (v1's boot-once state is stale after v2 acted). After a ≥1-week soak, delete v1 and its tests and fold this section's history into the main doc. **Everything below the "TL;DR (v1)" divider documents v1 — historical, rollback-only.**
 
 A ground-up rewrite lives in **`server/src/leveling/`** (17 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
@@ -10,7 +12,7 @@ A ground-up rewrite lives in **`server/src/leveling/`** (17 small modules, pure 
 
 **Hardware truth (2026-07-23, user-verified + web specs):** Abdu = **2-ton** (caps ≈ 4.1/6.5/~9A at L1/2/3), Abdullah & Najat = **1-ton** (≈ 2.2/3.9/5.3A). The registry `model` field is protocol-inference only — its capacity digits are WRONG (see tcl-ac.md). Observed raise JUMPS (3.6–3.8A, incl. compressor duty change) exceed steady per-level steps — the cost model stores both (`level:1>2` jumps vs steady model ceilings).
 
-**Tests:** `server/src/leveling/*.test.ts` (127) incl. `scenarios.test.ts` — 10 incident regressions replayed against the physics harness (`scenario.ts`). **Rollout:** deploy → `controller:"shadow"` 2–4 days (compare via journal) → `"v2"` → ≥1 week soak → delete v1 (`ac-leveler.ts`, `ac-leveling.ts`, their tests) and rewrite this doc. Everything below this line documents **v1**, still the acting controller until cutover.
+**Tests:** `server/src/leveling/*.test.ts` incl. `scenarios.test.ts` — incident regressions replayed against the physics harness (`scenario.ts`) + `controller.test.ts` (flavor re-sync). **Cutover history:** shadowed 2026-07-23→24 (journal-compared against v1), then flipped to `"v2"` after the 2026-07-24 restore-vs-raise fix set (below). Rollback = `PUT controller:"v1"` + restart. Everything below the "TL;DR (v1)" divider documents **v1** — historical, rollback-only.
 
 ### 2026-07-23 evening gen trip → physics envelope + frozen-meter detection + grid full-start
 
@@ -58,7 +60,64 @@ stays under the breaker), frozen-ESP suspend/resume, grid-entry full-start ×2; 
 envelope suite (7); `sensing.test.ts` frozen suite (7); `modes.test.ts` GRID_FULL suite (7);
 `collector.test.ts` v1 envelope strip + not-a-blanket-freeze.
 
+### 2026-07-24 restore-vs-raise fix set (the cutover changes)
+
+**The incident (live, 15A gen):** the leveler shed Najat, she restore-bounced (backoff armed), the
+user then turned **Abdullah off by hand** to free budget — and 11s later the leveler raised **Abdu
+L1→L2→L3** into that freed headroom instead of restoring the shed hot room. The user had to force
+Najat back on, causing a 16.2A emergency. Root cause (present in BOTH controllers): a backoff/calm-
+gated shed restore didn't hold the headroom it needed, and no signal told the leveler that a manual
+peer-off was decaying the meter — so an ordinary raise grabbed the budget first.
+
+**Fixes (all in `server/src/leveling/`):**
+1. **Restore reservation + raise parking (`raise.ts` `planRaise`):** a shed restore that is feasible
+   (plain, or by pulling raised peers to floors) but merely GATED (pacing backoff or its calm gate)
+   now **reserves its amps and parks the ENTIRE raise phase** — warm raises included, because a warm
+   raise is calm-exempt and would otherwise rewind the shared calm clock (`resetCalm` fires after
+   every non-fan batch). An infeasible-at-floors restore reserves nothing (no permanent strand); the
+   backoff ladder (≤15 min) bounds the wait. Restore-blocked-by-envelope is now labeled
+   `"physics envelope"` (was mis-labeled `"no headroom"`). `RaisePlan.reservedAmps` also fences the
+   fan-restore budget in `pipeline.ts`.
+2. **Calm invariant (`config.ts` merge):** `restoreCalmSeconds` is clamped to `raiseCalmSeconds` —
+   restore's calm gate can never open later than a raise's, so "restore outranks raises" holds.
+3. **Gentle gen restore (`raise.ts` + `fan-trim.ts` `recordGentleRestoreHold` + `controller.ts`):**
+   a shed room returns on gen with its **fan pinned to 1** (carried on the `power_on` command:
+   `Command` gained an optional `fan`) instead of letting the range automation slam it to a hot-room
+   smart-auto 3–7. The fan-slam is the bulk of a restore's un-modeled surge (fans aren't in the amp
+   model), so pinning it lets a shed room fit next to a running AC on the tight gen budget. A fan
+   hold is recorded (automation enforcement stands down via the collector's existing `hasFanHold`
+   guards); the fan climbs back to auto after the 5-min `FAN_RESTORE_CALM_MS`. Grid restores stay
+   plain. `turnOnAmps` is left fan-slam-sized (trip-safe over-estimate; graded gentle restores drift
+   it down). Warm-start level is deliberately NOT used for shed restores (they land at the floor).
+4. **Post-peer-off calm reset (`controller.ts`):** an observed managed power-off (in `tick()`'s
+   structural-off branch) AND `onUserPowerOff` now `resetCalm()` — a decaying meter is not settled
+   evidence, so raises wait out a fresh settle and the freed headroom is available to the pending
+   restore. v2 has no freed-headroom projection on an off (unlike a turn-on), so calm reset is the
+   mechanism. Also a defensive calm-null at collapse-latch creation in `sensing.ts` (intent clarity).
+5. **Acting-flavor re-sync (`controller.ts` `reloadConfig`):** when the flag flips to acting `"v2"`
+   without a restart (the cutover path), the persisted shed / fan-hold / remembered-level book and
+   learned costs are **re-read from the DB** — v1 may have written those rows while acting and v2 had
+   only a boot snapshot. **Flip via the API**, not direct SQL (v2 doesn't tick in `"v1"`/`"shadow"`).
+   `controller.test.ts` covers this (the class had no direct tests before).
+
+Tests: `raise.test.ts` reservation/parking/label/gentle suites; `config.test.ts` calm clamp;
+`fan-trim.test.ts` gentle hold; `sensing.test.ts` collapse-calm; `controller.test.ts` re-sync;
+`scenarios.test.ts` "the 2026-07-24 restore-vs-raise incident" (freed headroom → pending shed room,
+not a peer raise; gentle fan climb). **650 server tests green; server + client `tsc` clean.**
+
+**Security (shipped alongside, `auth.ts`):** `clientIp()` trusted `cf-connecting-ip` unconditionally
+(spoofable off-Cloudflare → login rate-limiter bypass + forged `ac_control_audit` IP). Now it is
+trusted only when the rightmost `x-forwarded-for` hop (Traefik-appended) is a published Cloudflare
+address; otherwise the real socket peer is used and a client-supplied XFF is never adopted. See the
+auth tests + `ac-control-audit.test.ts` (updated to the production forwarding shape).
+
 ---
+
+---
+
+# v1 (historical — rollback target until deletion)
+
+> Everything from here down documents the **v1** controller (`ac-leveler.ts` + `ac-leveling.ts`). v2 is acting (see the top of this file); v1 stays only as the rollback target and will be deleted after the soak. Kept verbatim so a rollback is well-understood.
 
 **TL;DR (v1):** A closed-loop controller (built 2026-06-06) in the collector keeps total household current within the active power source's limit (Grid 30A / Generator 15A, editable) by adjusting TCL AC **generator-mode levels** (per-unit current caps). It can also reduce fans, emergency-shed ACs, and auto-restore them. A pure allocator (`ac-leveling.ts`) decides targets; a stateful layer (`ac-leveler.ts`) handles gating, persistence, manual intents, prediction, and command execution; a severe over-limit (≥ limit+1A ×2 readings, or the grid oscillation pattern) bypasses the budget fit entirely via the **emergency reduction fast-path** (meter-sized cut, urgent tick — own section below). A separate calibration runner (`ac-calibration.ts`) measures each AC's real draw per level/fan to tune the amp models.
 
@@ -546,6 +605,7 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
 - **2026-06-12 (emergency reduction fast-path):** "when home current exceeds the limit (especially by >1A) act fast and smart — we have seconds before the breaker trips… and no bouncing: no extreme uncalculated reductions, smart actions based on accurate assumptions." Decisions asked and answered: **severe boundary ≥ limit+1A** (was strictly >; exactly-+1A readings — the 31A incident — were mild); **sheds stay OUT of the emergency cut batch** (levels+fans only; a power-off needs its own fresh severe streak and fires only when nothing else is reducible); **oscillation windowed gate on GRID only** (gen noise near the deliberately-ridden 15A limit would false-trigger). Sizing is meter-derived (min of severe readings + margin), smallest-sufficient-cut greedy with best-fit final step, 15s in-flight discount against stacked cuts.
 - **2026-06-11 (5-issue batch, root-caused from live gen→grid logs):** **Near-target band** — "if it is near [the target] by 0.5, it should not use more than L1, above that it is ok to use any level based on budget" → configurable `nearTargetBandC` (default 0.5), replaces the mild-tier `ceil(max/2)` cap. **Fan curve stays 0.3°C/step** (user keep). **Range fan is ALWAYS smart auto unless the slot fixes 1–7** — "it should always be on A unless the user specify"; the preset fan no longer drives range enforcement (automation side: ac-automations.md). **Shed restore made fast**: floor credit for ramping ACs in nonAcLoad, restores exempt from blind raise-hold blocking (expectation + batch-savings math), restore-priority over raises/warm-starts (Abdu's 20-min shed: Najat's 270s hold + Abdullah's preempting L3 raise + ramp-inflated budgets). **Unreachable un-mark on ANY late confirm** (Najat's L4/L5/L6 false marks). **UI command verify-resend 5s × 3** — user: "find the root cause and fix, and if not able, make 5 sec for retry for 3 times"; the root cause is her firmware, so the retry layer is the fix (tcl-ac.md).
 - **2026-06-13 (gen over-raise trip):** live 15A-gen breaker trip from the leveler raising Abdu L1→L2→L3 into a demand-driven compressor surge the gen amp model under-stated (logged observed L1→L2 step ~2.9A vs model 1.1A). Verified NOT caused by the same-day cost-aware optimizer (reduce-only). User chose to **fix the gen model**: gen STEP retuned to the observed surge (Abdu/Najat 2.9, Abdullah 2.0), bases kept — raises now need measured ≤ ~10.9A. Also implemented **guard B** (power-collapse raise-freeze + ramp re-arm, user-approved) so the leveler can't raise into a tripped/collapsed line. Still open: fan-restore buffer-gating, bounce-expiry re-raise. (See "Generator over-raise trip & gen-step retune".)
+- **2026-07-24 (v2 cutover + restore-vs-raise fix):** live incident — after the user turned a peer AC off to free budget, the leveler raised a running AC (Abdu→L3) instead of restoring the shed hot room (Najat). User decisions: **flip the controller to v2 this session** (live, rollback = flip to v1 + restart); **restore outranks raises** — a feasible-but-gated shed restore reserves its amps and parks raises (both controllers had the bug; v2 got the durable fix, v1 left as rollback-only); **gentle gen restores** — a shed room returns with its fan pinned to 1 so its surge fits (the fan-slam was the un-modeled cost); a managed peer-off resets calm so the freed headroom is the pending restore's, not a raise's. Also: this cutover delivers the standing **"grid entry → all ACs to max, then drop"** directive (v2's GRID_FULL, absent from v1). Hygiene: debug captures (`ssh_*.txt`, `*_out.json`) are gitignored and must be cleared at session end (see CLAUDE.md). (See "2026-07-24 restore-vs-raise fix set".)
 
 ## Gotchas & test notes
 
