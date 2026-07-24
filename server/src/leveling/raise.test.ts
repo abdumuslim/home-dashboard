@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { invariantCorrections, planRaise, type RaiseInput } from "./raise.js";
+import { envelopeTotalAmps, invariantCorrections, planRaise, type RaiseInput } from "./raise.js";
 import { initialPacingState, noteFailure } from "./pacing.js";
 import { updateCost } from "./costs.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
@@ -170,6 +170,147 @@ describe("warm restore", () => {
     expect(tight.commands).toHaveLength(0); // 2-step jump = 4A model > 3A headroom
     const capped = raise([ac("a", { warmStartLevel: 3, slotCap: 2 })], { calmMs: 0, headroomAmps: 5 });
     expect(capped.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+  });
+});
+
+describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 15A, shipped, tripped)", () => {
+  // Live-shaped gen models: Abdu (2-ton) 4.3+2.5 → 9.3 @L3; Najat (1-ton) 2.3+2 → 6.3 @L3.
+  const liveCfg: LevelingConfigV2 = {
+    ...cfg,
+    genAmpModels: {
+      abdu: { baseAmps: 4.3, stepAmps: 2.5 },
+      najat: { baseAmps: 2.3, stepAmps: 2 },
+    },
+  };
+
+  it("envelopeTotalAmps sums worst-case cap draws from the per-AC models", () => {
+    const total = envelopeTotalAmps(
+      [
+        { deviceId: "abdu", level: 3, maxLevel: 3 },
+        { deviceId: "najat", level: 3, maxLevel: 3 },
+      ],
+      liveCfg,
+      "gen",
+    );
+    expect(total).toBeCloseTo(15.6, 5);
+  });
+
+  it("blocks the second L3 on gen even when the meter shows room (the incident)", () => {
+    // Abdu already at L3, Najat at L2 wanting L3. The (lagging/frozen) meter
+    // reads 10.4A — plenty of apparent headroom — but 9.3 + 6.3 = 15.6 > 14.9.
+    const p = planRaise({
+      acs: [ac("abdu", { currentLevel: 3, needDelta: 3 }), ac("najat", { currentLevel: 2, needDelta: 2.7 })],
+      headroomAmps: 4.3, // 14.7 − 10.4
+      smoothedAmps: 10.4,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions.some((d) => d.deviceId === "najat" && d.blockedBy === "physics envelope")).toBe(true);
+  });
+
+  it("allows the same raise once a peer's cap comes down (end-state fits)", () => {
+    // Abdu at L1: 4.3 + Najat L3 6.3 = 10.6 ≤ 14.9 → the raise may proceed.
+    const p = planRaise({
+      acs: [ac("abdu", { currentLevel: 1, needDelta: 1 }), ac("najat", { currentLevel: 2, needDelta: 2.7 })],
+      headroomAmps: 4.3,
+      smoothedAmps: 10.4,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 3 }]);
+  });
+
+  it("grid raises are NOT envelope-guarded (grid starts full by directive)", () => {
+    const gridCfg = { ...liveCfg, gridLimitAmps: 12 }; // absurdly tight to prove the guard is off
+    const p = raise([ac("abdu", { currentLevel: 2, needDelta: 3, manualTarget: 3 })], {
+      source: "grid",
+      config: gridCfg,
+      headroomAmps: 5,
+      smoothedAmps: 5,
+      limitAmps: 12,
+    });
+    expect(p.commands).toEqual([{ deviceId: "abdu", kind: "set_level", level: 3 }]);
+  });
+
+  it("a warm restore degrades to the highest envelope-safe level instead of stranding", () => {
+    // Warm target L3 (6.3 + Abdu's 9.3 = 15.6 > 14.9) degrades to L2 (4.3 + 9.3 = 13.6 ✓).
+    const p = planRaise({
+      acs: [ac("abdu", { currentLevel: 3, needDelta: 1 }), ac("najat", { currentLevel: 1, needDelta: 2, warmStartLevel: 3 })],
+      headroomAmps: 4.3,
+      smoothedAmps: 10.4,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 2 }]);
+  });
+
+  it("an envelope-breaking plain restore falls through to restore-with-peer-floor-downs", () => {
+    // Peers' caps claim 9.3 + 6.3 = 15.6 > 14.9, so restoring c on TOP of them
+    // is refused even with meter room — but pulling both peers to their floors
+    // (4.3 + 2.3 + 2 = 8.6) makes the restore fit, so it ships as one batch.
+    const p = planRaise({
+      acs: [
+        ac("abdu", { currentLevel: 3, needDelta: 1 }),
+        ac("najat", { currentLevel: 3, needDelta: 1 }),
+        ac("c", { on: false, shed: true, needDelta: 4 }),
+      ],
+      headroomAmps: 8,
+      smoothedAmps: 6,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands).toEqual([
+      { deviceId: "abdu", kind: "set_level", level: 1 },
+      { deviceId: "najat", kind: "set_level", level: 1 },
+      { deviceId: "c", kind: "power_on", level: 1, reason: "restore" },
+    ]);
+  });
+
+  it("a restore that breaks the envelope even at floors stays off", () => {
+    // c's floor draw alone (9A base) + peers at floors (4.3 + 2.3) = 15.6 > 14.9.
+    const heavyCfg: LevelingConfigV2 = {
+      ...liveCfg,
+      genAmpModels: { ...liveCfg.genAmpModels, c: { baseAmps: 9, stepAmps: 1 } },
+    };
+    const p = planRaise({
+      acs: [
+        ac("abdu", { currentLevel: 3, needDelta: 1 }),
+        ac("najat", { currentLevel: 3, needDelta: 1 }),
+        ac("c", { on: false, shed: true, needDelta: 4 }),
+      ],
+      headroomAmps: 8,
+      smoothedAmps: 6,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: heavyCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands.every((c) => c.kind !== "power_on")).toBe(true);
+    expect(p.decisions.some((d) => d.deviceId === "c" && d.blockedBy === "no headroom")).toBe(true);
   });
 });
 

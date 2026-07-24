@@ -1775,7 +1775,48 @@ export class AcLeveler {
       );
     };
 
-    for (const [deviceId, level] of Object.entries(result.desiredLevels)) {
+    // Physics-envelope veto (2026-07-23 gen trip): the meter lags a compressor's
+    // response to a released cap by minutes, so meter-anchored admission alone
+    // can ship an end-state the model KNOWS exceeds the breaker — the 16:50 UTC
+    // batch predicted 16.9A on the 15A gen, shipped anyway, and tripped it 68s
+    // later. On gen, strip the RAISE side of any batch whose model-predicted
+    // steady-state total exceeds the raw limit; reductions/sheds/fans/restores
+    // always pass (they are the safe direction).
+    let desiredLevels = result.desiredLevels;
+    if (source === "gen") {
+      const raiseIds = new Set(
+        Object.entries(desiredLevels)
+          .filter(([id, level]) => {
+            const snap = snapshots.find((s) => s.deviceId === id);
+            return snap != null && snap.currentLevel >= 1 && level > snap.currentLevel;
+          })
+          .map(([id]) => id),
+      );
+      if (raiseIds.size > 0) {
+        // Same recipe as the expectation block below: non-AC load + every AC
+        // that will be ON at its commanded (or last-set) level.
+        let projected = Math.max(0, result.nonAcLoadAmps);
+        for (const s of snapshots) {
+          const willBeOn = result.toRestore.includes(s.deviceId) ||
+            (s.on && !this.shedIds.has(s.deviceId) && !result.toShed.includes(s.deviceId));
+          if (!willBeOn) continue;
+          const level = desiredLevels[s.deviceId] ??
+            (s.managed ? (this.lastSetLevel.get(s.deviceId) ?? s.currentLevel) : s.currentLevel);
+          projected += estimateAcDraw(level, s.maxLevel, this.ampModelFor(s.deviceId, source));
+        }
+        if (projected > limit) {
+          desiredLevels = Object.fromEntries(
+            Object.entries(desiredLevels).filter(([id]) => !raiseIds.has(id)),
+          );
+          log.warn(
+            `[leveler] Physics envelope: raise batch projects ${projected.toFixed(1)}A > ${limit}A on gen — ` +
+            `${raiseIds.size} raise(s) stripped (${[...raiseIds].map(name).join(", ")})`,
+          );
+        }
+      }
+    }
+
+    for (const [deviceId, level] of Object.entries(desiredLevels)) {
       const snap = snapshots.find((s) => s.deviceId === deviceId);
       try {
         await tcl.sendControl(deviceId, "set_generator_mode", level);

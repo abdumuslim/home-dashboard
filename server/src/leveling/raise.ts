@@ -11,10 +11,32 @@
 
 import type { AcView, Command, Decision, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
-import { levelCutSavings, raiseJumpAmps, turnOnAmps } from "./costs.js";
+import { levelCutSavings, modelFor, raiseJumpAmps, steadyDraw, turnOnAmps } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { ceilCapOf, ceilOf, floorOf } from "./needs.js";
 import { canAttempt, type PacingState } from "./pacing.js";
+
+/**
+ * Physics-envelope total: worst-case steady draw of a commanded end-state,
+ * summed from the per-AC cap models. A gen level is a firmware CAP — under
+ * binding (hot) demand the compressor is entitled to the whole cap, and the
+ * meter only shows that minutes later (or never, when the ESP hangs frozen).
+ * This is the number that already knew "expected 16.9A > 15A" when the
+ * 2026-07-23 double-L3 batch shipped and tripped the gen breaker.
+ * Non-AC load is deliberately excluded: the cap models over-state cool-room
+ * draw and v2 has no trustworthy non-AC split; the meter-side admission stays
+ * the primary gate — this is the catastrophic-end-state backstop.
+ */
+export function envelopeTotalAmps(
+  entries: Array<{ deviceId: string; level: number; maxLevel: number }>,
+  config: LevelingConfigV2,
+  source: Exclude<PowerSource, "none">,
+): number {
+  return entries.reduce(
+    (sum, e) => sum + steadyDraw(e.level, e.maxLevel, modelFor(config, e.deviceId, source)),
+    0,
+  );
+}
 
 export interface RaiseInput {
   /** ALL managed AC views (on and off/shed), pre-sorted by priority. */
@@ -74,6 +96,25 @@ export function planRaise(input: RaiseInput): RaisePlan {
 
   const onManaged = acs.filter((a) => a.on && a.managed && !a.shed);
 
+  // Physics-envelope veto (gen only — grid deliberately starts FULL and lets
+  // the reducer trim): never command an end-state whose worst-case modeled
+  // draw exceeds limit − margin, no matter how much room the meter shows.
+  const envelopeCeiling = input.limitAmps - config.marginAmps;
+  const envelopeGuard = source === "gen";
+  const envelopeWith = (overrides: Record<string, number>, extra?: { deviceId: string; level: number; maxLevel: number }): number =>
+    envelopeTotalAmps(
+      [
+        ...onManaged.map((a) => ({
+          deviceId: a.deviceId,
+          level: overrides[a.deviceId] ?? a.currentLevel,
+          maxLevel: a.maxLevel,
+        })),
+        ...(extra != null ? [extra] : []),
+      ],
+      config,
+      source,
+    );
+
   // ---- Restore phase: most-needy shed AC first, no queue jumping ----
   // Restores are exempt from the resting buffer (a whole room off is worse
   // than riding near the limit): fits under limit − margin.
@@ -97,7 +138,9 @@ export function planRaise(input: RaiseInput): RaisePlan {
     }
     const floor = floorOf(candidate);
     const cost = turnOnAmps(book, config, candidate.deviceId, source, floor, candidate.maxLevel, now);
-    const fitsPlain = input.smoothedAmps + cost.amps <= restoreCeiling;
+    const candidateEntry = { deviceId: candidate.deviceId, level: floor, maxLevel: candidate.maxLevel };
+    const envelopePlainOk = !envelopeGuard || envelopeWith({}, candidateEntry) <= envelopeCeiling;
+    const fitsPlain = envelopePlainOk && input.smoothedAmps + cost.amps <= restoreCeiling;
 
     if (fitsPlain && restoreCalmOk) {
       commands.push({ deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" });
@@ -128,7 +171,9 @@ export function planRaise(input: RaiseInput): RaisePlan {
         ? sum + levelCutSavings(book, config, a.deviceId, source, a.currentLevel, f, a.maxLevel, now)
         : sum;
     }, 0);
-    if (input.smoothedAmps - savingsAtFloors + cost.amps <= restoreCeiling) {
+    const floorOverrides = Object.fromEntries(onManaged.map((a) => [a.deviceId, floorOf(a)]));
+    const envelopeFloorsOk = !envelopeGuard || envelopeWith(floorOverrides, candidateEntry) <= envelopeCeiling;
+    if (envelopeFloorsOk && input.smoothedAmps - savingsAtFloors + cost.amps <= restoreCeiling) {
       if (!restoreCalmOk) {
         reservedAmps = cost.amps;
         decisions.push({ at: now, deviceId: candidate.deviceId, action: "restore", blockedBy: "calm" });
@@ -183,7 +228,26 @@ export function planRaise(input: RaiseInput): RaisePlan {
       decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "backoff" });
       continue;
     }
-    const target = warmTarget ?? ac.currentLevel + 1;
+    let target = warmTarget ?? ac.currentLevel + 1;
+    // Physics envelope BEFORE the meter gate: a frozen or ramp-lagging meter
+    // can show room for an end-state the cap models know exceeds the breaker
+    // (2026-07-23: two ACs at L3 on the 15A gen = 15.6A worst case → trip).
+    // Envelope is monotonic in level, so a too-high warm target degrades to
+    // the highest safe level instead of stranding the AC.
+    if (envelopeGuard) {
+      const desired = target;
+      while (target > ac.currentLevel && envelopeWith({ [ac.deviceId]: target }) > envelopeCeiling) target--;
+      if (target === ac.currentLevel) {
+        decisions.push({
+          at: now,
+          deviceId: ac.deviceId,
+          action: `raise L${desired}`,
+          blockedBy: "physics envelope",
+          detail: `worst case ${envelopeWith({ [ac.deviceId]: desired }).toFixed(1)}A > ${envelopeCeiling.toFixed(1)}A on ${source}`,
+        });
+        continue;
+      }
+    }
     const jump = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, target, ac.maxLevel, now);
     if (jump.amps > available) {
       decisions.push({
