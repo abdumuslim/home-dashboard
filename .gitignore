@@ -24,6 +24,20 @@ Thumbs.db
 ssh_out*.txt
 *.log
 
+# Debug captures (SSH/API command output — belong in the session scratchpad, never the repo)
+/ssh_*.txt
+/ssh_*.json
+/*_out.json
+
+# Generated build artifacts
+*.tsbuildinfo
+NUL
+
+# Local data / stray checkouts (not part of the app)
+server/data/
+.agent/
+everything-claude-code/
+
 # Claude Code / AI context (contain credentials, VPS details)
 CLAUDE.md
 docs/agent/operations.md
