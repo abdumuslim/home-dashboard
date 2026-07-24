@@ -60,6 +60,12 @@ export interface RaisePlan {
   attempts: Array<{ deviceId: string; kind: "raise" | "restore" }>;
   /** True when the batch turns an AC on (longer settle/ramp downstream). */
   isTurnOn: boolean;
+  /**
+   * Amps held back for a feasible-but-gated shed restore. > 0 means the raise
+   * phase was parked (see the parking guard) — the caller must also keep a fan
+   * restore from spending these amps.
+   */
+  reservedAmps: number;
 }
 
 /**
@@ -127,32 +133,63 @@ export function planRaise(input: RaiseInput): RaisePlan {
     .sort((a, b) => b.needDelta - a.needDelta || acs.indexOf(a) - acs.indexOf(b));
 
   for (const candidate of shedCandidates) {
+    const floor = floorOf(candidate);
+    const cost = turnOnAmps(book, config, candidate.deviceId, source, floor, candidate.maxLevel, now);
+    const candidateEntry = { deviceId: candidate.deviceId, level: floor, maxLevel: candidate.maxLevel };
+
+    // Both feasibilities up front, BEFORE any gate — the reservation decision
+    // needs to know whether this room could return at all (plain, or by pulling
+    // every raised peer down to its floor in the same batch).
+    const envelopePlainOk = !envelopeGuard || envelopeWith({}, candidateEntry) <= envelopeCeiling;
+    const fitsPlain = envelopePlainOk && input.smoothedAmps + cost.amps <= restoreCeiling;
+
+    const savingsAtFloors = onManaged.reduce((sum, a) => {
+      const f = floorOf(a);
+      return a.currentLevel > f
+        ? sum + levelCutSavings(book, config, a.deviceId, source, a.currentLevel, f, a.maxLevel, now)
+        : sum;
+    }, 0);
+    const floorOverrides = Object.fromEntries(onManaged.map((a) => [a.deviceId, floorOf(a)]));
+    const envelopeFloorsOk = !envelopeGuard || envelopeWith(floorOverrides, candidateEntry) <= envelopeCeiling;
+    const fitsAtFloors = envelopeFloorsOk && input.smoothedAmps - savingsAtFloors + cost.amps <= restoreCeiling;
+
+    // Can't return this tick even with peer floor-downs → reserve NOTHING
+    // (raises don't change floors math, so parking here would be a permanent
+    // strand); the next-most-needy candidate may still fit.
+    if (!fitsPlain && !fitsAtFloors) {
+      decisions.push({
+        at: now,
+        deviceId: candidate.deviceId,
+        action: "restore",
+        // envelopeFloorsOk is the most permissive envelope case (everyone at
+        // floors); if even that is over the breaker model, physics is the
+        // blocker, not the meter — label it so the journal is diagnosable.
+        blockedBy: !envelopeFloorsOk ? "physics envelope" : "no headroom",
+        detail: `floors ${(input.smoothedAmps - savingsAtFloors + cost.amps).toFixed(1)}A vs ${restoreCeiling.toFixed(1)}A`,
+      });
+      continue;
+    }
+
+    // Feasible but its restore backoff is cooling (a recent restore bounced):
+    // reserve its amps AND park raises (below) so a running AC can't grab the
+    // headroom the moment the backoff clears. Bounded by the backoff ladder
+    // (≤15 min) — never permanent. Keep scanning: a less-needy room may ship.
     if (!canAttempt(pacing, candidate.deviceId, "restore", now)) {
+      reservedAmps = Math.max(reservedAmps, cost.amps);
       decisions.push({
         at: now,
         deviceId: candidate.deviceId,
         action: "restore",
         blockedBy: "backoff",
+        detail: `reserved ${cost.amps.toFixed(1)}A`,
       });
-      continue; // backoff = blocked; the next candidate may try (no permanent strand)
-    }
-    const floor = floorOf(candidate);
-    const cost = turnOnAmps(book, config, candidate.deviceId, source, floor, candidate.maxLevel, now);
-    const candidateEntry = { deviceId: candidate.deviceId, level: floor, maxLevel: candidate.maxLevel };
-    const envelopePlainOk = !envelopeGuard || envelopeWith({}, candidateEntry) <= envelopeCeiling;
-    const fitsPlain = envelopePlainOk && input.smoothedAmps + cost.amps <= restoreCeiling;
-
-    if (fitsPlain && restoreCalmOk) {
-      commands.push({ deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" });
-      attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
-      decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}` });
-      return { commands, decisions, attempts, isTurnOn: true };
+      continue;
     }
 
-    if (fitsPlain && !restoreCalmOk) {
-      // Feasible but waiting out its calm gate: reserve its amps so raises
-      // can't steal them — but DON'T park the whole system (v2 change).
-      reservedAmps = cost.amps;
+    // Feasible but waiting out its calm gate: reserve its amps and STOP — no
+    // queue-jumping past a needier room that is merely time-gated.
+    if (!restoreCalmOk) {
+      reservedAmps = Math.max(reservedAmps, cost.amps);
       decisions.push({
         at: now,
         deviceId: candidate.deviceId,
@@ -163,42 +200,43 @@ export function planRaise(input: RaiseInput): RaisePlan {
       break;
     }
 
-    // Restore-with-reduction: judge feasibility at FLOORS — pull every raised
-    // peer to its floor in the same batch when that makes the restore fit.
-    const savingsAtFloors = onManaged.reduce((sum, a) => {
-      const f = floorOf(a);
-      return a.currentLevel > f
-        ? sum + levelCutSavings(book, config, a.deviceId, source, a.currentLevel, f, a.maxLevel, now)
-        : sum;
-    }, 0);
-    const floorOverrides = Object.fromEntries(onManaged.map((a) => [a.deviceId, floorOf(a)]));
-    const envelopeFloorsOk = !envelopeGuard || envelopeWith(floorOverrides, candidateEntry) <= envelopeCeiling;
-    if (envelopeFloorsOk && input.smoothedAmps - savingsAtFloors + cost.amps <= restoreCeiling) {
-      if (!restoreCalmOk) {
-        reservedAmps = cost.amps;
-        decisions.push({ at: now, deviceId: candidate.deviceId, action: "restore", blockedBy: "calm" });
-        break;
-      }
-      for (const a of onManaged) {
-        const f = floorOf(a);
-        if (a.currentLevel > f) commands.push({ deviceId: a.deviceId, kind: "set_level", level: f });
-      }
+    // Calm-clear and feasible → ship it now. Plain if it fits alone; otherwise
+    // pull every raised peer down to its floor in the same batch.
+    if (fitsPlain) {
       commands.push({ deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" });
       attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
-      decisions.push({
-        at: now,
-        deviceId: candidate.deviceId,
-        action: `restore @L${floor} with peer floor-downs`,
-      });
-      return { commands, decisions, attempts, isTurnOn: true };
+      decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}` });
+      return { commands, decisions, attempts, isTurnOn: true, reservedAmps };
     }
+    for (const a of onManaged) {
+      const f = floorOf(a);
+      if (a.currentLevel > f) commands.push({ deviceId: a.deviceId, kind: "set_level", level: f });
+    }
+    commands.push({ deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" });
+    attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
+    decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor} with peer floor-downs` });
+    return { commands, decisions, attempts, isTurnOn: true, reservedAmps };
+  }
 
-    // Infeasible even at floors: parks nothing (raises don't change floors math).
-    decisions.push({ at: now, deviceId: candidate.deviceId, action: "restore", blockedBy: "no headroom" });
+  // A feasible restore is reserved but gated (backoff/calm) — park the ENTIRE
+  // raise phase, warm raises included. Per-amp reservation alone can't stop a
+  // warm raise (it's calm-exempt) from rewinding the shared calm clock the
+  // pending restore depends on (the shell resetCalm()s after every non-fan
+  // batch), so the whole phase stands down. Never a permanent strand: an
+  // infeasible-at-floors candidate reserves nothing, and a reserved one is
+  // bounded by restoreCalmSeconds (~15s) or one backoff rung.
+  if (reservedAmps > 0) {
+    decisions.push({
+      at: now,
+      action: "raises",
+      blockedBy: "restore reservation",
+      detail: `${reservedAmps.toFixed(1)}A reserved`,
+    });
+    return { commands, decisions, attempts, isTurnOn: false, reservedAmps };
   }
 
   // ---- Raise phase: one-step, meter-anchored, most-needy first ----
-  let available = input.headroomAmps - reservedAmps;
+  let available = input.headroomAmps;
   const raiseCalmOk = input.calmMs >= config.raiseCalmSeconds * 1000;
 
   const candidates = onManaged
@@ -272,5 +310,5 @@ export function planRaise(input: RaiseInput): RaisePlan {
     if (source === "gen") break;
   }
 
-  return { commands, decisions, attempts, isTurnOn: false };
+  return { commands, decisions, attempts, isTurnOn: false, reservedAmps };
 }

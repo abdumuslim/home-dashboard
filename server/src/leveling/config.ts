@@ -73,6 +73,7 @@ export function mergeLevelingConfigV2(stored: Record<string, unknown> | null | u
   const num = (v: unknown, fallback: number): number =>
     typeof v === "number" && Number.isFinite(v) ? v : fallback;
   const d = DEFAULT_LEVELING_CONFIG_V2;
+  const raiseCalmSeconds = Math.max(5, num(s.raiseCalmSeconds, d.raiseCalmSeconds));
   return {
     enabled: typeof s.enabled === "boolean" ? s.enabled : d.enabled,
     controller: s.controller === "v2" || s.controller === "shadow" ? s.controller : "v1",
@@ -80,8 +81,12 @@ export function mergeLevelingConfigV2(stored: Record<string, unknown> | null | u
     genLimitAmps: num(s.genLimitAmps, d.genLimitAmps),
     marginAmps: num(s.marginAmps, d.marginAmps),
     restingBufferAmps: Math.max(0, num(s.restingBufferAmps, num(s.raiseBufferAmps, d.restingBufferAmps))),
-    raiseCalmSeconds: Math.max(5, num(s.raiseCalmSeconds, d.raiseCalmSeconds)),
-    restoreCalmSeconds: Math.max(5, num(s.restoreCalmSeconds, d.restoreCalmSeconds)),
+    raiseCalmSeconds,
+    // A restore must never wait LONGER for calm than an ordinary raise: if it
+    // did, a running AC's raise could become calm-eligible first and consume
+    // the headroom a pending restore needs, breaking "restore outranks raises".
+    // Clamp restore ≤ raise so restore's gate always opens no later.
+    restoreCalmSeconds: Math.min(raiseCalmSeconds, Math.max(5, num(s.restoreCalmSeconds, d.restoreCalmSeconds))),
     fanTrimEnabled: typeof s.fanTrimEnabled === "boolean" ? s.fanTrimEnabled : d.fanTrimEnabled,
     comfortTargetC: num(s.comfortTargetC, d.comfortTargetC),
     nearTargetBandC: Math.min(5, Math.max(0, num(s.nearTargetBandC, d.nearTargetBandC))),

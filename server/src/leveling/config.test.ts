@@ -53,4 +53,14 @@ describe("mergeLevelingConfigV2", () => {
     expect(mergeLevelingConfigV2({ raiseCalmSeconds: 1 }).raiseCalmSeconds).toBe(5);
     expect(mergeLevelingConfigV2({ restoreCalmSeconds: 0 }).restoreCalmSeconds).toBe(5);
   });
+
+  it("clamps restoreCalmSeconds to raiseCalmSeconds (restore must outrank raises)", () => {
+    // A restore that waited LONGER for calm than a raise would let a running
+    // AC's raise become eligible first and steal the pending restore's headroom.
+    const merged = mergeLevelingConfigV2({ restoreCalmSeconds: 120, raiseCalmSeconds: 30 });
+    expect(merged.restoreCalmSeconds).toBe(30);
+    expect(merged.raiseCalmSeconds).toBe(30);
+    // A shorter restore gate is left as-is.
+    expect(mergeLevelingConfigV2({ restoreCalmSeconds: 10, raiseCalmSeconds: 30 }).restoreCalmSeconds).toBe(10);
+  });
 });

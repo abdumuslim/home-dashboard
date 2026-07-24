@@ -236,10 +236,12 @@ export function plan(input: PlanInput): PlanOutput {
         fanOnly: false,
       };
     }
-    // Nothing to raise — a held fan may climb one sweet-spot step.
+    // Nothing to raise — a held fan may climb one sweet-spot step, but never
+    // into amps reserved for a pending shed restore (raises were parked; a fan
+    // restore must not spend that headroom either).
     const fanStep = planFanRestore(input.fanHolds, acs, {
       calmMs: meter.calmMs,
-      headroomAmps: pressure.headroomAmps,
+      headroomAmps: pressure.headroomAmps - raisePlan.reservedAmps,
       book,
       source,
       now,

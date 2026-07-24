@@ -88,17 +88,57 @@ describe("restore outranks raises", () => {
     expect(p.commands).toContainEqual({ deviceId: "c", kind: "power_on", level: 1, reason: "restore" });
   });
 
-  it("a calm-gated feasible restore reserves its amps — raises can't steal them", () => {
-    // Config with a restore gate ABOVE the raise gate: calm 35s unlocks raises
-    // but not the restore. Restore cost 2A is reserved; headroom 2.6 → 0.6 left;
-    // the raise needs 2A → blocked by "no headroom", NOT by a global park.
+  it("a calm-gated feasible restore reserves its amps and parks the raise phase", () => {
+    // Config with a restore gate ABOVE the raise gate (only reachable when
+    // passed raw, not through mergeLevelingConfigV2's clamp): calm 35s unlocks
+    // raises but not the restore. The restore is feasible → reserve + park the
+    // whole raise phase, so a running AC can't steal the reserved headroom.
     const p = raise([ac("a", { needDelta: 3 }), ac("b", { on: false, shed: true, needDelta: 4 })], {
       calmMs: 35_000,
       config: { ...cfg, restoreCalmSeconds: 45 },
     });
     expect(p.commands).toHaveLength(0);
+    expect(p.reservedAmps).toBeGreaterThan(0);
     expect(p.decisions.some((d) => d.deviceId === "b" && d.blockedBy === "calm")).toBe(true);
-    expect(p.decisions.some((d) => d.deviceId === "a" && d.blockedBy === "no headroom")).toBe(true);
+    expect(p.decisions.some((d) => d.action === "raises" && d.blockedBy === "restore reservation")).toBe(true);
+  });
+
+  it("reserves a backoff-blocked feasible restore's amps and parks the raise phase", () => {
+    // b (shed, most-needy) is feasible but its restore backoff is cooling. The
+    // raise phase must NOT hand a's headroom out while b waits for the ladder.
+    const pacing = noteFailure(initialPacingState("gen"), "b", "restore", T - 1_000);
+    const p = raise([ac("a", { needDelta: 3 }), ac("b", { on: false, shed: true, needDelta: 4 })], {
+      headroomAmps: 5,
+      pacing,
+    });
+    expect(p.commands).toHaveLength(0);
+    expect(p.reservedAmps).toBeGreaterThan(0);
+    expect(p.decisions.some((d) => d.deviceId === "b" && d.blockedBy === "backoff")).toBe(true);
+    expect(p.decisions.some((d) => d.action === "raises" && d.blockedBy === "restore reservation")).toBe(true);
+  });
+
+  it("a shed room infeasible even at floors reserves nothing — raises proceed", () => {
+    // b's turn-on can't fit even with a pulled to its floor (smoothed 14.8 + 2
+    // = 16.8, and a is already at floor L1 so there's nothing to pull down).
+    const p = raise([ac("a", { needDelta: 3 }), ac("b", { on: false, shed: true, needDelta: 4 })], {
+      smoothedAmps: 14.8,
+      headroomAmps: 5,
+    });
+    expect(p.reservedAmps).toBe(0);
+    expect(p.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+    expect(p.decisions.some((d) => d.deviceId === "b" && d.blockedBy === "no headroom")).toBe(true);
+  });
+
+  it("a calm-gated plain-feasible restore parks warm raises too", () => {
+    // A warm raise is calm-exempt, so per-amp reservation alone wouldn't stop
+    // it — the whole raise phase must park while the restore is reserved.
+    const p = raise(
+      [ac("a", { warmStartLevel: 3, currentLevel: 1 }), ac("b", { on: false, shed: true, needDelta: 4 })],
+      { calmMs: 35_000, headroomAmps: 6, config: { ...cfg, restoreCalmSeconds: 45 } },
+    );
+    expect(p.commands).toHaveLength(0);
+    expect(p.reservedAmps).toBeGreaterThan(0);
+    expect(p.decisions.some((d) => d.action === "raises" && d.blockedBy === "restore reservation")).toBe(true);
   });
 
   it("restore-with-reduction pulls raised peers to floors in the same batch", () => {
@@ -287,8 +327,11 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
     ]);
   });
 
-  it("a restore that breaks the envelope even at floors stays off", () => {
+  it("a restore that breaks the envelope even at floors stays off, labeled 'physics envelope'", () => {
     // c's floor draw alone (9A base) + peers at floors (4.3 + 2.3) = 15.6 > 14.9.
+    // Even everyone-at-floors is over the breaker model, so the blocker is
+    // physics, not the meter — the journal must say so (was mislabeled "no
+    // headroom" before the 2026-07-24 arbitration fix).
     const heavyCfg: LevelingConfigV2 = {
       ...liveCfg,
       genAmpModels: { ...liveCfg.genAmpModels, c: { baseAmps: 9, stepAmps: 1 } },
@@ -310,7 +353,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       pacing: initialPacingState("gen"),
     });
     expect(p.commands.every((c) => c.kind !== "power_on")).toBe(true);
-    expect(p.decisions.some((d) => d.deviceId === "c" && d.blockedBy === "no headroom")).toBe(true);
+    expect(p.decisions.some((d) => d.deviceId === "c" && d.blockedBy === "physics envelope")).toBe(true);
   });
 });
 
