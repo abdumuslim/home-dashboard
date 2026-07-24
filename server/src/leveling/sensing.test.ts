@@ -123,6 +123,23 @@ describe("power-collapse latch", () => {
     expect(meterView(after.state, after.now).calmMs).toBe(0);
   });
 
+  it("calm dies the instant a collapse latches and rebuilds only from post-recovery readings", () => {
+    // Build genuine calm, then trip: calmSince must be null on the very reading
+    // that latches (not merely masked by the view), and calm must rebuild from
+    // scratch after recovery — never resurface a stale pre-collapse timestamp.
+    const calm = feedGen([12, 12, 12, 12]);
+    expect(calm.state.calmSince).not.toBeNull();
+    const tripped = ingestReading(calm.state, { gridAmps: 0, genAmps: 4 }, cfg, calm.now + 5_000);
+    expect(tripped.state.collapse).not.toBeNull();
+    expect(tripped.state.calmSince).toBeNull();
+    // Recover, then feed fresh headroom: calm restarts at the first post-recovery
+    // reading, so calmMs reflects only the new stretch, not the pre-trip one.
+    const recovered = ingestReading(tripped.state, { gridAmps: 0, genAmps: 12 }, cfg, calm.now + 60_000);
+    expect(recovered.state.collapse).toBeNull();
+    const after = feedGen([12, 12], { state: recovered.state, startAt: calm.now + 65_000 });
+    expect(meterView(after.state, after.now).calmMs).toBeLessThanOrEqual(15_000);
+  });
+
   it("does NOT latch on a modest drop or a drop that stays above the floor", () => {
     const steady = feedGen([13, 13.2, 12.8, 13.1]);
     // Drop of ~5A but lands at 8A (> floor): a normal reduction, not a trip.

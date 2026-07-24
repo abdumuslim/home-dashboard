@@ -342,6 +342,10 @@ export class LevelingControllerV2 {
     await this.releaseHold(deviceId, "user_power_off");
     // The collector converts shed → manual-off lock before clearing; mirror v1:
     await this.clearShed(deviceId, "user_power_off");
+    // Fires immediately on the UI off (before the shadow flips) — reset calm so
+    // the falling meter settles before any raise, same as the structural-off
+    // branch in tick(). Lets a pending shed restore claim the freed headroom.
+    this.meterState = resetCalm(this.meterState);
   }
 
   async onUserPowerOn(deviceId: string): Promise<void> {
@@ -423,6 +427,16 @@ export class LevelingControllerV2 {
           this.manualTarget.delete(device.id);
           this.fanExempt.delete(device.id);
           await this.releaseHold(device.id, "power_off");
+          if (managed) {
+            // A managed AC just turned off (user/automation freed budget). The
+            // next readings are a DECAYING meter, not settled evidence — reset
+            // calm so raises wait out a fresh settle instead of grabbing the
+            // freed headroom before it is real (and before a pending shed
+            // restore can claim it). Mirror of the turn-on ramp, for falling
+            // draw: v2 has no freed-headroom projection on an off, so a calm
+            // reset is the mechanism.
+            this.meterState = resetCalm(this.meterState);
+          }
         }
       }
       this.prevPowerStates.set(device.id, device.power);

@@ -201,6 +201,14 @@ export function ingestReading(
   let overLimitReadings = state.overLimitReadings;
   let calmSince = state.calmSince;
 
+  // Defensive: a freshly-latched collapse means this reading is lost AC load,
+  // never headroom — kill calm here regardless of which measured-branch runs
+  // below. Today a ≤ POWER_COLLAPSE_FLOOR_AMPS collapse reading always lands in
+  // the ≤ limit−margin branch (which already nulls it), so this only guards a
+  // future floor/limit retune; the suspected stale-calm-after-recovery window
+  // was NOT reproducible.
+  if (collapse != null && state.collapse == null) calmSince = null;
+
   if (measured > limit) {
     // Over the limit → drain, magnitude-weighted. Calm is broken.
     calmSince = null;
