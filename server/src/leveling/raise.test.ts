@@ -41,6 +41,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     reachableCap: null,
     warmStartLevel: null,
     ramping: false,
+    startBaselineAmps: null,
     reshedPenalized: false,
     ...overrides,
   };
@@ -398,5 +399,88 @@ describe("invariant corrections", () => {
       T,
     );
     expect(commands).toHaveLength(0);
+  });
+});
+
+describe("grid turn-on full start (2026-07-25: L1 for 4m41s with 5A free)", () => {
+  // Grid: limit 27, margin 0.1, resting buffer 0.2 → resting ceiling 26.7.
+  // Model base 2 step 2 → steady draw L1 2A, L2 4A, L3 6A.
+  const gridCfg: LevelingConfigV2 = { ...cfg, gridLimitAmps: 27 };
+  const gridRaise = (acs: AcView[], overrides: Partial<RaiseInput> = {}) =>
+    raise(acs, {
+      source: "grid",
+      config: gridCfg,
+      limitAmps: 27,
+      smoothedAmps: 18,
+      headroomAmps: 8.7,
+      pacing: initialPacingState("grid"),
+      ...overrides,
+    });
+
+  it("lifts a fresh turn-on straight to its ceiling despite the ramp and no calm", () => {
+    // The live incident: the AC restores its last gen level (L1) and the ordinary
+    // raise path is blocked for the whole 4-min ramp, then creeps one step a batch.
+    const p = gridRaise([ac("a", { currentLevel: 1, ramping: true, startBaselineAmps: 17 })], {
+      calmMs: 0,
+    });
+    expect(p.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 3 }]);
+    expect(p.decisions.some((d) => d.action === "grid start L1→L3")).toBe(true);
+  });
+
+  it("degrades to the highest level the pre-start baseline affords", () => {
+    // 21.5 + L3 6 = 27.5 > 26.7; 21.5 + L2 4 = 25.5 fits.
+    const p = gridRaise([ac("a", { currentLevel: 1, ramping: true, startBaselineAmps: 21.5 })], {
+      calmMs: 0,
+    });
+    expect(p.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+  });
+
+  it("prices the lift off the pre-start baseline, NOT the ramping meter", () => {
+    // The meter still shows 18A because the new compressor's draw hasn't landed:
+    // 8.7A of apparent headroom would admit L3 outright. The baseline knows the
+    // house was already at 24A without this AC → nothing fits.
+    const p = gridRaise([ac("a", { currentLevel: 1, ramping: true, startBaselineAmps: 24 })], {
+      calmMs: 0,
+    });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", action: "grid start L3", blockedBy: "no headroom" }),
+    );
+  });
+
+  it("charges each start its WHOLE draw so two simultaneous starts can't double-spend", () => {
+    const p = gridRaise([
+      ac("a", { currentLevel: 1, ramping: true, startBaselineAmps: 17, needDelta: 4 }),
+      ac("b", { currentLevel: 1, ramping: true, startBaselineAmps: 17, needDelta: 3 }),
+    ], { calmMs: 0 });
+    // a: 17 + 6 = 23 ≤ 26.7 → L3, committing its whole 6A.
+    // b: same baseline, but only 26.7 − 6 = 20.7 left → even L2 (17+4) misses.
+    expect(p.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 3 }]);
+    expect(p.decisions.some((d) => d.deviceId === "b" && d.blockedBy === "no headroom")).toBe(true);
+  });
+
+  it("respects every ceiling: a manual cap clamps the start", () => {
+    const p = gridRaise([ac("a", { currentLevel: 1, ramping: true, startBaselineAmps: 17, manualCap: 2 })], {
+      calmMs: 0,
+    });
+    expect(p.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+  });
+
+  it("a near-target room is not full-started (its ceiling is L1)", () => {
+    const p = gridRaise([ac("a", { currentLevel: 1, ramping: true, startBaselineAmps: 17, needDelta: 0.2 })], {
+      calmMs: 0,
+    });
+    expect(p.commands).toHaveLength(0);
+  });
+
+  it("gen turn-ons keep the floors-first policy — no full start", () => {
+    const p = raise([ac("a", { currentLevel: 1, ramping: true, startBaselineAmps: 5 })], { calmMs: 60_000 });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions.some((d) => d.deviceId === "a" && d.blockedBy === "ramping")).toBe(true);
+  });
+
+  it("after the window closes the ordinary one-step meter-anchored path resumes", () => {
+    const p = gridRaise([ac("a", { currentLevel: 1, startBaselineAmps: null })], { calmMs: 60_000 });
+    expect(p.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
   });
 });

@@ -74,9 +74,13 @@ interface SimAc {
   demandAmps: number;
   needDelta: number;
   warmStartLevel: number | null;
+  /** Open grid full-start window (pre-start house amps + expiry). */
+  startBaseline: { amps: number; until: number } | null;
 }
 
 const STEP_MS = 5_000;
+/** Mirrors the controller shell's grid full-start window (AC_RAMP_MS). */
+const GRID_START_MS = 240_000;
 
 export class Scenario {
   now = 1_000_000_000;
@@ -136,6 +140,7 @@ export class Scenario {
       demandAmps: s.demandAmps,
       needDelta: s.needDelta,
       warmStartLevel: null,
+      startBaseline: null,
     }));
   }
 
@@ -148,6 +153,8 @@ export class Scenario {
   setSource(line: "grid" | "gen" | "none"): void {
     this.line = line;
     this.lineDead = false;
+    // Baselines are amps on the old source; the entry mode owns the transition.
+    for (const ac of this.acs) ac.startBaseline = null;
     if (line === "gen" || line === "grid") {
       // A real changeover restarts every running compressor.
       for (const ac of this.acs) if (ac.on) ac.turnedOnAt = this.now;
@@ -181,6 +188,12 @@ export class Scenario {
     ac.turnedOnAt = this.now;
     const source = this.line === "none" ? "gen" : this.line;
     this.pendingProjection = turnOnAmps(this.book, this.cfg, deviceId, source, level, 3, this.now).amps;
+    // Mirror the shell: on grid a turn-on opens a full-start window anchored on
+    // the house load measured just before the compressor started.
+    const view = meterView(this.meterState, this.now);
+    if (this.line === "grid" && view.sampleCount >= 2) {
+      ac.startBaseline = { amps: view.smoothedAmps, until: this.now + GRID_START_MS };
+    }
   }
 
   /**
@@ -192,6 +205,7 @@ export class Scenario {
     const ac = this.sim(deviceId);
     ac.on = false;
     ac.shed = false;
+    ac.startBaseline = null;
     this.meterState = resetCalm(this.meterState);
   }
 
@@ -276,6 +290,10 @@ export class Scenario {
         reachableCap: null,
         warmStartLevel: ac.warmStartLevel,
         ramping: ac.on && ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < ac.setup.rampSeconds * 1000,
+        startBaselineAmps:
+          ac.on && ac.startBaseline != null && ac.startBaseline.until > this.now
+            ? ac.startBaseline.amps
+            : null,
         reshedPenalized: reshedPenalized(this.pacing, ac.setup.deviceId, this.now),
       };
     });
@@ -297,6 +315,7 @@ export class Scenario {
           ac.on = false;
           ac.shed = true;
           ac.warmStartLevel = null;
+          ac.startBaseline = null;
           break;
         case "power_on":
           ac.on = true;
@@ -377,7 +396,11 @@ export class Scenario {
       this.execute(out);
       this.modeState = noteBatch(this.modeState, { fanOnly: out.fanOnly }, this.now);
       if (!out.fanOnly) this.meterState = resetCalm(this.meterState);
-      if (out.reason.startsWith("over")) this.meterState = refillBucket(this.meterState);
+      if (out.reason.startsWith("over")) {
+        this.meterState = refillBucket(this.meterState);
+        // The reducer's judgment beats the entry policy (shell parity).
+        for (const ac of this.acs) ac.startBaseline = null;
+      }
       // Failure attribution: a reduction that undoes a recent raise/restore is
       // that attempt's failure (the bounce, hybrid-backoff side).
       for (const cmd of out.commands) {

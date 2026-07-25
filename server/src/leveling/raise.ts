@@ -38,6 +38,40 @@ export function envelopeTotalAmps(
   );
 }
 
+/**
+ * Highest level a freshly-turned-on AC may be driven to on GRID, priced as
+ * `pre-start house load + its own modeled steady draw at that level` against
+ * the resting ceiling. Returns null when not even one step above its current
+ * level fits.
+ *
+ * Why not the meter (2026-07-25): a TCL restores the gen level it was last
+ * left at, so an AC turned on while on grid comes back at its previous gen
+ * floor (L1) — and for `AC_RAMP_MS` the compressor is still ramping, which
+ * blocks the ordinary raise path entirely (live: Abdu came on at L1 at 08:00:45
+ * with ~5A of headroom and only reached L3 at 08:05:26). Lifting it during the
+ * ramp means the meter has NOT yet absorbed this AC's own draw, so
+ * meter-anchored admission would spend phantom headroom. The pre-start baseline
+ * is the honest anchor: it is the rest of the house, and the AC's whole steady
+ * draw at the target level is charged on top of it.
+ */
+export function gridStartLevel(
+  ac: AcView,
+  ceil: number,
+  config: LevelingConfigV2,
+  ceilingAmps: number,
+): number | null {
+  if (ac.startBaselineAmps == null) return null;
+  const model = modelFor(config, ac.deviceId, "grid");
+  let target = Math.min(ceil, ac.maxLevel);
+  while (
+    target > ac.currentLevel &&
+    ac.startBaselineAmps + steadyDraw(target, ac.maxLevel, model) > ceilingAmps
+  ) {
+    target--;
+  }
+  return target > ac.currentLevel ? target : null;
+}
+
 export interface RaiseInput {
   /** ALL managed AC views (on and off/shed), pre-sorted by priority. */
   acs: AcView[];
@@ -256,8 +290,12 @@ export function planRaise(input: RaiseInput): RaisePlan {
   }
 
   // ---- Raise phase: one-step, meter-anchored, most-needy first ----
+  // `available` is the meter-anchored budget; every command debits what the
+  // meter has NOT yet seen — a level raise its delta, a grid start the whole
+  // steady draw of the AC that just came on (see gridStartLevel).
   let available = input.headroomAmps;
   const raiseCalmOk = input.calmMs >= config.raiseCalmSeconds * 1000;
+  const restingCeiling = input.limitAmps - config.marginAmps - config.restingBufferAmps;
 
   const candidates = onManaged
     .filter((a) => a.currentLevel >= 1)
@@ -266,13 +304,36 @@ export function planRaise(input: RaiseInput): RaisePlan {
     .sort((x, y) => y.ac.needDelta - x.ac.needDelta || acs.indexOf(x.ac) - acs.indexOf(y.ac));
 
   for (const { ac, ceil } of candidates) {
+    // Grid turn-on full start (user directive "on grid start all to full"):
+    // an AC that just came on restores its last gen level (usually L1 from the
+    // previous gen episode) — lift it to the affordable ceiling in ONE command
+    // instead of making it wait out the 4-min ramp gate and creep up a step at
+    // a time. Priced against its pre-start baseline, minus whatever this batch
+    // already committed, so two simultaneous starts can't spend the same amps.
+    const startBaseline = source === "grid" ? ac.startBaselineAmps : null;
+    const startTarget =
+      startBaseline == null
+        ? null
+        : gridStartLevel(ac, ceil, config, restingCeiling - (input.headroomAmps - available));
     const warmTarget =
       ac.warmStartLevel != null && ac.warmStartLevel > ac.currentLevel
         ? Math.min(ac.warmStartLevel, ceil)
         : null;
-    // Warm restores are exempt from the calm gate (the level was recently
-    // proven stable); ordinary raises need sustained calm and a settled meter.
-    if (warmTarget == null) {
+    // A grid start and a warm restore are both exempt from the calm gate (one
+    // is the entry policy, the other a recently-proven level) and from the ramp
+    // gate; ordinary raises need sustained calm and a settled meter.
+    if (startBaseline != null) {
+      if (startTarget == null) {
+        decisions.push({
+          at: now,
+          deviceId: ac.deviceId,
+          action: `grid start L${ceil}`,
+          blockedBy: "no headroom",
+          detail: `${startBaseline.toFixed(1)}A before start + L${ac.currentLevel + 1} draw > ${restingCeiling.toFixed(1)}A`,
+        });
+        continue;
+      }
+    } else if (warmTarget == null) {
       if (!raiseCalmOk) {
         decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "calm" });
         continue;
@@ -286,7 +347,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "backoff" });
       continue;
     }
-    let target = warmTarget ?? ac.currentLevel + 1;
+    let target = startTarget ?? warmTarget ?? ac.currentLevel + 1;
     // Physics envelope BEFORE the meter gate: a frozen or ramp-lagging meter
     // can show room for an end-state the cap models know exceeds the breaker
     // (2026-07-23: two ACs at L3 on the 15A gen = 15.6A worst case → trip).
@@ -307,7 +368,9 @@ export function planRaise(input: RaiseInput): RaisePlan {
       }
     }
     const jump = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, target, ac.maxLevel, now);
-    if (jump.amps > available) {
+    // A grid start was already admitted against its pre-start baseline — the
+    // meter cannot price it while the compressor is still ramping.
+    if (startTarget == null && jump.amps > available) {
       decisions.push({
         at: now,
         deviceId: ac.deviceId,
@@ -319,13 +382,25 @@ export function planRaise(input: RaiseInput): RaisePlan {
     }
     commands.push({ deviceId: ac.deviceId, kind: "set_level", level: target });
     attempts.push({ deviceId: ac.deviceId, kind: "raise" });
-    decisions.push({
-      at: now,
-      deviceId: ac.deviceId,
-      action: `raise L${ac.currentLevel}→L${target}`,
-      detail: `${jump.amps.toFixed(1)}A ${jump.confidence}`,
-    });
-    available -= jump.amps;
+    if (startTarget != null) {
+      // The meter has seen ~none of this AC yet → debit its WHOLE steady draw.
+      const wholeDraw = steadyDraw(target, ac.maxLevel, modelFor(config, ac.deviceId, source));
+      decisions.push({
+        at: now,
+        deviceId: ac.deviceId,
+        action: `grid start L${ac.currentLevel}→L${target}`,
+        detail: `${(startBaseline ?? 0).toFixed(1)}A before start + ${wholeDraw.toFixed(1)}A modeled`,
+      });
+      available -= wholeDraw;
+    } else {
+      decisions.push({
+        at: now,
+        deviceId: ac.deviceId,
+        action: `raise L${ac.currentLevel}→L${target}`,
+        detail: `${jump.amps.toFixed(1)}A ${jump.confidence}`,
+      });
+      available -= jump.amps;
+    }
     // Gen: ONE raise command per batch — confirm on the meter, then the next.
     if (source === "gen") break;
   }

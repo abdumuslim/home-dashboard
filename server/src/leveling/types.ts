@@ -185,6 +185,17 @@ export interface AcView {
   warmStartLevel: number | null;
   /** Compressor still inside its ~4-min post-start ramp window. */
   ramping: boolean;
+  /**
+   * House load measured just BEFORE this AC turned on, while its grid
+   * full-start window is open (null otherwise). A TCL restores the generator
+   * level it was last left at — typically L1 from the previous gen episode —
+   * so a turn-on on grid must be lifted to its ceiling ("on grid, start all to
+   * full" — user 2026-07-23) instead of creeping up one step at a time behind
+   * the ramp gate. Sizing that lift off the live meter would over-credit
+   * headroom (during the ramp the meter has not absorbed this AC's own draw
+   * yet), so the pre-start baseline is the anchor.
+   */
+  startBaselineAmps: number | null;
   /** A recent restore of this AC failed (backoff live) — re-shedding it is penalized. */
   reshedPenalized: boolean;
 }

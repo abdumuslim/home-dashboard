@@ -24,6 +24,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     reachableCap: null,
     warmStartLevel: null,
     ramping: false,
+    startBaselineAmps: null,
     reshedPenalized: false,
     ...overrides,
   };

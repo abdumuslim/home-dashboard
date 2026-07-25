@@ -359,6 +359,55 @@ describe("grid entry starts FULL, then drops on evidence (2026-07-23 directive)"
   });
 });
 
+describe("the 2026-07-25 grid turn-on incident (L1 for 4m41s with ~5A free)", () => {
+  // Live: the user turned Abdu on at 08:00:45 while already on grid. The TCL
+  // restored the gen level it was last left at (L1, from the previous gen
+  // episode), and the leveler could not touch it for the whole 4-min compressor
+  // ramp — L1→L2 landed at 08:04:50, L2→L3 at 08:05:26. Grid had ~5A free the
+  // entire time. The grid entry directive ("start all to full, then drop") now
+  // applies to a TURN-ON too, priced against the pre-start house load because
+  // the meter has not absorbed the new compressor yet.
+  const hotAbdu: SimAcSetup = { ...ABDU, on: false, level: 1, demandAmps: 9, needDelta: 3, rampSeconds: 240 };
+
+  it("a turn-on on grid lands at its ceiling in the FIRST batch, not 4 minutes later", () => {
+    const s = new Scenario(cfg, [hotAbdu, ABDULLAH, NAJAT], { nonAcAmps: 10, source: "grid" });
+    s.advance(60); // house resting ≈ 17A without Abdu
+    const on = s.now;
+    s.turnOn("abdu", 1);
+    s.advance(30); // still deep inside the 4-min ramp
+    const lifts = setLevels(s, on).filter((c) => c.cmd.deviceId === "abdu");
+    expect(lifts.length).toBeGreaterThan(0);
+    expect(lifts[0].cmd.level).toBe(3);
+    expect(lifts[0].at - on).toBeLessThanOrEqual(10_000);
+    // …and the house stays under the breaker as the compressor ramps in.
+    s.advance(300);
+    expect(s.totalAmps()).toBeLessThanOrEqual(27);
+  });
+
+  it("degrades to what the pre-start baseline affords instead of overshooting", () => {
+    // House ≈ 20A without Abdu: L3 (model 8.5A) would land at 28.5A, L2 fits.
+    const s = new Scenario(cfg, [hotAbdu, ABDULLAH, NAJAT], { nonAcAmps: 13, source: "grid" });
+    s.advance(60);
+    const on = s.now;
+    s.turnOn("abdu", 1);
+    s.advance(30);
+    const lifts = setLevels(s, on).filter((c) => c.cmd.deviceId === "abdu");
+    expect(lifts[0].cmd.level).toBe(2);
+    s.advance(300);
+    expect(s.totalAmps()).toBeLessThanOrEqual(27);
+  });
+
+  it("a turn-on on GEN keeps the floors-first policy — no full start", () => {
+    const s = new Scenario(cfg, [{ ...hotAbdu, demandAmps: 6 }, NAJAT], { nonAcAmps: 2, source: "gen" });
+    s.advance(60);
+    const on = s.now;
+    s.turnOn("abdu", 1);
+    s.advance(30);
+    const lifts = setLevels(s, on).filter((c) => c.cmd.deviceId === "abdu");
+    expect(lifts.every((c) => c.cmd.level < 3)).toBe(true);
+  });
+});
+
 describe("the 2026-07-24 restore-vs-raise incident (15A gen)", () => {
   // Live: the leveler shed Najat, she restore-bounced (backoff armed), the user
   // then turned a PEER off to free budget — and 11s later the leveler raised a

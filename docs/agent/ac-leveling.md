@@ -54,6 +54,8 @@ blind to ramp lag and to frozen/false readings.
    backstop, a manual change, or **any bucket_empty** (the reducer's judgment beats the entry
    policy — no fight). The gen side of the directive was already v2's FLOORS mode (and v1's
    persistent floors). Note: v1 has no grid full-start — that behavior arrives with cutover.
+   **GRID_FULL arms on a SOURCE CHANGE only**; an AC turning on while grid is already active got the
+   same policy on 2026-07-25 via the per-device start window — see the grid turn-on section below.
 
 New regressions: `scenarios.test.ts` "2026-07-23 double-L3 gen trip" (cool-meter climb → heat surge
 stays under the breaker), frozen-ESP suspend/resume, grid-entry full-start ×2; `raise.test.ts`
@@ -109,6 +111,50 @@ Tests: `raise.test.ts` reservation/parking/label/gentle suites; `config.test.ts`
 `fan-trim.test.ts` gentle hold; `sensing.test.ts` collapse-calm; `controller.test.ts` re-sync;
 `scenarios.test.ts` "the 2026-07-24 restore-vs-raise incident" (freed headroom → pending shed room,
 not a peer raise; gentle fan climb). **650 server tests green; server + client `tsc` clean.**
+
+### 2026-07-25 grid turn-on full start
+
+**The incident (live, on grid):** the user turned Abdu on at 08:00:45 Baghdad while the house was
+already on **grid** with ~5A free. He came up at **L1** and stayed there — L1→L2 landed at 08:04:50
+(**4m05s** later), L2→L3 at 08:05:26. Two independent causes:
+
+1. **Why L1:** a TCL restores the state it was last left at on power-on (`[tcl] Restored last state …
+   "generatorMode":1`) — i.e. the gen floor from the previous gen episode. Nothing re-applied the
+   grid policy, because **GRID_FULL only arms on a source change into grid** (`modes.ts`
+   `source_changed`), never on an AC turning on while grid is already the active source.
+2. **Why it took 4 minutes:** `rearmRamp()` marks a freshly-on AC `ramping` for `AC_RAMP_MS` (240s)
+   and `planRaise` blocks every ordinary (non-warm) raise while `ac.ramping` — so the first step
+   could not ship until the ramp expired, then one step per batch behind the 30s settle + calm.
+
+**Fix — the "on grid, start all to full" directive now covers TURN-ONS, not just changeovers.** A
+managed AC that comes on while on grid opens a **grid full-start window** (`GRID_START_MS` =
+`AC_RAMP_MS`) carrying `startBaselineAmps`: the smoothed house load measured **just before it
+started**. Inside that window `raise.ts` `gridStartLevel()` drives it to the highest level that fits
+`baseline + steadyDraw(level) ≤ limit − margin − restingBuffer`, in ONE command, exempt from the calm
+and ramping gates (still pacing-gated, still clamped by `ceilOf` — near-target/manual/slot/reachable
+caps all bind, so a satisfied room is not full-started).
+
+**Why the baseline and not the meter:** during the ramp the meter has not absorbed the new
+compressor's own draw, so meter-anchored admission would spend phantom headroom (in the incident the
+meter read ~18A for an AC whose L3 steady draw is 8.5A). The pre-start baseline is the rest of the
+house, and the AC's WHOLE steady draw at the target is charged on top of it — which is also why a
+grid start debits `available` by its whole draw, not the level delta: two simultaneous turn-ons then
+cannot spend the same amps. Fan slam is not modeled (grid restores were already fan-slam-sized); the
+0.3A margin+buffer and the reducer cover it.
+
+**Window bookkeeping (`controller.ts`):** opened by `onUserPowerOn` (fires before the shadow flips —
+the cleanest baseline) or the structural off→on branch in `tick()` for automation turn-ons (first
+writer wins); cleared on power-off, on a source change (baseline amps are per-source, and the entry
+mode owns the transition), on a manual gen-level change (AGENTS rule 7), after any over-limit batch
+(the reducer's judgment beats the entry policy — same rule that ends GRID_FULL on `bucket_empty`),
+and on expiry. **Gen is deliberately untouched:** entering gen means FLOORS, and a gen turn-on still
+starts at L1 and climbs meter-confirmed.
+
+Tests: `raise.test.ts` "grid turn-on full start" suite (8 — lift, degrade, baseline-not-meter,
+double-spend, cap clamp, near-target, gen policy, post-window); `scenarios.test.ts` "the 2026-07-25
+grid turn-on incident" (3 — first-batch ceiling, degrade-instead-of-overshoot, gen unchanged).
+**662 server tests green; server `tsc` clean.** Verified failing without the fix (7 of the 11 are
+behavioral; the other 4 pin unchanged behavior).
 
 **Security (shipped alongside, `auth.ts`):** `clientIp()` trusted `cf-connecting-ip` unconditionally
 (spoofable off-Cloudflare → login rate-limiter bypass + forged `ac_control_audit` IP). Now it is

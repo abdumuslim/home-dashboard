@@ -59,6 +59,13 @@ import type { AcView, Command, MeterState, Mode, PowerSource } from "./types.js"
 const log = childLogger("leveler2");
 
 const AC_RAMP_MS = 240_000;
+/**
+ * How long a fresh turn-on on grid is treated as a "grid full start" (priced
+ * against the house load measured just before it came on). Same window as the
+ * compressor ramp — exactly the stretch where the ordinary meter-anchored raise
+ * path is blind (the meter has not absorbed the new AC yet) and blocked.
+ */
+const GRID_START_MS = AC_RAMP_MS;
 const SHED_CLEAR_GRACE_MS = 15_000;
 const PUSH_THROTTLE_MS = 5 * 60_000;
 /** Grade a batch only when this many fresh readings arrived after compareAfter. */
@@ -94,6 +101,8 @@ export class LevelingControllerV2 {
   private manualTarget = new Map<string, number>();
   private fanExempt = new Set<string>();
   private rampUntil = new Map<string, number>();
+  /** Grid full-start windows: house amps measured just before this AC came on. */
+  private startBaseline = new Map<string, { amps: number; until: number }>();
   private boostActive = new Map<string, boolean>();
   private prevPowerStates = new Map<string, boolean>();
   private deviceNames = new Map<string, string>();
@@ -314,6 +323,9 @@ export class LevelingControllerV2 {
           this.pacing = resetPacing(this.pacing, event.to);
           this.recon = clearOnSourceChange(this.recon);
           this.pendingGrade = null;
+          // Baselines are amps on the OLD source — worthless on the new one,
+          // and the entry mode (FLOORS / GRID_FULL) owns the transition now.
+          this.startBaseline.clear();
           if (event.to === "grid") {
             this.manualCap.clear();
             this.manualTarget.clear();
@@ -367,6 +379,7 @@ export class LevelingControllerV2 {
   // ---------- user hooks (manual always wins) ----------
 
   async onUserPowerOff(deviceId: string): Promise<void> {
+    this.startBaseline.delete(deviceId);
     this.rememberedLevel.delete(deviceId);
     await this.pool.query("DELETE FROM ac_leveling_remembered_level WHERE device_id = $1", [deviceId]);
     this.recon = clearOnPowerOff(this.recon, deviceId);
@@ -384,6 +397,9 @@ export class LevelingControllerV2 {
   async onUserPowerOn(deviceId: string): Promise<void> {
     await this.clearShed(deviceId, "user_power_on");
     this.rearmRamp([deviceId]);
+    // Fires before the shadow flips — the meter here is still the pre-start
+    // house load, the exact anchor the grid full start needs.
+    this.noteTurnOn(deviceId, Date.now());
   }
 
   async onUserFanChange(deviceId: string): Promise<void> {
@@ -397,6 +413,8 @@ export class LevelingControllerV2 {
     this.modeState = clearFloorsOnManual(this.modeState);
     this.recon = clearMarksOnManual(this.recon, deviceId);
     this.rememberedLevel.delete(deviceId);
+    // Manual wins (AGENTS rule 7) — a hand-set level ends the entry policy.
+    this.startBaseline.delete(deviceId);
     const confirmed = this.recon[deviceId]?.confirmedLevel ?? null;
     const maxLevel = 3;
     const rank = (l: number): number => (l <= 0 ? maxLevel + 1 : Math.min(l, maxLevel));
@@ -435,6 +453,24 @@ export class LevelingControllerV2 {
     for (const id of deviceIds) this.rampUntil.set(id, until);
   }
 
+  /**
+   * Open a grid full-start window for an AC that just came on: remember the
+   * house load measured just BEFORE it started, so the raise planner can lift
+   * it straight to its ceiling ("on grid, start all to full" — user
+   * 2026-07-23) instead of waiting out the ramp gate and creeping up one step
+   * per batch (2026-07-25: 4m41s to reach L3 with ~5A of headroom free).
+   * Gen has no equivalent by design — entering gen means FLOORS.
+   * First writer wins: the routes-level user hook fires a tick before the
+   * observed power flip, and its reading is the cleaner baseline.
+   */
+  private noteTurnOn(deviceId: string, now: number): void {
+    const view = meterView(this.meterState, now);
+    if (view.source !== "grid" || view.sampleCount < 2) return;
+    const open = this.startBaseline.get(deviceId);
+    if (open != null && open.until > now) return;
+    this.startBaseline.set(deviceId, { amps: view.smoothedAmps, until: now + GRID_START_MS });
+  }
+
   // ---------- tick ----------
 
   async tick(ctx: LevelerDeviceContext[], outdoorTempC: number | null): Promise<void> {
@@ -453,8 +489,13 @@ export class LevelingControllerV2 {
       if (prev !== undefined && prev !== device.power) {
         if (device.power) {
           this.rearmRamp([device.id]);
-          if (managed && !this.shedIds.has(device.id)) this.freshlyOn.push(device.id);
+          if (managed && !this.shedIds.has(device.id)) {
+            this.freshlyOn.push(device.id);
+            // Automation turn-ons never pass through onUserPowerOn.
+            this.noteTurnOn(device.id, now);
+          }
         } else {
+          this.startBaseline.delete(device.id);
           this.recon = clearOnPowerOff(this.recon, device.id);
           this.manualCap.delete(device.id);
           this.manualTarget.delete(device.id);
@@ -615,6 +656,17 @@ export class LevelingControllerV2 {
     log.info(`[leveler2] Fan hold released for ${this.deviceNames.get(deviceId) ?? deviceId} (${reason})`);
   }
 
+  /** Live grid full-start baseline for a device, or null once the window closed. */
+  private startBaselineFor(deviceId: string, on: boolean, now: number): number | null {
+    const open = this.startBaseline.get(deviceId);
+    if (open == null) return null;
+    if (!on || open.until <= now) {
+      this.startBaseline.delete(deviceId);
+      return null;
+    }
+    return open.amps;
+  }
+
   private buildViews(ctx: LevelerDeviceContext[], outdoorTempC: number | null, now: number): AcView[] {
     const rank = (id: string): number => {
       const i = this.config.priority.indexOf(id);
@@ -647,6 +699,7 @@ export class LevelingControllerV2 {
         reachableCap: reachableCapOf(this.recon, device.id, device.maxGeneratorLevel || 3),
         warmStartLevel: this.rememberedLevel.get(device.id) ?? null,
         ramping: (this.rampUntil.get(device.id) ?? 0) > now && device.power,
+        startBaselineAmps: this.startBaselineFor(device.id, device.power, now),
         reshedPenalized: reshedPenalized(this.pacing, device.id, now),
       };
     });
@@ -768,7 +821,13 @@ export class LevelingControllerV2 {
 
     this.modeState = noteBatch(this.modeState, { fanOnly }, now);
     if (!fanOnly) this.meterState = resetCalm(this.meterState);
-    if (out.reason.startsWith("over")) this.meterState = refillBucket(this.meterState);
+    if (out.reason.startsWith("over")) {
+      this.meterState = refillBucket(this.meterState);
+      // The meter objected: the reducer's judgment beats the entry policy, so
+      // no grid start may re-assert a ceiling it just trimmed (same rule that
+      // ends GRID_FULL on bucket_empty — modes.ts).
+      this.startBaseline.clear();
+    }
 
     // Failure attribution: an over-limit cut/shed of a recently-attempted AC.
     if (out.reason.startsWith("over")) {
