@@ -26,6 +26,14 @@ export interface FanHold {
   /** What the trim last commanded. */
   lastSetFan: number;
   heldAt: number;
+  /**
+   * This hold came from a GENTLE restore (fan pinned on the power_on), not a
+   * trim — so the controller's freshly-on projection must price that turn-on at
+   * the same gentle cost the restore was admitted at (see restoreCostAmps).
+   * In-memory only: after a restart the flag is lost and the projection falls
+   * back to the full fan-slam cost, which errs trip-safe.
+   */
+  gentle?: boolean;
 }
 
 export type FanHolds = Readonly<Record<string, FanHold>>;
@@ -56,7 +64,7 @@ export function recordFanCut(holds: FanHolds, ac: AcView, target: number, now: n
 export function recordGentleRestoreHold(holds: FanHolds, deviceId: string, now: number): FanHolds {
   return {
     ...holds,
-    [deviceId]: { deviceId, originalFan: 0, lastSetFan: 1, heldAt: now },
+    [deviceId]: { deviceId, originalFan: 0, lastSetFan: 1, heldAt: now, gentle: true },
   };
 }
 

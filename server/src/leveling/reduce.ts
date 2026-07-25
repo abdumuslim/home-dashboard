@@ -66,6 +66,20 @@ export interface ReduceInput {
   requiredAmps: number;
   /** Extreme overshoot: a covering plan that sheds nothing is infeasible. */
   requireShed: boolean;
+  /**
+   * Turn-on inrush blanking (default true): when false the search may not
+   * enumerate a power-off at all, so a transient that is about to decay can
+   * only be answered with level cuts and fan trims. Set by the pipeline for a
+   * MILD overshoot whose smoothed meter is still under the limit while a
+   * compressor is ramping (the 2026-07-25 restore-bounce storm).
+   */
+  allowShed?: boolean;
+  /**
+   * When a shed IS taken, prefer this device: the room whose own turn-on caused
+   * the overload. Ranked above the need ordering, so the re-shed penalty can
+   * never export the shed to a bystander that did nothing.
+   */
+  preferShed?: string | null;
   fanTrimEnabled: boolean;
   book: CostBook;
   config: LevelingConfigV2;
@@ -92,6 +106,12 @@ interface ComboScore {
   disturbed: number;
   shedNeed: number;
   feasible: boolean;
+  /**
+   * This combo sheds a room OTHER than the one whose turn-on caused the
+   * overload, while leaving that room running — "a bystander pays". Ranked
+   * immediately after feasibility so it beats every other preference.
+   */
+  exportsShed: boolean;
 }
 
 /** Output order: least-needy first, top-priority last (historical shed-order semantics). */
@@ -103,6 +123,7 @@ function reductionOutputOrder(acs: AcView[]): AcView[] {
 
 function reductionBetter(a: ComboScore, b: ComboScore, required: number): boolean {
   if (a.feasible !== b.feasible) return a.feasible;
+  if (a.exportsShed !== b.exportsShed) return !a.exportsShed;
   if (a.feasible) {
     const an = Math.round(a.shedNeed * 10);
     const bn = Math.round(b.shedNeed * 10);
@@ -120,6 +141,10 @@ function reductionBetter(a: ComboScore, b: ComboScore, required: number): boolea
 
 export function planReduction(input: ReduceInput): ReducePlan {
   const { acs, requiredAmps, requireShed, book, config, source, now } = input;
+  // A forced shed (extreme) always outranks the inrush blanking — a real breach
+  // beats "this might be a transient".
+  const allowShed = requireShed || (input.allowShed ?? true);
+  const preferShed = input.preferShed ?? null;
   const w = input.weights ?? DEFAULT_REDUCTION_WEIGHTS;
   const needWeight = (ac: AcView): number => 1 + w.needK * Math.max(0, ac.needDelta);
   const topId = acs[0]?.deviceId ?? null;
@@ -183,17 +208,22 @@ export function planReduction(input: ReduceInput): ReducePlan {
     }
     // Power-off move. Priority breaks equal-need ties (lowest priority first);
     // need is the real driver via the shedNeed comparison term.
-    let shedCost = w.shed * needWeight(ac) + (acs.length - 1 - index) * 1e-3;
-    if (ac.reshedPenalized) shedCost += w.reshedPenalty;
-    moves.push({
-      level: null,
-      fanTarget: null,
-      savings: baselineDraw,
-      cost: shedCost,
-      commands: 1,
-      disturbed: true,
-      shedNeed: Math.max(0, ac.needDelta),
-    });
+    // Withheld entirely during turn-on inrush blanking (see ReduceInput).
+    if (allowShed) {
+      let shedCost = w.shed * needWeight(ac) + (acs.length - 1 - index) * 1e-3;
+      // The room that caused this overload is exempt from the re-shed penalty:
+      // undoing its own turn-on is the correct move, not a bounce to punish.
+      if (ac.reshedPenalized && ac.deviceId !== preferShed) shedCost += w.reshedPenalty;
+      moves.push({
+        level: null,
+        fanTarget: null,
+        savings: baselineDraw,
+        cost: shedCost,
+        commands: 1,
+        disturbed: true,
+        shedNeed: Math.max(0, ac.needDelta),
+      });
+    }
     return { ac, moves };
   });
 
@@ -211,6 +241,8 @@ export function planReduction(input: ReduceInput): ReducePlan {
     sheds: number,
   ): void => {
     if (i === perAc.length) {
+      // ≤3 ACs, so scanning the leaf is cheaper than threading two more counters.
+      const shedIds = combo.flatMap((mv, idx) => (mv.level == null ? [perAc[idx].ac.deviceId] : []));
       const candidate: ComboScore = {
         combo: combo.slice(),
         savings,
@@ -219,6 +251,10 @@ export function planReduction(input: ReduceInput): ReducePlan {
         disturbed,
         shedNeed,
         feasible: savings >= requiredAmps - EPS && (!requireShed || sheds > 0),
+        exportsShed:
+          preferShed != null &&
+          shedIds.length > 0 &&
+          !shedIds.includes(preferShed),
       };
       if (best == null || reductionBetter(candidate, best, requiredAmps)) best = candidate;
       return;
@@ -239,7 +275,16 @@ export function planReduction(input: ReduceInput): ReducePlan {
   recurse(0, 0, 0, 0, 0, 0, 0);
 
   const chosen: ComboScore =
-    best ?? { combo: [], savings: 0, cost: 0, commands: 0, disturbed: 0, shedNeed: 0, feasible: requiredAmps <= EPS };
+    best ?? {
+      combo: [],
+      savings: 0,
+      cost: 0,
+      commands: 0,
+      disturbed: 0,
+      shedNeed: 0,
+      feasible: requiredAmps <= EPS,
+      exportsShed: false,
+    };
   const moveOf = new Map<string, AcMove>();
   perAc.forEach((p, i) => moveOf.set(p.ac.deviceId, chosen.combo[i]));
 

@@ -102,3 +102,137 @@ describe("LevelingControllerV2 — acting-flavor re-sync", () => {
     expect(controller.isShed("ac1")).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Grade-queue integration (2026-07-25). `pendingGrade` used to be a single slot
+// that every new batch overwrote, so on a busy generator episode NOTHING was
+// ever graded: `ac_leveling_costs` still held its 2026-07-23 seeds after ~10
+// live restores, and surviving attempts never reached `noteSuccess`, which pins
+// the backoff ladder at its 15-min rung. It is a list now — which means a grade
+// window can outlive the batch that FAILED its attempt, so the failure path has
+// to strip that attempt or the backoff it just grew would be erased.
+// ---------------------------------------------------------------------------
+
+function createGradePool() {
+  const journal: Array<Record<string, unknown>> = [];
+  const costs: Array<{ deviceId: string; transition: string }> = [];
+  const query = vi.fn(async (sql: string, params: unknown[] = []) => {
+    if (sql.includes("FROM ac_leveling_config") && sql.includes("id IN (1, 2)")) {
+      return { rows: [{ id: 2, config: { controller: "v2", enabled: true, genLimitAmps: 15, marginAmps: 0.1 } }], rowCount: 1 };
+    }
+    if (sql.includes("INSERT INTO ac_leveling_journal")) {
+      journal.push({ reason: params[4], commands: params[7] });
+      return { rows: [{ id: journal.length }], rowCount: 1 };
+    }
+    if (sql.includes("INSERT INTO ac_leveling_costs")) {
+      costs.push({ deviceId: String(params[0]), transition: String(params[2]) });
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("COUNT(*)") && sql.includes("ac_leveling_costs")) return { rows: [{ n: 7 }], rowCount: 1 };
+    return { rows: [], rowCount: 0 };
+  });
+  return { pool: { query } as never, journal, costs };
+}
+
+function acDevice(id: string, power: boolean, generatorMode: number) {
+  return { id, name: id, power, generatorMode, maxGeneratorLevel: 3, fanSpeed: 1 } as never;
+}
+
+describe("LevelingControllerV2 — grade queue", () => {
+  it("a bounced attempt keeps its ladder position — a stale grade must not mark it a success", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-07-25T18:00:00Z"));
+      const mock = createGradePool();
+      const device = acDevice("a", true, 1) as unknown as { generatorMode: number };
+      const deps: LevelingDeps = {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({
+            // A real firmware applies the level, so the next view reflects it —
+            // otherwise the send-dedupe spacing masks the second raise.
+            sendControl: async (_id: string, cmd: string, value: number) => {
+              if (cmd === "set_generator_mode") device.generatorMode = value;
+            },
+            executeAcAction: async () => undefined,
+          }) as never,
+      };
+      const controller = new LevelingControllerV2(mock.pool, deps);
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: device as never, managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
+      ];
+
+      // A live CT always micro-jitters; a bit-identical stream would trip the
+      // frozen-meter detector and suspend raises, testing the wrong path.
+      let flip = 1;
+      const run = async (genAmps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(5_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+      const raiseCooldown = () => controller.getStatus().acs[0]?.raiseCooldownMs ?? 0;
+
+      // Bounce a raise so the cut lands INSIDE the raise's own grade window
+      // (GRADE_LEVEL_MS 45s) — that is the only case where a stale grade could
+      // later resolve an already-blamed attempt as a success.
+      const bounce = async () => {
+        await run(8, 8); // calm ≥ raiseCalmSeconds → a raise ships (~30s in)
+        await run(15.5, 6); // 5 mild readings empty the bucket → cut at ~25s
+      };
+
+      await run(8, 24); // settle in and climb
+      expect(device.generatorMode).toBeGreaterThan(1);
+
+      await bounce();
+      expect(raiseCooldown()).toBeGreaterThan(0); // failure #1 → ladder rung 1
+
+      await bounce(); // failure #2 → rung 2 (120s) if the ladder survived
+
+      // Sample AFTER the stale grade window would have resolved (~45s past the
+      // raise, ~20s past the failure) but well inside rung 2's 120s cooldown.
+      // With the strip: still cooling. Without it: the stale grade calls
+      // noteSuccess and the backoff is silently erased to 0.
+      await run(8, 6);
+      expect(raiseCooldown()).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("writes durable blocked rows when an evaluation commands nothing", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-07-25T18:00:00Z"));
+      const mock = createGradePool();
+      const deps: LevelingDeps = {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never,
+      };
+      const controller = new LevelingControllerV2(mock.pool, deps);
+      await controller.ensureLoaded();
+      // One shed AC with no headroom at all — the restore is blocked every tick.
+      const ctx = [
+        { device: acDevice("a", true, 3), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
+        { device: acDevice("b", false, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+      ];
+      let flip = 1;
+      for (let i = 0; i < 40; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: 14.5 + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx, 30);
+      }
+      const blocked = mock.journal.filter((r) => r.reason === "blocked");
+      expect(blocked.length).toBeGreaterThan(0);
+      // Throttled — one row per (device, blockedBy) per 5 min, not one per tick.
+      expect(blocked.length).toBeLessThan(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

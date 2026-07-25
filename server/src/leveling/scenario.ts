@@ -31,7 +31,7 @@ import {
 } from "./pacing.js";
 import type { FanHolds } from "./fan-trim.js";
 import type { CostBook } from "./costs.js";
-import { turnOnAmps } from "./costs.js";
+import { restoreCostAmps, turnOnAmps } from "./costs.js";
 import { ceilOf, floorOf } from "./needs.js";
 
 export interface SimAcSetup {
@@ -239,6 +239,11 @@ export class Scenario {
     return this.executed.filter((e) => e.at >= at && (kind == null || e.cmd.kind === kind));
   }
 
+  /** Device IDs currently powered on, sorted (order-independent assertions). */
+  acsOn(): string[] {
+    return this.acs.filter((a) => a.on).map((a) => a.setup.deviceId).sort();
+  }
+
   totalAmps(): number {
     return this.nonAcAmps + this.acs.reduce((sum, ac) => sum + this.drawOf(ac), 0);
   }
@@ -327,6 +332,23 @@ export class Scenario {
           // Gentle restore pins the fan; the hold itself rides in out.fanHolds
           // (recorded by the pipeline, assigned in step()).
           if (cmd.fan != null) ac.fan = cmd.fan;
+          // Shell parity: the controller sees this AC flip off→on on the NEXT
+          // tick, adds it to `freshlyOn` and arms the proactive projection —
+          // exactly like an automation turn-on. Without this the harness could
+          // not reproduce the 2026-07-24/25 restore-bounce storm, where the
+          // projection re-priced a just-admitted restore and declared it over.
+          // A restore that pinned the fan is projected at the same gentle cost
+          // it was admitted at (shell: fanHolds[id].gentle).
+          this.pendingProjection = restoreCostAmps(
+            this.book,
+            this.cfg,
+            cmd.deviceId,
+            this.line === "none" ? "gen" : this.line,
+            cmd.level,
+            3,
+            this.now,
+            { gentle: cmd.fan != null },
+          ).amps;
           break;
         case "set_fan":
           ac.fan = cmd.fan;
@@ -396,6 +418,10 @@ export class Scenario {
       this.execute(out);
       this.modeState = noteBatch(this.modeState, { fanOnly: out.fanOnly }, this.now);
       if (!out.fanOnly) this.meterState = resetCalm(this.meterState);
+      // Shell parity: a turn-on invalidates banked over-limit readings.
+      if (out.commands.some((c) => c.kind === "power_on")) {
+        this.meterState = refillBucket(this.meterState);
+      }
       if (out.reason.startsWith("over")) {
         this.meterState = refillBucket(this.meterState);
         // The reducer's judgment beats the entry policy (shell parity).

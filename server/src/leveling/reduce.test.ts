@@ -178,3 +178,67 @@ describe("reduce-only contract & floors", () => {
     expect(p.toShed).toEqual(["hot"]);
   });
 });
+
+describe("turn-on inrush blanking (2026-07-25 restore-bounce storm)", () => {
+  // Everyone pinned at their floor with no fan slack, so a shed is the only
+  // cover the search can normally find — the live 20:23 state.
+  const pinned = (): AcView[] => [
+    ac("hot", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 3 }),
+    ac("cool", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 0.5 }),
+  ];
+
+  it("allowShed=false withholds the power-off entirely", () => {
+    expect(plan(pinned(), 1.5).toShed).toEqual(["cool"]);
+    expect(plan(pinned(), 1.5, { allowShed: false }).toShed).toEqual([]);
+  });
+
+  it("still cuts levels and trims fans while blanking — it is not a no-op", () => {
+    const acs = [ac("hot", { currentLevel: 3, needDelta: 3 }), ac("cool", { currentLevel: 1, fanSpeed: 1 })];
+    const p = plan(acs, 1.5, { allowShed: false });
+    expect(p.desiredLevels.hot).toBeLessThan(3);
+    expect(p.satisfied).toBe(true);
+  });
+
+  it("a forced shed (extreme) overrides the blanking — a real breach still sheds", () => {
+    const p = plan(pinned(), 1.5, { allowShed: false, requireShed: true });
+    expect(p.toShed.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("reports satisfied=false rather than shedding when blanking leaves no cover", () => {
+    const p = plan(pinned(), 1.5, { allowShed: false });
+    expect(p.satisfied).toBe(false);
+    expect(p.toShed).toEqual([]);
+  });
+});
+
+describe("preferShed — undo the turn-on that caused this, never a bystander", () => {
+  it("sheds the preferred room even when a bystander is less needy", () => {
+    const acs = [
+      ac("hot", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 3 }),
+      ac("cool", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 0.2 }),
+    ];
+    // Without the hint the least-needy room (cool) sheds…
+    expect(plan(acs, 1.5).toShed).toEqual(["cool"]);
+    // …with it, the room whose own turn-on caused the overload does.
+    expect(plan(acs, 1.5, { preferShed: "hot" }).toShed).toEqual(["hot"]);
+  });
+
+  it("the preferred room is exempt from its own re-shed penalty", () => {
+    // Equal need, so the shedNeed term ties and COST decides: `cool` bounced and
+    // carries the +400 re-shed penalty, which pushes the shed onto `hot` — the
+    // bystander that did nothing. The hint reverses that.
+    const acs = [
+      ac("hot", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 0.5 }),
+      ac("cool", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 0.5, reshedPenalized: true }),
+    ];
+    expect(plan(acs, 1.5).toShed).toEqual(["hot"]);
+    expect(plan(acs, 1.5, { preferShed: "cool" }).toShed).toEqual(["cool"]);
+  });
+
+  it("is inert when the preferred room is not shed at all (level cuts cover it)", () => {
+    const acs = [ac("hot", { currentLevel: 3, needDelta: 3 }), ac("cool", { currentLevel: 1, fanSpeed: 1 })];
+    const p = plan(acs, 1.5, { preferShed: "hot" });
+    expect(p.toShed).toEqual([]);
+    expect(p.satisfied).toBe(true);
+  });
+});

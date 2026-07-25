@@ -478,6 +478,69 @@ describe("the 2026-07-24 restore-vs-raise incident (15A gen)", () => {
   });
 });
 
+describe("the 2026-07-25 restore-bounce storm (first night of v2 acting)", () => {
+  // Live 20:22–21:03 on the 15A gen: six restores of the shed room, each undone
+  // by a shed 8–65s later — EVERY one of them fired while the smoothed meter read
+  // 11.9–12.6A, i.e. 2.4–3.1A UNDER the limit. Two causes, both reproduced here:
+  //   1. the restore was ADMITTED at the gentle steady cost (2.3A) and then, on
+  //      the very next tick, re-priced by the freshly-on projection at the
+  //      fan-slam learned cost (3.7A) — a guaranteed self-inflicted "over".
+  //   2. the reducer may shed during that inrush, and because the bouncing room
+  //      earns a re-shed penalty the shed migrates to a BYSTANDER (live: Abdu,
+  //      the room the user then found off and switched on by hand).
+  // Everyone sits at their floor with no fan slack, so a shed is the only cover
+  // the reducer can find — exactly the live 20:23 state (Abdullah pinned at his
+  // 39°C boost floor L2, Abdu and Najat at L1, fans already trimmed to 1).
+  const bounceBook = {
+    // What the meter learned from the OLD fan-slam restores — the number the
+    // projection charged while admission used the gentle 2.7A model draw.
+    "najat|gen|on@L1": { ewmaAmps: 4.2, samples: 3, updatedAt: 1_000_000_000 },
+  };
+  const storm = (): Scenario =>
+    new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, fan: 1, demandAmps: 7, needDelta: 3 },
+        { ...ABDULLAH, level: 2, minLevel: 2, fan: 1, demandAmps: 3.5, needDelta: 1 },
+        { ...NAJAT, shed: true, fan: 1, demandAmps: 4.5, needDelta: 0.8, surgeFactor: 1.6, rampSeconds: 60 },
+      ],
+      { nonAcAmps: 4.3, source: "gen", book: bounceBook }, // ≈11.9A with Najat off
+    );
+
+  it("a gentle restore is not undone by its own inrush", () => {
+    const s = storm();
+    const t0 = s.now;
+    s.advance(120);
+
+    const restore = s.commandsSince(t0, "power_on").find((c) => c.cmd.deviceId === "najat");
+    expect(restore).toBeDefined();
+    // Najat's steady L1 draw fits (11.9 + 2.2 = 14.1 < 14.9); only the ~1-min
+    // startup transient crosses. Nothing may be shed while it decays.
+    const shedsAfterRestore = s
+      .commandsSince(restore!.at, "power_off")
+      .filter((e) => e.at - restore!.at <= 90_000);
+    expect(shedsAfterRestore).toHaveLength(0);
+    expect(s.sim("najat").on).toBe(true);
+  });
+
+  it("the inrush never sheds a bystander room", () => {
+    const s = storm();
+    const t0 = s.now;
+    s.advance(15 * 60);
+    // Abdu is the hottest room (needDelta 3) and did nothing — he must never be
+    // the one paying for another room's restore.
+    expect(s.commandsSince(t0, "power_off").filter((e) => e.cmd.deviceId === "abdu")).toHaveLength(0);
+    expect(s.sim("abdu").on).toBe(true);
+  });
+
+  it("settles with every room on and under the breaker", () => {
+    const s = storm();
+    s.advance(15 * 60);
+    expect(s.acsOn()).toEqual(["abdu", "abdullah", "najat"]);
+    expect(s.totalAmps()).toBeLessThanOrEqual(14.9);
+  });
+});
+
 describe("proactive near-limit turn-on (instant reduce, no bucket wait)", () => {
   it("an automation turn-on that projects over the limit triggers a cut within one evaluation", () => {
     const s = new Scenario(

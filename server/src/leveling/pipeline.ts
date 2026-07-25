@@ -49,6 +49,23 @@ export interface PlanOutput extends Plan {
   fanOnly: boolean;
 }
 
+/**
+ * One command per device+kind, last writer wins. The corrections block and the
+ * reducer/raise blocks are computed independently and can land on the same AC:
+ * live journal row 2701 (2026-07-25 05:33) shipped `set_level 3` TWICE for one
+ * device — harmless on the wire, but it made the batch multi-command, which
+ * silently disables single-actuator cost grading and misreads the journal.
+ * Emission order is preserved (the executor sends in array order) and the LAST
+ * command is what the device would have ended at anyway, so in an over-limit
+ * batch the reducer wins over a correction and in a calm batch a raise wins
+ * over a floor lift — both the intended precedence.
+ */
+function dedupeCommands(commands: Command[]): Command[] {
+  const lastIndex = new Map<string, number>();
+  commands.forEach((c, i) => lastIndex.set(`${c.deviceId}|${c.kind}`, i));
+  return commands.filter((c, i) => lastIndex.get(`${c.deviceId}|${c.kind}`) === i);
+}
+
 function emptyPlan(input: PlanInput, reason: string, decisions: Decision[] = []): PlanOutput {
   return {
     commands: [],
@@ -86,10 +103,33 @@ export function plan(input: PlanInput): PlanOutput {
   // ---- Over-limit: the one graduated reducer, at every severity ----
   if (pressure.kind === "over") {
     const requireShed = pressure.severity === "extreme";
+    // Inrush blanking (2026-07-25 restore-bounce storm). A compressor that just
+    // started draws its startup transient for ~1 min before settling to its cap.
+    // Those raw readings drain the leaky bucket while the SMOOTHED meter is
+    // still well under the limit: six live sheds fired at 11.9–12.6A on a 15A
+    // gen, five of them within 14s of the restore that caused them, and the
+    // sixth shed a bystander room the user then found off. While a compressor
+    // is ramping and the smoothed meter has NOT crossed the limit, a MILD
+    // overshoot may still cut levels and trim fans — but it may not shed a whole
+    // room for a transient that is about to decay on its own. Severe and extreme
+    // are deliberately untouched: a real breach still sheds immediately.
+    const rampingNow = onManaged.filter((a) => a.ramping);
+    const inrushBlanking =
+      pressure.severity === "mild" && meter.smoothedAmps <= limit && rampingNow.length > 0;
+    // If a shed IS unavoidable while exactly one room is ramping (its own
+    // turn-on caused this), undo THAT turn-on rather than exporting the shed to
+    // a bystander — the re-shed penalty otherwise protects the bouncing room and
+    // moves the pain to a peer (live: Abdu, 21:03:14).
+    const preferShed =
+      !inrushBlanking && rampingNow.length === 1 && onManaged.length > 1
+        ? rampingNow[0].deviceId
+        : null;
     const reduction = planReduction({
       acs: onManaged,
       requiredAmps: pressure.requiredAmps,
       requireShed,
+      allowShed: !inrushBlanking,
+      preferShed,
       fanTrimEnabled: config.fanTrimEnabled,
       book,
       config,
@@ -129,10 +169,30 @@ export function plan(input: PlanInput): PlanOutput {
         action: `reduce ${pressure.requiredAmps.toFixed(1)}A (${pressure.severity})`,
         detail: `est savings ${reduction.estimatedSavingsAmps.toFixed(1)}A, satisfied=${reduction.satisfied}`,
       },
+      ...(inrushBlanking
+        ? [
+            {
+              at: now,
+              action: "shed",
+              blockedBy: "turn-on inrush",
+              detail: `smoothed ${meter.smoothedAmps.toFixed(1)}A ≤ ${limit.toFixed(1)}A, ${rampingNow.length} ramping`,
+            } satisfies Decision,
+          ]
+        : []),
+      ...(preferShed != null
+        ? [
+            {
+              at: now,
+              deviceId: preferShed,
+              action: "shed preference",
+              detail: "its own turn-on caused this — undo it, not a peer",
+            } satisfies Decision,
+          ]
+        : []),
       ...corrections.decisions,
     ];
     return {
-      commands: [...corrections.commands, ...commands],
+      commands: dedupeCommands([...corrections.commands, ...commands]),
       expectedDeltaAmps: -reduction.estimatedSavingsAmps,
       compareAfter: now + GRADE_LEVEL_MS,
       decisions,
@@ -232,7 +292,7 @@ export function plan(input: PlanInput): PlanOutput {
         }
       }
       return {
-        commands: [...corrections.commands, ...raisePlan.commands],
+        commands: dedupeCommands([...corrections.commands, ...raisePlan.commands]),
         expectedDeltaAmps: 0, // graded per-command by the journal, not batch-summed here
         compareAfter: now + (raisePlan.isTurnOn ? GRADE_TURN_ON_MS : GRADE_LEVEL_MS),
         decisions: [...corrections.decisions, ...raisePlan.decisions],

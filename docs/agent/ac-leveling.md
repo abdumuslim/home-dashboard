@@ -12,7 +12,7 @@ A ground-up rewrite lives in **`server/src/leveling/`** (17 small modules, pure 
 
 **Hardware truth (2026-07-23, user-verified + web specs):** Abdu = **2-ton** (caps ≈ 4.1/6.5/~9A at L1/2/3), Abdullah & Najat = **1-ton** (≈ 2.2/3.9/5.3A). The registry `model` field is protocol-inference only — its capacity digits are WRONG (see tcl-ac.md). Observed raise JUMPS (3.6–3.8A, incl. compressor duty change) exceed steady per-level steps — the cost model stores both (`level:1>2` jumps vs steady model ceilings).
 
-**Tests:** `server/src/leveling/*.test.ts` incl. `scenarios.test.ts` — incident regressions replayed against the physics harness (`scenario.ts`) + `controller.test.ts` (flavor re-sync). **Cutover history:** shadowed 2026-07-23→24 (journal-compared against v1), then flipped to `"v2"` after the 2026-07-24 restore-vs-raise fix set (below). Rollback = `PUT controller:"v1"` + restart. Everything below the "TL;DR (v1)" divider documents **v1** — historical, rollback-only.
+**Tests:** `server/src/leveling/*.test.ts` incl. `scenarios.test.ts` — incident regressions replayed against the physics harness (`scenario.ts`) + `controller.test.ts` (flavor re-sync) + `pipeline.test.ts` (emission-layer rules a whole-house sim can't isolate: batch dedupe, inrush blanking). **Cutover history:** shadowed 2026-07-23→24 (journal-compared against v1), then flipped to `"v2"` after the 2026-07-24 restore-vs-raise fix set (below). Rollback = `PUT controller:"v1"` + restart. Everything below the "TL;DR (v1)" divider documents **v1** — historical, rollback-only.
 
 ### 2026-07-23 evening gen trip → physics envelope + frozen-meter detection + grid full-start
 
@@ -155,6 +155,79 @@ double-spend, cap clamp, near-target, gen policy, post-window); `scenarios.test.
 grid turn-on incident" (3 — first-batch ceiling, degrade-instead-of-overshoot, gen unchanged).
 **662 server tests green; server `tsc` clean.** Verified failing without the fix (7 of the 11 are
 behavioral; the other 4 pin unchanged behavior).
+
+### 2026-07-25 restore-bounce storm (first night of v2 acting)
+
+**The incident (20:22–21:03 Baghdad, 15A gen, v2 acting since 18:47):** the controller restored the
+shed room six times and undid every one of them with a shed 8–65s later. **Every one of those sheds
+fired while the SMOOTHED meter read 11.9–12.6A — 2.4–3.1A UNDER the limit** (journal ids
+2644/2645, 2646/2647, 2649/2651, 2654/2655, 2656/2658, 2661/2662; `required_amps` only 0.43–1.40A).
+The sixth shed **Abdu**, and that is the AC the user found off and switched on by hand. Everyone was
+pinned at their floor (Abdullah at his 39°C boost floor L2, Abdu and Najat at L1, fans already
+trimmed to 1), so the reducer's only feasible cover was a shed.
+
+**Root cause — admission and projection priced the same restore differently.** `raise.ts` admitted a
+gen restore at the gentle `steadyDraw` (Najat L1 ≈ 2.3A, the 2026-07-24 change) while
+`controller.ts`'s freshly-on projection re-charged it at the fan-slam learned `on@L1` (3.7A) on the
+very next tick. `assessPressure`'s projection branch then declared `over/mild` from
+`smoothed + 3.7 > limit` — a **deterministic** self-inflicted overload after every gen restore.
+Contributing: `pressure.kind === "over"` outranks `SETTLING` in `pipeline.ts`, so the settle window
+never protected the restore that had just shipped; and the bucket was refilled only after `over_*`
+batches, so over-limit readings banked *before* a restore carried into its inrush.
+
+**Fixes (all in `server/src/leveling/`):**
+1. **One restore cost (`costs.ts` `restoreCostAmps`)** — a single definition used by BOTH the restore
+   admission (`raise.ts`) and the freshly-on projection (`controller.ts`). `gentle: true` (fan pinned
+   → gen shed restore) prices the calibrated steady floor draw; `gentle: false` (automation/user
+   turn-on, fan slams to a hot-room 3–7) keeps the full `turnOnAmps`. The gentle flag rides on the
+   fan hold (`FanHold.gentle`, set by `recordGentleRestoreHold`) — **in-memory only**, so after a
+   restart the projection falls back to the full cost, which errs trip-safe.
+2. **Turn-on inrush blanking (`pipeline.ts` → `reduce.ts` `allowShed`)** — while any managed AC is
+   ramping **and** `meter.smoothedAmps <= limit`, a **mild** overshoot may cut levels and trim fans
+   but may **not** shed. Severe/extreme are untouched (`requireShed` also overrides the blanking), so
+   a real breach still sheds immediately. Journals `blockedBy: "turn-on inrush"`.
+3. **Bucket refill on a turn-on batch (`controller.ts`)** — a `power_on` changes the load picture, so
+   readings banked before it stop counting. A genuine post-restore overload still empties the bucket
+   from full in ~10s (2 severe) or ~25s (5 mild).
+4. **`preferShed` (`reduce.ts`)** — when a shed IS unavoidable and exactly one room is ramping, that
+   room is undone rather than a bystander, and it is exempt from its own `reshedPenalty`. Ranked via
+   `ComboScore.exportsShed`, immediately after feasibility. (Note: `shedNeed` is compared before
+   cost, so `reshedPenalized` only redirects a shed on an equal-need tie — this guard closes that tie
+   case, it was not the proven cause of the Abdu shed.)
+5. **Grade queue (`controller.ts` `pendingGrades`)** — was a single slot overwritten by every batch,
+   so on a busy episode nothing was ever graded: `ac_leveling_costs` still held its 2026-07-23 seeds
+   after ~10 live restores, and surviving attempts never reached `noteSuccess` (which pins the
+   backoff ladder at its 15-min rung). Now a list; an overlapping batch marks entries `contaminated`
+   → still journal-graded and still resolves attempts, but never used to LEARN a cost (an
+   un-attributable delta is worse than no learning). Capped at 20, abandoned 10 min past due.
+   **Consequence that bites:** a grade window now OUTLIVES the batch that failed its attempt, so
+   `noteFailure` must also strip that attempt from every open window — otherwise the stale grade
+   resolves it as a success and silently erases the backoff it just grew (`scenario.ts` always had
+   this guard; the shell did not need it while the slot was overwritten). Pinned by
+   `controller.test.ts` "a bounced attempt keeps its ladder position", which fails (cooldown 0) with
+   the strip removed.
+6. **Batch dedupe (`pipeline.ts` `dedupeCommands`)** — corrections and the reducer/raise blocks could
+   both target one device; live row 2701 shipped `set_level 3` twice, which silently disabled
+   single-actuator cost grading. One command per device+kind, last writer wins (reducer beats a
+   correction in an over batch; a raise beats a floor lift in a calm one).
+7. **Durable blocked rows (`controller.ts` `journalBlocked`)** — a tick that commanded nothing wrote
+   no journal row at all, so "why was that room never restored?" was unanswerable after a restart
+   (`getStatus().decisions` keeps only 20 in memory; docker logs rotate in ~1.5 days). Now writes a
+   `reason: "blocked"` row with `commands: []`, throttled to one per `(deviceId, blockedBy)` per
+   5 min.
+
+**Not bugs (verified, unchanged):** the other overnight Abdu offs were his own range hysteresis —
+minute-level `feels_like_ch8_c` matches the slot band (25.2/25.8) exactly (off 22:35 → on 22:47; off
+01:06 → on 01:19; off 02:12 → on 02:25), each followed 0–60s later by a `re-cap L1 "never level 0"`
+row (ids 2678, 2684, 2685) because a TCL power-cycle comes back unrestricted. Abdu sitting at gen L1
+from 22:00 is his night slot's `gen_level: 1` hard cap (user-confirmed intentional).
+
+Tests: `scenarios.test.ts` "the 2026-07-25 restore-bounce storm" (3); new `pipeline.test.ts` (8 —
+dedupe ×3, blanking ×5); `reduce.test.ts` blanking + preferShed suites (8); `costs.test.ts`
+`restoreCostAmps` (4); `controller.test.ts` grade queue + blocked rows (2). The harness gained shell
+parity for the projection (a pipeline `power_on` now arms `pendingProjection`) — **without that the
+storm was not reproducible in simulation at all**. **686 server tests green; server + client `tsc`
+clean.** Both the storm regression and the ladder-position test were verified failing first.
 
 **Security (shipped alongside, `auth.ts`):** `clientIp()` trusted `cf-connecting-ip` unconditionally
 (spoofable off-Cloudflare → login rate-limiter bypass + forged `ac_control_audit` IP). Now it is

@@ -9,6 +9,7 @@ import {
   levelCutSavings,
   modelFor,
   raiseJumpAmps,
+  restoreCostAmps,
   steadyDraw,
   turnOnAmps,
   updateCost,
@@ -105,5 +106,34 @@ describe("turnOnAmps / levelCutSavings / fanTrimSavings", () => {
     expect(fanTrimSavings({}, "a", "gen", 6, T)).toBe(FAN_FULL_DROP_DEFAULT_AMPS);
     const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
     expect(fanTrimSavings(book, "a", "gen", 3, T)).toBeCloseTo(0.6);
+  });
+});
+
+describe("restoreCostAmps — ONE price for a shed room's return", () => {
+  // The 2026-07-25 storm: admission used the gentle steady draw while the
+  // freshly-on projection re-charged the fan-slam learned cost, so every gen
+  // restore declared itself over-limit ~10s later and a room got shed.
+  // Learned ABOVE the model draw (4.5A at L1) — that gap is the fan slam.
+  const slam = updateCost({}, "a", "gen", "on@L1", 6.0, T);
+
+  it("a gentle restore is priced at the calibrated steady floor draw", () => {
+    // Fan pinned to 1 → the fan-slam that inflated on@L1 no longer applies.
+    expect(restoreCostAmps(slam, cfg, "a", "gen", 1, 3, T, { gentle: true }).amps).toBeCloseTo(4.5);
+  });
+
+  it("a fan-slamming turn-on keeps the full learned cost", () => {
+    expect(restoreCostAmps(slam, cfg, "a", "gen", 1, 3, T, { gentle: false }).amps).toBe(6.0);
+  });
+
+  it("gentle and non-gentle agree when nothing was learned", () => {
+    const gentle = restoreCostAmps({}, cfg, "a", "gen", 1, 3, T, { gentle: true }).amps;
+    const plain = restoreCostAmps({}, cfg, "a", "gen", 1, 3, T, { gentle: false }).amps;
+    expect(gentle).toBeCloseTo(plain);
+  });
+
+  it("non-gentle is exactly turnOnAmps (no second code path to drift)", () => {
+    expect(restoreCostAmps(slam, cfg, "a", "gen", 1, 3, T, { gentle: false })).toEqual(
+      turnOnAmps(slam, cfg, "a", "gen", 1, 3, T),
+    );
   });
 });

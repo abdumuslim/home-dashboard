@@ -11,7 +11,7 @@
 
 import type { AcView, Command, CostEstimate, Decision, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
-import { levelCutSavings, modelFor, raiseJumpAmps, steadyDraw, turnOnAmps } from "./costs.js";
+import { levelCutSavings, modelFor, raiseJumpAmps, restoreCostAmps, steadyDraw } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { ceilCapOf, ceilOf, floorOf } from "./needs.js";
 import { canAttempt, type PacingState } from "./pacing.js";
@@ -173,13 +173,20 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // fan-slam restores) no longer applies — size it at the calibrated steady
     // floor draw (~2.3A) instead, or a room that really fits on ~2.3A stays shed
     // behind a 3.7A phantom (live 2026-07-24: peer freed budget, restore still
-    // blocked "no headroom"). The physics-envelope veto still guards the end-
-    // state, and the compressor inrush is transient (ramp credit + emergency
-    // reducer catch a real breach). Grid restores stay plain → fan-slam-sized.
-    const cost: CostEstimate =
-      source === "gen"
-        ? { amps: steadyDraw(floor, candidate.maxLevel, modelFor(config, candidate.deviceId, source)), confidence: "seed" }
-        : turnOnAmps(book, config, candidate.deviceId, source, floor, candidate.maxLevel, now);
+    // blocked "no headroom"). Grid restores stay plain → fan-slam-sized.
+    // `restoreCostAmps` is shared with the controller's freshly-on projection so
+    // admission and re-pricing can never disagree (the 2026-07-25 storm).
+    const gentleRestore = source === "gen";
+    const cost: CostEstimate = restoreCostAmps(
+      book,
+      config,
+      candidate.deviceId,
+      source,
+      floor,
+      candidate.maxLevel,
+      now,
+      { gentle: gentleRestore },
+    );
     const candidateEntry = { deviceId: candidate.deviceId, level: floor, maxLevel: candidate.maxLevel };
 
     // Both feasibilities up front, BEFORE any gate — the reservation decision
@@ -253,7 +260,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // on@L1 EWMA was learned WITH slams): over-estimating a gentle restore errs
     // trip-safe, and graded gentle restores drift the estimate down over time.
     const restoreCmd = (): Command =>
-      source === "gen"
+      gentleRestore
         ? { deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore", fan: 1 }
         : { deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" };
     if (fitsPlain) {

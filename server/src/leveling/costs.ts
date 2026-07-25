@@ -121,6 +121,41 @@ export function turnOnAmps(
 }
 
 /**
+ * Amps to charge for bringing a SHED room back — the ONE definition, used by
+ * BOTH the restore admission (raise.ts) and the freshly-on projection that
+ * re-prices it on the next tick (controller.ts).
+ *
+ * They disagreed 2026-07-24→25 and that was the whole restore-bounce storm:
+ * admission used the gentle steady draw (Najat L1 ≈ 2.3A, correct — a gentle
+ * restore pins the fan to 1, so the fan-slam that inflated the learned on-cost
+ * is gone) while the projection still charged the fan-slam-sized `on@L1` (3.7A).
+ * Every gen restore therefore declared itself over-limit ~10s later and the
+ * reducer shed a room — six times in 41 minutes, the last one a bystander.
+ *
+ * `gentle` must mean "this turn-on pinned the fan": true for a gen shed restore,
+ * false for an automation/user turn-on (which slams the fan to a hot-room 3–7).
+ */
+export function restoreCostAmps(
+  book: CostBook,
+  config: LevelingConfigV2,
+  deviceId: string,
+  source: PowerSource,
+  level: number,
+  maxLevel: number,
+  now: number,
+  opts: { gentle: boolean },
+): CostEstimate {
+  if (!opts.gentle) return turnOnAmps(book, config, deviceId, source, level, maxLevel, now);
+  // The physics-envelope veto still guards the end-state and the compressor
+  // inrush is transient (inrush blanking in pipeline.ts covers the decay), so
+  // the calibrated steady floor draw is the honest price of a gentle return.
+  return {
+    amps: steadyDraw(level, maxLevel, modelFor(config, deviceId, source)),
+    confidence: "seed",
+  };
+}
+
+/**
  * Savings credited to a level cut `from → to`. Sized like the raise jump in
  * reverse (max of model delta and learned up-jump): the static model
  * under-crediting a cut is what shed an AC to cover a 0.3A overshoot.

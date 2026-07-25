@@ -52,7 +52,7 @@ import {
   type ReconcilerState,
 } from "./reconciler.js";
 import { boostFloor, ceilOf, floorOf, nearTargetNeedCap } from "./needs.js";
-import { raiseJumpAmps, steadyDraw, modelFor, turnOnAmps, updateCost, type CostBook } from "./costs.js";
+import { raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, updateCost, type CostBook } from "./costs.js";
 import { LevelingStore } from "./store.js";
 import type { AcView, Command, MeterState, Mode, PowerSource } from "./types.js";
 
@@ -71,6 +71,13 @@ const PUSH_THROTTLE_MS = 5 * 60_000;
 /** Grade a batch only when this many fresh readings arrived after compareAfter. */
 const GRADE_MIN_SAMPLES = 4;
 
+/** Hard cap on outstanding grade windows (runaway guard — normally 1–3). */
+const MAX_PENDING_GRADES = 20;
+/** Drop a grade window this long past its compare point (never graded, never leaks). */
+const GRADE_ABANDON_MS = 10 * 60_000;
+/** One durable "blocked" journal row per (device, blockedBy) per this window. */
+const BLOCKED_JOURNAL_THROTTLE_MS = 5 * 60_000;
+
 interface PendingGrade {
   journalId: number;
   compareAfter: number;
@@ -79,6 +86,12 @@ interface PendingGrade {
   /** Set when the batch had exactly one meter-affecting command (cost learning). */
   single: { deviceId: string; transition: string } | null;
   attempts: Array<{ deviceId: string; kind: "raise" | "restore" }>;
+  /**
+   * A later batch moved the meter inside this window, so the observed delta is
+   * no longer attributable to this batch alone: journal it (post_amps is still
+   * useful forensics) and resolve its attempts, but never LEARN a cost from it.
+   */
+  contaminated: boolean;
 }
 
 export class LevelingControllerV2 {
@@ -108,7 +121,16 @@ export class LevelingControllerV2 {
   private deviceNames = new Map<string, string>();
   private armRampOnSourceChange = false;
   private freshlyOn: string[] = [];
-  private pendingGrade: PendingGrade | null = null;
+  /**
+   * Outstanding grade windows, oldest first. Was a single slot until 2026-07-25:
+   * every new batch overwrote it, so on a busy generator episode NO batch was
+   * ever graded — `ac_leveling_costs` still held its 2026-07-23 seeds after ~10
+   * live restores, and surviving raise/restore attempts never reached
+   * `noteSuccess`, which pinned the backoff ladder at its 15-min rung.
+   */
+  private pendingGrades: PendingGrade[] = [];
+  /** Throttle for durable blocked-decision rows, keyed `deviceId|blockedBy`. */
+  private lastBlockedJournalAt = new Map<string, number>();
   private lastPushAt = 0;
   private lastStatus: LevelingStatusV2 | null = null;
   private lastPruneAt = 0;
@@ -322,7 +344,7 @@ export class LevelingControllerV2 {
         case "source_changed": {
           this.pacing = resetPacing(this.pacing, event.to);
           this.recon = clearOnSourceChange(this.recon);
-          this.pendingGrade = null;
+          this.pendingGrades = [];
           // Baselines are amps on the OLD source — worthless on the new one,
           // and the entry mode (FLOORS / GRID_FULL) owns the transition now.
           this.startBaseline.clear();
@@ -615,12 +637,27 @@ export class LevelingControllerV2 {
     const mode = deriveMode(this.modeState, now);
 
     // Proactive projection for freshly-on managed ACs (near-limit turn-on).
+    // Priced with restoreCostAmps so a room WE just restored gently (fan pinned)
+    // is re-priced at exactly the cost its restore was admitted at — the two
+    // disagreed on 2026-07-24→25 (2.3A admitted, 3.7A projected) and every gen
+    // restore then declared itself over-limit and got shed ~10s later.
+    // An automation/user turn-on still slams the fan, so it keeps the full cost.
     let projectedExtraAmps: number | undefined;
     if (this.freshlyOn.length > 0 && view.source !== "none") {
       projectedExtraAmps = this.freshlyOn.reduce((sum, id) => {
         const ac = acs.find((a) => a.deviceId === id);
         if (ac == null) return sum;
-        return sum + turnOnAmps(this.book, this.config, id, view.source as Exclude<PowerSource, "none">, floorOf(ac), ac.maxLevel, now).amps;
+        const cost = restoreCostAmps(
+          this.book,
+          this.config,
+          id,
+          view.source as Exclude<PowerSource, "none">,
+          floorOf(ac),
+          ac.maxLevel,
+          now,
+          { gentle: this.fanHolds[id]?.gentle === true },
+        );
+        return sum + cost.amps;
       }, 0);
     }
 
@@ -705,6 +742,46 @@ export class LevelingControllerV2 {
     });
   }
 
+  /**
+   * Durable trace for evaluations that commanded NOTHING. Without this a
+   * "restore blocked by calm / backoff / no headroom" tick leaves no record at
+   * all — `getStatus().decisions` keeps only the last 20 in memory, and docker
+   * logs rotate in ~1.5 days, so "why was that room never restored?" became
+   * unanswerable after a restart (2026-07-25). Throttled hard: at most one row
+   * per (device, blockedBy) per BLOCKED_JOURNAL_THROTTLE_MS, so a room blocked
+   * for an hour costs ~12 rows instead of ~720.
+   */
+  private async journalBlocked(
+    out: PlanOutput,
+    view: ReturnType<typeof meterView>,
+    mode: Mode,
+    now: number,
+  ): Promise<void> {
+    const fresh = out.decisions.filter((d) => {
+      if (d.blockedBy == null) return false;
+      const key = `${d.deviceId ?? "-"}|${d.blockedBy}`;
+      if (now - (this.lastBlockedJournalAt.get(key) ?? 0) < BLOCKED_JOURNAL_THROTTLE_MS) return false;
+      this.lastBlockedJournalAt.set(key, now);
+      return true;
+    });
+    if (fresh.length === 0) return;
+    await this.store
+      .insertJournal({
+        at: now,
+        source: view.source,
+        mode,
+        severity: out.severity,
+        reason: "blocked",
+        requiredAmps: out.requiredAmps,
+        preAmps: view.smoothedAmps,
+        commands: [],
+        decisions: fresh,
+        expectedDelta: null,
+        executed: this.acts(),
+      })
+      .catch(() => undefined);
+  }
+
   private async executeAndJournal(
     out: PlanOutput,
     view: ReturnType<typeof meterView>,
@@ -712,13 +789,19 @@ export class LevelingControllerV2 {
     now: number,
     tcl: NonNullable<ReturnType<LevelingDeps["getTclCloud"]>>,
   ): Promise<void> {
-    if (out.commands.length === 0) return;
+    if (out.commands.length === 0) {
+      await this.journalBlocked(out, view, mode, now);
+      return;
+    }
 
     // Send-side dedupe: unconfirmed same-level re-sends respect the spacing.
     const commands: Command[] = out.commands.filter((cmd) =>
       cmd.kind === "set_level" ? shouldSendLevel(this.recon, cmd.deviceId, cmd.level, now) : true,
     );
-    if (commands.length === 0) return;
+    if (commands.length === 0) {
+      await this.journalBlocked(out, view, mode, now);
+      return;
+    }
 
     const journalId = await this.store
       .insertJournal({
@@ -821,6 +904,15 @@ export class LevelingControllerV2 {
 
     this.modeState = noteBatch(this.modeState, { fanOnly }, now);
     if (!fanOnly) this.meterState = resetCalm(this.meterState);
+    // A turn-on changes the load picture wholesale: over-limit readings banked
+    // BEFORE it are no longer evidence about the house that exists now, and
+    // letting them carry over meant a restore inherited a half-drained bucket
+    // and tripped on its own inrush (2026-07-25). A genuine post-restore
+    // overload still empties the bucket from full in ~10s (2 severe readings)
+    // or ~25s (5 mild) — protection kept, carry-over removed.
+    if (commands.some((c) => c.kind === "power_on")) {
+      this.meterState = refillBucket(this.meterState);
+    }
     if (out.reason.startsWith("over")) {
       this.meterState = refillBucket(this.meterState);
       // The meter objected: the reducer's judgment beats the entry policy, so
@@ -836,6 +928,15 @@ export class LevelingControllerV2 {
         for (const kind of ["raise", "restore"] as const) {
           if (attemptedRecently(this.pacing, cmd.deviceId, kind, now)) {
             this.pacing = noteFailure(this.pacing, cmd.deviceId, kind, now);
+            // A failed attempt must never be graded a SUCCESS later — its grade
+            // window is still open and `gradeOne` calls noteSuccess on whatever
+            // attempts it carries, which would reset the backoff we just grew.
+            // (Harmless while pendingGrade was a single slot that this batch
+            // overwrote; load-bearing now that windows survive.)
+            this.pendingGrades = this.pendingGrades.map((g) => ({
+              ...g,
+              attempts: g.attempts.filter((a) => !(a.deviceId === cmd.deviceId && a.kind === kind)),
+            }));
             log.info(`[leveler2] ${this.deviceNames.get(cmd.deviceId) ?? cmd.deviceId}: ${kind} bounced — backoff grows`);
           }
         }
@@ -860,29 +961,61 @@ export class LevelingControllerV2 {
         single = { deviceId: cmd.deviceId, transition: `on@L${cmd.level}` };
       }
     }
-    this.pendingGrade = {
+    // This batch moves the meter, so every window still open can no longer
+    // attribute its delta to one batch — mark them, but KEEP them: they still
+    // deserve a journal grade and their attempts still need resolving.
+    this.pendingGrades = this.pendingGrades.map((g) => (g.contaminated ? g : { ...g, contaminated: true }));
+    this.pendingGrades.push({
       journalId,
       compareAfter: out.compareAfter || now + GRADE_FAN_MS,
       preAmps: view.smoothedAmps,
       source: view.source,
       single,
       attempts: out.attempts,
-    };
+      contaminated: false,
+    });
+    if (this.pendingGrades.length > MAX_PENDING_GRADES) {
+      this.pendingGrades = this.pendingGrades.slice(-MAX_PENDING_GRADES);
+    }
   }
 
   private async gradePending(view: ReturnType<typeof meterView>, now: number): Promise<void> {
-    const grade = this.pendingGrade;
-    if (grade == null || now < grade.compareAfter || view.sampleCount < GRADE_MIN_SAMPLES) return;
-    if (view.source !== grade.source) {
-      this.pendingGrade = null;
-      return;
+    if (this.pendingGrades.length === 0) return;
+    const due: PendingGrade[] = [];
+    const keep: PendingGrade[] = [];
+    for (const g of this.pendingGrades) {
+      // Long past due and still never gradeable — drop it rather than leak.
+      if (now > g.compareAfter + GRADE_ABANDON_MS) continue;
+      // Not ripe yet: KEEP it, without judging the source. An ESP gap makes the
+      // view read "none" for a few seconds, and dropping every open window on
+      // that transient would throw away grades the old single slot survived
+      // (it only checked the source once the window was actually due).
+      if (now < g.compareAfter || view.sampleCount < GRADE_MIN_SAMPLES) {
+        keep.push(g);
+        continue;
+      }
+      // Due, but the meter is on a different line than the batch ran on — a
+      // source change already empties the queue, so this is a backstop.
+      if (view.source !== g.source) continue;
+      due.push(g);
     }
-    this.pendingGrade = null;
+    this.pendingGrades = keep;
+    for (const grade of due) await this.gradeOne(grade, view, now);
+  }
+
+  private async gradeOne(
+    grade: PendingGrade,
+    view: ReturnType<typeof meterView>,
+    now: number,
+  ): Promise<void> {
     const observedDelta = view.smoothedAmps - grade.preAmps;
     if (grade.journalId > 0) {
       await this.store.gradeJournal(grade.journalId, now, view.smoothedAmps, observedDelta).catch(() => undefined);
     }
-    if (grade.single != null && grade.source !== "none" && observedDelta > 0.2) {
+    // Learn ONLY from a window no other batch disturbed — an overlapping batch
+    // makes the delta un-attributable, and a wrong learned cost is worse than
+    // no learned cost (it gates raise/restore admission).
+    if (grade.single != null && !grade.contaminated && grade.source !== "none" && observedDelta > 0.2) {
       this.book = updateCost(
         this.book,
         grade.single.deviceId,
