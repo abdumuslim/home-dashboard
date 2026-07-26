@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { envelopeTotalAmps, invariantCorrections, planRaise, type RaiseInput } from "./raise.js";
+import { envelopeTotalAmps, invariantCorrections, planRaise, rampDebitAmps, type RaiseInput } from "./raise.js";
 import { initialPacingState, noteFailure } from "./pacing.js";
 import { updateCost } from "./costs.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
@@ -42,6 +42,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     warmStartLevel: null,
     ramping: false,
     startBaselineAmps: null,
+    rampBaselineAmps: null,
     reshedPenalized: false,
     ...overrides,
   };
@@ -52,6 +53,7 @@ function raise(acs: AcView[], overrides: Partial<RaiseInput> = {}) {
     acs,
     headroomAmps: 2.6, // e.g. smoothed 12.1 vs resting ceiling 14.7
     smoothedAmps: 12.1,
+    rampDebitAmps: 0,
     limitAmps: 15,
     calmMs: 60_000,
     config: cfg,
@@ -266,6 +268,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       acs: [ac("abdu", { currentLevel: 3, needDelta: 3 }), ac("najat", { currentLevel: 2, needDelta: 2.7 })],
       headroomAmps: 4.3, // 14.7 − 10.4
       smoothedAmps: 10.4,
+      rampDebitAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -284,6 +287,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       acs: [ac("abdu", { currentLevel: 1, needDelta: 1 }), ac("najat", { currentLevel: 2, needDelta: 2.7 })],
       headroomAmps: 4.3,
       smoothedAmps: 10.4,
+      rampDebitAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -313,6 +317,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       acs: [ac("abdu", { currentLevel: 3, needDelta: 1 }), ac("najat", { currentLevel: 1, needDelta: 2, warmStartLevel: 3 })],
       headroomAmps: 4.3,
       smoothedAmps: 10.4,
+      rampDebitAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -336,6 +341,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       ],
       headroomAmps: 8,
       smoothedAmps: 6,
+      rampDebitAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -368,6 +374,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       ],
       headroomAmps: 8,
       smoothedAmps: 6,
+      rampDebitAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: heavyCfg,
@@ -482,5 +489,119 @@ describe("grid turn-on full start (2026-07-25: L1 for 4m41s with 5A free)", () =
   it("after the window closes the ordinary one-step meter-anchored path resumes", () => {
     const p = gridRaise([ac("a", { currentLevel: 1, startBaselineAmps: null })], { calmMs: 60_000 });
     expect(p.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+  });
+});
+
+// The 2026-07-26 gen trip #1. `planRaise` refused to raise the AC that was
+// ramping — and raised its NEIGHBOUR on the headroom that ramping AC was
+// already committed to. The journal recorded both facts in the same row.
+describe("ramp debit (committed-but-unmetered draw)", () => {
+  // Abdu 2-ton: L1 4.3A. Najat 1-ton: L1 2.3, L2 4.3.
+  const liveCfg: LevelingConfigV2 = {
+    ...cfg,
+    genAmpModels: {
+      abdu: { baseAmps: 4.3, stepAmps: 2.5 },
+      najat: { baseAmps: 2.3, stepAmps: 2 },
+    },
+  };
+
+  it("charges the whole modeled draw the instant a compressor starts", () => {
+    // Restored at L1 with the meter still reading its pre-start value → the
+    // meter has absorbed none of the 4.3A.
+    const acs = [ac("abdu", { currentLevel: 1, ramping: true, rampBaselineAmps: 10.5 })];
+    expect(rampDebitAmps(acs, 10.5, liveCfg, "gen")).toBeCloseTo(4.3, 5);
+  });
+
+  it("decays to zero as the meter absorbs the ramp", () => {
+    const acs = [ac("abdu", { currentLevel: 1, ramping: true, rampBaselineAmps: 10.5 })];
+    expect(rampDebitAmps(acs, 12.5, liveCfg, "gen")).toBeCloseTo(2.3, 5); // 4.3 − 2.0 risen
+    expect(rampDebitAmps(acs, 14.8, liveCfg, "gen")).toBe(0); // fully absorbed
+    expect(rampDebitAmps(acs, 20, liveCfg, "gen")).toBe(0); // never goes negative
+  });
+
+  it("charges the full draw when the baseline is unknown (post-restart ramp)", () => {
+    const acs = [ac("abdu", { currentLevel: 1, ramping: true, rampBaselineAmps: null })];
+    expect(rampDebitAmps(acs, 99, liveCfg, "gen")).toBeCloseTo(4.3, 5);
+  });
+
+  it("ignores ACs that are off, shed, unmanaged or already settled", () => {
+    const acs = [
+      ac("abdu", { currentLevel: 1, ramping: false, rampBaselineAmps: 10.5 }),
+      ac("najat", { on: false, shed: true, ramping: true, rampBaselineAmps: 10.5 }),
+      ac("c", { managed: false, ramping: true, rampBaselineAmps: 10.5 }),
+    ];
+    expect(rampDebitAmps(acs, 10.5, liveCfg, "gen")).toBe(0);
+  });
+
+  it("blocks a PEER raise while a neighbour is still ramping in (the incident)", () => {
+    // Live 10:26:22: Abdu restored 37s earlier at L1, meter 10.11A, resting
+    // ceiling 14.7 → 4.6A of apparent headroom, and Najat L1→L2 costs 2.0A.
+    // Charging Abdu's un-absorbed 4.3A leaves 0.3A and the raise is refused.
+    const acs = [
+      ac("abdu", { currentLevel: 1, needDelta: 3, ramping: true, rampBaselineAmps: 10.5 }),
+      ac("najat", { currentLevel: 1, needDelta: 2.5 }),
+    ];
+    const p = planRaise({
+      acs,
+      headroomAmps: 4.59,
+      smoothedAmps: 10.11,
+      rampDebitAmps: rampDebitAmps(acs, 10.11, liveCfg, "gen"),
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands).toEqual([]);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "najat", blockedBy: "no headroom" }),
+    );
+  });
+
+  it("lets the same peer raise through once the meter has caught up", () => {
+    const acs = [
+      ac("abdu", { currentLevel: 1, needDelta: 3, ramping: true, rampBaselineAmps: 10.5 }),
+      ac("najat", { currentLevel: 1, needDelta: 2.5 }),
+    ];
+    const p = planRaise({
+      acs,
+      headroomAmps: 4.59,
+      smoothedAmps: 14.8, // Abdu's 4.3A is fully on the meter now
+      rampDebitAmps: rampDebitAmps(acs, 14.8, liveCfg, "gen"),
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 2 }]);
+  });
+
+  it("a shed restore is charged the debit too, and says so", () => {
+    const acs = [
+      ac("abdu", { currentLevel: 1, needDelta: 1, ramping: true, rampBaselineAmps: 10.5 }),
+      ac("najat", { on: false, shed: true, needDelta: 4 }),
+    ];
+    const p = planRaise({
+      acs,
+      headroomAmps: 4.59,
+      smoothedAmps: 10.11,
+      rampDebitAmps: rampDebitAmps(acs, 10.11, liveCfg, "gen"),
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands).toEqual([]);
+    const blocked = p.decisions.find((d) => d.deviceId === "najat");
+    expect(blocked?.blockedBy).toBe("no headroom");
+    expect(blocked?.detail).toContain("ramping in");
   });
 });

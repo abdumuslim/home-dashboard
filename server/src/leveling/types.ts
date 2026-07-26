@@ -72,6 +72,13 @@ export interface MeterState {
   lastRaw: { gridAmps: number; genAmps: number } | null;
   lastMicroChangeAt: number;
   frozen: boolean;
+  /**
+   * Post-collapse limit derate: a breaker that just tripped is HOT and holds
+   * less than its rating until it cools. Rides through the per-source episodic
+   * reset (it is safety knowledge about a line, not episode bookkeeping), so it
+   * records which source it applies to.
+   */
+  derate: { source: PowerSource; amps: number; until: number } | null;
 }
 
 /** What the decision pipeline needs to know about the meter, per evaluation. */
@@ -90,6 +97,13 @@ export interface MeterView {
   collapsed: boolean;
   /** Readings arrive but carry no micro-variation — hung sensor, value is a lie. */
   frozen: boolean;
+  /**
+   * Amps to subtract from the configured limit for the active source right now
+   * (0 normally). Grows with each recent power collapse — see the derate note
+   * on MeterState. EVERY limit consumer must apply it, or the reducer and the
+   * sensing bucket would disagree about what "over" means.
+   */
+  derateAmps: number;
 }
 
 /** A single device command the pipeline wants executed. */
@@ -196,6 +210,16 @@ export interface AcView {
    * yet), so the pre-start baseline is the anchor.
    */
   startBaselineAmps: number | null;
+  /**
+   * House load measured just BEFORE this AC's compressor started, for as long
+   * as its ramp window is open (null otherwise). This is the PHYSICS anchor,
+   * not a policy window: unlike `startBaselineAmps` it is armed on every source
+   * and every ramp re-arm (turn-on, restore, changeover, collapse recovery) and
+   * is never cleared by an over-limit batch or a manual change — it exists only
+   * to answer "how much of this AC's committed draw has the meter absorbed so
+   * far?" (see rampDebitAmps). Null means unknown → charge the whole draw.
+   */
+  rampBaselineAmps: number | null;
   /** A recent restore of this AC failed (backoff live) — re-shedding it is penalized. */
   reshedPenalized: boolean;
 }

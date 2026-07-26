@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   CALM_REFILL_MS,
+  COLLAPSE_DERATE_AMPS,
+  COLLAPSE_DERATE_MAX_AMPS,
+  COLLAPSE_DERATE_MS,
   METER_FROZEN_AFTER_MS,
   OVER_LIMIT_BUDGET,
   POWER_COLLAPSE_MAX_MS,
@@ -10,7 +13,7 @@ import {
   meterView,
   refillBucket,
 } from "./sensing.js";
-import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
+import { DEFAULT_LEVELING_CONFIG_V2, effectiveLimit, type LevelingConfigV2 } from "./config.js";
 import type { MeterEvent, MeterState } from "./types.js";
 
 const cfg: LevelingConfigV2 = {
@@ -304,5 +307,51 @@ describe("calm refill timing", () => {
     // 3 readings = 10s of calm < 30s
     expect(briefCalm.now - (briefCalm.state.calmSince ?? 0)).toBeLessThan(CALM_REFILL_MS);
     expect(briefCalm.state.overLimitBudget).toBe(OVER_LIMIT_BUDGET - 3);
+  });
+});
+
+// The 2026-07-26 triple gen trip: 15.65A, then 14.48A, then 13.99A on a 15A
+// configured limit. Every gate correctly admitted the third raise — against a
+// limit the hot breaker was no longer holding.
+describe("post-collapse limit derate", () => {
+  const collapseThen = (after: number[], opts: { state?: MeterState; startAt?: number } = {}) =>
+    // 4 readings to seat the smoothing window, then the collapse, then `after`.
+    feedGen([14, 14, 14, 14, 3, ...after], opts);
+
+  it("a collapse derates the limit for its window, then releases it", () => {
+    const { state, now } = collapseThen([]);
+    expect(meterView(state, now).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
+    expect(effectiveLimit(cfg, "gen", meterView(state, now).derateAmps)).toBe(14);
+    // Past the window the rating comes back.
+    expect(meterView(state, now + COLLAPSE_DERATE_MS + 1).derateAmps).toBe(0);
+  });
+
+  it("repeat trips inside the window stack, capped", () => {
+    // Recover (≥ preMedian − 3), settle, then trip again.
+    let { state, now } = collapseThen([13, 13, 13, 13]);
+    expect(meterView(state, now).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
+    ({ state, now } = feedGen([3, 13, 13, 13, 13], { state, startAt: now + 5_000 }));
+    expect(meterView(state, now).derateAmps).toBe(2 * COLLAPSE_DERATE_AMPS);
+    ({ state, now } = feedGen([3, 13, 13, 13, 13], { state, startAt: now + 5_000 }));
+    ({ state, now } = feedGen([3, 13, 13, 13, 13], { state, startAt: now + 5_000 }));
+    expect(meterView(state, now).derateAmps).toBe(COLLAPSE_DERATE_MAX_AMPS);
+  });
+
+  it("the leaky bucket judges readings against the derated limit", () => {
+    // 14.2A is UNDER the configured 15A limit but OVER the 14A derated one:
+    // exactly the band the gen tripped in at 13.99A.
+    const { state } = collapseThen([]);
+    const fresh = { ...state, overLimitBudget: OVER_LIMIT_BUDGET, overLimitReadings: [] };
+    const { events } = feedGen([14.2, 14.2, 14.2, 14.2, 14.2], { state: fresh, startAt: 2_000_000 });
+    expect(events.some((e) => e.kind === "bucket_empty")).toBe(true);
+  });
+
+  it("is per-source and survives a changeover (a hot gen stays hot)", () => {
+    const { state, now } = collapseThen([]);
+    // Bounce to grid and back: the grid line was never the one that tripped.
+    const onGrid = ingestReading(state, { gridAmps: 12, genAmps: 0 }, cfg, now + 5_000);
+    expect(meterView(onGrid.state, now + 5_000).derateAmps).toBe(0);
+    const backOnGen = ingestReading(onGrid.state, { gridAmps: 0, genAmps: 12 }, cfg, now + 10_000);
+    expect(meterView(backOnGen.state, now + 10_000).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
   });
 });

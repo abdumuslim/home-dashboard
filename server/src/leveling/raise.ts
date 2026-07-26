@@ -39,6 +39,48 @@ export function envelopeTotalAmps(
 }
 
 /**
+ * Amps that ramping ACs have already COMMITTED but the meter has not absorbed
+ * yet — the budget the house owes but cannot see.
+ *
+ * A compressor reaches its cap over ~4 minutes, so for those minutes the meter
+ * under-reports the load that is already on its way. `planRaise` has always
+ * refused to raise an AC while IT is ramping — but nothing stopped it raising a
+ * PEER on the same phantom headroom, and that is exactly what tripped the gen
+ * on 2026-07-26: Abdu was restored at 10:25:45, and 37s later the journal shows
+ * `Abdu: raise blockedBy "ramping"` in the SAME batch that raised Najat L1→L2,
+ * then L2→L3 35s after that. Both were admitted against a meter that had seen
+ * almost none of Abdu's 4.3A. The controller's freshly-on projection could not
+ * cover it either: it lives for exactly ONE tick (`freshlyOn` is cleared at the
+ * top of every tick), and both raises landed after it.
+ *
+ * Per AC: what the cap model says it will pull at its current level, minus what
+ * the meter has actually risen since its compressor started. Deliberately
+ * conservative in three ways — a null baseline charges the WHOLE draw (unknown
+ * absorption is not evidence of absorption), level 0 charges the unrestricted
+ * draw, and with two ACs ramping each measures the rise from its own baseline,
+ * so shared rise is counted twice. All three err toward not spending.
+ *
+ * SPENDING SIDE ONLY. This must never inflate the reducer's savings target: a
+ * ramping AC's inrush is transient and the 2026-07-25 storm proved that acting
+ * on it sheds rooms for load that decays on its own (see pipeline.ts inrush
+ * blanking). It gates what we ADD, never what we cut.
+ */
+export function rampDebitAmps(
+  acs: AcView[],
+  smoothedAmps: number,
+  config: LevelingConfigV2,
+  source: Exclude<PowerSource, "none">,
+): number {
+  return acs.reduce((sum, ac) => {
+    if (!ac.on || !ac.managed || ac.shed || !ac.ramping) return sum;
+    const committed = steadyDraw(ac.currentLevel, ac.maxLevel, modelFor(config, ac.deviceId, source));
+    const absorbed =
+      ac.rampBaselineAmps == null ? 0 : Math.max(0, smoothedAmps - ac.rampBaselineAmps);
+    return sum + Math.max(0, committed - absorbed);
+  }, 0);
+}
+
+/**
  * Highest level a freshly-turned-on AC may be driven to on GRID, priced as
  * `pre-start house load + its own modeled steady draw at that level` against
  * the resting ceiling. Returns null when not even one step above its current
@@ -78,6 +120,12 @@ export interface RaiseInput {
   /** Room under the resting ceiling (limit − margin − restingBuffer − smoothed). */
   headroomAmps: number;
   smoothedAmps: number;
+  /**
+   * Committed-but-unmetered draw of ramping ACs (see rampDebitAmps). Charged
+   * against BOTH the restore admission and the raise budget: the meter is not
+   * a valid anchor while load it has not seen is still arriving.
+   */
+  rampDebitAmps: number;
   limitAmps: number;
   calmMs: number;
   config: LevelingConfigV2;
@@ -161,6 +209,10 @@ export function planRaise(input: RaiseInput): RaisePlan {
   const restoreCeiling = input.limitAmps - config.marginAmps;
   const restoreCalmOk = input.calmMs >= config.restoreCalmSeconds * 1000;
   let reservedAmps = 0;
+  // The meter plus the load already on its way to it — the honest picture of
+  // what this house is committed to right now.
+  const committedAmps = input.smoothedAmps + input.rampDebitAmps;
+  const rampNote = input.rampDebitAmps > 0 ? ` (+${input.rampDebitAmps.toFixed(1)}A ramping in)` : "";
 
   const shedCandidates = acs
     .filter((a) => a.shed && a.managed && !a.on)
@@ -193,7 +245,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // needs to know whether this room could return at all (plain, or by pulling
     // every raised peer down to its floor in the same batch).
     const envelopePlainOk = !envelopeGuard || envelopeWith({}, candidateEntry) <= envelopeCeiling;
-    const fitsPlain = envelopePlainOk && input.smoothedAmps + cost.amps <= restoreCeiling;
+    const fitsPlain = envelopePlainOk && committedAmps + cost.amps <= restoreCeiling;
 
     const savingsAtFloors = onManaged.reduce((sum, a) => {
       const f = floorOf(a);
@@ -203,7 +255,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
     }, 0);
     const floorOverrides = Object.fromEntries(onManaged.map((a) => [a.deviceId, floorOf(a)]));
     const envelopeFloorsOk = !envelopeGuard || envelopeWith(floorOverrides, candidateEntry) <= envelopeCeiling;
-    const fitsAtFloors = envelopeFloorsOk && input.smoothedAmps - savingsAtFloors + cost.amps <= restoreCeiling;
+    const fitsAtFloors = envelopeFloorsOk && committedAmps - savingsAtFloors + cost.amps <= restoreCeiling;
 
     // Can't return this tick even with peer floor-downs → reserve NOTHING
     // (raises don't change floors math, so parking here would be a permanent
@@ -217,7 +269,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
         // floors); if even that is over the breaker model, physics is the
         // blocker, not the meter — label it so the journal is diagnosable.
         blockedBy: !envelopeFloorsOk ? "physics envelope" : "no headroom",
-        detail: `floors ${(input.smoothedAmps - savingsAtFloors + cost.amps).toFixed(1)}A vs ${restoreCeiling.toFixed(1)}A`,
+        detail: `floors ${(committedAmps - savingsAtFloors + cost.amps).toFixed(1)}A vs ${restoreCeiling.toFixed(1)}A${rampNote}`,
       });
       continue;
     }
@@ -300,7 +352,9 @@ export function planRaise(input: RaiseInput): RaisePlan {
   // `available` is the meter-anchored budget; every command debits what the
   // meter has NOT yet seen — a level raise its delta, a grid start the whole
   // steady draw of the AC that just came on (see gridStartLevel).
-  let available = input.headroomAmps;
+  // …minus what ramping compressors have committed but not yet spent on the
+  // meter, or a peer raise buys amps a neighbour is already on its way to using.
+  let available = input.headroomAmps - input.rampDebitAmps;
   const raiseCalmOk = input.calmMs >= config.raiseCalmSeconds * 1000;
   const restingCeiling = input.limitAmps - config.marginAmps - config.restingBufferAmps;
 
@@ -383,7 +437,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
         deviceId: ac.deviceId,
         action: `raise L${target}`,
         blockedBy: "no headroom",
-        detail: `needs ${jump.amps.toFixed(1)}A (${jump.confidence}), ${Math.max(0, available).toFixed(1)}A available`,
+        detail: `needs ${jump.amps.toFixed(1)}A (${jump.confidence}), ${Math.max(0, available).toFixed(1)}A available${rampNote}`,
       });
       continue;
     }

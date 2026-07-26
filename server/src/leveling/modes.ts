@@ -65,7 +65,20 @@ export function applyMeterEvent(state: ModeState, event: MeterEvent, now: number
     case "collapse":
       return { ...state, collapsed: true };
     case "collapse_recovered":
-      return { ...state, collapsed: false };
+      // A gen trip is the strongest evidence there is that the load was too
+      // high — and the ACs power-cycle with the line, so they come back at
+      // exactly the levels that tripped it. Clearing the latch alone let the
+      // house climb straight back to that load: on 2026-07-26 it went
+      // 9.4 → 14.6A in five minutes and tripped a second time, with the
+      // controller doing nothing but (correctly) refusing to raise. Recovery
+      // into gen is therefore treated exactly like an entry into gen: floor
+      // everyone, then climb back meter-confirmed. Grid recovers plain — it is
+      // the roomy source and GRID_FULL owns its entry policy.
+      return {
+        ...state,
+        collapsed: false,
+        floors: event.source === "gen" ? { since: now, until: now + FLOORS_MAX_MS } : state.floors,
+      };
     case "bucket_empty":
       // The meter objected during the grid full-start: the reducer's judgment
       // beats the entry policy — stop re-asserting ceilings it is cutting.

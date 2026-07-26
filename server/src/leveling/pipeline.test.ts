@@ -41,6 +41,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     warmStartLevel: null,
     ramping: false,
     startBaselineAmps: null,
+    rampBaselineAmps: null,
     reshedPenalized: false,
     ...overrides,
   };
@@ -57,6 +58,7 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     overLimitReadings: [],
     collapsed: false,
     frozen: false,
+    derateAmps: 0,
     ...overrides,
   };
 }
@@ -143,5 +145,58 @@ describe("turn-on inrush blanking (2026-07-25 restore-bounce storm)", () => {
     const offs = out.commands.filter((c) => c.kind === "power_off");
     expect(offs.map((c) => c.deviceId)).toEqual(["b"]);
     expect(out.decisions.some((d) => d.action === "shed preference" && d.deviceId === "b")).toBe(true);
+  });
+});
+
+// The ramp debit is computed here (gen only) and fences every spender in the
+// calm branch — including the fan restore, which has no cost model of its own.
+describe("ramp debit fencing (2026-07-26 gen trip #1)", () => {
+  const held = { a: { deviceId: "a", originalFan: 0, lastSetFan: 1, heldAt: T - 600_000 } };
+
+  it("a held fan does not climb back into a ramping compressor's committed amps", () => {
+    // b came on 10s ago at L1 (model draw 2A) with the meter still at its
+    // pre-start 13.0A → 2A committed, 1.6A of resting headroom. Live: Najat's
+    // fan went 1→7 and Abdu's →auto 12s apart, both mid-ramp, and the house
+    // crossed the breaker 65s later.
+    const acs = [
+      ac("a", { currentLevel: 1, fanSpeed: 1, needDelta: 0 }),
+      ac("b", { currentLevel: 1, needDelta: 0, ramping: true, rampBaselineAmps: 13.0 }),
+    ];
+    const blocked = run(acs, meter({ smoothedAmps: 13.0, calmMs: 300_000 }), { fanHolds: held });
+    expect(blocked.commands).toEqual([]);
+
+    // Once the meter has absorbed b's draw the same step is allowed.
+    const absorbed = run(
+      [acs[0], ac("b", { currentLevel: 1, needDelta: 0, ramping: true, rampBaselineAmps: 11.0 })],
+      meter({ smoothedAmps: 13.0, calmMs: 300_000 }),
+      { fanHolds: held },
+    );
+    expect(absorbed.reason).toBe("fan_restore");
+    expect(absorbed.commands).toEqual([{ deviceId: "a", kind: "set_fan", fan: 0, reason: "trim_restore" }]);
+  });
+
+  it("grid is deliberately not ramp-debited (it starts every AC full by directive)", () => {
+    const gridCfg = { ...cfg, gridLimitAmps: 27 };
+    const out = run(
+      [
+        ac("a", { currentLevel: 1, fanSpeed: 1, needDelta: 0 }),
+        ac("b", { currentLevel: 1, needDelta: 0, ramping: true, rampBaselineAmps: 13.0 }),
+      ],
+      meter({ source: "grid", smoothedAmps: 13.0, calmMs: 300_000 }),
+      { fanHolds: held, config: gridCfg },
+    );
+    expect(out.commands).toEqual([{ deviceId: "a", kind: "set_fan", fan: 0, reason: "trim_restore" }]);
+  });
+
+  it("the derate lowers every ceiling the pipeline works against", () => {
+    // 14.2A is calm under the 15A rating but over-limit against a 1A derate.
+    const acs = [ac("a", { currentLevel: 2 }), ac("b", { currentLevel: 2 })];
+    const calm = run(acs, meter({ smoothedAmps: 14.2, calmMs: 300_000 }));
+    expect(calm.reason).not.toMatch(/^over/);
+    const derated = run(
+      acs,
+      meter({ smoothedAmps: 14.2, calmMs: 300_000, derateAmps: 1, overLimitBudget: 0, overLimitReadings: [14.2, 14.3] }),
+    );
+    expect(derated.reason).toMatch(/^over/);
   });
 });

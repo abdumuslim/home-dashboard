@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from "vitest";
 import { Scenario, type SimAcSetup } from "./scenario.js";
+import { meterView } from "./sensing.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
 import type { Command } from "./types.js";
 
@@ -559,5 +560,127 @@ describe("proactive near-limit turn-on (instant reduce, no bucket wait)", () => 
     const cuts = setLevels(s, t0);
     expect(cuts.length).toBeGreaterThanOrEqual(1);
     expect(cuts[0].cmd.level).toBeLessThan(2.5);
+  });
+});
+
+// ── 2026-07-26: three gen trips in 25 minutes ────────────────────────────────
+// #1 10:29:41 at 15.65A — the leveler shed Abdu at 10:25:14, restored him at
+//    10:25:45, then raised NAJAT L1→L2 (10:26:22) and L2→L3 (10:26:57) while
+//    the journal was recording `Abdu: raise blockedBy "ramping"` in the very
+//    same batches. The meter had seen almost none of Abdu's 4.3A.
+// #2 ~10:40:45 at 14.48A — recovery only cleared the collapse latch, so the
+//    power-cycled ACs climbed the house straight back to the tripping load.
+// #3 ~10:53:30 at 13.99A — an ordinary single raise, admitted correctly
+//    against a 15A limit the hot breaker was no longer holding.
+describe("the 2026-07-26 triple gen trip", () => {
+  // Live shape: a big non-AC baseline (measured ~7–8A that morning) leaves only
+  // ~6A for the ACs on the 15A gen. Sized so that everyone at their floor fits
+  // (7.3 + 4.1 + 2.2 = 13.6) but ONE peer raise does not (+1.7 = 15.3 > 14.9) —
+  // i.e. the trap only springs if the controller spends amps the meter has not
+  // seen yet. Both compressors carry the real 4-minute ramp.
+  const trips = (): Scenario =>
+    new Scenario(
+      cfg,
+      [
+        { ...ABDU, shed: true, demandAmps: 9.0, needDelta: 3, fan: 1, rampSeconds: 240 },
+        { ...NAJAT, level: 1, demandAmps: 5.3, needDelta: 2.5, fan: 1, rampSeconds: 240 },
+      ],
+      { nonAcAmps: 7.3, source: "gen" },
+    );
+
+  it("does not raise a peer on the headroom a restored room is still ramping into", () => {
+    const s = trips();
+    const t0 = s.now;
+    s.advance(6 * 60); // restore, then the whole 4-min ramp window after it
+
+    const restore = s.commandsSince(t0, "power_on").find((c) => c.cmd.deviceId === "abdu");
+    expect(restore).toBeDefined();
+    // Najat may not be lifted while Abdu's compressor is still arriving.
+    const najatRaises = s
+      .commandsSince(restore!.at, "set_level")
+      .filter((e) => e.cmd.deviceId === "najat" && e.at - restore!.at < 240_000);
+    expect(najatRaises).toEqual([]);
+  });
+
+  it("never lets the house cross the breaker while a restore ramps in", () => {
+    const s = trips();
+    s.advance(20 * 60);
+    expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps);
+    // …and it did not buy that by leaving a room off.
+    expect(s.acsOn()).toEqual(["abdu", "najat"]);
+  });
+
+  it("floors every AC again when the gen recovers from a trip", () => {
+    const s = trips();
+    s.advance(5 * 60); // settle, Abdu restored and climbing
+    s.sim("najat").level = 3;
+    s.sim("najat").shadowLevel = 3;
+    s.trip();
+    s.advance(30);
+    s.recoverLine();
+    const t0 = s.now;
+    s.advance(120);
+
+    // Recovery must re-level, not resume: everyone driven back to their floor.
+    const floored = s.commandsSince(t0, "set_level");
+    expect(floored.length).toBeGreaterThan(0);
+    expect(floored.every((e) => e.cmd.kind === "set_level" && e.cmd.level === 1)).toBe(true);
+  });
+
+  // Trip #3's shape: after the dust settles there IS room under the nameplate
+  // limit for one more step (floors 12.5A vs a 14.6A resting ceiling → 2.1A
+  // free, and Najat's step costs 1.6A), so the pre-fix controller raises — and
+  // the hot breaker, which had just failed at 13.99A, goes again. Derated by
+  // one trip the same ceiling is 13.6A → 1.1A free → the step is refused.
+  const postTrip = (): Scenario =>
+    new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, demandAmps: 9.0, needDelta: 3, fan: 1, rampSeconds: 240 },
+        { ...NAJAT, level: 1, demandAmps: 5.3, needDelta: 2.5, fan: 1, rampSeconds: 240 },
+      ],
+      { nonAcAmps: 6.2, source: "gen" },
+    );
+
+  it("stops spending into a gen that just tripped (trip #3's raise)", () => {
+    const s = postTrip();
+    s.advance(5 * 60);
+    s.trip();
+    s.advance(30);
+    s.recoverLine();
+    const t0 = s.now;
+    s.advance(15 * 60);
+    // Live 10:49:58: Abdu L1→L2 at 12.0A, every gate satisfied, gen gone at
+    // 13.99A. Nothing may be lifted above its floor while the derate stands.
+    const lifts = s
+      .commandsSince(t0, "set_level")
+      .filter((e) => e.cmd.kind === "set_level" && e.cmd.level > 1);
+    expect(lifts).toEqual([]);
+    expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps - 1);
+  });
+
+  it("a second trip inside the window derates further", () => {
+    // The live cascade: each trip left the breaker holding less than the last
+    // (15.65 → 14.48 → 13.99). Two trips inside the window must compound, not
+    // restart the ceiling at the nameplate rating.
+    const s = postTrip();
+    s.advance(5 * 60);
+    for (let i = 0; i < 2; i++) {
+      s.trip();
+      s.advance(30);
+      s.recoverLine();
+      s.advance(3 * 60);
+    }
+    expect(meterView(s.meterState, s.now).derateAmps).toBe(2);
+  });
+
+  it("releases the derate once the window passes without another trip", () => {
+    const s = postTrip();
+    s.advance(5 * 60);
+    s.trip();
+    s.advance(30);
+    s.recoverLine();
+    s.advance(21 * 60); // past COLLAPSE_DERATE_MS
+    expect(meterView(s.meterState, s.now).derateAmps).toBe(0);
   });
 });

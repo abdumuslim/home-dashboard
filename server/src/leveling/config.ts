@@ -129,3 +129,20 @@ function sanitizeBoosts(raw: unknown): Record<string, AcLevelBoost> {
 export function limitFor(config: LevelingConfigV2, source: "grid" | "gen"): number {
   return source === "grid" ? config.gridLimitAmps : config.genLimitAmps;
 }
+
+/**
+ * The limit the controller must actually respect: the configured limit minus
+ * the live post-collapse derate (see MeterView.derateAmps). A breaker that
+ * just tripped is hot and holds LESS than its rating until it cools — live
+ * 2026-07-26 the same gen tripped at 15.65A, then 14.48A, then 13.99A within
+ * 25 minutes on a 15A configured limit. Every limit consumer (sensing's leaky
+ * bucket, pressure, the pipeline's ceilings) must go through here or they
+ * disagree about what "over" means.
+ */
+export function effectiveLimit(
+  config: LevelingConfigV2,
+  source: "grid" | "gen",
+  derateAmps: number,
+): number {
+  return Math.max(1, limitFor(config, source) - Math.max(0, derateAmps));
+}

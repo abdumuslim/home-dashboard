@@ -8,6 +8,12 @@
 
 A ground-up rewrite lives in **`server/src/leveling/`** (17 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
+**Two invariants added 2026-07-26 after three gen trips in 25 minutes — read the incident section
+before touching admission:** (a) the meter is NOT a valid budget anchor while a compressor is
+ramping, so every spender (raise, restore, fan restore) is charged the committed-but-unmetered draw
+of ramping peers on gen; (b) the CONFIGURED limit is not the limit — a breaker that just tripped is
+derated for 20 min, so all limit math goes through `effectiveLimit()`, never `limitFor()`.
+
 **Key design (vs v1):** ONE graduated reducer at every severity (no separate mild/emergency planners); explicit mode machine NORMAL/SETTLING/FLOORS/COLLAPSED replaces ~15 latches (FLOORS arms on ANY entry into gen incl. cold start); **fans are last-resort trim only** (enumerable only at floor level; restore needs 5-min calm — v1 cut fans with level cuts available 57% of the time and bounced them at 61s median); one-step meter-anchored raises priced by a **persistent learned cost model** (`ac_leveling_costs` — per device × source × transition EWMA, survives deploys, config saves do NOT wipe it; explicit `POST /api/ac/leveling/costs/reset`); restore/raise retries use **evidence + capped backoff** (30s→2m→5m→15m — kills permanent strands); on gen only ONE raise command per batch; every batch is journaled + outcome-graded in **`ac_leveling_journal`** (`GET /api/ac/leveling/journal?hours=24` — durable forensics, docker logs rotate in ~1.5 days); single-actuator graded batches feed the cost model continuously. Hard rules all preserved (never level 0, manual wins, slot caps, boost floors, shed≠manual-off, warm restore, opt-out, collapse latch, leaky bucket, requireShed ≥ max(3A, 20%)).
 
 **Hardware truth (2026-07-23, user-verified + web specs):** Abdu = **2-ton** (caps ≈ 4.1/6.5/~9A at L1/2/3), Abdullah & Najat = **1-ton** (≈ 2.2/3.9/5.3A). The registry `model` field is protocol-inference only — its capacity digits are WRONG (see tcl-ac.md). Observed raise JUMPS (3.6–3.8A, incl. compressor duty change) exceed steady per-level steps — the cost model stores both (`level:1>2` jumps vs steady model ceilings).
@@ -155,6 +161,61 @@ double-spend, cap clamp, near-target, gen policy, post-window); `scenarios.test.
 grid turn-on incident" (3 — first-batch ceiling, degrade-instead-of-overshoot, gen unchanged).
 **662 server tests green; server `tsc` clean.** Verified failing without the fix (7 of the 11 are
 behavioral; the other 4 pin unchanged behavior).
+
+### 2026-07-26 triple gen trip → ramp debit + collapse re-floor + post-trip derate
+
+**The incidents (10:29:41, ~10:40:45, ~10:53:30 Baghdad, 15A gen, ~7–8A of non-AC load).** Three
+breaker trips in 25 minutes, each at a LOWER current than the last — **15.65A → 14.48A → 13.99A**.
+Two independent controller bugs plus one wrong assumption:
+
+1. **Trip #1 — peer-ramp blindness.** 10:25:14 shed Abdu (18.1A extreme) → 10:25:45 gentle restore
+   → **10:26:22 raised NAJAT L1→L2 and 10:26:57 L2→L3**. Journal rows 3201/3202 contain
+   `Abdu: raise blockedBy "ramping"` *in the same batch* as the executed Najat raise: `planRaise`
+   gates on `ac.ramping` — the AC's OWN flag — while `available` is pure meter headroom, so a peer
+   freely spent the 4.3A Abdu's compressor was still ramping into. Two fan restores (Najat 1→7 at
+   10:28:00, Abdu →auto at 10:28:12) rode the same phantom budget. The controller's freshly-on
+   projection cannot cover this: `freshlyOn` is cleared at the top of every tick, so it lives for
+   exactly ONE tick and both raises landed after it. The physics envelope passed too — it excludes
+   non-AC load by design (4.3 + 6.3 = 10.6 ≤ 14.9).
+2. **Trip #2 — recovery resumed instead of re-levelling.** `modes.ts` `collapse_recovered` only
+   cleared the latch. The ACs power-cycle with the line and come back at the levels that tripped it,
+   so the house climbed 9.4 → 14.6A in five minutes and went again. v2 did everything right in
+   between (rows 3211–3214 are all `blocked`/`no headroom`) — it simply had no way to back OFF.
+3. **Trip #3 — the limit itself was wrong.** 10:49:58 raised Abdu L1→L2 at `pre 12.00A`; the house
+   settled at 13.99A and the gen tripped **1A under the configured limit**. A thermal breaker that
+   just tripped is hot and holds less until it cools; no admission logic survives a limit above what
+   the hardware holds. (User kept `genLimitAmps` at 15 — the derate is what tracks reality.)
+
+**Fixes:**
+1. **Ramp debit (`raise.ts` `rampDebitAmps`, GEN only).** Per ON managed ramping AC:
+   `max(0, steadyDraw(currentLevel) − (smoothed − rampBaseline))` — what it has COMMITTED minus what
+   the meter has actually absorbed. Charged against the raise budget, the restore admission
+   (`committedAmps`) and the fan-restore headroom in `pipeline.ts`. Conservative by construction: a
+   null baseline charges the whole draw, level 0 charges the unrestricted draw, and two simultaneous
+   ramps each measure rise from their own baseline (shared rise counted twice). **Spending side
+   only** — it must never inflate the reducer's target, or it re-creates the 2026-07-25 storm.
+   `AcView.rampBaselineAmps` is armed by `rearmRamp()` at EVERY arming point (user/automation
+   turn-on, restore, changeover, collapse recovery) and, unlike `startBaselineAmps`, is never
+   cleared by policy events — it is physics, not entry policy. Grid is deliberately exempt, the same
+   split the physics envelope uses (grid starts FULL by directive; the reducer is its safety).
+2. **Gen collapse recovery re-arms FLOORS (`modes.ts`).** A recovery into gen is treated exactly
+   like an entry into gen. Grid recovers plain (GRID_FULL owns that entry).
+3. **Post-collapse limit derate (`sensing.ts` + `config.ts` `effectiveLimit`).** Each collapse takes
+   `COLLAPSE_DERATE_AMPS` (1A) off the effective limit for that source for `COLLAPSE_DERATE_MS`
+   (20 min, refreshed by each new collapse), stacking to `COLLAPSE_DERATE_MAX_AMPS` (3A). Stored on
+   `MeterState.derate` with its own source tag so it RIDES THROUGH the per-source episodic reset (a
+   gen→grid→gen bounce must not launder a hot gen breaker back to full rating). Exposed as
+   `MeterView.derateAmps`; **every** limit consumer goes through `effectiveLimit()` — sensing's leaky
+   bucket, `pressure.ts`, the pipeline's ceilings, the manual-increment guard, and the status card —
+   or they disagree about what "over" means. A collapse also pushes a critical notification naming
+   the new ceiling.
+
+Tests: `raise.test.ts` ramp-debit suite (7); `pipeline.test.ts` fencing suite (3 — fan restore,
+grid exemption, derated ceilings); `modes.test.ts` recovery suite (3); `sensing.test.ts` derate suite
+(4); `scenarios.test.ts` "the 2026-07-26 triple gen trip" (6). The harness gained ramp-baseline
+parity (`scenario.ts` `startRamp()`). **709 server tests green; server + client `tsc` clean.** One
+behavioral regression per fix was verified failing first (peer raise during a ramp, floors on
+recovery, trip #3's raise); the rest pin bookkeeping.
 
 ### 2026-07-25 restore-bounce storm (first night of v2 acting)
 

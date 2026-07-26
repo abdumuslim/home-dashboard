@@ -129,3 +129,36 @@ describe("FLOORS exit", () => {
     expect(deriveMode(clearFloorsOnManual(floors()), T)).toBe("NORMAL");
   });
 });
+
+// The 2026-07-26 gen trip #2. Clearing the collapse latch was all recovery did,
+// so the ACs — which power-cycle with the line and come back at the levels that
+// tripped it — climbed the house straight back to 14.6A and tripped again six
+// minutes later.
+describe("gen collapse recovery re-arms FLOORS", () => {
+  it("a recovery on gen arms the floors window", () => {
+    const collapsed = applyMeterEvent(initialModeState(), { kind: "collapse", fromAmps: 15.6, toAmps: 3.9, source: "gen" }, T);
+    expect(deriveMode(collapsed, T)).toBe("COLLAPSED");
+
+    const recovered = applyMeterEvent(collapsed, { kind: "collapse_recovered", source: "gen" }, T + 60_000);
+    expect(recovered.collapsed).toBe(false);
+    expect(deriveMode(recovered, T + 60_000)).toBe("FLOORS");
+    expect(recovered.floors?.until).toBe(T + 60_000 + FLOORS_MAX_MS);
+  });
+
+  it("a recovery on grid does not — GRID_FULL owns that entry policy", () => {
+    const collapsed = applyMeterEvent(initialModeState(), { kind: "collapse", fromAmps: 26, toAmps: 4, source: "grid" }, T);
+    const recovered = applyMeterEvent(collapsed, { kind: "collapse_recovered", source: "grid" }, T + 60_000);
+    expect(recovered.floors).toBeNull();
+    expect(deriveMode(recovered, T + 60_000)).toBe("NORMAL");
+  });
+
+  it("the re-armed floors window still clears the normal way", () => {
+    const recovered = applyMeterEvent(
+      applyMeterEvent(initialModeState(), { kind: "collapse", fromAmps: 15.6, toAmps: 3.9, source: "gen" }, T),
+      { kind: "collapse_recovered", source: "gen" },
+      T,
+    );
+    const done = clearFloorsIfDone(recovered, { allConfirmedAtFloor: true, anyRamping: false });
+    expect(done.floors).toBeNull();
+  });
+});

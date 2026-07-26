@@ -10,7 +10,7 @@
 import pg from "pg";
 import { childLogger } from "../logger.js";
 import type { LevelerDeviceContext, LevelingDeps, LevelingStatusV2 } from "./api.js";
-import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, limitFor, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
+import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, effectiveLimit, limitFor, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
 import { ingestReading, initialMeterState, meterView, refillBucket, resetCalm } from "./sensing.js";
 import {
   applyMeterEvent,
@@ -114,6 +114,16 @@ export class LevelingControllerV2 {
   private manualTarget = new Map<string, number>();
   private fanExempt = new Set<string>();
   private rampUntil = new Map<string, number>();
+  /**
+   * Ramp baselines: house amps measured just before this AC's compressor
+   * started, for every ramp we arm on either source. Distinct from
+   * `startBaseline` on purpose — that one is the grid full-start POLICY window
+   * and gets cleared by an over-limit batch, a manual level or a source change,
+   * while this one is pure physics accounting (see rampDebitAmps) and must
+   * survive all of those: the un-metered load is still arriving regardless of
+   * what policy decided.
+   */
+  private rampBaseline = new Map<string, number>();
   /** Grid full-start windows: house amps measured just before this AC came on. */
   private startBaseline = new Map<string, { amps: number; until: number }>();
   private boostActive = new Map<string, boolean>();
@@ -347,7 +357,10 @@ export class LevelingControllerV2 {
           this.pendingGrades = [];
           // Baselines are amps on the OLD source — worthless on the new one,
           // and the entry mode (FLOORS / GRID_FULL) owns the transition now.
+          // (armRampOnSourceChange re-arms every running AC a tick later, which
+          // re-anchors the ramp baselines against the new line's first readings.)
           this.startBaseline.clear();
+          this.rampBaseline.clear();
           if (event.to === "grid") {
             this.manualCap.clear();
             this.manualTarget.clear();
@@ -357,12 +370,25 @@ export class LevelingControllerV2 {
           this.deps.onPowerEvent?.(`source ${event.from} → ${event.to}`);
           break;
         }
-        case "collapse":
+        case "collapse": {
+          const derated =
+            event.source !== "none"
+              ? effectiveLimit(this.config, event.source, this.meterState.derate?.amps ?? 0)
+              : null;
           log.warn(
-            `[leveler2] Power collapse ${event.fromAmps.toFixed(1)}A → ${event.toAmps.toFixed(1)}A on ${event.source} — probable trip/blackout; commands frozen until recovery`,
+            `[leveler2] Power collapse ${event.fromAmps.toFixed(1)}A → ${event.toAmps.toFixed(1)}A on ${event.source} — probable trip/blackout; commands frozen until recovery` +
+              (derated != null ? `; ${event.source} limit derated to ${derated.toFixed(1)}A while it cools` : ""),
           );
           this.deps.onPowerEvent?.(`power collapse on ${event.source}`);
+          if (derated != null && (this.meterState.derate?.amps ?? 0) > 0) {
+            void this.pushNotice(
+              `${event.source === "gen" ? "Generator" : "Grid"} tripped at ${event.fromAmps.toFixed(1)}A — ` +
+                `holding the AC budget at ${derated.toFixed(1)}A while the breaker cools.`,
+              true,
+            );
+          }
           break;
+        }
         case "collapse_recovered":
           // Compressors restarted with the line — re-arm the ramp windows.
           this.rearmRamp([...this.prevPowerStates.entries()].filter(([, on]) => on).map(([id]) => id));
@@ -454,7 +480,9 @@ export class LevelingControllerV2 {
     const source = view.source;
     if (source !== "none" && view.sampleCount >= 4) {
       const jump = raiseJumpAmps(this.book, this.config, deviceId, source, confirmed, target, maxLevel, now);
-      const limit = limitFor(this.config, source);
+      // Derated after a recent trip — a hand-set increment is checked against
+      // the limit the line has actually been holding, like everything else.
+      const limit = effectiveLimit(this.config, source, view.derateAmps);
       if (view.smoothedAmps + jump.amps > limit - this.config.marginAmps) {
         log.warn(
           `[leveler2] Manual gen increment on ${deviceId} to L${target} projects ` +
@@ -470,9 +498,23 @@ export class LevelingControllerV2 {
     return { reverted: false, level: target };
   }
 
+  /**
+   * Open (or re-open) a compressor ramp window. Every arming point also
+   * snapshots the house load right now: that reading is taken BEFORE this
+   * compressor contributes, so it is the anchor `rampDebitAmps` measures
+   * absorption against. Applies on both sources and to every cause — user
+   * turn-on, automation turn-on, shed restore, changeover, collapse recovery.
+   */
   rearmRamp(deviceIds: string[]): void {
-    const until = Date.now() + AC_RAMP_MS;
-    for (const id of deviceIds) this.rampUntil.set(id, until);
+    const now = Date.now();
+    const until = now + AC_RAMP_MS;
+    const view = meterView(this.meterState, now);
+    const baseline = view.source !== "none" && view.sampleCount >= 2 ? view.smoothedAmps : null;
+    for (const id of deviceIds) {
+      this.rampUntil.set(id, until);
+      if (baseline == null) this.rampBaseline.delete(id);
+      else this.rampBaseline.set(id, baseline);
+    }
   }
 
   /**
@@ -518,6 +560,9 @@ export class LevelingControllerV2 {
           }
         } else {
           this.startBaseline.delete(device.id);
+          // No compressor, no ramp to account for.
+          this.rampUntil.delete(device.id);
+          this.rampBaseline.delete(device.id);
           this.recon = clearOnPowerOff(this.recon, device.id);
           this.manualCap.delete(device.id);
           this.manualTarget.delete(device.id);
@@ -714,6 +759,7 @@ export class LevelingControllerV2 {
       const boost = boostFloor(this.config.levelBoosts[device.id], outdoorTempC, this.boostActive.get(device.id) ?? false);
       this.boostActive.set(device.id, boost.active);
       const recon = this.recon[device.id];
+      const ramping = (this.rampUntil.get(device.id) ?? 0) > now && device.power;
       // During settle the shadow reflects the pre-command state — use pending.
       const observed = deriveMode(this.modeState, now) === "SETTLING" && recon?.pendingLevel != null
         ? recon.pendingLevel
@@ -735,7 +781,8 @@ export class LevelingControllerV2 {
         slotCap: slotGenCap,
         reachableCap: reachableCapOf(this.recon, device.id, device.maxGeneratorLevel || 3),
         warmStartLevel: this.rememberedLevel.get(device.id) ?? null,
-        ramping: (this.rampUntil.get(device.id) ?? 0) > now && device.power,
+        ramping,
+        rampBaselineAmps: ramping ? (this.rampBaseline.get(device.id) ?? null) : null,
         startBaselineAmps: this.startBaselineFor(device.id, device.power, now),
         reshedPenalized: reshedPenalized(this.pacing, device.id, now),
       };
@@ -843,7 +890,10 @@ export class LevelingControllerV2 {
           }
           case "power_off": {
             await tcl.executeAcAction(cmd.deviceId, { power: 0 });
-            await this.recordShed(cmd.deviceId, `over ${limitFor(this.config, view.source === "none" ? "gen" : view.source)}A on ${view.source}`);
+            await this.recordShed(
+              cmd.deviceId,
+              `over ${effectiveLimit(this.config, view.source === "none" ? "gen" : view.source, view.derateAmps)}A on ${view.source}`,
+            );
             await this.releaseHold(cmd.deviceId, "shed");
             this.deps.setDevicePowerCache(cmd.deviceId, "off");
             await this.pushNotice(`AC ${name} turned off to protect the ${view.source} breaker`, true);
@@ -1066,7 +1116,9 @@ export class LevelingControllerV2 {
     now: number,
   ): LevelingStatusV2 {
     const source = view.source;
-    const limit = source === "none" ? null : limitFor(this.config, source);
+    // Report the ENFORCED limit, derate included — otherwise the card shows
+    // headroom the controller will not spend after a trip.
+    const limit = source === "none" ? null : effectiveLimit(this.config, source, view.derateAmps);
     return {
       enabled: this.config.enabled,
       source,

@@ -10,11 +10,11 @@
 
 import type { AcView, Command, Decision, MeterView, Mode, Plan, Severity } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
-import { limitFor } from "./config.js";
+import { effectiveLimit } from "./config.js";
 import type { CostBook } from "./costs.js";
 import { assessPressure } from "./pressure.js";
 import { planReduction } from "./reduce.js";
-import { invariantCorrections, planRaise } from "./raise.js";
+import { invariantCorrections, planRaise, rampDebitAmps } from "./raise.js";
 import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
 import { ceilOf, floorOf } from "./needs.js";
 import { canAttempt, type PacingState } from "./pacing.js";
@@ -85,7 +85,9 @@ export function plan(input: PlanInput): PlanOutput {
   const { now, config, mode, meter, acs, book, pacing } = input;
   if (meter.source === "none") return emptyPlan(input, "no_power");
   const source = meter.source;
-  const limit = limitFor(config, source);
+  // Derated while a recent collapse is still cooling — the limit the hardware
+  // has actually been holding, not the one it is rated for.
+  const limit = effectiveLimit(config, source, meter.derateAmps);
 
   // COLLAPSED: the line is (probably) dead — no commands into it. Raises,
   // restores, corrections and even reductions wait; the latch clears on
@@ -270,10 +272,18 @@ export function plan(input: PlanInput): PlanOutput {
 
   // ---- NORMAL + calm: spend headroom (restore ≫ warm ≫ raise ≫ fan restore).
   if (pressure.kind === "calm") {
+    // Committed-but-unmetered draw of ramping compressors. GEN only, the same
+    // split the physics envelope uses: grid starts every AC FULL by explicit
+    // user directive and leans on the reducer as its safety, so charging a
+    // ramp there would fight the entry policy on the roomy source. On gen the
+    // budget is ~15A against ~8A of non-AC load — there is nothing to spare for
+    // load the meter has not caught up with (2026-07-26 trip #1).
+    const rampDebit = source === "gen" ? rampDebitAmps(onManaged, meter.smoothedAmps, config, source) : 0;
     const raisePlan = planRaise({
       acs,
       headroomAmps: pressure.headroomAmps,
       smoothedAmps: meter.smoothedAmps,
+      rampDebitAmps: rampDebit,
       limitAmps: limit,
       calmMs: meter.calmMs,
       config,
@@ -306,10 +316,13 @@ export function plan(input: PlanInput): PlanOutput {
     }
     // Nothing to raise — a held fan may climb one sweet-spot step, but never
     // into amps reserved for a pending shed restore (raises were parked; a fan
-    // restore must not spend that headroom either).
+    // restore must not spend that headroom either) and never into amps a
+    // ramping compressor is already committed to. Two fan restores 12s apart
+    // rode exactly that phantom budget into the 2026-07-26 trip (Najat 1→7 at
+    // 10:28:00, Abdu →auto at 10:28:12, both while Abdu was still ramping).
     const fanStep = planFanRestore(input.fanHolds, acs, {
       calmMs: meter.calmMs,
-      headroomAmps: pressure.headroomAmps - raisePlan.reservedAmps,
+      headroomAmps: pressure.headroomAmps - raisePlan.reservedAmps - rampDebit,
       book,
       source,
       now,

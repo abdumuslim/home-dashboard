@@ -76,6 +76,8 @@ interface SimAc {
   warmStartLevel: number | null;
   /** Open grid full-start window (pre-start house amps + expiry). */
   startBaseline: { amps: number; until: number } | null;
+  /** House amps just before this compressor last started (ramp-debit anchor). */
+  rampBaseline: number | null;
 }
 
 const STEP_MS = 5_000;
@@ -141,7 +143,19 @@ export class Scenario {
       needDelta: s.needDelta,
       warmStartLevel: null,
       startBaseline: null,
+      rampBaseline: null,
     }));
+  }
+
+  /**
+   * Shell parity for `rearmRamp`: every arming point snapshots the house load
+   * measured BEFORE this compressor contributes, which is what the ramp debit
+   * measures absorption against.
+   */
+  private startRamp(ac: SimAc): void {
+    ac.turnedOnAt = this.now;
+    const view = meterView(this.meterState, this.now);
+    ac.rampBaseline = view.source !== "none" && view.sampleCount >= 2 ? view.smoothedAmps : null;
   }
 
   setNonAc(amps: number): void {
@@ -157,7 +171,7 @@ export class Scenario {
     for (const ac of this.acs) ac.startBaseline = null;
     if (line === "gen" || line === "grid") {
       // A real changeover restarts every running compressor.
-      for (const ac of this.acs) if (ac.on) ac.turnedOnAt = this.now;
+      for (const ac of this.acs) if (ac.on) this.startRamp(ac);
     }
   }
 
@@ -169,7 +183,7 @@ export class Scenario {
   /** Power returns after a trip: compressors restart at their firmware levels. */
   recoverLine(): void {
     this.lineDead = false;
-    for (const ac of this.acs) if (ac.on) ac.turnedOnAt = this.now;
+    for (const ac of this.acs) if (ac.on) this.startRamp(ac);
   }
 
   setDemand(deviceId: string, demandAmps: number, needDelta?: number): void {
@@ -185,7 +199,7 @@ export class Scenario {
     ac.shed = false;
     ac.level = level;
     ac.shadowLevel = level;
-    ac.turnedOnAt = this.now;
+    this.startRamp(ac);
     const source = this.line === "none" ? "gen" : this.line;
     this.pendingProjection = turnOnAmps(this.book, this.cfg, deviceId, source, level, 3, this.now).amps;
     // Mirror the shell: on grid a turn-on opens a full-start window anchored on
@@ -206,6 +220,8 @@ export class Scenario {
     ac.on = false;
     ac.shed = false;
     ac.startBaseline = null;
+    ac.rampBaseline = null;
+    ac.turnedOnAt = 0;
     this.meterState = resetCalm(this.meterState);
   }
 
@@ -295,6 +311,10 @@ export class Scenario {
         reachableCap: null,
         warmStartLevel: ac.warmStartLevel,
         ramping: ac.on && ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < ac.setup.rampSeconds * 1000,
+        rampBaselineAmps:
+          ac.on && ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < ac.setup.rampSeconds * 1000
+            ? ac.rampBaseline
+            : null,
         startBaselineAmps:
           ac.on && ac.startBaseline != null && ac.startBaseline.until > this.now
             ? ac.startBaseline.amps
@@ -328,7 +348,7 @@ export class Scenario {
           ac.level = cmd.level;
           ac.shadowLevel = cmd.level;
           ac.shadowLevelAt = 0;
-          ac.turnedOnAt = this.now;
+          this.startRamp(ac);
           // Gentle restore pins the fan; the hold itself rides in out.fanHolds
           // (recorded by the pipeline, assigned in step()).
           if (cmd.fan != null) ac.fan = cmd.fan;

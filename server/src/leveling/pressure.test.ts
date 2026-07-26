@@ -22,6 +22,7 @@ function view(overrides: Partial<MeterView> = {}): MeterView {
     overLimitReadings: [],
     collapsed: false,
     frozen: false,
+    derateAmps: 0,
     ...overrides,
   };
 }

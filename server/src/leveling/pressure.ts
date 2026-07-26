@@ -5,7 +5,7 @@
 
 import type { MeterView, Pressure } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
-import { limitFor } from "./config.js";
+import { effectiveLimit } from "./config.js";
 import { OVER_LIMIT_SEVERE_AMPS, median } from "./sensing.js";
 
 /** Extreme-overshoot shed escalation (ported 2026-07-10 values). */
@@ -33,7 +33,9 @@ export function assessPressure(
   opts: { projectedExtraAmps?: number } = {},
 ): Pressure {
   if (view.source === "none") return { kind: "hold" };
-  const limit = limitFor(config, view.source);
+  // Derated after a recent trip — the same number sensing classified its
+  // readings against, so severity and the leaky bucket stay in agreement.
+  const limit = effectiveLimit(config, view.source, view.derateAmps);
 
   if (view.overLimitBudget <= 0 && view.overLimitReadings.length > 0) {
     const required = requiredSavingsAmps(view, limit, config.marginAmps);

@@ -10,7 +10,7 @@
 
 import type { CollapseLatch, MeterEvent, MeterState, MeterView, PowerSource } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
-import { limitFor } from "./config.js";
+import { effectiveLimit } from "./config.js";
 
 // ---- Ported v1 constants (values unchanged; provenance: ac-leveling.ts) ----
 
@@ -54,6 +54,32 @@ export const FROZEN_EPSILON_AMPS = 0.005;
 /** Readings with no micro-change on either channel for this long = frozen sensor. */
 export const METER_FROZEN_AFTER_MS = 60_000;
 
+/**
+ * Post-collapse limit derate (2026-07-26 triple gen trip). A thermal-magnetic
+ * breaker that just tripped is hot and re-trips well below its rating until it
+ * cools: the same 15A gen went at 15.65A, then 14.48A 11 min later, then
+ * 13.99A 9 min after that — the third on an ordinary single raise that every
+ * meter- and model-side gate correctly admitted against the CONFIGURED limit.
+ * No decision logic can survive a limit that is above what the hardware holds,
+ * so each collapse walks the effective limit down and every consumer follows.
+ */
+export const COLLAPSE_DERATE_AMPS = 1;
+/** Ceiling on the stacked derate — a cascade must not starve the line to nothing. */
+export const COLLAPSE_DERATE_MAX_AMPS = 3;
+/**
+ * How long a derate lasts; each new collapse refreshes it (and adds a step).
+ * Longer than the observed 9–11 min between cascade trips, so a repeat trip
+ * lands INSIDE the window and stacks rather than starting over at full rating.
+ */
+export const COLLAPSE_DERATE_MS = 20 * 60_000;
+
+/** Live derate for `source`, or 0 (expired / different line / never tripped). */
+export function derateFor(state: MeterState, source: PowerSource, now: number): number {
+  const d = state.derate;
+  if (d == null || d.source !== source || now >= d.until) return 0;
+  return d.amps;
+}
+
 export function initialMeterState(): MeterState {
   return {
     source: "none",
@@ -66,6 +92,7 @@ export function initialMeterState(): MeterState {
     lastRaw: null,
     lastMicroChangeAt: 0,
     frozen: false,
+    derate: null,
   };
 }
 
@@ -147,7 +174,10 @@ export function ingestReading(
 
   if (source !== prev.source) {
     // Episodic state is per-source: bucket, calm, smoothing ring, collapse latch.
-    // Frozen tracking is device-level and rides through.
+    // Frozen tracking is device-level and rides through; so does the derate —
+    // it is knowledge about a LINE that just tripped, not episode bookkeeping,
+    // and it carries its own source tag so it only binds where it was earned
+    // (a gen→grid→gen bounce must not launder a hot gen breaker back to full).
     events.push({ kind: "source_changed", from: prev.source, to: source });
     state = {
       source,
@@ -160,6 +190,7 @@ export function ingestReading(
       lastRaw,
       lastMicroChangeAt,
       frozen,
+      derate: prev.derate,
     };
   }
 
@@ -167,7 +198,6 @@ export function ingestReading(
     return { state: { ...state, calmSince: null }, events };
   }
 
-  const limit = limitFor(config, source);
   const measured = source === "grid" ? reading.gridAmps : reading.genAmps;
 
   // Collapse latch: resolve an active latch first (recovery or safety expiry),
@@ -194,6 +224,25 @@ export function ingestReading(
     collapse = { preMedianAmps: priorMedian, until: now + POWER_COLLAPSE_MAX_MS };
     events.push({ kind: "collapse", fromAmps: priorMedian, toAmps: measured, source });
   }
+
+  // Walk the effective limit down on every collapse: the line just PROVED it
+  // cannot hold what it was carrying, and a repeat trip inside the window
+  // proves the derate was still not enough (live 15.65A → 14.48A → 13.99A).
+  // Stacking is capped so a cascade cannot starve the house to nothing.
+  let derate = state.derate;
+  if (collapse != null && state.collapse == null) {
+    const standing = derateFor(state, source, now);
+    derate = {
+      source,
+      amps: Math.min(COLLAPSE_DERATE_MAX_AMPS, standing + COLLAPSE_DERATE_AMPS),
+      until: now + COLLAPSE_DERATE_MS,
+    };
+  } else if (derate != null && now >= derate.until) {
+    derate = null;
+  }
+  // Classify this reading against the derated limit, so the leaky bucket and
+  // the reducer can never disagree about what "over" means.
+  const limit = effectiveLimit(config, source, derateFor({ ...state, derate }, source, now));
 
   const recent = [...state.recent, measured].slice(-RECENT_RING);
 
@@ -256,6 +305,7 @@ export function ingestReading(
       lastRaw,
       lastMicroChangeAt,
       frozen,
+      derate,
     },
     events,
   };
@@ -275,6 +325,7 @@ export function resetCalm(state: MeterState): MeterState {
 export function meterView(state: MeterState, now: number): MeterView {
   const stale = state.lastReadingAt === 0 || now - state.lastReadingAt > STALE_POWER_MS;
   return {
+    derateAmps: stale ? 0 : derateFor(state, state.source, now),
     source: stale ? "none" : state.source,
     smoothedAmps: smoothedAmps(state),
     latestAmps: state.recent.length > 0 ? state.recent[state.recent.length - 1] : 0,
