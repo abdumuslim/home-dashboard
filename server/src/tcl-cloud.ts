@@ -20,6 +20,16 @@ export const CONTROL_VERIFY_DELAY_MS = 5_000;
 /** …and re-send an unapplied command at most this many times (user decision 2026-06-11). */
 export const CONTROL_VERIFY_MAX_RESENDS = 3;
 
+/**
+ * The TAC-12CHSD fan block. Fan speed on this model is not a single field:
+ * 1 is `silenceSwitch`, 7 is `turbo`, 2–6 are `windSpeed` — so "the fan" is
+ * always these three together, and they must reach the device ALONE (see the
+ * split in executeAcAction).
+ */
+export const TCL_12CHSD_FAN_KEYS = ["windSpeed", "silenceSwitch", "turbo"];
+/** Settle gap between the main and fan halves of a split profile. */
+export const PROFILE_SPLIT_DELAY_MS = 500;
+
 /** Newest per-field reported timestamp from an AWS IoT shadow `metadata.reported`, in ms (null if none). */
 export function latestReportedAtMs(
   metadataReported: Record<string, { timestamp?: number }> | undefined,
@@ -947,26 +957,52 @@ export class TclCloud {
     }
 
     if (hasProfile) {
-      const najat = this.isNajatModel(deviceId);
-      const fanKeys = ["windSpeed", "silenceSwitch", "turbo"];
-      const hasFan = !najat && fanKeys.some(k => k in desired);
-      const hasMode = "workMode" in desired;
-
-      if (hasFan && hasMode) {
-        const fanPayload: Record<string, unknown> = {};
-        for (const k of fanKeys) {
-          if (k in desired) { fanPayload[k] = desired[k]; delete desired[k]; }
-        }
-        await this.publishWithRetry(deviceId, desired);
-        log.info(`[tcl] Profile (main) applied to ${deviceId}: ${JSON.stringify(desired)}`);
-        await new Promise(r => setTimeout(r, 500));
-        await this.publishWithRetry(deviceId, fanPayload);
-        log.info(`[tcl] Profile (fan) applied to ${deviceId}: ${JSON.stringify(fanPayload)}`);
+      const { main, fan } = this.splitFanPayload(deviceId, desired);
+      if (fan) {
+        await this.publishWithRetry(deviceId, main);
+        log.info(`[tcl] Profile (main) applied to ${deviceId}: ${JSON.stringify(main)}`);
+        await this.profileSplitDelay();
+        await this.publishWithRetry(deviceId, fan);
+        log.info(`[tcl] Profile (fan) applied to ${deviceId}: ${JSON.stringify(fan)}`);
       } else {
-        await this.publishWithRetry(deviceId, desired);
-        log.info(`[tcl] Profile applied to device ${deviceId}: ${JSON.stringify(desired)}`);
+        await this.publishWithRetry(deviceId, main);
+        log.info(`[tcl] Profile applied to device ${deviceId}: ${JSON.stringify(main)}`);
       }
     }
+  }
+
+  /**
+   * Peel the fan block off a shadow payload so it can travel alone.
+   *
+   * A TAC-12CHSD silently drops the fan whenever it shares an update with ANY
+   * other property: it applies the other property, internally resets the
+   * blower, and still REPORTS the fan as applied — so `computeAcDiff` sees no
+   * diff and never retries, leaving the unit blowing low while the dashboard
+   * reads max. Found with `workMode` (2026-05-10); widened to every companion
+   * property on 2026-07-27, when a fan + swing re-enforcement after a
+   * changeover reboot pinned Abdu AC low for 13 minutes.
+   *
+   * `fan` is null when no split is needed — the payload has no fan block, has
+   * nothing else to conflict with, or the device is a Najat (unaffected).
+   */
+  private splitFanPayload(
+    deviceId: string,
+    desired: Record<string, unknown>,
+  ): { main: Record<string, unknown>; fan: Record<string, unknown> | null } {
+    if (this.isNajatModel(deviceId)) return { main: desired, fan: null };
+    const main: Record<string, unknown> = {};
+    const fan: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(desired)) {
+      if (TCL_12CHSD_FAN_KEYS.includes(key)) fan[key] = value;
+      else main[key] = value;
+    }
+    const splittable = Object.keys(fan).length > 0 && Object.keys(main).length > 0;
+    return splittable ? { main, fan } : { main: desired, fan: null };
+  }
+
+  /** Test seam for the settle gap between the main and fan halves of a split payload. */
+  protected profileSplitDelay(): Promise<void> {
+    return new Promise((r) => setTimeout(r, PROFILE_SPLIT_DELAY_MS));
   }
 
   /**
@@ -1196,7 +1232,14 @@ export class TclCloud {
       const payload = typeof saved.generatorMode === "number"
         ? { ...saved, generatorMode: this.clampGeneratorMode(deviceId, saved.generatorMode) }
         : saved;
-      await this.publishShadowUpdate(deviceId, payload);
+      // The saved set always carries workMode alongside the fan block, so on a
+      // TAC-12CHSD this restore would otherwise lose the fan on every power-on.
+      const { main, fan } = this.splitFanPayload(deviceId, payload);
+      await this.publishShadowUpdate(deviceId, main);
+      if (fan) {
+        await this.profileSplitDelay();
+        await this.publishShadowUpdate(deviceId, fan);
+      }
       log.info(`[tcl] Restored last state for device ${deviceId}:`, JSON.stringify(payload));
     } catch (err) {
       log.warn(`[tcl] Failed to restore last state for ${deviceId}:`, (err as Error).message);

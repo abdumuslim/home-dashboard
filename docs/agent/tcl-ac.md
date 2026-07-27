@@ -112,7 +112,7 @@ The backend resolves property names per device model (e.g., `set_fan_speed` → 
 
 ### Last state restore
 - On power-on, the backend restores all saved properties (mode, temp, fan, swing, etc.) from `/app/data/ac-last-state.json`. State is saved on every shadow poll while the device is on (per device ID).
-- On a **manual** power-on (`sendControl("set_power", 1)` from the UI), the backend sends `powerSwitch: 1`, waits 1s, then publishes all saved properties from last state.
+- On a **manual** power-on (`sendControl("set_power", 1)` from the UI), the backend sends `powerSwitch: 1`, waits 1s, then publishes all saved properties from last state — **fan block split off into its own update on TAC-12CHSD** (see the fan-block quirk below; the saved set always contains `workMode`, so before 2026-07-27 this path lost the fan on every manual power-on).
 - `executeAcAction` with power=1 + profile does NOT use `sendControl`/`restoreLastState` — it directly publishes power-on via `publishWithRetry`, waits 3s, then sends the automation's profile. This prevents last-state vs automation-profile conflicts.
 - `executeAcAction` with power=1 but NO profile (e.g., a timer without a preset) falls back to `sendControl("set_power", 1)`, which restores last state.
 - Saved props per model:
@@ -172,11 +172,13 @@ Discovered 2026-05-10 when debugging "mom AC trigger not updating state."
 - **Why:** Firmware applies defaults/last-state during boot, ignoring settings received during the boot sequence.
 - Verified: the atomic (single-update) approach works for Abdu (TAC-12CHSD) but fails for Najat.
 
-### Abdu/Abdullah (TAC-12CHSD) — mode + fan speed quirk
-Discovered 2026-05-10 when debugging "abdu ac not taking fan speed."
-- **Problem:** When a profile contains BOTH `workMode` and fan-speed properties (`windSpeed`/`silenceSwitch`/`turbo`) in the same shadow update, the device processes `workMode` first and internally resets the fan speed, ignoring the fan values in the same payload. The shadow reports them as applied (same deceptive pattern as Najat).
-- **Fix (profile split):** In `executeAcAction`, when a non-Najat profile contains both `workMode` and fan-speed props, split into two shadow updates: main profile first → wait 500ms → fan speed separately.
-- **Why:** Firmware resets fan speed to the mode default when processing a mode change, before reading the fan-speed properties from the same update.
+### Abdu/Abdullah (TAC-12CHSD) — the fan block must travel ALONE
+Discovered 2026-05-10 when debugging "abdu ac not taking fan speed"; **widened 2026-07-27** — the conflict is not `workMode`-specific.
+- **Problem:** when fan-speed properties (`windSpeed`/`silenceSwitch`/`turbo`) share a shadow update with **any** other property, the device applies the other property, internally resets the blower, and ignores the fan values in that payload. The shadow reports them as applied (same deceptive pattern as Najat), so `computeAcDiff()` sees no diff and **never retries** — the unit stays at the wrong fan indefinitely while the dashboard reads the commanded value.
+- **Fix (payload split):** `splitFanPayload()` in `tcl-cloud.ts` peels the fan block (`TCL_12CHSD_FAN_KEYS`) off whenever the payload carries anything else, on non-Najat models. Both publish paths use it — `executeAcAction` (profiles + automation diff re-enforcement) and `restoreLastState` (every manual power-on, whose saved set always carries `workMode` next to the fan). Main payload first → `profileSplitDelay()` (500 ms) → fan alone.
+- **Why:** the firmware resets fan speed to the mode/reconfigure default while processing the companion property, before reading the fan props from the same update.
+- **2026-07-27 incident (why the guard was widened):** a gen→grid changeover at 17:29:52 rebooted all three ACs (beep back on, swings and fan reverted). The range automation's diff re-enforcement re-sent Abdu AC's `{fan_speed:7, vertical_swing:10, horizontal_swing:11}` as ONE update — no `workMode`, so the old `hasFan && hasMode` guard did not split it. The swings applied, the blower did not, and `turbo:1` was reported back, so nothing ever retried. It sat low for 13 minutes until the user set fan to `A` (forcing the reported value to actually change), which produced a fan-only diff that applied on the first try. Regression tests: `tcl-cloud.test.ts` → "executeAcAction fan isolation" + "restoreLastState fan isolation".
+- **No detection is possible after the fact** — the shadow is the only fan sensor, and the CT is whole-house (a fan step is ~0.1–0.3 A, buried under the compressor). Prevention via the split is the only defense; do not add a shadow-based verifier for this, it will always agree with the lie.
 
 ### Common pattern — "shadow says yes but device says no"
 Both quirks share the same signature: shadow `state.reported` shows the settings as applied (the device acknowledges), but the physical AC ignores them. `computeAcDiff()` sees no difference because the reported state looks correct. The mitigation in both cases is to split the conflicting properties into separate shadow updates with a delay.

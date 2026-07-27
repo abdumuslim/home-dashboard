@@ -269,3 +269,126 @@ describe("sendControlVerified (5s × 3 confirm-or-resend)", () => {
     expect(getThingShadow).not.toHaveBeenCalled();
   });
 });
+
+// The TAC-12CHSD "shadow says yes but device says no" quirk: when fan props
+// share a shadow update with ANY other property, the firmware applies the other
+// property, internally resets the blower, and still reports the fan as applied.
+// computeAcDiff then sees no diff and never retries — the fan stays low forever
+// while the dashboard reads max.
+//
+// Discovered 2026-05-10 with workMode; the guard was written for that one pair.
+// 2026-07-27 proved it is not workMode-specific: after a gen→grid changeover
+// rebooted Abdu AC, the re-enforcement published
+//   {windSpeed:0, silenceSwitch:0, turbo:1, verticalSwitch:0, verticalDirection:10,
+//    horizontalSwitch:0, horizontalDirection:11}
+// (fan + swings, NO workMode) and the blower never went to turbo. 13 minutes
+// later the identical fan block sent ALONE applied on the first try.
+describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
+  function publishingTcl(dev: AcDevice): { tcl: TclCloud; publishWithRetry: ReturnType<typeof vi.fn> } {
+    const tcl = tclWithDevice(dev);
+    const seam = tcl as unknown as { publishWithRetry: unknown; profileSplitDelay: unknown };
+    const publishWithRetry = vi.fn(async () => undefined);
+    seam.publishWithRetry = publishWithRetry;
+    seam.profileSplitDelay = vi.fn(async () => undefined); // no real 500ms waits in tests
+    return { tcl, publishWithRetry };
+  }
+
+  const FAN_7 = { windSpeed: 0, silenceSwitch: 0, turbo: 1 };
+
+  it("splits the fan out of a swing payload (2026-07-27 post-changeover regression)", async () => {
+    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    await tcl.executeAcAction("ac1", { fan_speed: 7, vertical_swing: 10, horizontal_swing: 11 });
+    expect(publishWithRetry).toHaveBeenCalledTimes(2);
+    expect(publishWithRetry).toHaveBeenNthCalledWith(1, "ac1", {
+      verticalSwitch: 0, verticalDirection: 10, horizontalSwitch: 0, horizontalDirection: 11,
+    });
+    expect(publishWithRetry).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
+  });
+
+  it("still splits the fan out of a workMode payload (the 2026-05-10 case)", async () => {
+    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    await tcl.executeAcAction("ac1", { mode: 1, temperature: 25, fan_speed: 7 });
+    expect(publishWithRetry).toHaveBeenCalledTimes(2);
+    expect(publishWithRetry).toHaveBeenNthCalledWith(1, "ac1", { workMode: 1, targetTemperature: 25 });
+    expect(publishWithRetry).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
+  });
+
+  it("splits the fan out of a generator-level payload too", async () => {
+    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    await tcl.executeAcAction("ac1", { fan_speed: 7, generator_mode: 3 });
+    expect(publishWithRetry).toHaveBeenCalledTimes(2);
+    expect(publishWithRetry).toHaveBeenNthCalledWith(1, "ac1", { generatorMode: 3 });
+    expect(publishWithRetry).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
+  });
+
+  it("publishes once when the payload is fan-only (nothing to conflict with)", async () => {
+    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    await tcl.executeAcAction("ac1", { fan_speed: 7 });
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", FAN_7);
+  });
+
+  it("publishes once when the payload carries no fan at all", async () => {
+    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    await tcl.executeAcAction("ac1", { mode: 1, temperature: 25 });
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { workMode: 1, targetTemperature: 25 });
+  });
+
+  it("leaves Najat bundled — her fan key is unaffected by this quirk", async () => {
+    const { tcl, publishWithRetry } = publishingTcl(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
+    await tcl.executeAcAction("ac1", { fan_speed: 5, vertical_swing: 9 });
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { windSpeed7Gear: 5, verticalWind: 0, verticalDirection: 9 });
+  });
+});
+
+// The saved last-state set always carries workMode next to the fan block, so
+// the same quirk cost the fan on EVERY manual power-on of a TAC-12CHSD.
+describe("restoreLastState fan isolation (TAC-12CHSD)", () => {
+  function restorableTcl(dev: AcDevice, saved: Record<string, unknown>): {
+    tcl: TclCloud;
+    publishShadowUpdate: ReturnType<typeof vi.fn>;
+    restore: () => Promise<void>;
+  } {
+    const tcl = tclWithDevice(dev);
+    const seam = tcl as unknown as {
+      lastState: Record<string, Record<string, unknown>>;
+      publishShadowUpdate: unknown;
+      profileSplitDelay: unknown;
+      restoreLastState: (deviceId: string) => Promise<void>;
+    };
+    const publishShadowUpdate = vi.fn(async () => undefined);
+    seam.lastState = { ac1: saved };
+    seam.publishShadowUpdate = publishShadowUpdate;
+    seam.profileSplitDelay = vi.fn(async () => undefined);
+    return { tcl, publishShadowUpdate, restore: () => seam.restoreLastState.call(tcl, "ac1") };
+  }
+
+  it("restores the fan block as its own update", async () => {
+    const { publishShadowUpdate, restore } = restorableTcl(acDevice({}), {
+      workMode: 1, targetTemperature: 25, windSpeed: 0, silenceSwitch: 0, turbo: 1, generatorMode: 3,
+    });
+    await restore();
+    expect(publishShadowUpdate).toHaveBeenCalledTimes(2);
+    expect(publishShadowUpdate).toHaveBeenNthCalledWith(1, "ac1", { workMode: 1, targetTemperature: 25, generatorMode: 3 });
+    expect(publishShadowUpdate).toHaveBeenNthCalledWith(2, "ac1", { windSpeed: 0, silenceSwitch: 0, turbo: 1 });
+  });
+
+  it("still clamps a saved generator level above the device max", async () => {
+    const { publishShadowUpdate, restore } = restorableTcl(acDevice({}), {
+      workMode: 1, turbo: 1, generatorMode: 6,
+    });
+    await restore();
+    expect(publishShadowUpdate).toHaveBeenNthCalledWith(1, "ac1", { workMode: 1, generatorMode: 3 });
+  });
+
+  it("restores Najat in a single update", async () => {
+    const { publishShadowUpdate, restore } = restorableTcl(acDevice({ name: "Najat", model: "TAC-24CHSA" }), {
+      workMode: 1, targetTemperature: 22, windSpeed7Gear: 5,
+    });
+    await restore();
+    expect(publishShadowUpdate).toHaveBeenCalledTimes(1);
+    expect(publishShadowUpdate).toHaveBeenCalledWith("ac1", { workMode: 1, targetTemperature: 22, windSpeed7Gear: 5 });
+  });
+});
