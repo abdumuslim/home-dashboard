@@ -27,11 +27,13 @@ export interface FanHold {
   lastSetFan: number;
   heldAt: number;
   /**
-   * This hold came from a GENTLE restore (fan pinned on the power_on), not a
-   * trim — so the controller's freshly-on projection must price that turn-on at
-   * the same gentle cost the restore was admitted at (see restoreCostAmps).
-   * In-memory only: after a restart the flag is lost and the projection falls
-   * back to the full fan-slam cost, which errs trip-safe.
+   * This restore was ADMITTED at the gentle PROBE price (steady floor draw),
+   * not the learned plain cost — the controller's freshly-on projection must
+   * re-price it at the same price admission charged (see restoreCostAmps;
+   * disagreeing was the 2026-07-25 storm). Every gen restore pins the fan,
+   * but only probe-priced ones set this. In-memory only: after a restart the
+   * flag is lost and the projection falls back to the full learned cost,
+   * which errs trip-safe.
    */
   gentle?: boolean;
 }
@@ -53,18 +55,23 @@ export function recordFanCut(holds: FanHolds, ac: AcView, target: number, now: n
 }
 
 /**
- * Record a fan hold for a GENTLE restore. A shed room comes back with its fan
- * pinned to 1 (the `fan` field on the power_on command) instead of letting the
- * range automation slam it to a hot-room smart-auto 3–7. That fan-slam is the
- * bulk of a restore's un-modeled surge (fans aren't in the amp model), so
- * pinning it lets a shed room fit next to a running AC on the tight gen budget.
- * The original is 0 (auto): hand the fan back to the automation once a long
- * sustained calm lets `planFanRestore` climb it back in one jump.
+ * Record a fan hold for a gen restore (fan pinned to 1 on the power_on so the
+ * range automation can't slam it to a hot-room smart-auto 3–7 while the
+ * compressor is still ramping). The original is 0 (auto): hand the fan back
+ * to the automation once a long sustained calm lets `planFanRestore` climb it
+ * back in one jump. `probePriced` marks a restore admitted at the gentle
+ * steady price instead of the learned cost — the freshly-on projection reads
+ * it back as `hold.gentle` so re-pricing matches admission exactly.
  */
-export function recordGentleRestoreHold(holds: FanHolds, deviceId: string, now: number): FanHolds {
+export function recordGentleRestoreHold(
+  holds: FanHolds,
+  deviceId: string,
+  now: number,
+  probePriced: boolean,
+): FanHolds {
   return {
     ...holds,
-    [deviceId]: { deviceId, originalFan: 0, lastSetFan: 1, heldAt: now, gentle: true },
+    [deviceId]: { deviceId, originalFan: 0, lastSetFan: 1, heldAt: now, gentle: probePriced },
   };
 }
 

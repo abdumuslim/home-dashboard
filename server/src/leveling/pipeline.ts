@@ -17,7 +17,7 @@ import { planReduction } from "./reduce.js";
 import { invariantCorrections, planRaise, rampDebitAmps } from "./raise.js";
 import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
 import { ceilOf, floorOf } from "./needs.js";
-import { canAttempt, type PacingState } from "./pacing.js";
+import { attemptedWithin, canAttempt, RESTORE_CONFIRM_WAIT_MS, type PacingState } from "./pacing.js";
 
 /** Outcome-grading delays: when the batch's meter effect is judged. */
 export const GRADE_LEVEL_MS = 45_000;
@@ -243,6 +243,8 @@ export function plan(input: PlanInput): PlanOutput {
       if (ac.shed && !ac.on) {
         // Restores ride the pacing backoff so a dead cloud can't be hammered.
         if (!canAttempt(pacing, ac.deviceId, "restore", now)) continue;
+        // In flight, shadow not confirmed yet — don't re-send every batch.
+        if (attemptedWithin(pacing, ac.deviceId, "restore", RESTORE_CONFIRM_WAIT_MS, now)) continue;
         commands.push({ deviceId: ac.deviceId, kind: "power_on", level: ceil, reason: "restore" });
         attempts.push({ deviceId: ac.deviceId, kind: "restore" });
         isTurnOn = true;
@@ -295,10 +297,12 @@ export function plan(input: PlanInput): PlanOutput {
     if (raisePlan.commands.length > 0 || corrections.commands.length > 0) {
       // A gentle restore (power_on carrying a pinned fan) records a fan hold so
       // the range automation can't slam the fan back up before the room settles.
+      // The hold's gentle flag mirrors the ADMISSION price (probe vs learned),
+      // so the freshly-on projection re-prices exactly what admission charged.
       let fanHolds = input.fanHolds;
       for (const cmd of raisePlan.commands) {
         if (cmd.kind === "power_on" && cmd.fan != null) {
-          fanHolds = recordGentleRestoreHold(fanHolds, cmd.deviceId, now);
+          fanHolds = recordGentleRestoreHold(fanHolds, cmd.deviceId, now, raisePlan.probeRestoreIds.includes(cmd.deviceId));
         }
       }
       return {

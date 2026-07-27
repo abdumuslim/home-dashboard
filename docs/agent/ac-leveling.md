@@ -342,6 +342,55 @@ trusted only when the rightmost `x-forwarded-for` hop (Traefik-appended) is a pu
 address; otherwise the real socket peer is used and a client-supplied XFF is never adopted. See the
 auth tests + `ac-control-audit.test.ts` (updated to the production forwarding shape).
 
+### 2026-07-27 evening bounce loop + bogus manual-off lock ("why does Najat never turn on?")
+
+**The incident (16:43–17:15 UTC, 15A gen):** Najat was restored at L1 (gentle, fan pinned to 1)
+three times, and each time the gen total hit 15.3–15.7A ~3 min later — the reducer shed her back
+("its own turn-on caused this") every time. The shed off-drops measured her REAL hot-evening ON draw
+at **3.5–3.8A** (obs −3.8 / −3.52 / −5.13) while admission had priced her at the steady-model
+**2.3A** — the 07-25 fix's "fan-slam theory" (gentle restore ⇒ steady price) is disproven: the
+excess is compressor duty on a hot room, not fan (fan steps ≈ 0.1A/gear). The bounces wound the
+backoff ladder to 5–15 min, so the room read as "never turns on". Then at 17:15:44 a restore finally
+fired into real headroom — and 5.8s later the collector saw her TCL shadow still reporting OFF,
+**after** the controller had already cleared the shed flag at command SEND. Un-shed + observed off +
+`beep:false` (never lost power) → classified **manual** → a bogus `observed_off` lock stranded the
+room until it was cleared by hand. The `on@L1` learned cost had ALSO been stuck at its 07-23 seed:
+turn-on grades need the full ramp window (`GRADE_TURN_ON_MS` 270s) and every window was either
+contaminated or cut short by the bounce itself — the wrong-low admission price could never
+self-correct.
+
+**Fixes (verified failing-first where testable):**
+1. **Plain learned pricing + bounded probe (`raise.ts`, `costs.ts`)** — gen restores still SHIP
+   gentle (fan pinned) but are ADMITTED at the plain `turnOnAmps` = max(model, learned on@L).
+   Because a learned cost can also be stale-HIGH (the 07-24 phantom strand), a restore blocked at
+   the learned price may ship ONE **probe** at the gentle steady price — only while
+   `restoreFailures === 0` (zero bounce evidence this source-session; resets on source change or a
+   graded success). A probe that bounces feeds the ladder and disables further probes; one that
+   sticks re-grades the cost cheap. `RaisePlan.probeRestoreIds` → the fan hold's `gentle` flag now
+   means "probe-priced", and the freshly-on projection re-prices EXACTLY what admission charged
+   (the 07-25 one-definition rule is preserved).
+2. **Shed clears on confirmed ON, not at command send (`controller.ts`)** — the `power_on` executor
+   no longer clears the shed; the structural OFF→ON flip in `tick()` does
+   (`clearShed("restore_confirmed")`). While the shadow lags (5.8s–13 min observed live), the
+   device stays shed, so every observed-off lock recorder and auto-on path keeps skipping it. An
+   in-flight restore is a shed candidate again, so a new **"awaiting confirm"** gate
+   (`RESTORE_CONFIRM_WAIT_MS` 60s in `pacing.ts`, via `attemptedWithin`) reserves its amps, parks
+   raises, and blocks re-sends; past the window the loop re-sends — which doubles as
+   confirm-or-resend for Najat's command-dropping firmware. Same guard on the GRID_FULL path.
+3. **Off-drop cost learning (`controller.ts`)** — a lone `power_off` shed now arms a grade for
+   `on@L{confirmedLevel}` with `negate: true`: the instantaneous drop is the cleanest on-cost
+   sample there is, so a wrong-low learned cost corrects after ONE bounce instead of storming.
+   (EWMA α=0.35 absorbs fan-state noise; over-estimation errs trip-safe.)
+4. **Commanded-ON shadow-lag grace (collector side)** — `handleObservedAcOff` never locks within
+   120s of a server-commanded power ON (`lastServerAcOnAt`, stamped by the leveler dep, automation
+   turn-ons, timer ONs, and the UI clear path). Beats every fingerprint — see
+   [ac-automations.md](ac-automations.md) → Manual-off locks.
+
+Tests: `scenarios.test.ts` "the 2026-07-27 evening bounce loop" (2 — capAmps above the model =
+the physics vs the belief); `raise.test.ts` probe/bounced-re-admission/awaiting-confirm (3);
+`controller.test.ts` shed-until-confirm + off-drop learning (2); `collector.test.ts` observed-off
+grace ×2. **739 server tests green, `tsc` clean.**
+
 ---
 
 ---

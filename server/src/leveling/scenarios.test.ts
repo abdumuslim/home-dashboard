@@ -542,6 +542,59 @@ describe("the 2026-07-25 restore-bounce storm (first night of v2 acting)", () =>
   });
 });
 
+describe("the 2026-07-27 evening bounce loop (hot-room draw exceeds the steady model)", () => {
+  // Live 16:43–17:15 on the 15A gen: Najat's restores were admitted at her
+  // steady model 2.3A while her REAL hot-evening L1 draw was 3.5–3.8A (the
+  // fan was pinned to 1 the whole time — the excess is compressor, not fan).
+  // Three restore→shed bounces in 17 minutes wound the backoff ladder to
+  // 15 min and the room read as "never turns on". Encoded here: her capAmps
+  // (the physics) sit ABOVE the config model (the belief), and the learned
+  // book already knows the honest 3.7A price.
+  const book = {
+    "najat|gen|on@L1": { ewmaAmps: 3.7, samples: 2, updatedAt: 1_000_000_000 },
+  };
+  const evening = (): Scenario =>
+    new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, fan: 6, demandAmps: 6, needDelta: 1.9 }, // 4.1A cap-bound at L1
+        // Real L1 draw 3.7A vs the 2.7A gen-model belief — today's regime. The
+        // live compressor took ~3 min to full draw (the meter crossed the limit
+        // 2–3 min after each restore), so the over-limit lands mid-ramp and the
+        // shed preference correctly undoes HER turn-on, not a peer's.
+        { ...NAJAT, shed: true, capAmps: [3.7, 4.5, 5.5], demandAmps: 5, needDelta: 2, rampSeconds: 180, surgeFactor: 1.2 },
+      ],
+      { nonAcAmps: 7.5, source: "gen", book }, // ≈11.9A with Najat off
+    );
+
+  it("bounces at most once (the probe), then waits for real headroom instead of storming", () => {
+    const s = evening();
+    const t0 = s.now;
+    s.advance(10 * 60);
+    // The probe (admitted at the 2.7A steady price) may ship and bounce ONCE —
+    // its failure disables further probes, and the learned 3.7A price does not
+    // fit 11.9A committed (15.6 > 14.9), so she stays shed. No 17-minute storm.
+    const restores = s.commandsSince(t0, "power_on").filter((c) => c.cmd.deviceId === "najat");
+    expect(restores.length).toBeLessThanOrEqual(1);
+    const sheds = s.commandsSince(t0, "power_off").filter((c) => c.cmd.deviceId === "najat");
+    expect(sheds.length).toBeLessThanOrEqual(1);
+    expect(s.sim("najat").on).toBe(false);
+  });
+
+  it("returns at the learned price — and stays — once the house frees real headroom", () => {
+    const s = evening();
+    s.advance(10 * 60);
+    expect(s.sim("najat").on).toBe(false);
+    const t1 = s.now;
+    s.setNonAc(6.0); // ≈1.5A of non-AC load leaves
+    s.advance(6 * 60);
+    expect(s.sim("najat").on).toBe(true);
+    expect(s.totalAmps()).toBeLessThanOrEqual(15);
+    // No bounce after the honest-priced return.
+    expect(s.commandsSince(t1, "power_off").filter((c) => c.cmd.deviceId === "najat")).toHaveLength(0);
+  });
+});
+
 describe("proactive near-limit turn-on (instant reduce, no bucket wait)", () => {
   it("an automation turn-on that projects over the limit triggers a cut within one evaluation", () => {
     const s = new Scenario(

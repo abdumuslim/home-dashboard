@@ -126,14 +126,26 @@ export function turnOnAmps(
  * re-prices it on the next tick (controller.ts).
  *
  * They disagreed 2026-07-24→25 and that was the whole restore-bounce storm:
- * admission used the gentle steady draw (Najat L1 ≈ 2.3A, correct — a gentle
- * restore pins the fan to 1, so the fan-slam that inflated the learned on-cost
- * is gone) while the projection still charged the fan-slam-sized `on@L1` (3.7A).
- * Every gen restore therefore declared itself over-limit ~10s later and the
- * reducer shed a room — six times in 41 minutes, the last one a bystander.
+ * admission used the gentle steady draw while the projection charged the full
+ * `on@L1` — every gen restore declared itself over-limit ~10s later and the
+ * reducer shed a room. The lesson that survives: ONE function, both sides,
+ * and the SAME price for one restore (the hold's `gentle` flag carries which
+ * price a shipped restore was admitted at).
  *
- * `gentle` must mean "this turn-on pinned the fan": true for a gen shed restore,
- * false for an automation/user turn-on (which slams the fan to a hot-room 3–7).
+ * Two prices, because the two incidents bracket each other:
+ *   - `gentle: false` — the honest plain price, max(model, learned on-cost).
+ *     2026-07-27 evening proved the fan-pin does NOT shrink the draw: three
+ *     restores of Najat admitted at her steady 2.3A (fan pinned the whole
+ *     time) each ramped the meter +3.5–3.8A — her on@L1 is compressor, not
+ *     fan (fan steps ≈ 0.1A/gear) — and every one bounced back to shed
+ *     within ~3 min, winding the backoff ladder to 15 min ("never turns on").
+ *   - `gentle: true` — the PROBE price, the calibrated steady floor draw.
+ *     A learned cost can also be stale-HIGH (2026-07-24: peer freed budget,
+ *     restore still blocked "no headroom" behind a phantom), so raise.ts may
+ *     admit ONE probe at this price while there is zero bounce evidence
+ *     (restore failures = 0 this source-session). A probe that bounces feeds
+ *     the pacing ladder AND re-learns the on-cost from the shed's off-drop,
+ *     so the next admission is honest; a probe that sticks re-grades cheap.
  */
 export function restoreCostAmps(
   book: CostBook,
@@ -146,9 +158,6 @@ export function restoreCostAmps(
   opts: { gentle: boolean },
 ): CostEstimate {
   if (!opts.gentle) return turnOnAmps(book, config, deviceId, source, level, maxLevel, now);
-  // The physics-envelope veto still guards the end-state and the compressor
-  // inrush is transient (inrush blanking in pipeline.ts covers the decay), so
-  // the calibrated steady floor draw is the honest price of a gentle return.
   return {
     amps: steadyDraw(level, maxLevel, modelFor(config, deviceId, source)),
     confidence: "seed",

@@ -83,8 +83,15 @@ interface PendingGrade {
   compareAfter: number;
   preAmps: number;
   source: PowerSource;
-  /** Set when the batch had exactly one meter-affecting command (cost learning). */
-  single: { deviceId: string; transition: string } | null;
+  /**
+   * Set when the batch had exactly one meter-affecting command (cost learning).
+   * `negate` inverts the observed delta before learning: a single power_off
+   * shed measures the device's ON draw as a clean instantaneous DROP — the
+   * best on-cost sample there is (a turn-on's grade needs the full ramp
+   * window and is often contaminated by then; the 2026-07-27 bounces never
+   * produced one, which is how a wrong-low on@L1 could persist).
+   */
+  single: { deviceId: string; transition: string; negate?: boolean } | null;
   attempts: Array<{ deviceId: string; kind: "raise" | "restore" }>;
   /**
    * A later batch moved the meter inside this window, so the observed delta is
@@ -583,6 +590,14 @@ export class LevelingControllerV2 {
       if (prev !== undefined && prev !== device.power) {
         if (device.power) {
           this.rearmRamp([device.id]);
+          // A shed device flips ON in the shadow: OUR restore confirmed (or an
+          // external hand did it) — THIS is where the shed clears, not at
+          // command send (2026-07-27 bogus-lock incident). The OFF→ON flip
+          // requires the shadow to have shown the off first, so a stale-ON
+          // shadow can't trip this the way it could trip reconcileObservedOn.
+          if (managed && this.shedIds.has(device.id)) {
+            await this.clearShed(device.id, "restore_confirmed");
+          }
           if (managed && !this.shedIds.has(device.id)) {
             this.freshlyOn.push(device.id);
             // Automation turn-ons never pass through onUserPowerOn.
@@ -939,7 +954,13 @@ export class LevelingControllerV2 {
               generator_mode: cmd.level,
               ...(cmd.fan != null ? { fan_speed: cmd.fan } : {}),
             });
-            await this.clearShed(cmd.deviceId, "restored");
+            // Shed stays SET until the shadow confirms the ON (structural flip
+            // in tick()). Clearing at send time opened a lag window where the
+            // collector saw an un-shed device still OFF and minted a bogus
+            // manual-off `observed_off` lock (live 2026-07-27 17:15:53 — 5.8s
+            // after this very command; TCL shadows can lag minutes). While
+            // shed, every observed-off recorder and auto-on path keeps
+            // skipping the device, however long the shadow lags.
             this.deps.setDevicePowerCache(cmd.deviceId, "on");
             this.recon = noteLevelSend(this.recon, cmd.deviceId, cmd.level, now).state;
             if (cmd.fan != null) {
@@ -1041,6 +1062,14 @@ export class LevelingControllerV2 {
         }
       } else if (cmd.kind === "power_on") {
         single = { deviceId: cmd.deviceId, transition: `on@L${cmd.level}` };
+      } else if (cmd.kind === "power_off") {
+        // A lone shed measures the room's true ON draw as an instant drop —
+        // learn on@L{level} from it (negated) so a restore admitted on a
+        // wrong-low cost corrects after ONE bounce instead of storming.
+        const level = this.recon[cmd.deviceId]?.confirmedLevel;
+        if (level != null && level >= 1) {
+          single = { deviceId: cmd.deviceId, transition: `on@L${level}`, negate: true };
+        }
       }
     }
     // This batch moves the meter, so every window still open can no longer
@@ -1097,13 +1126,14 @@ export class LevelingControllerV2 {
     // Learn ONLY from a window no other batch disturbed — an overlapping batch
     // makes the delta un-attributable, and a wrong learned cost is worse than
     // no learned cost (it gates raise/restore admission).
-    if (grade.single != null && !grade.contaminated && grade.source !== "none" && observedDelta > 0.2) {
+    const learnSample = grade.single?.negate ? -observedDelta : observedDelta;
+    if (grade.single != null && !grade.contaminated && grade.source !== "none" && learnSample > 0.2) {
       this.book = updateCost(
         this.book,
         grade.single.deviceId,
         grade.source,
         grade.single.transition as never,
-        observedDelta,
+        learnSample,
         now,
       );
       const entry = this.book[`${grade.single.deviceId}|${grade.source}|${grade.single.transition}`];
@@ -1111,8 +1141,9 @@ export class LevelingControllerV2 {
         await this.store.upsertCost(grade.single.deviceId, grade.source, grade.single.transition, entry).catch(() => undefined);
       }
       log.info(
-        `[leveler2] Learned ${grade.single.transition} ≈ ${observedDelta.toFixed(1)}A for ` +
-          `${this.deviceNames.get(grade.single.deviceId) ?? grade.single.deviceId} on ${grade.source}`,
+        `[leveler2] Learned ${grade.single.transition} ≈ ${learnSample.toFixed(1)}A for ` +
+          `${this.deviceNames.get(grade.single.deviceId) ?? grade.single.deviceId} on ${grade.source}` +
+          (grade.single.negate ? " (from shed off-drop)" : ""),
       );
     }
     // Attempts that survived to grading without a failure are successes.

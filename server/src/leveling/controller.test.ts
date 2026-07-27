@@ -113,9 +113,9 @@ describe("LevelingControllerV2 — acting-flavor re-sync", () => {
 // to strip that attempt or the backoff it just grew would be erased.
 // ---------------------------------------------------------------------------
 
-function createGradePool(configExtra: Record<string, unknown> = {}) {
+function createGradePool(configExtra: Record<string, unknown> = {}, shedIds: string[] = []) {
   const journal: Array<Record<string, unknown>> = [];
-  const costs: Array<{ deviceId: string; transition: string }> = [];
+  const costs: Array<{ deviceId: string; transition: string; ewma: number }> = [];
   const query = vi.fn(async (sql: string, params: unknown[] = []) => {
     if (sql.includes("FROM ac_leveling_config") && sql.includes("id IN (1, 2)")) {
       return {
@@ -128,12 +128,18 @@ function createGradePool(configExtra: Record<string, unknown> = {}) {
         rowCount: 1,
       };
     }
+    if (sql.includes("FROM ac_leveling_shed")) {
+      return {
+        rows: shedIds.map((device_id) => ({ device_id, shed_at: new Date() })),
+        rowCount: shedIds.length,
+      };
+    }
     if (sql.includes("INSERT INTO ac_leveling_journal")) {
       journal.push({ reason: params[4], commands: params[7], decisions: params[8] });
       return { rows: [{ id: journal.length }], rowCount: 1 };
     }
     if (sql.includes("INSERT INTO ac_leveling_costs")) {
-      costs.push({ deviceId: String(params[0]), transition: String(params[2]) });
+      costs.push({ deviceId: String(params[0]), transition: String(params[2]), ewma: Number(params[3]) });
       return { rows: [], rowCount: 1 };
     }
     if (sql.includes("COUNT(*)") && sql.includes("ac_leveling_costs")) return { rows: [{ n: 7 }], rowCount: 1 };
@@ -239,6 +245,126 @@ describe("LevelingControllerV2 — grade queue", () => {
       expect(blocked.length).toBeGreaterThan(0);
       // Throttled — one row per (device, blockedBy) per 5 min, not one per tick.
       expect(blocked.length).toBeLessThan(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shed-until-confirm + off-drop learning (2026-07-27 evening). Two halves of
+// the same incident: (1) clearing the shed flag at power_on SEND opened a
+// shadow-lag window in which the collector saw an un-shed device still OFF and
+// minted a bogus manual-off lock 5.8s after the restore command; (2) a lone
+// shed's instantaneous meter drop is the cleanest on-cost sample there is —
+// without it, the wrong-low on@L1 that caused the bounce loop could never
+// self-correct (turn-on grades need the full ramp window and were always
+// contaminated or cut short by the bounce itself).
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — shed clears on confirmed ON, not at command send", () => {
+  it("keeps the shed flag through the shadow lag, re-sends past the confirm window, clears on the flip", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-07-27T17:15:00Z"));
+      const mock = createGradePool({}, ["b"]);
+      const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+      const powerOns: string[] = [];
+      const deps: LevelingDeps = {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({
+            sendControl: async () => undefined,
+            // The cloud accepts the ON but the TCL shadow lags — b.power stays
+            // false until the test flips it (5.8s–13 min observed live).
+            executeAcAction: async (deviceId: string, action: { power?: number }) => {
+              if (action.power === 1) powerOns.push(deviceId);
+            },
+          }) as never,
+      };
+      const controller = new LevelingControllerV2(mock.pool, deps);
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+      ];
+      let flip = 1;
+      const run = async (genAmps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(5_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+
+      await run(8, 8); // calm builds → the restore ships
+      expect(powerOns).toEqual(["b"]);
+      // The shadow still reads OFF — the shed flag MUST survive (it is what
+      // keeps every observed-off lock recorder and auto-on path skipping b).
+      expect(controller.isShed("b")).toBe(true);
+
+      await run(8, 5); // 25s later: inside the confirm window — no re-send
+      expect(powerOns).toEqual(["b"]);
+      expect(controller.isShed("b")).toBe(true);
+
+      await run(8, 9); // past the 60s confirm window — confirm-or-resend fires
+      expect(powerOns.length).toBeGreaterThanOrEqual(2);
+      expect(controller.isShed("b")).toBe(true);
+
+      b.power = true; // the shadow finally confirms
+      await run(8, 2);
+      expect(controller.isShed("b")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("LevelingControllerV2 — a lone shed's off-drop grades the on-cost", () => {
+  it("learns on@L{level} from the negated drop (a wrong-low cost self-corrects after ONE bounce)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-07-27T16:43:00Z"));
+      const mock = createGradePool();
+      const a = { id: "a", name: "a", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+      const deps: LevelingDeps = {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({
+            sendControl: async () => undefined,
+            executeAcAction: async (_id: string, action: { power?: number }) => {
+              if (action.power === 0) a.power = false;
+            },
+          }) as never,
+      };
+      const controller = new LevelingControllerV2(mock.pool, deps);
+      await controller.ensureLoaded();
+      // needDelta under the near-target band → no raises interfere.
+      const ctx = [{ device: a as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null }];
+      let flip = 1;
+      const run = async (genAmps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(5_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+
+      await run(10, 8); // settle; recon confirms L1
+      await run(18, 6); // hard over — the only cover is shedding a (single power_off)
+      expect(a.power).toBe(false);
+      // 13.5A after the off: the restore does not fit (13.5 + 2 > 14.9), so no
+      // batch contaminates the off's grade window while it ripens (45s).
+      await run(13.5, 14);
+
+      const learned = mock.costs.find((c) => c.deviceId === "a" && c.transition === "on@L1");
+      // Negated: the drop is a POSITIVE on-cost sample (the 0.2A learn gate
+      // passed). Without the negate the delta is negative and nothing would
+      // ever be learned from a shed — this row would not exist.
+      expect(learned).toBeDefined();
+      expect(learned!.ewma).toBeGreaterThan(0.2);
     } finally {
       vi.useRealTimers();
     }

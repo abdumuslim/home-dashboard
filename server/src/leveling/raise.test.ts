@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { envelopeTotalAmps, invariantCorrections, planRaise, rampDebitAmps, type RaiseInput } from "./raise.js";
-import { initialPacingState, noteFailure } from "./pacing.js";
+import { initialPacingState, noteAttempt, noteFailure } from "./pacing.js";
 import { updateCost } from "./costs.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
 import type { AcView } from "./types.js";
@@ -83,10 +83,12 @@ describe("restore outranks raises", () => {
     expect(grid.commands.find((c) => c.kind === "power_on" && "fan" in c && c.fan != null)).toBeUndefined();
   });
 
-  it("sizes a gen restore by the steady model draw, not the fan-slam-inflated learned on-cost", () => {
-    // Learned on@L1 is 4A (measured from the OLD fan-slam restores), but a gentle
-    // restore pins the fan and really draws the ~2A model floor. smoothed 12.5 +
-    // 2 = 14.5 ≤ 14.9 fits; the phantom 12.5 + 4 = 16.5 would have blocked it.
+  it("probes a blocked restore at the steady price while there is zero bounce evidence (2026-07-24 phantom)", () => {
+    // Learned on@L1 is 4A but may be stale-high (live 2026-07-24: a phantom
+    // 3.7A stranded a room that really fit on ~2.3A). smoothed 12.5 + 4 = 16.5
+    // blocks; with NO restore failures this source-session, ONE probe ships at
+    // the 2A steady price (12.5 + 2 = 14.5 ≤ 14.9) — marked probe so the
+    // freshly-on projection re-prices it identically.
     const book = updateCost({}, "b", "gen", "on@L1", 4, T);
     const p = raise([ac("a"), ac("b", { on: false, shed: true, needDelta: 4 })], {
       smoothedAmps: 12.5,
@@ -94,6 +96,59 @@ describe("restore outranks raises", () => {
       book,
     });
     expect(p.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 });
+    expect(p.probeRestoreIds).toEqual(["b"]);
+  });
+
+  it("a restore that bounced re-admits ONLY at the learned price (2026-07-27 bounce loop)", () => {
+    // Live 16:43–17:00: three restores admitted at Najat's steady 2.3A each
+    // ramped +3.5–3.8A and bounced. After a bounce (failures > 0) the probe is
+    // off the table: the learned 4A must fit or the room stays shed.
+    const book = updateCost({}, "b", "gen", "on@L1", 4, T);
+    // Failure recorded 31s ago — its 30s backoff rung has expired, so ONLY the
+    // probe gate (failures > 0), not the backoff, blocks the cheap re-admission.
+    const bounced = noteFailure(initialPacingState("gen"), "b", "restore", T - 31_000);
+    const blocked = raise([ac("a"), ac("b", { on: false, shed: true, needDelta: 4 })], {
+      smoothedAmps: 12.5,
+      headroomAmps: 2.2,
+      book,
+      pacing: bounced,
+    });
+    expect(blocked.commands.every((c) => c.kind !== "power_on")).toBe(true);
+    expect(blocked.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "b", action: "restore", blockedBy: "no headroom" }),
+    );
+    // Once the house truly has room for the learned cost, the restore ships.
+    const fits = raise([ac("a"), ac("b", { on: false, shed: true, needDelta: 4 })], {
+      smoothedAmps: 10.8,
+      headroomAmps: 3.9,
+      book,
+      pacing: bounced,
+    });
+    expect(fits.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 });
+    expect(fits.probeRestoreIds).toEqual([]);
+  });
+
+  it("an in-flight restore (sent, shadow unconfirmed) reserves its amps and is not re-sent", () => {
+    // Shed clears on shadow CONFIRM since 2026-07-27 (clearing at send let a
+    // 5.8s shadow lag mint a bogus manual-off lock), so a just-sent restore is
+    // still a shed candidate — the confirm window must park it AND the raises.
+    const pacing = noteAttempt(initialPacingState("gen"), "b", "restore", T - 30_000);
+    const p = raise([ac("a", { needDelta: 3 }), ac("b", { on: false, shed: true, needDelta: 4 })], {
+      pacing,
+    });
+    expect(p.commands).toEqual([]);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "b", action: "restore", blockedBy: "awaiting confirm" }),
+    );
+    expect(p.reservedAmps).toBeGreaterThan(0);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ action: "raises", blockedBy: "restore reservation" }),
+    );
+    // Past the confirm window the same state re-sends (confirm-or-resend).
+    const late = raise([ac("a", { needDelta: 3 }), ac("b", { on: false, shed: true, needDelta: 4 })], {
+      pacing: noteAttempt(initialPacingState("gen"), "b", "restore", T - 61_000),
+    });
+    expect(late.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 });
   });
 
   it("restores are exempt from the resting buffer (fit under limit − margin)", () => {

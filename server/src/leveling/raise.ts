@@ -14,7 +14,13 @@ import type { CostBook } from "./costs.js";
 import { levelCutSavings, modelFor, raiseJumpAmps, restoreCostAmps, steadyDraw } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { ceilCapOf, ceilOf, floorOf } from "./needs.js";
-import { canAttempt, type PacingState } from "./pacing.js";
+import {
+  attemptedWithin,
+  canAttempt,
+  RESTORE_CONFIRM_WAIT_MS,
+  restoreFailures,
+  type PacingState,
+} from "./pacing.js";
 
 /**
  * Physics-envelope total: worst-case steady draw of a commanded end-state,
@@ -161,6 +167,12 @@ export interface RaisePlan {
    * restore from spending these amps.
    */
   reservedAmps: number;
+  /**
+   * Restores in `commands` that were admitted at the gentle PROBE price
+   * instead of the learned plain price — the recorded fan hold must carry
+   * gentle=true so the freshly-on projection re-prices them identically.
+   */
+  probeRestoreIds: string[];
 }
 
 /**
@@ -233,16 +245,18 @@ export function planRaise(input: RaiseInput): RaisePlan {
 
   for (const candidate of shedCandidates) {
     const floor = floorOf(candidate);
-    // On gen a restore is GENTLE (fan pinned to 1), so the fan-slam that inflated
-    // the learned/seed on-cost (e.g. Najat's on@L1 3.7A, measured from the old
-    // fan-slam restores) no longer applies — size it at the calibrated steady
-    // floor draw (~2.3A) instead, or a room that really fits on ~2.3A stays shed
-    // behind a 3.7A phantom (live 2026-07-24: peer freed budget, restore still
-    // blocked "no headroom"). Grid restores stay plain → fan-slam-sized.
-    // `restoreCostAmps` is shared with the controller's freshly-on projection so
-    // admission and re-pricing can never disagree (the 2026-07-25 storm).
+    // On gen every restore ships GENTLE (fan pinned to 1), but gentleness is
+    // NOT a discount: 2026-07-27 proved the pin doesn't shrink the compressor
+    // draw — three fan-pinned restores of Najat admitted at her steady 2.3A
+    // each ramped the meter +3.5–3.8A and bounced back to shed within ~3 min.
+    // Admission prices at the PLAIN learned cost; the steady price survives
+    // only as a bounded PROBE below, for stale-HIGH learned costs (2026-07-24:
+    // a phantom 3.7A stranded a room that really fit). `restoreCostAmps` is
+    // shared with the controller's freshly-on projection so admission and
+    // re-pricing can never disagree (the 2026-07-25 storm) — probeRestoreIds
+    // tells the caller which price this restore carried.
     const gentleRestore = source === "gen";
-    const cost: CostEstimate = restoreCostAmps(
+    const plainCost: CostEstimate = restoreCostAmps(
       book,
       config,
       candidate.deviceId,
@@ -250,7 +264,17 @@ export function planRaise(input: RaiseInput): RaisePlan {
       floor,
       candidate.maxLevel,
       now,
-      { gentle: gentleRestore },
+      { gentle: false },
+    );
+    const probeCost: CostEstimate = restoreCostAmps(
+      book,
+      config,
+      candidate.deviceId,
+      source,
+      floor,
+      candidate.maxLevel,
+      now,
+      { gentle: true },
     );
     const candidateEntry = { deviceId: candidate.deviceId, level: floor, maxLevel: candidate.maxLevel };
 
@@ -258,8 +282,6 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // needs to know whether this room could return at all (plain, or by pulling
     // every raised peer down to its floor in the same batch).
     const envelopePlainOk = !envelopeGuard || envelopeWith({}, candidateEntry) <= envelopeCeiling;
-    const fitsPlain = envelopePlainOk && committedAmps + cost.amps <= restoreCeiling;
-
     const savingsAtFloors = onManaged.reduce((sum, a) => {
       const f = floorOf(a);
       return a.currentLevel > f
@@ -268,7 +290,36 @@ export function planRaise(input: RaiseInput): RaisePlan {
     }, 0);
     const floorOverrides = Object.fromEntries(onManaged.map((a) => [a.deviceId, floorOf(a)]));
     const envelopeFloorsOk = !envelopeGuard || envelopeWith(floorOverrides, candidateEntry) <= envelopeCeiling;
-    const fitsAtFloors = envelopeFloorsOk && committedAmps - savingsAtFloors + cost.amps <= restoreCeiling;
+    const fitsWith = (amps: number): { plain: boolean; atFloors: boolean } => ({
+      plain: envelopePlainOk && committedAmps + amps <= restoreCeiling,
+      atFloors: envelopeFloorsOk && committedAmps - savingsAtFloors + amps <= restoreCeiling,
+    });
+
+    let cost = plainCost;
+    let probe = false;
+    let fits = fitsWith(cost.amps);
+    // PROBE: the learned price blocks, but it may be stale-high — while there
+    // is ZERO bounce evidence this source-session, try once at the steady
+    // floor price. A bounce feeds the pacing ladder (failures > 0 disables
+    // further probes) and re-learns the on-cost from the shed's off-drop; a
+    // probe that sticks re-grades the learned cost cheap. Both wrong beliefs
+    // self-correct from the meter instead of stranding or storming.
+    if (
+      !fits.plain &&
+      !fits.atFloors &&
+      gentleRestore &&
+      plainCost.amps > probeCost.amps + 1e-9 &&
+      restoreFailures(pacing, candidate.deviceId) === 0
+    ) {
+      const probeFits = fitsWith(probeCost.amps);
+      if (probeFits.plain || probeFits.atFloors) {
+        cost = probeCost;
+        probe = true;
+        fits = probeFits;
+      }
+    }
+    const fitsPlain = fits.plain;
+    const fitsAtFloors = fits.atFloors;
 
     // Can't return this tick even with peer floor-downs → reserve NOTHING
     // (raises don't change floors math, so parking here would be a permanent
@@ -303,6 +354,24 @@ export function planRaise(input: RaiseInput): RaisePlan {
       continue;
     }
 
+    // A restore was SENT within the confirm window and the shadow still shows
+    // OFF (shed clears only on confirmed ON since 2026-07-27): the turn-on is
+    // in flight, its draw is neither metered nor ramp-debited yet. Reserve its
+    // amps and STOP — nothing else may spend into a meter picture that is
+    // about to change wholesale. Past the window the loop re-sends (Najat's
+    // firmware drops commands; confirm-or-resend is the cure).
+    if (attemptedWithin(pacing, candidate.deviceId, "restore", RESTORE_CONFIRM_WAIT_MS, now)) {
+      reservedAmps = Math.max(reservedAmps, cost.amps);
+      decisions.push({
+        at: now,
+        deviceId: candidate.deviceId,
+        action: "restore",
+        blockedBy: "awaiting confirm",
+        detail: `reserved ${cost.amps.toFixed(1)}A`,
+      });
+      break;
+    }
+
     // Feasible but waiting out its calm gate: reserve its amps and STOP — no
     // queue-jumping past a needier room that is merely time-gated.
     if (!restoreCalmOk) {
@@ -321,18 +390,21 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // pull every raised peer down to its floor in the same batch. On gen the
     // room comes back GENTLE — fan pinned to 1 — so the range automation's
     // hot-room fan-slam (3–7, un-modeled) can't re-push the meter over; grid is
-    // roomy enough to restore plain. `turnOnAmps` is left fan-slam-sized (its
-    // on@L1 EWMA was learned WITH slams): over-estimating a gentle restore errs
-    // trip-safe, and graded gentle restores drift the estimate down over time.
+    // roomy enough to restore plain. Over-estimating a restore errs trip-safe,
+    // and graded restores drift the on-cost EWMA down over time.
     const restoreCmd = (): Command =>
       gentleRestore
         ? { deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore", fan: 1 }
         : { deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" };
+    const probeIds = probe ? [candidate.deviceId] : [];
+    const probeDetail = probe
+      ? `probe at ${cost.amps.toFixed(1)}A (learned ${plainCost.amps.toFixed(1)}A unproven)`
+      : undefined;
     if (fitsPlain) {
       commands.push(restoreCmd());
       attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
-      decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}` });
-      return { commands, decisions, attempts, isTurnOn: true, reservedAmps };
+      decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}`, detail: probeDetail });
+      return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds };
     }
     for (const a of onManaged) {
       const f = floorOf(a);
@@ -340,8 +412,13 @@ export function planRaise(input: RaiseInput): RaisePlan {
     }
     commands.push(restoreCmd());
     attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
-    decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor} with peer floor-downs` });
-    return { commands, decisions, attempts, isTurnOn: true, reservedAmps };
+    decisions.push({
+      at: now,
+      deviceId: candidate.deviceId,
+      action: `restore @L${floor} with peer floor-downs`,
+      detail: probeDetail,
+    });
+    return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds };
   }
 
   // A feasible restore is reserved but gated (backoff/calm) — park the ENTIRE
@@ -358,7 +435,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       blockedBy: "restore reservation",
       detail: `${reservedAmps.toFixed(1)}A reserved`,
     });
-    return { commands, decisions, attempts, isTurnOn: false, reservedAmps };
+    return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [] };
   }
 
   // ---- Raise phase: one-step, meter-anchored, most-needy first ----
@@ -479,5 +556,5 @@ export function planRaise(input: RaiseInput): RaisePlan {
     if (source === "gen") break;
   }
 
-  return { commands, decisions, attempts, isTurnOn: false, reservedAmps };
+  return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [] };
 }

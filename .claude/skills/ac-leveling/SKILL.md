@@ -46,6 +46,15 @@ envelope-guarded (grid starts FULL by directive; the reducer is the safety).
 moves ≥ `FROZEN_EPSILON_AMPS` (0.005) for `METER_FROZEN_AFTER_MS` (60 s), the meter is frozen — calm
 is killed so nothing can spend on a stale value. Reductions still act (safe direction).
 
+**Added 2026-07-27 evening after a restore→shed bounce loop + a bogus manual-off lock:**
+3. **Gen restores are admitted at the PLAIN learned on-cost** (max of model and `on@L` EWMA) — the
+   fan-pin does NOT shrink compressor draw. One gentle-priced **probe** is allowed only while
+   `restoreFailures === 0`; the fan hold's `gentle` flag = "probe-priced" and the projection must
+   re-price exactly what admission charged. A lone shed's off-drop grades `on@L{level}` (negated).
+4. **Shed clears on the CONFIRMED shadow ON, never at power_on send** — the send-to-confirm lag
+   (5.8s–13 min) is when the collector's observed-off classifier minted a bogus manual-off lock.
+   In-flight restores are parked by the `awaiting confirm` gate (60s, then confirm-or-resend).
+
 **Hard rules preserved from v1:** never level 0 · manual wins · slot caps · boost floors ·
 shed ≠ manual-off · warm restore · opt-out · collapse latch · leaky bucket ·
 requireShed ≥ max(3 A, 20%).

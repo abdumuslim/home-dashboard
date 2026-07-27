@@ -4160,6 +4160,45 @@ describe("observed-off classification — power events vs manual (2026-07-06)", 
     expect(actions).toHaveLength(1);
     expect(actions[0].action.power).toBe(1);
   });
+
+  it("an off observed right after a server-commanded ON is shadow lag, never a manual off (2026-07-27 Najat)", async () => {
+    // Live 17:15:53: a leveler restore's power-on was 5.8s old, the TCL shadow
+    // still read OFF, and the classifier minted an observed_off lock — beep was
+    // false (the unit never lost power), which the fingerprint reads as "a hand
+    // did it". The commanded-ON grace must win over every fingerprint.
+    const { collector, tclCloud, actions, locks, beepPrefs } = createCollector();
+    setTrig(collector, 1);
+    beepPrefs.add("ac1");
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: false, fanSpeed: 1 }]);
+    // The leveler restore path stamps this via the setDevicePowerCache dep.
+    (collector as never as { noteServerAcOn: (id: string) => void }).noteServerAcOn("ac1");
+
+    await setWeatherValue(collector, 27);
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    expect(locks.size).toBe(0); // no bogus sacred lock
+    expect(actions).toHaveLength(1); // the automation simply re-asserts the ON
+    expect(actions[0].action.power).toBe(1);
+  });
+
+  it("the commanded-ON grace expires — a later observed off still locks", async () => {
+    const { collector, tclCloud, actions, locks, beepPrefs } = createCollector();
+    setTrig(collector, 1);
+    beepPrefs.add("ac1");
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: false, fanSpeed: 1 }]);
+    (collector as never as { lastServerAcOnAt: Map<string, number> }).lastServerAcOnAt.set(
+      "ac1",
+      Date.now() - 121_000, // past AC_SERVER_ON_SHADOW_GRACE_MS
+    );
+
+    await setWeatherValue(collector, 27);
+    await checkAcRangeAutomation(collector, acRangeRule());
+
+    expect(locks.has("ac1")).toBe(true); // genuine manual off locks as before
+    expect(actions).toEqual([]);
+  });
 });
 
 describe("collector loop watchdog + step deadlines (2026-07-06 stall)", () => {

@@ -15,6 +15,15 @@ import type { PowerSource } from "./types.js";
 export const BACKOFF_LADDER_MS = [30_000, 120_000, 300_000, 900_000] as const;
 /** How long after a raise/restore a reduction of the same AC counts as its failure. */
 export const ATTEMPT_BLAME_WINDOW_MS = 300_000;
+/**
+ * Minimum spacing between restore SENDS of one AC while its shadow has not
+ * confirmed the ON. Shed now clears on shadow CONFIRM, not on command send
+ * (2026-07-27: clearing at send let a 5.8s shadow lag mint a bogus manual-off
+ * lock), so an in-flight restore stays a shed candidate for a while — this
+ * gate keeps it from being re-sent every batch, and doubles as the
+ * confirm-or-resend retry pace for firmware that drops commands (Najat).
+ */
+export const RESTORE_CONFIRM_WAIT_MS = 60_000;
 
 export type AttemptKind = "raise" | "restore" | "fan_restore";
 
@@ -85,6 +94,18 @@ export function noteSuccess(state: PacingState, deviceId: string, kind: AttemptK
   return withEntry(state, deviceId, kind, { ...prev, failures: 0, cooldownUntil: 0 });
 }
 
+/** Was `kind` attempted on this AC within the last `withinMs`? */
+export function attemptedWithin(
+  state: PacingState,
+  deviceId: string,
+  kind: AttemptKind,
+  withinMs: number,
+  now: number,
+): boolean {
+  const at = entry(state, deviceId, kind).lastAttemptAt;
+  return at > 0 && now - at <= withinMs;
+}
+
 /** Was `kind` attempted on this AC within the blame window? */
 export function attemptedRecently(
   state: PacingState,
@@ -92,14 +113,23 @@ export function attemptedRecently(
   kind: AttemptKind,
   now: number,
 ): boolean {
-  const at = entry(state, deviceId, kind).lastAttemptAt;
-  return at > 0 && now - at <= ATTEMPT_BLAME_WINDOW_MS;
+  return attemptedWithin(state, deviceId, kind, ATTEMPT_BLAME_WINDOW_MS, now);
 }
 
 /** A restore of this AC recently failed (feeds the reducer's re-shed penalty). */
 export function reshedPenalized(state: PacingState, deviceId: string, now: number): boolean {
   const e = entry(state, deviceId, "restore");
   return e.failures > 0 && now < e.cooldownUntil;
+}
+
+/**
+ * Consecutive unresolved restore failures for this AC. 0 = no bounce evidence
+ * this source-session — the condition for probing a restore at the gentle
+ * steady price when the learned on-cost would block it (see restoreCostAmps).
+ * Resets on a graded success or a source change (new physics, fair to re-probe).
+ */
+export function restoreFailures(state: PacingState, deviceId: string): number {
+  return entry(state, deviceId, "restore").failures;
 }
 
 /** Source change: per-source physics — the ladder resets wholesale. */

@@ -374,8 +374,9 @@ export class Scenario {
           // exactly like an automation turn-on. Without this the harness could
           // not reproduce the 2026-07-24/25 restore-bounce storm, where the
           // projection re-priced a just-admitted restore and declared it over.
-          // A restore that pinned the fan is projected at the same gentle cost
-          // it was admitted at (shell: fanHolds[id].gentle).
+          // A restore is projected at the same price its admission charged —
+          // the recorded hold's gentle flag says which (shell parity:
+          // fanHolds[id].gentle marks a probe-priced restore).
           this.pendingProjection = restoreCostAmps(
             this.book,
             this.cfg,
@@ -384,7 +385,7 @@ export class Scenario {
             cmd.level,
             3,
             this.now,
-            { gentle: cmd.fan != null },
+            { gentle: out.fanHolds[cmd.deviceId]?.gentle === true },
           ).amps;
           break;
         case "set_fan":

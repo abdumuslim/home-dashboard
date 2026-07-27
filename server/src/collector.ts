@@ -255,6 +255,15 @@ export class Collector {
    */
   private lastPowerEventAt = 0;
   private readonly AC_POWER_EVENT_GRACE_MS = 15 * 60_000;
+  /**
+   * Server-commanded AC power-ons (automation/schedule/timer/leveler/UI) can
+   * take seconds-to-minutes to reach the TCL shadow; until then the device
+   * still reads OFF. An observed OFF inside this window is OUR command in
+   * flight, never the user's hand — 2026-07-27 17:15: a leveler restore's
+   * 5.8s shadow lag minted a bogus observed_off lock that stranded the room.
+   */
+  private lastServerAcOnAt = new Map<string, number>();
+  private readonly AC_SERVER_ON_SHADOW_GRACE_MS = 120_000;
   // Loop-liveness watchdog (2026-07-06 ~3h silent stall): heartbeat + per-step
   // deadlines so one hung external call can never freeze every automation.
   private lastLoopTickAt = Date.now();
@@ -339,6 +348,12 @@ export class Collector {
       await this.pool.query("DELETE FROM ac_manual_off_locks WHERE device_id = $1", [deviceId]);
     }
     this.devicePowerCache.set(deviceId, { power: "on", ts: Date.now() });
+    // Covers the UI set_power=1 path (a commanded ON whose shadow may lag OFF
+    // for minutes). Also fires on observed-ON clears, where the stamp is
+    // harmless: the shadow already shows ON, and a remote off soon after at
+    // worst skips one observed-off lock (errs toward cooling; a dashboard off
+    // still locks instantly via its commanded path).
+    this.noteServerAcOn(deviceId);
     if (wasLocked) log.info(`[collector] AC ${deviceId}: manual-off lock cleared`);
     return wasLocked;
   }
@@ -441,6 +456,15 @@ export class Collector {
     if (await this.isAcManualOffLocked(deviceId)) {
       log.info(`[collector] ${context}: device ${deviceId} observed OFF but already manual-off locked — keeping the lock`);
       return false;
+    }
+    // An OFF observed shortly after a power ON we ourselves commanded is the
+    // shadow lagging our own command, not a hand on the remote — never lock.
+    const serverOnAt = this.lastServerAcOnAt.get(deviceId) ?? 0;
+    if (serverOnAt > 0 && Date.now() - serverOnAt < this.AC_SERVER_ON_SHADOW_GRACE_MS) {
+      log.info(
+        `[collector] ${context}: device ${deviceId} observed OFF ${Math.round((Date.now() - serverOnAt) / 1000)}s after a server-commanded ON — shadow lag, not a manual off`,
+      );
+      return true;
     }
     await this.ensureAcBeepPrefsLoaded();
     if (this.classifyObservedAcOff(deviceId) === "power_event") {
@@ -547,6 +571,7 @@ export class Collector {
       broadcast: (payload: Record<string, unknown>) => this.broadcastPush(payload),
       setDevicePowerCache: (deviceId: string, power: "on" | "off") => {
         this.devicePowerCache.set(deviceId, { power, ts: Date.now() });
+        if (power === "on") this.noteServerAcOn(deviceId);
       },
       isManualOffLocked: (deviceId: string) => this.isAcManualOffLocked(deviceId),
       onLevelerFanCommand: (deviceId: string, fan: number) => this.refreshAcFanBaseline(deviceId, fan),
@@ -1078,10 +1103,16 @@ export class Collector {
       const effectiveAction = this.stripLeveledControls(rule, action, did);
       if (rule.device_type === "ac") {
         await this.tclCloud!.executeAcAction(did, effectiveAction as AcAction);
+        if ((effectiveAction as AcAction).power === 1) this.noteServerAcOn(did);
       } else {
         await this.xiaomiCloud!.executeAction(did, effectiveAction as PurifierAction);
       }
     }
+  }
+
+  /** Stamp a server-commanded AC power-on for observed-off shadow-lag grace. */
+  private noteServerAcOn(deviceId: string): void {
+    this.lastServerAcOnAt.set(deviceId, Date.now());
   }
 
   private async checkMetricAutomation(rule: AutomationRule): Promise<void> {
@@ -1853,6 +1884,7 @@ export class Collector {
               : {}),
           };
           await this.tclCloud.executeAcAction(deviceId, action);
+          this.noteServerAcOn(deviceId);
           log.info(`[collector] AC timer: turned ON device ${deviceId} with preset`);
         }
       } catch (err) {
