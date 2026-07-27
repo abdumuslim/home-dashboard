@@ -1,3 +1,12 @@
+---
+type: Reference
+title: 'Database Schema'
+description: 'TL;DR: The app uses a PostgreSQL database named home running on the shared, pre-existing rag-postgres-1 container (pgvector:pg16) on the VPS; the database is auto-created on first startup. Schema init and migrations…'
+tags: [home, dashboard, claude-code, current]
+maintainer: claude-code
+timestamp: 2026-07-27
+---
+
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
 
 # Database Schema

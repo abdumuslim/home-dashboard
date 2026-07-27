@@ -1,3 +1,12 @@
+---
+type: Reference
+title: 'Home Dashboard API Reference'
+description: 'Complete API reference for https://home.altijwal.com — a home environmental monitoring and device control dashboard in Baghdad, Iraq (lat 33.3215, lon 44.3583, timezone Asia/Baghdad UTC+3).'
+tags: [home, dashboard, claude-code, current]
+maintainer: claude-code
+timestamp: 2026-07-27
+---
+
 # Home Dashboard API Reference
 
 Complete API reference for `https://home.altijwal.com` — a home environmental monitoring and device control dashboard in Baghdad, Iraq (lat 33.3215, lon 44.3583, timezone Asia/Baghdad UTC+3).

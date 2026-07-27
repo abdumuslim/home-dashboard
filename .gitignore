@@ -44,7 +44,12 @@ docs/agent/operations.md
 GEMINI.md
 HANDOFF.md
 home-dashboard-plan.md
-.claude/
+# `.claude/skills/` is knowledge, not tool state, and carries no credentials — so it
+# is tracked. Everything else under .claude/ is local settings/cache. Note the `/*`
+# form: git cannot re-include a path whose parent directory is excluded, so a bare
+# `.claude/` would defeat the negation below.
+.claude/*
+!.claude/skills/
 
 # Misc
 test.md

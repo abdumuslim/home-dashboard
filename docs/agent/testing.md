@@ -1,3 +1,12 @@
+---
+type: Guide
+title: 'Testing'
+description: 'Pure logic (allocator, auto-fan, slots, calibration helpers, alert sustain) is fully unit-tested with no I/O. Stateful integration (collector loop, leveler, calibrator) is tested against mocked TCL/DB/timers in…'
+tags: [home, dashboard, claude-code, current]
+maintainer: claude-code
+timestamp: 2026-07-27
+---
+
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
 
 # Testing

@@ -1,0 +1,10 @@
+# okf_lint exclusions for the home docs bundle.
+# Gitignore-style patterns, relative to the REPO ROOT (not to docs/).
+
+# LOCAL-ONLY, gitignored: contains VPS credentials by design. Not part of the
+# published bundle, so the deny-scan must not flag it on every run.
+docs/agent/operations.md
+
+# Raw sensor exports dropped here for analysis - not hand-authored concepts.
+docs/*.CSV
+docs/*.csv

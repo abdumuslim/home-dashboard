@@ -1,3 +1,12 @@
+---
+type: Reference
+title: 'Prayer Times API'
+description: 'Computed by the in-repo prayer-engine (server/src/prayer-engine/, see its README) on the astronomy-engine(https://github.com/cosinekitty/astronomy) ephemeris (~1 arcminute solar accuracy, elevation-aware). The dashboard…'
+tags: [home, dashboard, claude-code, current]
+maintainer: claude-code
+timestamp: 2026-07-27
+---
+
 # Prayer Times API
 
 ## GET /api/prayer-times

@@ -1,3 +1,12 @@
+---
+type: Reference
+title: 'TCL AC Cloud Integration (tcl-cloud.ts)'
+description: 'Related docs: automation/range/hysteresis logic → ac-automations.md(ac-automations.md); Smart AC Leveling (generator-mode budget controller) → ac-leveling.md(ac-leveling.md); AC widget UI, presets UI, visual design →…'
+tags: [home, dashboard, claude-code, current]
+maintainer: claude-code
+timestamp: 2026-07-27
+---
+
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
 # TCL AC Cloud Integration (tcl-cloud.ts)
 
@@ -11,6 +20,7 @@ Auth chain summary: TCL login → token refresh (saasToken + cognitoToken) → A
 
 ### 1. Login
 - `POST https://pa.account.tcl.com/account/login?clientId=54148614`
+<!-- okf-allow: describes the protocol's password handling; no value here (values live in the VPS .env) -->
 - Password: MD5-hashed before sending.
 - **Critical:** Field name is `username` (NOT `account`).
 - **Critical:** Requires Android emulation fields in the body: `equipment`, `osType: "Android"`, `clientVersion`, `deviceModel`, etc.

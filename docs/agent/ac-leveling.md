@@ -1,3 +1,12 @@
+---
+type: Reference
+title: 'Smart AC Leveling & Per-AC Calibration'
+description: 'A ground-up rewrite lives in server/src/leveling/ (17 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands,…'
+tags: [home, dashboard, claude-code, current]
+maintainer: claude-code
+timestamp: 2026-07-27
+---
+
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
 
 # Smart AC Leveling & Per-AC Calibration

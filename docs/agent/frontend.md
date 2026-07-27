@@ -1,3 +1,12 @@
+---
+type: Reference
+title: 'Frontend — Dashboard Layout, Card Design Language & Widgets'
+description: 'Related docs: server-side preset/automation semantics → ac-automations.md(ac-automations.md); TCL shadow properties and AC model quirks → tcl-ac.md(tcl-ac.md); React performance patterns (React.memo, chart memoization,…'
+tags: [home, dashboard, claude-code, current]
+maintainer: claude-code
+timestamp: 2026-07-27
+---
+
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
 # Frontend — Dashboard Layout, Card Design Language & Widgets
 

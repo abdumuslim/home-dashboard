@@ -1,3 +1,12 @@
+---
+type: Reference
+title: 'Architecture'
+description: 'TL;DR: Home environmental monitoring dashboard at https://home.altijwal.com — Express 5 (Node.js/TypeScript) backend + React/Vite frontend, PostgreSQL storage, MQTT + cloud-API collectors, Web Push alerts, cookie-JWT…'
+tags: [home, dashboard, claude-code, current]
+maintainer: claude-code
+timestamp: 2026-07-27
+---
+
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
 
 # Architecture

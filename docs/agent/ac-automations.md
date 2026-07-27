@@ -1,3 +1,12 @@
+---
+type: Reference
+title: 'Purifier & AC Automations'
+description: 'Persistent device-level user intent stored in acmanualofflocks (deviceid TEXT PRIMARY KEY, lockedat TIMESTAMPTZ, reason TEXT — schema in database.md(database.md)). The table prevents deploys/restarts from clearing a…'
+tags: [home, dashboard, claude-code, current]
+maintainer: claude-code
+timestamp: 2026-07-27
+---
+
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
 # Purifier & AC Automations
 
