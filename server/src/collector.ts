@@ -14,6 +14,7 @@ import { AcCalibrator } from "./ac-calibration.js";
 import { computeNeedTier, type NeedTier } from "./ac-leveling.js";
 import { computeAutoFanLevel } from "./ac-auto-fan.js";
 import { childLogger } from "./logger.js";
+import { RateGate } from "./rate-gate.js";
 import type { AuthKind } from "./auth.js";
 import {
   findActiveRangeSlot,
@@ -262,6 +263,9 @@ export class Collector {
   private readonly STEP_TIMEOUT_MS = 90_000;
   private readonly LOOP_STALL_WARN_MS = 60_000;
   private readonly LOOP_STALL_FATAL_MS = 3 * 60_000;
+  /** Ambient Weather meters 1 request/sec per USER — the poll and the backfill share this budget. */
+  private readonly AW_MIN_REQUEST_GAP_MS = 1_100;
+  private readonly awGate = new RateGate(this.AW_MIN_REQUEST_GAP_MS);
 
   getLatestAir(): Record<string, unknown> | null {
     return this.latestAirRow;
@@ -2065,9 +2069,9 @@ export class Collector {
     url.searchParams.set("apiKey", this.config.awApiKey);
     url.searchParams.set("applicationKey", this.config.awAppKey);
 
-    const resp = await fetch(url.toString(), {
+    const resp = await this.awGate.run(() => fetch(url.toString(), {
       signal: AbortSignal.timeout(30_000),
-    });
+    }));
     if (!resp.ok) {
       throw new Error(`AW API ${resp.status}: ${await resp.text()}`);
     }
@@ -2217,9 +2221,8 @@ export class Collector {
           break;
         }
         endDate = ts.getTime();
-
-        // Respect rate limit: 1 req/sec
-        await sleep(1100);
+        // No sleep here — `awGate` paces every AW request, including against
+        // the concurrent collection poll, which a local sleep could not.
       }
       log.info(`[collector] Backfilled ${totalCount} weather records total`);
     } catch (err) {
@@ -2236,9 +2239,9 @@ export class Collector {
       url.searchParams.set("endDate", String(endDate));
     }
 
-    const resp = await fetch(url.toString(), {
+    const resp = await this.awGate.run(() => fetch(url.toString(), {
       signal: AbortSignal.timeout(60_000),
-    });
+    }));
     if (!resp.ok) {
       throw new Error(`AW backfill API ${resp.status}: ${await resp.text()}`);
     }

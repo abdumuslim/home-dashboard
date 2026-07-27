@@ -86,6 +86,7 @@ D:\dev\home\
 │   │   ├── ac-auto-fan.ts  # computeAutoFanLevel — delta-based smart auto fan mapping (pure, no I/O)
 │   │   ├── database.ts     # pg pool, schema init, migrations (automations, power, AC presets, AC manual-off locks, AC leveling config/shed/fan-hold, AC calibration results, AC control audit)
 │   │   ├── logger.ts       # Structured logging via pino (childLogger factory, console-compatible API)
+│   │   ├── rate-gate.ts    # RateGate — serializes calls to a per-user-metered vendor API, spacing START times (collector's awGate; see API Rate Limits)
 │   │   ├── config.ts       # Env vars (dotenv)
 │   │   ├── auth.test.ts    # JWT sign/verify/tamper/expiry tests (vitest)
 │   │   ├── ac-leveling.test.ts # Pure allocator tests (priority fill, gating, shed/restore, restore-with-reduction, caps)
@@ -208,7 +209,8 @@ Baghdad's arid climate is favorable — a very predictable summer diurnal cycle 
 
 ## API Rate Limits
 
-- Ambient Weather: 1 request/sec. Collector polls every 5s (sensors only update every ~5 min, dedup discards repeats). 2-second sleep after backfill prevents 429 on the first collection cycle
+- Ambient Weather: **1 request/sec, metered per USER** (429 body `{"error":"above-user-rate-limit"}`) — so the budget is shared across every caller, not per call site. Collector polls every 5s (sensors only update every ~5 min, dedup discards repeats). **Every AW request goes through `awGate` (a `RateGate`, `server/src/rate-gate.ts`) which serializes them 1.1s apart** — do not add raw `fetch` calls to `rt.ambientweather.net`, and do not "fix" AW pacing with a local `sleep()`; it paces a caller against itself, not against the other caller.
+  - **Why the gate exists (2026-07-27):** `runForever()` fires `runBackfills()` without awaiting and then immediately enters the collection loop, so at every container restart the backfill's request and the first poll landed in the same second. The backfill lost, and its gap-fill batch (the only thing that repairs history for the minutes the container was down) was silently dropped. Cost was small — the batch covers 24h, so a later restart usually re-fills it — but it recurred on every deploy. The pre-gate `sleep(2000)` in `runBackfills()` sits BETWEEN the AW and Qingping backfills (different vendors, separate limits) and never guarded this race, despite what this line used to claim.
 - Qingping MQTT (primary): Device pushes to self-hosted Mosquitto broker every ~15s. Collector subscribes to `qingping/{MAC}/up`. Interval configured via downlink to `qingping/{MAC}/down`. Readings buffered in memory; 1-minute median written to DB. `/api/current` serves in-memory latest via `collector.getLatestAir()` getter (passed to routes from index.ts). Each sensor field in the MQTT payload has `{ value, status }` — battery `status` (1=charging, 0=discharging) is extracted as `batteryCharging` on the live object.
 - Qingping Cloud API (fallback): OAuth token expires in ~2 hours, refreshed 5 min before expiry. Automatically resumes when MQTT is silent >2 minutes.
 - Xiaomi Cloud: Managed by `xmihome`. Avoid aggressive polling. Commands are sent as needed for automations or UI interactions.
