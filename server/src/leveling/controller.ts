@@ -124,6 +124,14 @@ export class LevelingControllerV2 {
    * what policy decided.
    */
   private rampBaseline = new Map<string, number>();
+  /**
+   * Peak rise above `rampBaseline` seen since each live ramp armed, refreshed on
+   * every ESP reading. The instantaneous rise is a whole-house delta, so a peer
+   * reduction (or an AC turning off) masks it and re-charges a ramping room its
+   * whole draw for the rest of its window — the 2026-07-27 fan stall. Cleared
+   * wherever `rampBaseline` is: the two are only meaningful together.
+   */
+  private rampAbsorbed = new Map<string, number>();
   /** Grid full-start windows: house amps measured just before this AC came on. */
   private startBaseline = new Map<string, { amps: number; until: number }>();
   private boostActive = new Map<string, boolean>();
@@ -361,6 +369,7 @@ export class LevelingControllerV2 {
           // re-anchors the ramp baselines against the new line's first readings.)
           this.startBaseline.clear();
           this.rampBaseline.clear();
+          this.rampAbsorbed.clear();
           if (event.to === "grid") {
             this.manualCap.clear();
             this.manualTarget.clear();
@@ -422,6 +431,7 @@ export class LevelingControllerV2 {
           break;
       }
     }
+    this.noteRampAbsorption(now);
   }
 
   // ---------- user hooks (manual always wins) ----------
@@ -512,8 +522,28 @@ export class LevelingControllerV2 {
     const baseline = view.source !== "none" && view.sampleCount >= 2 ? view.smoothedAmps : null;
     for (const id of deviceIds) {
       this.rampUntil.set(id, until);
+      // A fresh ramp has proven no absorption yet — the previous window's peak
+      // is about a compressor start that is over.
+      this.rampAbsorbed.delete(id);
       if (baseline == null) this.rampBaseline.delete(id);
       else this.rampBaseline.set(id, baseline);
+    }
+  }
+
+  /**
+   * Ratchet each live ramp's absorbed peak against this reading. Runs on the ESP
+   * cadence (~5s) rather than the tick so a rise that happens between ticks is
+   * still banked — it is the only evidence that a ramping compressor's amps
+   * actually landed, and a peer reduction later erases the instantaneous view.
+   */
+  private noteRampAbsorption(now: number): void {
+    if (this.rampBaseline.size === 0) return;
+    const view = meterView(this.meterState, now);
+    if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return;
+    for (const [id, baseline] of this.rampBaseline) {
+      if ((this.rampUntil.get(id) ?? 0) <= now) continue;
+      const risen = view.smoothedAmps - baseline;
+      if (risen > (this.rampAbsorbed.get(id) ?? 0)) this.rampAbsorbed.set(id, risen);
     }
   }
 
@@ -563,6 +593,7 @@ export class LevelingControllerV2 {
           // No compressor, no ramp to account for.
           this.rampUntil.delete(device.id);
           this.rampBaseline.delete(device.id);
+          this.rampAbsorbed.delete(device.id);
           this.recon = clearOnPowerOff(this.recon, device.id);
           this.manualCap.delete(device.id);
           this.manualTarget.delete(device.id);
@@ -783,6 +814,7 @@ export class LevelingControllerV2 {
         warmStartLevel: this.rememberedLevel.get(device.id) ?? null,
         ramping,
         rampBaselineAmps: ramping ? (this.rampBaseline.get(device.id) ?? null) : null,
+        rampAbsorbedAmps: ramping ? (this.rampAbsorbed.get(device.id) ?? null) : null,
         startBaselineAmps: this.startBaselineFor(device.id, device.power, now),
         reshedPenalized: reshedPenalized(this.pacing, device.id, now),
       };

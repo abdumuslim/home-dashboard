@@ -196,7 +196,8 @@ Two independent controller bugs plus one wrong assumption:
    only** — it must never inflate the reducer's target, or it re-creates the 2026-07-25 storm.
    `AcView.rampBaselineAmps` is armed by `rearmRamp()` at EVERY arming point (user/automation
    turn-on, restore, changeover, collapse recovery) and, unlike `startBaselineAmps`, is never
-   cleared by policy events — it is physics, not entry policy. Grid is deliberately exempt, the same
+   cleared by policy events — it is physics, not entry policy. **The absorbed term ratchets since
+   2026-07-27** (`rampAbsorbedAmps`) — see the fan-restore stall section below. Grid is deliberately exempt, the same
    split the physics envelope uses (grid starts FULL by directive; the reducer is its safety).
 2. **Gen collapse recovery re-arms FLOORS (`modes.ts`).** A recovery into gen is treated exactly
    like an entry into gen. Grid recovers plain (GRID_FULL owns that entry).
@@ -216,6 +217,42 @@ grid exemption, derated ceilings); `modes.test.ts` recovery suite (3); `sensing.
 parity (`scenario.ts` `startRamp()`). **709 server tests green; server + client `tsc` clean.** One
 behavioral regression per fix was verified failing first (peer raise during a ramp, floors on
 recovery, trip #3's raise); the rest pin bookkeeping.
+
+### 2026-07-27 fan-restore stall → the ramp debit's absorption ratchets
+
+**The incident (16:49–16:53 Baghdad, 15A gen, user: "isn't it taking too much to restore fan
+speed?").** The reducer trimmed **Abdu 7→3 and Abdullah →1** at 16:49:41 clearing a severe 15.6A
+overshoot. The fans did not come back until **16:52:55 / 16:53:06 — 3m14s and 3m25s later**, on a
+meter that had been calm and 1.5A under the ceiling since 16:50:03. Breakdown: ~20s for the meter to
+fall back under the limit + 60s `FAN_RESTORE_CALM_MS` (both by design) + **~2 min of phantom ramp
+debit** (a bug).
+
+**Root cause — the ramp debit's absorption term is a whole-house delta, so a peer's departure erases
+it.** `rampDebitAmps` credits a ramping AC with `max(0, smoothed − rampBaseline)`, and `rampBaseline`
+is snapshotted at turn-on and never adjusted (`controller.ts` `rearmRamp`). Najat had turned on at
+~16:47 against a **14.3A** house; the meter had risen ~1.0A into her ramp by 16:49:21 — then the
+reducer's own cuts took ~2.5A off two peers and the house landed **1.5A below her baseline**. The
+rise term went negative, `absorbed` clamped to 0, and she was re-charged her **entire** modeled draw
+(journal 16:50:31: `0.1A available (+1.7A ramping in)`) for the rest of her 240s window. That fenced
+the fan restore — and every raise — until the ramp clock simply expired. Nothing was wrong with the
+fan-restore path itself; it was priced out by imaginary load.
+
+**Fix — absorption RATCHETS (`raise.ts` + `controller.ts` `noteRampAbsorption`).** The credit is now
+`max(live rise, peak rise seen since this ramp armed)`: absorption is a one-way fact, and a peer
+leaving cannot un-prove amps the meter saw arrive. `AcView.rampAbsorbedAmps` carries the peak,
+refreshed on the **ESP cadence** (~5s, not the tick — a rise between ticks is still evidence),
+skipped while the meter is stale/frozen/collapsed, and cleared exactly where `rampBaseline` is
+(re-arm, power-off, source change) since the two are only meaningful together. Every other
+conservatism is untouched: no baseline → no credit ratchet or not, level 0 still charges the
+unrestricted draw, two simultaneous ramps still each measure from their own baseline, and it stays
+**spending-side only**.
+
+Tests: `raise.test.ts` ratchet suite (3 — masked absorption, live rise still winning while it
+climbs, no credit without a baseline); `controller.test.ts` shell ratchet (the peak survives a peer
+drop, so the parked raise ships); `scenarios.test.ts` "the 2026-07-27 fan-restore stall" (2 — the
+held fan returns before the ramp window expires, and still does NOT return while the ramping room's
+draw genuinely has not landed). **715 server tests green; server `tsc` clean.** Both behavioral tests
+verified failing first.
 
 ### 2026-07-25 restore-bounce storm (first night of v2 acting)
 

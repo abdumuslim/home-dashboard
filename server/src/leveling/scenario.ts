@@ -78,6 +78,8 @@ interface SimAc {
   startBaseline: { amps: number; until: number } | null;
   /** House amps just before this compressor last started (ramp-debit anchor). */
   rampBaseline: number | null;
+  /** Peak rise above `rampBaseline` seen since it armed (shell: rampAbsorbed). */
+  rampAbsorbed: number;
 }
 
 const STEP_MS = 5_000;
@@ -144,6 +146,7 @@ export class Scenario {
       warmStartLevel: null,
       startBaseline: null,
       rampBaseline: null,
+      rampAbsorbed: 0,
     }));
   }
 
@@ -156,6 +159,21 @@ export class Scenario {
     ac.turnedOnAt = this.now;
     const view = meterView(this.meterState, this.now);
     ac.rampBaseline = view.source !== "none" && view.sampleCount >= 2 ? view.smoothedAmps : null;
+    ac.rampAbsorbed = 0;
+  }
+
+  /** Shell parity for `noteRampAbsorption` — ratchet each live ramp's peak rise. */
+  private noteRampAbsorption(): void {
+    const view = meterView(this.meterState, this.now);
+    if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return;
+    for (const ac of this.acs) {
+      if (ac.rampBaseline == null || !this.isRamping(ac)) continue;
+      ac.rampAbsorbed = Math.max(ac.rampAbsorbed, view.smoothedAmps - ac.rampBaseline);
+    }
+  }
+
+  private isRamping(ac: SimAc): boolean {
+    return ac.on && ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < ac.setup.rampSeconds * 1000;
   }
 
   setNonAc(amps: number): void {
@@ -221,6 +239,7 @@ export class Scenario {
     ac.shed = false;
     ac.startBaseline = null;
     ac.rampBaseline = null;
+    ac.rampAbsorbed = 0;
     ac.turnedOnAt = 0;
     this.meterState = resetCalm(this.meterState);
   }
@@ -310,11 +329,9 @@ export class Scenario {
         slotCap: null,
         reachableCap: null,
         warmStartLevel: ac.warmStartLevel,
-        ramping: ac.on && ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < ac.setup.rampSeconds * 1000,
-        rampBaselineAmps:
-          ac.on && ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < ac.setup.rampSeconds * 1000
-            ? ac.rampBaseline
-            : null,
+        ramping: this.isRamping(ac),
+        rampBaselineAmps: this.isRamping(ac) ? ac.rampBaseline : null,
+        rampAbsorbedAmps: this.isRamping(ac) ? ac.rampAbsorbed : null,
         startBaselineAmps:
           ac.on && ac.startBaseline != null && ac.startBaseline.until > this.now
             ? ac.startBaseline.amps
@@ -402,6 +419,7 @@ export class Scenario {
       this.modeState = applyMeterEvent(this.modeState, event, this.now);
       if (event.kind === "source_changed") this.pacing = resetPacing(this.pacing, event.to);
     }
+    this.noteRampAbsorption();
 
     // FLOORS / GRID_FULL exit checks against confirmed shadows + ramps.
     const views = this.buildViews();

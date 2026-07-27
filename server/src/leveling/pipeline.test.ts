@@ -42,6 +42,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     ramping: false,
     startBaselineAmps: null,
     rampBaselineAmps: null,
+    rampAbsorbedAmps: null,
     reshedPenalized: false,
     ...overrides,
   };

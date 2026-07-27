@@ -220,6 +220,17 @@ export interface AcView {
    * far?" (see rampDebitAmps). Null means unknown → charge the whole draw.
    */
   rampBaselineAmps: number | null;
+  /**
+   * The LARGEST rise above `rampBaselineAmps` the meter has shown since this
+   * ramp armed (null when unknown/not ramping). Absorption is a one-way fact —
+   * once the meter has proven a compressor's amps arrived, a later drop cannot
+   * un-prove it. Without this ratchet, a reduction elsewhere (or any peer
+   * turning off) drops the house below the baseline, `smoothed − baseline`
+   * clamps to 0, and the ramping AC is re-charged its whole draw for the rest
+   * of its window — which stalled a fan restore for 2 extra minutes on
+   * 2026-07-27 (see rampDebitAmps).
+   */
+  rampAbsorbedAmps: number | null;
   /** A recent restore of this AC failed (backoff live) — re-shedding it is penalized. */
   reshedPenalized: boolean;
 }

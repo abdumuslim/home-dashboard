@@ -113,15 +113,23 @@ describe("LevelingControllerV2 — acting-flavor re-sync", () => {
 // to strip that attempt or the backoff it just grew would be erased.
 // ---------------------------------------------------------------------------
 
-function createGradePool() {
+function createGradePool(configExtra: Record<string, unknown> = {}) {
   const journal: Array<Record<string, unknown>> = [];
   const costs: Array<{ deviceId: string; transition: string }> = [];
   const query = vi.fn(async (sql: string, params: unknown[] = []) => {
     if (sql.includes("FROM ac_leveling_config") && sql.includes("id IN (1, 2)")) {
-      return { rows: [{ id: 2, config: { controller: "v2", enabled: true, genLimitAmps: 15, marginAmps: 0.1 } }], rowCount: 1 };
+      return {
+        rows: [
+          {
+            id: 2,
+            config: { controller: "v2", enabled: true, genLimitAmps: 15, marginAmps: 0.1, ...configExtra },
+          },
+        ],
+        rowCount: 1,
+      };
     }
     if (sql.includes("INSERT INTO ac_leveling_journal")) {
-      journal.push({ reason: params[4], commands: params[7] });
+      journal.push({ reason: params[4], commands: params[7], decisions: params[8] });
       return { rows: [{ id: journal.length }], rowCount: 1 };
     }
     if (sql.includes("INSERT INTO ac_leveling_costs")) {
@@ -231,6 +239,76 @@ describe("LevelingControllerV2 — grade queue", () => {
       expect(blocked.length).toBeGreaterThan(0);
       // Throttled — one row per (device, blockedBy) per 5 min, not one per tick.
       expect(blocked.length).toBeLessThan(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ramp-absorption ratchet (2026-07-27). `rampDebitAmps` credits a ramping AC
+// with what the meter has risen since its compressor started — a whole-house
+// delta, so any load that LEAVES afterwards masks it. Live: the reducer cut
+// ~2.5A off two peers mid-ramp, the house landed below the ramping room's
+// baseline, the credit clamped to 0 and it was re-charged its whole draw for
+// the rest of its 240s window, fencing a fan restore for 2 extra minutes.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — ramp absorption ratchet", () => {
+  it("keeps the absorption credit when a peer's load leaves after the ramp armed", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-07-27T13:47:00Z"));
+      // Resting ceiling 15 − 0.1 − 0.2 = 14.7. b's modeled floor draw is 4.3A;
+      // a's L1→L2 step costs 1.0A. Sized so the ONLY thing that decides the
+      // raise is whether b's absorption survives the drop.
+      const mock = createGradePool({
+        ampModels: { a: { baseAmps: 2, stepAmps: 1 }, b: { baseAmps: 4.3, stepAmps: 2.5 } },
+      });
+      const sent: Array<{ deviceId: string; cmd: string; value: number }> = [];
+      const deps: LevelingDeps = {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({
+            sendControl: async (deviceId: string, cmd: string, value: number) => {
+              sent.push({ deviceId, cmd, value });
+            },
+            executeAcAction: async () => undefined,
+          }) as never,
+      };
+      const controller = new LevelingControllerV2(mock.pool, deps);
+      await controller.ensureLoaded();
+
+      // "a" is running; "b" is off and will turn on (arming its ramp).
+      const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+      const ctx = [
+        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+      ];
+      let flip = 1;
+      const run = async (genAmps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(5_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+
+      await run(10.0, 6); // settle: house ≈ 10.0A — a's step does not fit yet
+      b.power = true; // off→on: tick() arms b's ramp against ~10.0A
+      await run(10.0, 1);
+      await run(12.0, 6); // b's compressor arrives — 2.0A of it is on the meter
+
+      // Now a peer's load leaves (the live shape: the reducer's cuts), dropping
+      // the house BELOW b's ramp baseline, so the instantaneous rise is negative.
+      // Headroom 14.7 − 9.6 = 5.1A. Charged b's WHOLE 4.3A it leaves 0.8A and a's
+      // step is refused for the rest of b's 240s window; crediting the 2.0A the
+      // meter already proved arrived leaves 2.8A and the step ships.
+      sent.length = 0;
+      await run(9.6, 10);
+
+      expect(sent).toContainEqual({ deviceId: "a", cmd: "set_generator_mode", value: 2 });
     } finally {
       vi.useRealTimers();
     }

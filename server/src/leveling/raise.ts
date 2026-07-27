@@ -60,6 +60,17 @@ export function envelopeTotalAmps(
  * draw, and with two ACs ramping each measures the rise from its own baseline,
  * so shared rise is counted twice. All three err toward not spending.
  *
+ * Absorption RATCHETS (2026-07-27). The live rise is only half the story: it is
+ * a whole-house delta, so any load that leaves after the ramp armed masks it.
+ * On 2026-07-27 the reducer cut ~2.5A off two peers two minutes into Najat's
+ * ramp, dropping the house 1.5A below her baseline — `smoothed − baseline`
+ * clamped to 0 and she was re-charged her entire 2.3A for the remaining half of
+ * her window, fencing a fan restore (and every raise) on a meter that had been
+ * calm and 1.5A under the ceiling the whole time. So the credit is the LARGER
+ * of the live rise and the peak rise this ramp has already shown: absorption is
+ * a one-way fact, and a peer's departure cannot un-prove amps the meter saw
+ * arrive. Still bounded by the baseline — no baseline, no credit, ratchet or not.
+ *
  * SPENDING SIDE ONLY. This must never inflate the reducer's savings target: a
  * ramping AC's inrush is transient and the 2026-07-25 storm proved that acting
  * on it sheds rooms for load that decays on its own (see pipeline.ts inrush
@@ -75,7 +86,9 @@ export function rampDebitAmps(
     if (!ac.on || !ac.managed || ac.shed || !ac.ramping) return sum;
     const committed = steadyDraw(ac.currentLevel, ac.maxLevel, modelFor(config, ac.deviceId, source));
     const absorbed =
-      ac.rampBaselineAmps == null ? 0 : Math.max(0, smoothedAmps - ac.rampBaselineAmps);
+      ac.rampBaselineAmps == null
+        ? 0
+        : Math.max(0, smoothedAmps - ac.rampBaselineAmps, ac.rampAbsorbedAmps ?? 0);
     return sum + Math.max(0, committed - absorbed);
   }, 0);
 }

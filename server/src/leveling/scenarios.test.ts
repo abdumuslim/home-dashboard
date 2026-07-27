@@ -684,3 +684,71 @@ describe("the 2026-07-26 triple gen trip", () => {
     expect(meterView(s.meterState, s.now).derateAmps).toBe(0);
   });
 });
+
+describe("the 2026-07-27 fan-restore stall", () => {
+  // Live 16:49:41 → 16:53:06: the reducer trimmed Abdu 7→3 and Abdullah →1 while
+  // Najat was 2 min into her turn-on ramp. Those same cuts dropped the house
+  // 1.5A BELOW the baseline snapshotted when Najat started, so `smoothed −
+  // rampBaseline` clamped to 0 and she was re-charged her WHOLE modeled draw for
+  // the rest of her 240s window (journal 16:50:31: "0.1A available (+1.7A
+  // ramping in)"). The fans could not come back until the ramp simply expired —
+  // 3m14s / 3m25s after the cut, on a meter that had been calm and 1.5A under
+  // the ceiling the whole time.
+  //
+  // Sized so the ONLY thing standing between the hold and its restore is that
+  // stale absorption: while the ramp rises the budget is invariant (each amp the
+  // meter absorbs is an amp the debit gives back), and after the peer drop the
+  // ratcheted absorption is worth exactly the 0.5A the fan swing costs.
+  const stall = (): Scenario => {
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDU, level: 1, demandAmps: 6.0, needDelta: 0, fan: 1, rampSeconds: 240 },
+        { ...ABDULLAH, level: 1, demandAmps: 3.5, needDelta: 0, fan: 1, rampSeconds: 240 },
+        { ...NAJAT, on: false, level: 1, demandAmps: 3.0, needDelta: 0, fan: 1, rampSeconds: 240 },
+      ],
+      { nonAcAmps: 5.7, source: "gen" },
+    );
+    s.advance(60); // settle: house ≈ 12.0A, calm, nothing to raise
+    return s;
+  };
+
+  /** Abdu comes out of an over-limit trim holding fan 1, owing a climb back to 7. */
+  const holdAbduFan = (s: Scenario): void => {
+    s.sim("abdu").fan = 1;
+    s.fanHolds = {
+      abdu: { deviceId: "abdu", originalFan: 7, lastSetFan: 1, heldAt: s.now },
+    };
+  };
+
+  it("restores a held fan once a peer drop makes room, without waiting out the ramp", () => {
+    const s = stall();
+    holdAbduFan(s);
+    s.turnOn("najat");
+    const rampEndsAt = s.now + 240_000;
+    s.advance(120); // Najat half-ramped: ~1.1A of her draw is on the meter
+
+    // The cuts that caused the hold also take load off the house, landing it
+    // BELOW the baseline Najat started against (the live shape).
+    s.setNonAc(4.4);
+    const dropAt = s.now;
+    s.advance(90);
+
+    const restore = s
+      .commandsSince(dropAt, "set_fan")
+      .find((e) => e.cmd.deviceId === "abdu" && e.cmd.kind === "set_fan" && e.cmd.fan === 7);
+    expect(restore).toBeDefined();
+    expect(restore!.at).toBeLessThan(rampEndsAt);
+  });
+
+  it("still refuses the fan while the ramping room's draw genuinely has not landed", () => {
+    // Same house, no peer drop: every amp Najat has committed is still arriving,
+    // so the fan stays held — the debit is doing its job (2026-07-26 trip #1).
+    const s = stall();
+    holdAbduFan(s);
+    s.turnOn("najat");
+    const t0 = s.now;
+    s.advance(180);
+    expect(s.commandsSince(t0, "set_fan")).toEqual([]);
+  });
+});

@@ -43,6 +43,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     ramping: false,
     startBaselineAmps: null,
     rampBaselineAmps: null,
+    rampAbsorbedAmps: null,
     reshedPenalized: false,
     ...overrides,
   };
@@ -579,6 +580,38 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       pacing: initialPacingState("gen"),
     });
     expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 2 }]);
+  });
+
+  it("keeps the absorption a peer reduction later masked (2026-07-27 fan stall)", () => {
+    // Live 16:47→16:53: Najat came on with the house at 14.3A and the meter had
+    // risen ~1.0A into her ramp by 16:49:21. The reducer then cut ~2.5A off two
+    // peers, landing the house 1.5A BELOW her baseline — instant absorption
+    // clamps to 0 and re-charges her whole 2.3A for the rest of the 240s window,
+    // which fenced the fan restore for 2 more minutes. The ratcheted peak keeps
+    // what the meter already proved arrived.
+    const acs = [
+      ac("najat", {
+        currentLevel: 1,
+        ramping: true,
+        rampBaselineAmps: 14.3,
+        rampAbsorbedAmps: 1.0,
+      }),
+    ];
+    expect(rampDebitAmps(acs, 12.8, liveCfg, "gen")).toBeCloseTo(1.3, 5);
+  });
+
+  it("uses the live rise while it is still climbing past the ratchet", () => {
+    const acs = [
+      ac("najat", { currentLevel: 1, ramping: true, rampBaselineAmps: 10.5, rampAbsorbedAmps: 0.4 }),
+    ];
+    expect(rampDebitAmps(acs, 12.0, liveCfg, "gen")).toBeCloseTo(0.8, 5); // 2.3 − 1.5 live
+  });
+
+  it("never lets a stale ratchet credit a baseline-less ramp", () => {
+    const acs = [
+      ac("najat", { currentLevel: 1, ramping: true, rampBaselineAmps: null, rampAbsorbedAmps: 2 }),
+    ];
+    expect(rampDebitAmps(acs, 99, liveCfg, "gen")).toBeCloseTo(2.3, 5);
   });
 
   it("a shed restore is charged the debit too, and says so", () => {
