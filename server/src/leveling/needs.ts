@@ -38,6 +38,19 @@ export function ceilOf(ac: AcView, nearBandC: number): number {
   return Math.max(floorOf(ac), Math.min(cap, ac.reachableCap ?? ac.maxLevel, ac.maxLevel));
 }
 
+/**
+ * The highest-DRAW level among candidates — for worst-case (envelope) pricing.
+ * Not `Math.max`: level 0 means "unrestricted", which draws MORE than L3, so a
+ * numeric max would silently under-price an unrestricted AC as if it were at
+ * whatever level happens to be in flight (`steadyDraw` treats 0 as base +
+ * step × maxLevel — see costs.ts).
+ */
+export function worstCaseLevel(levels: readonly number[]): number {
+  if (levels.length === 0) return 0;
+  if (levels.some((l) => l <= 0)) return 0;
+  return Math.max(...levels);
+}
+
 /** Never-level-0 re-entry ceiling: top commandable level under physics/user caps. */
 export function ceilCapOf(ac: AcView): number {
   return Math.max(

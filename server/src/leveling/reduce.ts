@@ -25,7 +25,7 @@ import type { AcView, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { fanTrimSavings, levelCutSavings, modelFor, steadyDraw } from "./costs.js";
-import { ceilCapOf, floorOf } from "./needs.js";
+import { ceilCapOf, ceilOf, floorOf } from "./needs.js";
 
 export interface ReductionWeights {
   shed: number;
@@ -157,6 +157,11 @@ export function planReduction(input: ReduceInput): ReducePlan {
     // Effective "from" for step counting & savings (level 0 = one above max).
     const effFrom = ac.currentLevel > 0 ? ac.currentLevel : ac.maxLevel + 1;
     const isTop = ac.deviceId === topId;
+    // The level this room's own need justifies. Levels above it are dormant
+    // capacity: giving them up costs the occupant nothing (see the surcharge
+    // bound below). `ceilOf` honours manualTarget, so a user-pinned room keeps
+    // its full protection.
+    const ceil = ceilOf(ac, config.nearTargetBandC);
     const model = modelFor(config, ac.deviceId, source);
     const baselineDraw = steadyDraw(effFrom, ac.maxLevel + 1, model);
 
@@ -194,7 +199,21 @@ export function planReduction(input: ReduceInput): ReducePlan {
         const fanDrop = fanChoice.target != null;
         let cost = steps * w.levelStep * needWeight(ac);
         if (fanDrop) cost += w.fan * needWeight(ac);
-        if (levelChanged && isTop) cost += w.topPriority;
+        // The top-priority surcharge protects a room's COMFORT, so it only
+        // applies where comfort is actually at stake — a move that lands at or
+        // above this AC's own need ceiling is giving up levels the near-target
+        // cap already says buy nothing (2026-06-11: "within 0.5°C of target it
+        // should not use more than L1").
+        //
+        // Without this bound the surcharge re-created, one tier down, the very
+        // complaint the 2026-06-13 "priority is a tiebreak, not a shed shield"
+        // decision fixed for sheds. Live 2026-07-28 16:06: Najat sat satisfied
+        // at L3 and was first in priority among the ON ACs (Abdullah was off,
+        // so she inherited the top slot); cutting her cost 17.5 + 25 = 42.5 vs
+        // 38.5 to cut Abdu — whose room was 1.9°C hot. The reducer took the
+        // amps from the hot room and left the dormant levels standing, twice
+        // more at 16:38 and 16:40.
+        if (levelChanged && isTop && level < ceil) cost += w.topPriority;
         moves.push({
           level,
           fanTarget: fanChoice.target,

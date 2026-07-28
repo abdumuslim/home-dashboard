@@ -16,6 +16,8 @@ import {
   reachableCapOf,
   shouldSendLevel,
   sweepExpiredMarks,
+  UNCONFIRMED_SEND_TTL_MS,
+  unconfirmedLevels,
   type ReconcilerState,
 } from "./reconciler.js";
 
@@ -171,5 +173,55 @@ describe("fan confirm-or-resend", () => {
     let s = noteFanSend(initialReconcilerState(), "a", 4, T);
     s = confirmFan(s, "a", 4);
     expect(fanResendDue(s, "a", 2, T + 60_000)).toBeNull();
+  });
+});
+
+describe("unconfirmed levels (physics-envelope pricing)", () => {
+  it("reports a level we sent and never saw confirm", () => {
+    const s = noteLevelSend(adopted(1), "a", 3, T).state;
+    expect(unconfirmedLevels(s, "a", T + 1_000)).toEqual([3]);
+  });
+
+  it("a confirm clears it", () => {
+    let s = noteLevelSend(adopted(1), "a", 3, T).state;
+    s = observeLevel(s, "a", 3, opts).state;
+    expect(unconfirmedLevels(s, "a", T + 1_000)).toEqual([]);
+  });
+
+  it("a LATER demote send does not erase the earlier unconfirmed raise", () => {
+    // 2026-07-28: an L3 sent at 15:39:49 was still unconfirmed 15.8 min later.
+    // `pendingLevel` is one slot — a demote overwrites it and the envelope
+    // would price the room a whole ton light. sendCounts keeps both.
+    let s = noteLevelSend(adopted(1), "a", 3, T).state;
+    s = noteLevelSend(s, "a", 1, T + 60_000).state;
+    expect(unconfirmedLevels(s, "a", T + 61_000).sort()).toEqual([1, 3]);
+    expect(s.a.pendingLevel).toBe(1); // the control-path slot did move
+  });
+
+  it("expires a send that outlived the TTL (no permanent phantom charge)", () => {
+    const s = noteLevelSend(adopted(1), "a", 3, T).state;
+    expect(unconfirmedLevels(s, "a", T + UNCONFIRMED_SEND_TTL_MS - 1_000)).toEqual([3]);
+    expect(unconfirmedLevels(s, "a", T + UNCONFIRMED_SEND_TTL_MS)).toEqual([]);
+  });
+
+  it("the TTL outlasts the worst observed confirm lag (≥15.8 min)", () => {
+    expect(UNCONFIRMED_SEND_TTL_MS).toBeGreaterThan(16 * 60_000);
+  });
+
+  it("excludes a level marked firmware-unreachable", () => {
+    let s = adopted(1);
+    for (let i = 0; i < UNREACHABLE_LEVEL_SENDS; i++) s = noteLevelSend(s, "a", 3, T + i * 60_000).state;
+    expect(unconfirmedLevels(s, "a", T + 4 * 60_000)).toEqual([]);
+  });
+
+  it("power-off, source change and a manual probe all clear it", () => {
+    const sent = noteLevelSend(adopted(1), "a", 3, T).state;
+    expect(unconfirmedLevels(clearOnPowerOff(sent, "a"), "a", T + 1_000)).toEqual([]);
+    expect(unconfirmedLevels(clearOnSourceChange(sent), "a", T + 1_000)).toEqual([]);
+    expect(unconfirmedLevels(clearMarksOnManual(sent, "a"), "a", T + 1_000)).toEqual([]);
+  });
+
+  it("is empty for an unknown device", () => {
+    expect(unconfirmedLevels(initialReconcilerState(), "nobody", T)).toEqual([]);
   });
 });

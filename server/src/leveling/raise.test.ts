@@ -45,7 +45,10 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     rampBaselineAmps: null,
     rampAbsorbedAmps: null,
     reshedPenalized: false,
+    satisfiedForMs: 0,
+    unmeteredJumpAmps: 0,
     ...overrides,
+    envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 1,
   };
 }
 
@@ -335,6 +338,53 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
     });
     expect(p.commands).toHaveLength(0);
     expect(p.decisions.some((d) => d.deviceId === "najat" && d.blockedBy === "physics envelope")).toBe(true);
+  });
+
+  it("2026-07-28 15:55 blind raise: prices a peer at its UNCONFIRMED level, not its stale shadow", () => {
+    // Live: Najat was sent L3 at 15:39:49; her shadow still said L2 at 15:55:36,
+    // so the envelope summed 9.3 (Abdu@L3 wanted) + 4.3 (Najat@L2 believed) =
+    // 13.6 ≤ 14.9 and ADMITTED the raise. By 16:06 her shadow flipped and the
+    // identical end-state was vetoed at 15.6 — after the raise had landed and
+    // produced an over_severe. envelopeLevel prices the worst case the firmware
+    // could be in, so the veto now happens BEFORE the breach.
+    // Najat is hot too, so there is nothing dormant to harvest from her — the
+    // only question is what Abdu is allowed to do against her real level.
+    const lagging = ac("najat", { currentLevel: 2, envelopeLevel: 3, needDelta: 2.7 });
+    const p = planRaise({
+      acs: [ac("abdu", { currentLevel: 2, needDelta: 3 }), lagging],
+      headroomAmps: 4.3,
+      smoothedAmps: 10.4,
+      rampDebitAmps: 0,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands.filter((c) => c.deviceId === "abdu")).toHaveLength(0);
+    const veto = p.decisions.find((d) => d.deviceId === "abdu" && d.blockedBy === "physics envelope");
+    expect(veto?.detail).toContain("15.6");
+  });
+
+  it("the same raise IS admitted when the peer's low level is genuinely confirmed", () => {
+    // Control for the case above: identical numbers, nothing in flight —
+    // 9.3 + 4.3 = 13.6, the exact envelope that admitted the live 15:55 raise.
+    const p = planRaise({
+      acs: [ac("abdu", { currentLevel: 2, needDelta: 3 }), ac("najat", { currentLevel: 2, needDelta: 0.3 })],
+      headroomAmps: 4.3,
+      smoothedAmps: 10.4,
+      rampDebitAmps: 0,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+    });
+    expect(p.commands).toEqual([{ deviceId: "abdu", kind: "set_level", level: 3 }]);
   });
 
   it("allows the same raise once a peer's cap comes down (end-state fits)", () => {
@@ -691,5 +741,134 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
     const blocked = p.decisions.find((d) => d.deviceId === "najat");
     expect(blocked?.blockedBy).toBe("no headroom");
     expect(blocked?.detail).toContain("ramping in");
+  });
+});
+
+// The 2026-07-28 evening state: Najat satisfied and parked at L3 holding 6.3A
+// of a 15A gen, Abdu's room 1.9°C hot and pinned at L1 because the envelope
+// says 9.3 + 6.3 = 15.6 > 14.9. Nothing ever reclaimed her dormant levels.
+describe("funding swap — dormant peer levels pay for a hot room", () => {
+  const liveCfg: LevelingConfigV2 = {
+    ...cfg,
+    genLimitAmps: 15,
+    genAmpModels: {
+      abdu: { baseAmps: 4.3, stepAmps: 2.5 },
+      najat: { baseAmps: 2.3, stepAmps: 2.0 },
+    },
+  };
+  const swap = (overrides: Partial<RaiseInput> = {}) =>
+    planRaise({
+      acs: [ac("najat", { currentLevel: 3, needDelta: 0.3 }), ac("abdu", { currentLevel: 2, needDelta: 1.9 })],
+      headroomAmps: 3.0,
+      smoothedAmps: 11.7,
+      rampDebitAmps: 0,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+      ...overrides,
+    });
+
+  it("envelope-blocked but meter-funded: demote and raise ship in ONE batch, cuts first", () => {
+    const p = swap();
+    expect(p.commands).toEqual([
+      { deviceId: "najat", kind: "set_level", level: 1 },
+      { deviceId: "abdu", kind: "set_level", level: 3 },
+    ]);
+    expect(p.cutAmps).toBeCloseTo(4.0, 5); // najat 6.3 → 2.3, model-priced
+    expect(p.decisions.some((d) => d.action.includes("funded by peer demote"))).toBe(true);
+  });
+
+  it("meter-blocked: the demote ships ALONE — never spend savings that have not landed", () => {
+    // Only 1.0A of real headroom; Abdu's L2→L3 needs 2.5A. Shipping both would
+    // commit ~16A on a breaker that tripped at 15.65A on 2026-07-26 while the
+    // satisfied compressor takes minutes to throttle down.
+    const p = swap({ headroomAmps: 1.0, smoothedAmps: 13.7 });
+    expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 1 }]);
+    expect(p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "awaiting demote")).toBe(true);
+  });
+
+  it("never harvests a manually pinned peer", () => {
+    const p = swap({
+      acs: [
+        ac("najat", { currentLevel: 3, needDelta: 0.3, manualTarget: 3 }),
+        ac("abdu", { currentLevel: 2, needDelta: 1.9 }),
+      ],
+    });
+    expect(p.commands.filter((c) => c.deviceId === "najat")).toHaveLength(0);
+    expect(p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "physics envelope")).toBe(true);
+  });
+
+  it("never harvests a peer that still needs its level", () => {
+    const p = swap({
+      acs: [
+        ac("najat", { currentLevel: 3, needDelta: 2.5 }),
+        ac("abdu", { currentLevel: 2, needDelta: 1.9 }),
+      ],
+    });
+    expect(p.commands.filter((c) => c.deviceId === "najat")).toHaveLength(0);
+  });
+
+  it("the swapped end-state is still envelope-checked", () => {
+    // Boost floor pins Najat at L2 (4.3A), so the best swap is 9.3 + 4.3 = 13.6
+    // ≤ 14.9 — allowed. Raise the floor to L3 and there is nothing to give.
+    const pinnedHigh = swap({
+      acs: [
+        ac("najat", { currentLevel: 3, needDelta: 0.3, minLevel: 3 }),
+        ac("abdu", { currentLevel: 2, needDelta: 1.9 }),
+      ],
+    });
+    expect(pinnedHigh.commands).toHaveLength(0);
+    expect(pinnedHigh.decisions.some((d) => d.blockedBy === "physics envelope")).toBe(true);
+  });
+});
+
+// 2026-07-26: Najat was raised L1→L2 and then L2→L3 just 35s apart, both
+// admitted against a meter that had absorbed almost none of the first jump —
+// a level raise never arms `ramping`, so nothing charged its committed draw.
+// The physics envelope can't cover this: it excludes non-AC load by design.
+describe("post-raise jump debit (2026-07-26 back-to-back raises)", () => {
+  it("charges an unabsorbed jump against the next spender", () => {
+    // The pipeline feeds rampDebitAmps() into planRaise, so compose them here
+    // exactly as the calm branch does.
+    const acs = [ac("a", { needDelta: 3, currentLevel: 2, unmeteredJumpAmps: 2.0 })];
+    const debit = rampDebitAmps(acs, 12.1, cfg, "gen");
+    expect(debit).toBeCloseTo(2.0, 5);
+    const p = raise(acs, { headroomAmps: 2.6, rampDebitAmps: debit });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions.some((d) => d.blockedBy === "no headroom")).toBe(true);
+  });
+
+  it("allows the next raise once the meter has absorbed the previous one", () => {
+    const acs = [ac("a", { needDelta: 3, currentLevel: 2, unmeteredJumpAmps: 0 })];
+    const p = raise(acs, { headroomAmps: 2.6, rampDebitAmps: rampDebitAmps(acs, 12.1, cfg, "gen") });
+    expect(p.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 3 }]);
+  });
+
+  it("does not double-charge an AC that is ALSO ramping (turn-on debit subsumes it)", () => {
+    // Ramping AC at L1: the turn-on debit already charges its whole 2A steady
+    // draw; adding the jump on top would charge the same amps twice.
+    const ramping = ac("a", {
+      needDelta: 3,
+      currentLevel: 1,
+      ramping: true,
+      rampBaselineAmps: 10.0,
+      rampAbsorbedAmps: 0,
+      unmeteredJumpAmps: 1.5,
+    });
+    expect(rampDebitAmps([ramping], 10.0, cfg, "gen")).toBeCloseTo(2.0, 5);
+  });
+
+  it("charges the jump for a non-ramping AC", () => {
+    const raised = ac("a", { currentLevel: 2, unmeteredJumpAmps: 1.5 });
+    expect(rampDebitAmps([raised], 10.0, cfg, "gen")).toBeCloseTo(1.5, 5);
+  });
+
+  it("ignores the jump for an off or shed AC", () => {
+    expect(rampDebitAmps([ac("a", { on: false, unmeteredJumpAmps: 1.5 })], 10.0, cfg, "gen")).toBe(0);
+    expect(rampDebitAmps([ac("a", { shed: true, on: false, unmeteredJumpAmps: 1.5 })], 10.0, cfg, "gen")).toBe(0);
   });
 });

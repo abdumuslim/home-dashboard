@@ -7,6 +7,7 @@ import {
   fanTrimSavings,
   learnedFor,
   levelCutSavings,
+  modelCutAmps,
   modelFor,
   raiseJumpAmps,
   restoreCostAmps,
@@ -135,5 +136,29 @@ describe("restoreCostAmps — ONE price for a shed room's return", () => {
     expect(restoreCostAmps(slam, cfg, "a", "gen", 1, 3, T, { gentle: false })).toEqual(
       turnOnAmps(slam, cfg, "a", "gen", 1, 3, T),
     );
+  });
+});
+
+describe("modelCutAmps — the collapse credit's conservative price", () => {
+  const cutCfg = { ...cfg, genAmpModels: { najat: { baseAmps: 2.3, stepAmps: 2.0 } } };
+
+  it("prices a level cut at the model steady delta, ignoring a bigger learned jump", () => {
+    const book = updateCost({}, "najat", "gen", "level:1>2", 3.6, T);
+    // The learned per-step jump (3.6 × 2 steps = 7.2A) is what the ADMISSION
+    // side would charge; the credit must stay at the model's 4.0A.
+    expect(levelCutSavings(book, cutCfg, "najat", "gen", 3, 1, 3, T)).toBeCloseTo(7.2, 5);
+    expect(modelCutAmps(cutCfg, "najat", "gen", 3, 1, 3)).toBeCloseTo(4.0, 5);
+  });
+
+  it("prices a shed at the whole modeled draw", () => {
+    expect(modelCutAmps(cutCfg, "najat", "gen", 3, null, 3)).toBeCloseTo(6.3, 5);
+  });
+
+  it("never returns a negative credit for an up-move", () => {
+    expect(modelCutAmps(cutCfg, "najat", "gen", 1, 3, 3)).toBe(0);
+  });
+
+  it("treats an unrestricted (level 0) AC as drawing more than L3", () => {
+    expect(modelCutAmps(cutCfg, "najat", "gen", 0, 3, 3)).toBeGreaterThan(0);
   });
 });

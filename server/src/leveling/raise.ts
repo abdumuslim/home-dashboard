@@ -11,7 +11,7 @@
 
 import type { AcView, Command, CostEstimate, Decision, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
-import { levelCutSavings, modelFor, raiseJumpAmps, restoreCostAmps, steadyDraw } from "./costs.js";
+import { levelCutSavings, modelCutAmps, modelFor, raiseJumpAmps, restoreCostAmps, steadyDraw } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { ceilCapOf, ceilOf, floorOf } from "./needs.js";
 import {
@@ -89,7 +89,13 @@ export function rampDebitAmps(
   source: Exclude<PowerSource, "none">,
 ): number {
   return acs.reduce((sum, ac) => {
-    if (!ac.on || !ac.managed || ac.shed || !ac.ramping) return sum;
+    if (!ac.on || !ac.managed || ac.shed) return sum;
+    if (!ac.ramping) {
+      // Not starting, but a recent level raise may still be arriving. Charged
+      // only here: a RAMPING AC is already charged its whole steady draw at its
+      // current (raised) level below, which subsumes the jump.
+      return sum + Math.max(0, ac.unmeteredJumpAmps);
+    }
     const committed = steadyDraw(ac.currentLevel, ac.maxLevel, modelFor(config, ac.deviceId, source));
     const absorbed =
       ac.rampBaselineAmps == null
@@ -173,6 +179,11 @@ export interface RaisePlan {
    * gentle=true so the freshly-on projection re-prices them identically.
    */
   probeRestoreIds: string[];
+  /**
+   * Model-priced total of any down-moves this plan emitted (funding demotes and
+   * restore peer floor-downs) — the collapse detector's credit.
+   */
+  cutAmps: number;
 }
 
 /**
@@ -206,6 +217,8 @@ export function planRaise(input: RaiseInput): RaisePlan {
   const decisions: Decision[] = [];
   const attempts: Array<{ deviceId: string; kind: "raise" | "restore" }> = [];
   const commands: Command[] = [];
+  /** Model-priced down-moves this plan emits (funding demotes, peer floor-downs). */
+  let cutAmps = 0;
 
   const onManaged = acs.filter((a) => a.on && a.managed && !a.shed);
 
@@ -219,7 +232,14 @@ export function planRaise(input: RaiseInput): RaisePlan {
       [
         ...onManaged.map((a) => ({
           deviceId: a.deviceId,
-          level: overrides[a.deviceId] ?? a.currentLevel,
+          // `envelopeLevel`, not `currentLevel`: the shadow confirms minutes
+          // late on some firmware, and a worst-case guard that prices a peer at
+          // a level we already commanded it away from is not a guard at all
+          // (2026-07-28 15:55:36 — Abdu L2→L3 admitted at a 13.6A envelope
+          // because Najat's L3, sent 16 min earlier, had not confirmed; the
+          // same end-state was vetoed at 15.6A once it did). An explicit
+          // override always wins — those are commanded end-states this batch.
+          level: overrides[a.deviceId] ?? a.envelopeLevel,
           maxLevel: a.maxLevel,
         })),
         ...(extra != null ? [extra] : []),
@@ -404,11 +424,14 @@ export function planRaise(input: RaiseInput): RaisePlan {
       commands.push(restoreCmd());
       attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
       decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}`, detail: probeDetail });
-      return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds };
+      return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps };
     }
     for (const a of onManaged) {
       const f = floorOf(a);
-      if (a.currentLevel > f) commands.push({ deviceId: a.deviceId, kind: "set_level", level: f });
+      if (a.currentLevel > f) {
+        commands.push({ deviceId: a.deviceId, kind: "set_level", level: f });
+        cutAmps += modelCutAmps(config, a.deviceId, source, a.currentLevel, f, a.maxLevel);
+      }
     }
     commands.push(restoreCmd());
     attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
@@ -418,7 +441,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       action: `restore @L${floor} with peer floor-downs`,
       detail: probeDetail,
     });
-    return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds };
+    return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps };
   }
 
   // A feasible restore is reserved but gated (backoff/calm) — park the ENTIRE
@@ -435,7 +458,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       blockedBy: "restore reservation",
       detail: `${reservedAmps.toFixed(1)}A reserved`,
     });
-    return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [] };
+    return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps };
   }
 
   // ---- Raise phase: one-step, meter-anchored, most-needy first ----
@@ -453,6 +476,27 @@ export function planRaise(input: RaiseInput): RaisePlan {
     .map((a) => ({ ac: a, ceil: ceilOf(a, config.nearTargetBandC) }))
     .filter(({ ac, ceil }) => ac.currentLevel < ceil)
     .sort((x, y) => y.ac.needDelta - x.ac.needDelta || acs.indexOf(x.ac) - acs.indexOf(y.ac));
+
+  /**
+   * Rooms parked above the level their own need justifies — dormant capacity a
+   * hot peer may reclaim. No dwell requirement here (unlike the idle demote): a
+   * room that is actually waiting on these amps is evidence enough. `ceilOf`
+   * honours manualTarget, so a user-pinned room is never harvested.
+   */
+  const harvestableFor = (raiser: AcView): Array<{ ac: AcView; ceil: number }> =>
+    onManaged
+      .filter((a) => a.deviceId !== raiser.deviceId && !a.ramping && a.currentLevel >= 1)
+      .map((a) => ({ ac: a, ceil: ceilOf(a, config.nearTargetBandC) }))
+      .filter(({ ac: peer, ceil }) => peer.currentLevel > ceil);
+
+  const emitDemotes = (peers: Array<{ ac: AcView; ceil: number }>): number => {
+    let cut = 0;
+    for (const { ac: peer, ceil } of peers) {
+      commands.push({ deviceId: peer.deviceId, kind: "set_level", level: ceil });
+      cut += modelCutAmps(config, peer.deviceId, source, peer.currentLevel, ceil, peer.maxLevel);
+    }
+    return cut;
+  };
 
   for (const { ac, ceil } of candidates) {
     // Grid turn-on full start (user directive "on grid start all to full"):
@@ -508,6 +552,52 @@ export function planRaise(input: RaiseInput): RaisePlan {
       const desired = target;
       while (target > ac.currentLevel && envelopeWith({ [ac.deviceId]: target }) > envelopeCeiling) target--;
       if (target === ac.currentLevel) {
+        // FUNDING SWAP, envelope-blocked case. The cap models object, but the
+        // METER may already hold the amps — and the peers standing in the way
+        // are satisfied, i.e. drawing well under the caps the envelope charges
+        // them for. Pull them to their own ceilings in the SAME batch and
+        // re-check the end-state.
+        //
+        // Same-batch is only sound here. When the meter itself is short (the
+        // branch below) the raise would be riding savings that have not landed,
+        // and a satisfied compressor can take minutes to throttle down — on a
+        // breaker that tripped at 15.65A on 2026-07-26 that is a real breach,
+        // not a modelling nicety.
+        const peers = harvestableFor(ac);
+        const swapOverrides: Record<string, number> = { [ac.deviceId]: desired };
+        for (const { ac: peer, ceil: peerCeil } of peers) swapOverrides[peer.deviceId] = peerCeil;
+        const swapJump = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, desired, ac.maxLevel, now);
+        if (peers.length > 0 && envelopeWith(swapOverrides) <= envelopeCeiling) {
+          if (swapJump.amps <= available) {
+            // The meter already holds the amps — only the cap models objected,
+            // and they are objecting about rooms that are satisfied (drawing
+            // well under the caps charged to them). Ship it as one batch.
+            cutAmps += emitDemotes(peers);
+            commands.push({ deviceId: ac.deviceId, kind: "set_level", level: desired });
+            attempts.push({ deviceId: ac.deviceId, kind: "raise" });
+            decisions.push({
+              at: now,
+              deviceId: ac.deviceId,
+              action: `raise L${ac.currentLevel}→L${desired} funded by peer demote`,
+              detail: `${peers.map((p) => `${p.ac.deviceId}→L${p.ceil}`).join(", ")}; ${swapJump.amps.toFixed(1)}A ${swapJump.confidence}`,
+            });
+            available -= swapJump.amps;
+            if (source === "gen") break;
+            continue;
+          }
+          // The swap fixes the envelope but the METER is short: free the amps
+          // now, raise in a later calm window once they have actually landed.
+          const freed = emitDemotes(peers);
+          cutAmps += freed;
+          decisions.push({
+            at: now,
+            deviceId: ac.deviceId,
+            action: `raise L${desired}`,
+            blockedBy: "awaiting demote",
+            detail: `freeing ~${freed.toFixed(1)}A from ${peers.map((p) => `${p.ac.deviceId}→L${p.ceil}`).join(", ")}`,
+          });
+          break;
+        }
         decisions.push({
           at: now,
           deviceId: ac.deviceId,
@@ -522,6 +612,26 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // A grid start was already admitted against its pre-start baseline — the
     // meter cannot price it while the compressor is still ramping.
     if (startTarget == null && jump.amps > available) {
+      // FUNDING SWAP, meter-blocked case: free the amps NOW, raise LATER.
+      // Deliberately not one batch — the credit for a demote is a prediction,
+      // and this room's raise is admissible only if that prediction is already
+      // true. Shipping both together would commit ~16A on a 15A generator for
+      // however long the demoted compressor takes to actually throttle down
+      // (seconds to minutes on this firmware). The raise follows in the next
+      // calm window, against a meter that has really fallen.
+      const peers = harvestableFor(ac);
+      if (peers.length > 0) {
+        const freed = emitDemotes(peers);
+        cutAmps += freed;
+        decisions.push({
+          at: now,
+          deviceId: ac.deviceId,
+          action: `raise L${target}`,
+          blockedBy: "awaiting demote",
+          detail: `freeing ~${freed.toFixed(1)}A from ${peers.map((p) => `${p.ac.deviceId}→L${p.ceil}`).join(", ")}`,
+        });
+        break;
+      }
       decisions.push({
         at: now,
         deviceId: ac.deviceId,
@@ -556,5 +666,5 @@ export function planRaise(input: RaiseInput): RaisePlan {
     if (source === "gen") break;
   }
 
-  return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [] };
+  return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps };
 }

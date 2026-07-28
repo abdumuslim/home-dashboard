@@ -14,7 +14,7 @@
 // Pure module: the CostBook is a plain immutable record; store.ts persists it
 // (table ac_leveling_costs) so learning survives deploys and config saves.
 
-import type { CostEstimate, CostTransition, LearnedCost, PowerSource } from "./types.js";
+import type { AcView, Command, CostEstimate, CostTransition, LearnedCost, PowerSource } from "./types.js";
 import type { AcAmpModel, LevelingConfigV2 } from "./config.js";
 
 /** EWMA weight of a new observation. */
@@ -180,6 +180,62 @@ export function levelCutSavings(
   now: number,
 ): number {
   return raiseJumpAmps(book, config, deviceId, source, to, from, maxLevel, now).amps;
+}
+
+/**
+ * Amps a commanded cut removes, priced at the MODEL steady delta ONLY —
+ * `to == null` means a power-off. This is the collapse detector's credit, NOT
+ * an admission number, and the two must be priced differently:
+ *
+ *  - `levelCutSavings` takes max(model, learned jump) because under-crediting a
+ *    reduction would leave the house over the limit — over-crediting there
+ *    self-corrects when the bucket re-fires.
+ *  - Here the failure is the opposite and it is silent. Every room this credit
+ *    is claimed for is one we chose to cut, typically a SATISFIED one, which by
+ *    definition draws below its cap; the learned book stores the largest jump
+ *    ever observed. Crediting that (Najat L3→L1 prices at 7.2A learned vs 4.0A
+ *    model vs a real fall nearer 2–3A) would let a genuine ~11A breaker trip
+ *    inside the 180s window read as "our own cut landing" and never latch.
+ *
+ * Trip-safe direction for a CREDIT is therefore the conservative one: model.
+ */
+export function modelCutAmps(
+  config: LevelingConfigV2,
+  deviceId: string,
+  source: PowerSource,
+  from: number,
+  to: number | null,
+  maxLevel: number,
+): number {
+  const model = modelFor(config, deviceId, source);
+  const fromDraw = steadyDraw(from, maxLevel, model);
+  const toDraw = to == null ? 0 : steadyDraw(to, maxLevel, model);
+  return Math.max(0, fromDraw - toDraw);
+}
+
+/**
+ * Model-priced total of everything a batch commands OFF the meter. Runs over
+ * the FINAL command list, so an up-move (a never-level-0 re-cap, a boost-floor
+ * lift, a raise bundled into a swap) simply contributes 0 — there is no way to
+ * accidentally credit a batch that adds load.
+ */
+export function commandedCutAmpsOf(
+  commands: readonly Command[],
+  acs: readonly AcView[],
+  config: LevelingConfigV2,
+  source: PowerSource,
+): number {
+  return commands.reduce((sum, cmd) => {
+    const ac = acs.find((a) => a.deviceId === cmd.deviceId);
+    if (ac == null) return sum;
+    if (cmd.kind === "power_off") {
+      return sum + modelCutAmps(config, ac.deviceId, source, ac.currentLevel, null, ac.maxLevel);
+    }
+    if (cmd.kind === "set_level") {
+      return sum + modelCutAmps(config, ac.deviceId, source, ac.currentLevel, cmd.level, ac.maxLevel);
+    }
+    return sum;
+  }, 0);
 }
 
 /** Savings credited to a fan trim of `steps` gears (small — fans are trim, not levers). */

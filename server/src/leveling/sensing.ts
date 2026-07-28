@@ -418,5 +418,6 @@ export function meterView(state: MeterState, now: number): MeterView {
     overLimitReadings: state.overLimitReadings,
     collapsed: state.collapse != null,
     frozen: state.frozen,
+    commandedCutCreditAmps: pendingCutCredit(state, now),
   };
 }

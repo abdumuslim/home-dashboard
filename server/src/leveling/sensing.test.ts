@@ -207,6 +207,24 @@ describe("commanded-cut credit (self-inflicted collapse suppression)", () => {
     expect(r.state.derate?.amps).toBe(COLLAPSE_DERATE_AMPS);
   });
 
+  it("a MODEL-priced demote credit cannot launder a real trip (learned pricing would)", () => {
+    // The loaded-spring demote cuts SATISFIED rooms — rooms that by definition
+    // draw below their cap — so the learned book's largest-ever jump wildly
+    // over-states what the meter will actually lose (Najat L3→L1: 7.2A learned,
+    // 4.0A model, ~2–3A real). Here a genuine breaker trip takes 11A while that
+    // credit is live:
+    //   model  4.0 → unexplained 13.5 − 2.5 − 4.0 = 7.0 ≥ 6 → LATCHES (correct)
+    //   learned 7.2 → unexplained             = 3.8 <  6 → suppressed (silent)
+    const steady = feedGen([13.5, 13.6, 13.4, 13.5]);
+    const modelPriced = noteCommandedCut(steady.state, 4.0, steady.now);
+    const real = ingestReading(modelPriced, { gridAmps: 0, genAmps: 2.5 }, cfg, steady.now + 30_000);
+    expect(real.events.some((e) => e.kind === "collapse")).toBe(true);
+
+    const learnedPriced = noteCommandedCut(steady.state, 7.2, steady.now);
+    const masked = ingestReading(learnedPriced, { gridAmps: 0, genAmps: 2.5 }, cfg, steady.now + 30_000);
+    expect(masked.events.some((e) => e.kind === "collapse")).toBe(false);
+  });
+
   it("credit expires — a trip long after the shed is still a trip", () => {
     const steady = feedGen([11.5, 11.6, 11.4, 11.5]);
     const cut = noteCommandedCut(steady.state, 8, steady.now);

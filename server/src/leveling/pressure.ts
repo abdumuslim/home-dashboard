@@ -38,7 +38,22 @@ export function assessPressure(
   const limit = effectiveLimit(config, view.source, view.derateAmps);
 
   if (view.overLimitBudget <= 0 && view.overLimitReadings.length > 0) {
-    const required = requiredSavingsAmps(view, limit, config.marginAmps);
+    // Demand side of invariant 5: readings taken while a cut we already
+    // commanded is still landing describe a house that no longer exists. Only
+    // the part the in-flight cut does NOT already cover is still owed.
+    //
+    // Live 2026-07-28 16:38 and 16:40: the reducer cut a room, the bucket
+    // refilled on the act and drained again ~30-60s later on readings the
+    // stopped compressor had not yet left, and the second pass — finding that
+    // room already commanded — took the amps out of the HOT room instead.
+    //
+    // The EXTREME tier (which forces a shed) keys off the credited figure for
+    // the same reason — escalating to a shed for amps already on their way out
+    // is the double-cut this fixes. The SEVERE tier still keys off the raw
+    // readings, and the credit both expires (PENDING_CUT_MS) and is spent as
+    // the meter absorbs it, so a cut that never lands stops excusing anything.
+    const rawRequired = requiredSavingsAmps(view, limit, config.marginAmps);
+    const required = Math.max(0, rawRequired - view.commandedCutCreditAmps);
     const extremeAt = Math.max(EMERGENCY_SHED_OVERSHOOT_AMPS, EMERGENCY_SHED_OVERSHOOT_FRACTION * limit);
     const severity = required >= extremeAt
       ? "extreme"

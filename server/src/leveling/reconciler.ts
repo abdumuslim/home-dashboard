@@ -22,6 +22,15 @@ export const UNREACHABLE_LEVEL_SENDS = 4;
 export const UNREACHABLE_SAFETY_EXPIRY_MS = 60 * 60_000;
 /** Minimum spacing between re-sends of the same unconfirmed level. */
 export const LEVEL_RESEND_SPACING_MS = 30_000;
+/**
+ * How long an unconfirmed send keeps counting as "the firmware might be here"
+ * for envelope pricing. Must comfortably exceed the worst observed confirm lag:
+ * Najat's documented range is 5.8s–13min, and 2026-07-28 measured ≥15.8min (an
+ * L3 sent 15:39:49 was still unconfirmed at 15:55:36). Below that, the TTL
+ * would expire the very pending the envelope exists to charge for; above it,
+ * a permanently-unconfirmed send would inflate the envelope forever.
+ */
+export const UNCONFIRMED_SEND_TTL_MS = 25 * 60_000;
 export const FAN_RESEND_MAX = 2;
 export const FAN_RESEND_SPACING_MS = 15_000;
 
@@ -30,6 +39,13 @@ export interface ReconDevice {
   pendingLevel: number | null;
   /** Unconfirmed sends per level (flutter between two targets can't evade). */
   sendCounts: Readonly<Record<number, number>>;
+  /**
+   * When each unconfirmed level was last sent (parallel to `sendCounts`, same
+   * lifetime). Envelope pricing needs per-level timestamps: `lastLevelSentAt`
+   * only remembers the most recent send, and a demote sent after a raise must
+   * not make the raise's level look fresh — or expire it early.
+   */
+  sentAt: Readonly<Record<number, number>>;
   /** Firmware-unreachable marks: level → markedAt. */
   unreachable: Readonly<Record<number, number>>;
   lastLevelSentAt: number;
@@ -46,6 +62,7 @@ const EMPTY: ReconDevice = {
   confirmedLevel: null,
   pendingLevel: null,
   sendCounts: {},
+  sentAt: {},
   unreachable: {},
   lastLevelSentAt: 0,
   lastLevelSent: null,
@@ -97,6 +114,7 @@ export function observeLevel(
         confirmedLevel: obs,
         pendingLevel: null,
         sendCounts: {},
+        sentAt: {},
         unreachable,
       }),
       result: { kind: "landed", level: obs, unmarked },
@@ -118,6 +136,7 @@ export function observeLevel(
         confirmedLevel: obs,
         pendingLevel: null,
         sendCounts: {},
+        sentAt: {},
         unreachable,
       }),
       result: { kind: "late_confirm", level: obs },
@@ -171,6 +190,7 @@ export function noteLevelSend(
       ...d,
       pendingLevel: level,
       sendCounts: { ...d.sendCounts, [level]: count },
+      sentAt: { ...d.sentAt, [level]: now },
       unreachable,
       lastLevelSentAt: now,
       lastLevelSent: level,
@@ -220,6 +240,7 @@ export function clearOnPowerOff(state: ReconcilerState, deviceId: string): Recon
     confirmedLevel: null,
     pendingLevel: null,
     sendCounts: {},
+    sentAt: {},
     pendingFan: null,
     fanResends: 0,
   });
@@ -229,7 +250,15 @@ export function clearOnPowerOff(state: ReconcilerState, deviceId: string): Recon
 export function clearOnSourceChange(state: ReconcilerState): ReconcilerState {
   const next: Record<string, ReconDevice> = {};
   for (const [id, d] of Object.entries(state)) {
-    next[id] = { ...d, confirmedLevel: null, pendingLevel: null, sendCounts: {}, pendingFan: null, fanResends: 0 };
+    next[id] = {
+      ...d,
+      confirmedLevel: null,
+      pendingLevel: null,
+      sendCounts: {},
+      sentAt: {},
+      pendingFan: null,
+      fanResends: 0,
+    };
   }
   return next;
 }
@@ -237,7 +266,7 @@ export function clearOnSourceChange(state: ReconcilerState): ReconcilerState {
 /** A manual gen change is a user probe — unreachable marks reset (mirrors v1). */
 export function clearMarksOnManual(state: ReconcilerState, deviceId: string): ReconcilerState {
   const d = dev(state, deviceId);
-  return put(state, deviceId, { ...d, unreachable: {}, sendCounts: {} });
+  return put(state, deviceId, { ...d, unreachable: {}, sendCounts: {}, sentAt: {} });
 }
 
 // ---- fan confirm-or-resend (fan-trim holds) ----
@@ -275,6 +304,43 @@ export function confirmFan(state: ReconcilerState, deviceId: string, observedFan
 
 export function initialReconcilerState(): ReconcilerState {
   return {};
+}
+
+/**
+ * Every level the firmware might currently be sitting at because we sent it and
+ * never saw it confirm — for PHYSICS-ENVELOPE pricing, not for control.
+ *
+ * Deliberately NOT `pendingLevel`: that is a single slot overwritten by every
+ * send, so a demote sent to a satisfied room erases the memory of the raise
+ * that may still be in flight (2026-07-28: an L3 sent 15:39:49 was unconfirmed
+ * for ≥15.8 min; a demote landing in that window would have made the envelope
+ * price her a whole ton light and admitted a peer raise into a breach — the
+ * exact hole this pricing exists to close). `sendCounts` keeps ALL of them and
+ * is cleared wholesale on any confirm / power-off / source change / manual.
+ *
+ * Levels already marked firmware-unreachable are excluded: 4 unconfirmed sends
+ * is hard evidence the device is NOT taking that level, so charging for it
+ * would veto legitimate peer raises forever.
+ */
+export function unconfirmedLevels(state: ReconcilerState, deviceId: string, now: number): number[] {
+  return unconfirmedSends(state, deviceId, now).map((s) => s.level);
+}
+
+/** As `unconfirmedLevels`, keeping each send's timestamp (demote resend spacing). */
+export function unconfirmedSends(
+  state: ReconcilerState,
+  deviceId: string,
+  now: number,
+): Array<{ level: number; sentAt: number }> {
+  const d = dev(state, deviceId);
+  const sends: Array<{ level: number; sentAt: number }> = [];
+  for (const [levelStr, sentAt] of Object.entries(d.sentAt)) {
+    const level = Number(levelStr);
+    if (d.unreachable[level] != null) continue;
+    if (now - sentAt >= UNCONFIRMED_SEND_TTL_MS) continue;
+    sends.push({ level, sentAt });
+  }
+  return sends;
 }
 
 /** For status/AcView building. */

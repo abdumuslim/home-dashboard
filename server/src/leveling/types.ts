@@ -118,6 +118,14 @@ export interface MeterView {
    * sensing bucket would disagree about what "over" means.
    */
   derateAmps: number;
+  /**
+   * Load we have already COMMANDED off that the meter has not shown yet (the
+   * unabsorbed remainder of `MeterState.pendingCut`). The demand-side half of
+   * "a drop we commanded is not a breaker trip": while a cut is still landing,
+   * these amps are not outstanding load and must not be demanded a second time
+   * from another room.
+   */
+  commandedCutCreditAmps: number;
 }
 
 /** A single device command the pipeline wants executed. */
@@ -146,6 +154,17 @@ export interface Plan {
   commands: Command[];
   /** Expected meter delta of this batch (signed amps) at learned/model cost. */
   expectedDeltaAmps: number;
+  /**
+   * Amps this batch COMMANDS off the meter (sheds + level cuts), priced at the
+   * MODEL steady delta — always ≥ 0. The single input to `noteCommandedCut()`,
+   * so every batch shape that lowers load (reducer, demote, funding swap, and
+   * the peer floor-downs bundled into a restore) credits the collapse detector
+   * identically. Model-priced deliberately: the learned book stores the largest
+   * observed jump, and crediting that for a satisfied room — which by
+   * definition draws below its cap — would over-credit enough to mask a real
+   * breaker trip inside the pendingCut window.
+   */
+  commandedCutAmps: number;
   /** Earliest time the batch outcome may be graded (settle + slowest ramp end). */
   compareAfter: number;
   decisions: Decision[];
@@ -192,12 +211,37 @@ export interface AcView {
   maxLevel: number;
   /** Observed shadow generator level; 0 = unrestricted (never left there). */
   currentLevel: number;
+  /**
+   * The highest level this AC might ACTUALLY be drawing at right now: its
+   * confirmed shadow, or any level we sent and never saw confirm (whichever is
+   * larger). For PHYSICS-ENVELOPE pricing of PEERS only — control decisions
+   * still key off `currentLevel`, because a command in flight is not an
+   * observation (that distinction is what stops a lagging write minting a false
+   * manual intent).
+   *
+   * Why it exists: 2026-07-28 15:55:36 admitted Abdu L2→L3 at a 13.6A envelope
+   * because Najat's L3 (sent 15:39:49) had not confirmed yet; by 16:06 her
+   * shadow flipped and the identical end-state was vetoed at 15.6A — after the
+   * raise had already landed and produced an over_severe. The envelope is a
+   * worst-case physics guard, so it must price the worst case the firmware
+   * could be in, not the best case the shadow admits to.
+   */
+  envelopeLevel: number;
   /** Observed fan (0 = built-in auto); null when unknown. */
   fanSpeed: number | null;
   /** User touched the fan this episode — never trim it again until the episode ends. */
   fanExempt: boolean;
   /** °C above the target/satisfied point (≤0 = satisfied). Orders raises (desc) and sheds (asc). */
   needDelta: number;
+  /**
+   * How long this room has been CONTINUOUSLY satisfied (needDelta at or below
+   * the demote threshold), in ms; 0 when it is not satisfied right now. The
+   * dwell input to the loaded-spring demote — a room that merely dips into the
+   * band for one reading has not proven anything. Frozen (not accrued) while
+   * the temperature reading behind `needDelta` is stale, so a dead sensor
+   * cannot demote a live room.
+   */
+  satisfiedForMs: number;
   /** Boost floor (≥1; >1 when an outdoor-heat boost is active). */
   minLevel: number;
   manualCap: number | null;
@@ -245,6 +289,19 @@ export interface AcView {
    * 2026-07-27 (see rampDebitAmps).
    */
   rampAbsorbedAmps: number | null;
+  /**
+   * Amps a recent LEVEL RAISE of this AC committed that the meter has not shown
+   * yet (0 when none). The raise-side mirror of the turn-on ramp debit.
+   *
+   * A level raise never arms `ramping` — that flag is only for compressor
+   * starts — so nothing charged a raise's committed-but-unmetered jump, and the
+   * raise gate reopens ~35s later (30s settle + calm reset) while the meter has
+   * absorbed only part of it. That is the 2026-07-26 trip shape: Najat L1→L2
+   * then L2→L3 35s apart, both admitted against a meter still catching up. The
+   * physics envelope cannot cover it either, because it deliberately excludes
+   * non-AC load — on gen that load is the difference between fitting and not.
+   */
+  unmeteredJumpAmps: number;
   /** A recent restore of this AC failed (backoff live) — re-shedding it is penalized. */
   reshedPenalized: boolean;
 }

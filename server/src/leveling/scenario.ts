@@ -31,8 +31,9 @@ import {
 } from "./pacing.js";
 import type { FanHolds } from "./fan-trim.js";
 import type { CostBook } from "./costs.js";
-import { restoreCostAmps, turnOnAmps } from "./costs.js";
-import { ceilOf, floorOf } from "./needs.js";
+import { raiseJumpAmps, restoreCostAmps, turnOnAmps } from "./costs.js";
+import { ceilOf, floorOf, worstCaseLevel } from "./needs.js";
+import { DEMOTE_HYSTERESIS_C } from "./demote.js";
 
 export interface SimAcSetup {
   deviceId: string;
@@ -77,6 +78,15 @@ interface SimAc {
   /** What the cloud shadow reports (lags firmware). */
   shadowLevel: number;
   shadowLevelAt: number;
+  /**
+   * Levels commanded whose confirm we have not seen — the harness mirror of the
+   * reconciler's `sendCounts`, used to price the physics envelope at worst case.
+   * Cleared wholesale on any confirm / off / on / source change, exactly like
+   * the real reconciler.
+   */
+  sentLevels: number[];
+  /** When the most recent level command was sent (demote resend spacing). */
+  lastLevelSentAt: number;
   fan: number;
   turnedOnAt: number;
   demandAmps: number;
@@ -90,6 +100,10 @@ interface SimAc {
   rampAbsorbed: number;
   /** Compressor still spinning down after an off was sent (0 = already stopped). */
   drawingUntil: number;
+  /** Shell parity: a level RAISE's committed-but-unmetered amps (gen only). */
+  jumpDebit: { amps: number; baseline: number | null; absorbed: number; until: number } | null;
+  /** User-pinned level (manual wins over every automation ceiling). */
+  manualTarget: number | null;
 }
 
 const STEP_MS = 5_000;
@@ -108,6 +122,8 @@ export class Scenario {
   readonly events: Array<{ at: number; event: MeterEvent }> = [];
 
   private acs: SimAc[];
+  /** Shell parity: when each room's uninterrupted satisfied stretch began. */
+  private satisfiedSince = new Map<string, number>();
   private nonAcAmps: number;
   private line: "grid" | "gen" | "none";
   private lineDead = false;
@@ -149,6 +165,8 @@ export class Scenario {
       level: s.level ?? 1,
       shadowLevel: s.level ?? 1,
       shadowLevelAt: 0,
+      sentLevels: [],
+      lastLevelSentAt: 0,
       fan: s.fan ?? 3,
       turnedOnAt: 0,
       demandAmps: s.demandAmps,
@@ -158,6 +176,8 @@ export class Scenario {
       rampBaseline: null,
       rampAbsorbed: 0,
       drawingUntil: 0,
+      jumpDebit: null,
+      manualTarget: null,
     }));
   }
 
@@ -178,6 +198,12 @@ export class Scenario {
     const view = meterView(this.meterState, this.now);
     if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return;
     for (const ac of this.acs) {
+      if (ac.jumpDebit != null) {
+        if (ac.jumpDebit.until <= this.now) ac.jumpDebit = null;
+        else if (ac.jumpDebit.baseline != null) {
+          ac.jumpDebit.absorbed = Math.max(ac.jumpDebit.absorbed, view.smoothedAmps - ac.jumpDebit.baseline);
+        }
+      }
       if (ac.rampBaseline == null || !this.isRamping(ac)) continue;
       ac.rampAbsorbed = Math.max(ac.rampAbsorbed, view.smoothedAmps - ac.rampBaseline);
     }
@@ -197,7 +223,10 @@ export class Scenario {
     this.line = line;
     this.lineDead = false;
     // Baselines are amps on the old source; the entry mode owns the transition.
-    for (const ac of this.acs) ac.startBaseline = null;
+    for (const ac of this.acs) {
+      ac.startBaseline = null;
+      ac.sentLevels = []; // mirrors clearOnSourceChange
+    }
     if (line === "gen" || line === "grid") {
       // A real changeover restarts every running compressor.
       for (const ac of this.acs) if (ac.on) this.startRamp(ac);
@@ -213,6 +242,11 @@ export class Scenario {
   recoverLine(): void {
     this.lineDead = false;
     for (const ac of this.acs) if (ac.on) this.startRamp(ac);
+  }
+
+  /** The user pins a level from the dashboard — manual beats every need cap. */
+  pinLevel(deviceId: string, level: number | null): void {
+    this.sim(deviceId).manualTarget = level;
   }
 
   setDemand(deviceId: string, demandAmps: number, needDelta?: number): void {
@@ -320,6 +354,19 @@ export class Scenario {
     return Math.min(ac.demandAmps, cap) + fanExtra;
   }
 
+  /** Shell parity for the demote dwell clock (controller.satisfiedForMs). */
+  private trackSatisfied(ac: SimAc): void {
+    const satisfied =
+      ac.on && !ac.shed && ac.needDelta <= this.cfg.nearTargetBandC - DEMOTE_HYSTERESIS_C;
+    if (!satisfied) this.satisfiedSince.delete(ac.setup.deviceId);
+    else if (!this.satisfiedSince.has(ac.setup.deviceId)) this.satisfiedSince.set(ac.setup.deviceId, this.now);
+  }
+
+  private satisfiedForMs(ac: SimAc): number {
+    const since = this.satisfiedSince.get(ac.setup.deviceId);
+    return since == null ? 0 : this.now - since;
+  }
+
   private buildViews(): AcView[] {
     // Priority-sorted, like the controller shell will pass them (priority list
     // first, unknowns after in setup order).
@@ -333,6 +380,9 @@ export class Scenario {
     return sorted.map((ac) => {
       // Shadow lags firmware by confirmDelayMs.
       const observedLevel = this.now - ac.shadowLevelAt >= ac.setup.confirmDelayMs ? ac.level : ac.shadowLevel;
+      // Any confirm clears every unconfirmed send (reconciler parity).
+      if (ac.sentLevels.includes(observedLevel)) ac.sentLevels = [];
+      this.trackSatisfied(ac);
       return {
         deviceId: ac.setup.deviceId,
         name: ac.setup.name ?? ac.setup.deviceId,
@@ -341,12 +391,14 @@ export class Scenario {
         shed: ac.shed,
         maxLevel: 3,
         currentLevel: observedLevel,
+        envelopeLevel: worstCaseLevel([observedLevel, ...ac.sentLevels]),
         fanSpeed: ac.fan,
         fanExempt: false,
         needDelta: ac.needDelta,
+        satisfiedForMs: this.satisfiedForMs(ac),
         minLevel: ac.setup.minLevel ?? 1,
         manualCap: null,
-        manualTarget: null,
+        manualTarget: ac.manualTarget,
         slotCap: null,
         reachableCap: null,
         warmStartLevel: ac.warmStartLevel,
@@ -357,6 +409,10 @@ export class Scenario {
           ac.on && ac.startBaseline != null && ac.startBaseline.until > this.now
             ? ac.startBaseline.amps
             : null,
+        unmeteredJumpAmps:
+          ac.jumpDebit != null && ac.jumpDebit.until > this.now
+            ? Math.max(0, ac.jumpDebit.amps - ac.jumpDebit.absorbed)
+            : 0,
         reshedPenalized: reshedPenalized(this.pacing, ac.setup.deviceId, this.now),
       };
     });
@@ -368,6 +424,22 @@ export class Scenario {
       const ac = this.sim(cmd.deviceId);
       switch (cmd.kind) {
         case "set_level":
+          // Sent is sent — the envelope must charge for it even when the
+          // firmware ignores the level (that is precisely when it is unsafe to
+          // assume the device is where the shadow says).
+          ac.sentLevels.push(cmd.level);
+          ac.lastLevelSentAt = this.now;
+          if (this.line === "gen" && cmd.level > ac.shadowLevel && ac.shadowLevel >= 1) {
+            const view = meterView(this.meterState, this.now);
+            ac.jumpDebit = {
+              amps: raiseJumpAmps(this.book, this.cfg, ac.setup.deviceId, "gen", ac.shadowLevel, cmd.level, 3, this.now).amps,
+              baseline: view.sampleCount >= 2 && !view.frozen ? view.smoothedAmps : null,
+              absorbed: 0,
+              until: this.now + 240_000,
+            };
+          } else {
+            ac.jumpDebit = null;
+          }
           if (!(ac.setup.ignoreLevels ?? []).includes(cmd.level)) {
             ac.shadowLevel = ac.level; // shadow keeps the OLD level until confirm lag passes
             ac.level = cmd.level;
@@ -377,6 +449,7 @@ export class Scenario {
         case "power_off":
           ac.on = false;
           ac.shed = true;
+          ac.sentLevels = [];
           ac.warmStartLevel = null;
           ac.startBaseline = null;
           // The controller's model of the device flips now; the physical
@@ -389,6 +462,7 @@ export class Scenario {
           ac.level = cmd.level;
           ac.shadowLevel = cmd.level;
           ac.shadowLevelAt = 0;
+          ac.sentLevels = [];
           ac.drawingUntil = 0;
           this.startRamp(ac);
           // Gentle restore pins the fan; the hold itself rides in out.fanHolds
@@ -473,6 +547,10 @@ export class Scenario {
       pacing: this.pacing,
       fanHolds: this.fanHolds,
       projectedExtraAmps: this.pendingProjection ?? undefined,
+      inFlight: (deviceId) => {
+        const ac = this.acs.find((a) => a.setup.deviceId === deviceId);
+        return ac == null ? [] : ac.sentLevels.map((level) => ({ level, sentAt: ac.lastLevelSentAt }));
+      },
     });
     this.pendingProjection = null;
     this.plans.push(out);

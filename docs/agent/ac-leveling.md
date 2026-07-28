@@ -1,10 +1,10 @@
 ---
 type: Reference
 title: 'Smart AC Leveling & Per-AC Calibration'
-description: 'A ground-up rewrite lives in server/src/leveling/ (17 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands,…'
+description: 'A ground-up rewrite lives in server/src/leveling/ (18 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands,…'
 tags: [home, dashboard, claude-code, current]
 maintainer: claude-code
-timestamp: 2026-07-27
+timestamp: 2026-07-28
 ---
 
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
@@ -15,7 +15,7 @@ timestamp: 2026-07-27
 
 > **Status:** v2 is the **acting controller** (config `controller: "v2"` in `ac_leveling_config` row id=2). v1 (`ac-leveler.ts` + `ac-leveling.ts`) is kept only as the **instant rollback target** — flip the flag back to `"v1"` via `PUT /api/ac/leveling` and `docker compose restart` (v1's boot-once state is stale after v2 acted). After a ≥1-week soak, delete v1 and its tests and fold this section's history into the main doc. **Everything below the "TL;DR (v1)" divider documents v1 — historical, rollback-only.**
 
-A ground-up rewrite lives in **`server/src/leveling/`** (17 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
+A ground-up rewrite lives in **`server/src/leveling/`** (18 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
 **Two invariants added 2026-07-26 after three gen trips in 25 minutes — read the incident section
 before touching admission:** (a) the meter is NOT a valid budget anchor while a compressor is
@@ -28,6 +28,16 @@ reducing batch credits the meter with its own priced saving (`noteCommandedCut()
 latches only on the part of the fall that credit does NOT explain — otherwise shedding the last ACs
 on gen freezes the house for 5 min and derates the limit for a blackout that never happened. See the
 2026-07-28 incident section.
+
+**Three more added 2026-07-28 evening (the budget-hog incident — read that section before touching
+the envelope, the reducer's costs, or the demote):** (d) **the envelope prices peers at every level
+the firmware might be at** (`AcView.envelopeLevel` over the reconciler's unconfirmed `sendCounts`,
+NOT the single-slot `pendingLevel`) — a stale shadow admitted the raise that caused the 16:06
+over_severe; (e) **a satisfied room does not keep dormant levels** (`demote.ts`, the v1 "loaded
+spring", now built and running on BOTH sources), and its levels are cheap for the reducer to take
+(the `topPriority` surcharge applies only BELOW `ceilOf`); (f) **never spend a saving that has not
+landed** — the funding swap ships same-batch only when the METER already holds the amps, and a level
+raise now arms its own unmetered-jump debit (`AcView.unmeteredJumpAmps`) the way a turn-on does.
 
 **Key design (vs v1):** ONE graduated reducer at every severity (no separate mild/emergency planners); explicit mode machine NORMAL/SETTLING/FLOORS/COLLAPSED replaces ~15 latches (FLOORS arms on ANY entry into gen incl. cold start); **fans are last-resort trim only** (enumerable only at floor level; restore needs 5-min calm — v1 cut fans with level cuts available 57% of the time and bounced them at 61s median); one-step meter-anchored raises priced by a **persistent learned cost model** (`ac_leveling_costs` — per device × source × transition EWMA, survives deploys, config saves do NOT wipe it; explicit `POST /api/ac/leveling/costs/reset`); restore/raise retries use **evidence + capped backoff** (30s→2m→5m→15m — kills permanent strands); on gen only ONE raise command per batch; every batch is journaled + outcome-graded in **`ac_leveling_journal`** (`GET /api/ac/leveling/journal?hours=24` — durable forensics, docker logs rotate in ~1.5 days); single-actuator graded batches feed the cost model continuously. Hard rules all preserved (never level 0, manual wins, slot caps, boost floors, shed≠manual-off, warm restore, opt-out, collapse latch, leaky bucket, requireShed ≥ max(3A, 20%)).
 
@@ -509,6 +519,126 @@ compressor ramp" (2 — with the old 45 s window the sample was **0.30A**; witho
 > over ~4 honest samples. `POST /api/ac/leveling/costs/reset` only if faster convergence is wanted,
 > at the cost of the honest `on@L*` rows.
 
+### 2026-07-28 evening — the budget hog ("why is Najat on L3 while Abdu's room is hotter?")
+
+**The complaint (live, 15A gen):** Najat's AC sat at **L3** holding 6.3A with her room 0.5°C from
+target, while Abdu's room ran **1.9°C hot** and was pinned at **L1**. The user also asked why shed
+rooms "took too long" to come back that morning — that part proved to be physics, not a bug (see the
+note at the end).
+
+**Four causes, all confirmed from the journal:**
+
+1. **Nothing ever walked a satisfied room's level DOWN.** `ceilOf()` caps a room inside
+   `nearTargetBandC` at L1, but only the RAISE path and GRID_FULL ever consulted it; the reducer runs
+   solely when the meter is over the limit. This is v1's deferred **"loaded spring"** (see the v1
+   section below) — *not* a v2 regression: v2's `needs.ts` is a straight port of the same raise-only
+   ceiling.
+2. **The reducer taxed the hot room.** Cut cost is `steps × levelStep × (1 + needK·needDelta)` plus a
+   flat **+25 `topPriority`** for the first ON AC in priority order. With Abdullah's AC off, Najat
+   inherited that slot. 16:06:07, needing 1.1A: cutting Najat cost 17.5 + 25 = 42.5 vs 38.5 to cut
+   Abdu → **Abdu paid**, twice more at 16:38 and 16:40. That re-created, one tier down, the "priority
+   protects a cool room over a hot one" complaint the 2026-06-13 decision fixed for sheds.
+3. **The physics envelope priced peers at a STALE shadow.** `AcView.currentLevel` is the confirmed TCL
+   shadow (the `pendingLevel` substitution happens only in SETTLING, and `planRaise` never runs in
+   SETTLING). Najat's L3 was sent 15:39:49 and had not confirmed at 15:55:36, so the envelope summed
+   9.3 + **4.3** = 13.6 ≤ 14.9 and **admitted** Abdu's L2→L3; by 16:06:45 her shadow flipped and the
+   identical end-state was vetoed at 15.6. That blind raise is what produced the 16:06 over_severe.
+   Her firmware's documented confirm lag is 5.8s–13min; **≥15.8 min was observed here**.
+4. **The over-limit DEMAND side ignored in-flight cuts.** `requiredSavingsAmps` never subtracted the
+   live `pendingCut` credit, so while a laggy room's commanded cut was still landing the bucket
+   drained again and the second pass took the amps from the hot room.
+
+**Fixes (2026-07-28 evening; 811 server tests green, `tsc` clean):**
+
+1. **Envelope honesty — `AcView.envelopeLevel`.** Peers are priced at
+   `worstCaseLevel([confirmed, ...unconfirmedLevels(recon, id, now)])` (`needs.ts` `worstCaseLevel`
+   ranks level 0 = unrestricted as the HIGHEST draw). Deliberately **not** `pendingLevel`: that is a
+   single slot overwritten by every send, so a demote to a satisfied room would erase the memory of
+   the raise still in flight and re-open this exact hole. `sendCounts` keeps every unconfirmed level
+   and is cleared wholesale on any confirm / power-off / source change / manual probe. New per-level
+   `sentAt` timestamps drive `UNCONFIRMED_SEND_TTL_MS` (**25 min**, chosen to exceed the ≥15.8-min
+   observed lag), and unreachable-marked levels are excluded so 4 sends of "the firmware refuses this"
+   cannot veto peers forever. `currentLevel` semantics are untouched — a command in flight is still
+   not an observation, which is what stops a lagging write minting a false manual intent.
+2. **The loaded spring — `demote.ts` (`planIdleDemotes`).** A room that is `on && managed && !shed`,
+   not ramping, above `ceilOf`, and **continuously satisfied for `DEMOTE_DWELL_MS` (120s)** at
+   `needDelta ≤ nearTargetBandC − DEMOTE_HYSTERESIS_C (0.2)` is walked straight to its ceiling in ONE
+   command. Runs on **both sources** (user decision; the v1 sketch was gen-only) — on gen it frees
+   budget, on grid it stops paying for cooling nobody asked for. Never amps-triggered, so the reduce
+   trigger's "even 0.1A below → no reduction" rule is untouched. `ceilOf` honours `manualTarget`, so a
+   pinned room never demotes. Confirm-or-resend uses **`DEMOTE_RESEND_MS` (60s)**, deliberately slower
+   than `LEVEL_RESEND_SPACING_MS` (30s): every non-fan batch rewinds the SHARED calm clock, and these
+   are precisely the lag-prone rooms — a tight resend loop would starve the peer raise the demote
+   exists to fund.
+   **Pipeline precedence (calm branch):** raise-phase commands → *(restore reservation ⇒ nothing)* →
+   idle demotes → fan restore → idle. Idle demotes **park under a restore reservation** even though
+   they free amps: the reservation is waiting on the shared calm clock, and the restore's own
+   feasibility already prices peer floor-downs (floors ≤ ceilings).
+   *Stale-sensor note:* no explicit guard is needed. `needDelta` comes from `computeAcNeed`, which
+   maps a missing/zero `currentTemp` to delta 1 — above the demote threshold — so a dead room sensor
+   can never read as satisfied. A stale-but-plausible cloud reading is self-correcting and low-harm
+   (the outcome is an L1 cap, never an off).
+3. **Funding swap, SPLIT BY BLOCKER (`raise.ts`).** When the most-needy raise is blocked and a peer
+   sits above its own ceiling (no dwell needed — a hot peer is evidence enough):
+   - *envelope-blocked but the meter already holds the amps* → **same batch**: demotes first, then the
+     one raise, with the swapped end-state re-checked against the envelope;
+   - *the meter itself is short* → **demote ALONE**; the raise follows a later calm window against a
+     meter that has actually fallen.
+   The split is the safety property: a demote credit is a *prediction*, and a satisfied compressor can
+   take minutes to throttle down — shipping both together would commit ~16A on a breaker that tripped
+   at **15.65A** on 2026-07-26. Peers are never cut BELOW their own ceiling to fund a raise (only
+   restores may pull peers to floors).
+4. **Ceiling-aware reduction cost (`reduce.ts`).** The +25 `topPriority` surcharge now applies only
+   when the move ends **below** that AC's `ceilOf` — levels above it are dormant capacity the
+   near-target decision already says buy nothing. `needK` weighting is unchanged, so it still breaks
+   ties between two above-ceiling rooms. Nothing else in the cost model moved.
+5. **One honest commanded-cut credit — `Plan.commandedCutAmps`.** Populated by EVERY batch shape that
+   lowers load (reducer, demote, funding swap, and the peer floor-downs bundled into a restore) and
+   priced at the **MODEL steady delta** (`costs.ts` `modelCutAmps`), never `max(model, learned)`. It
+   replaced the controller's `expectedDeltaAmps < 0` test, which missed every batch whose cuts and
+   turn-on cancelled to a net 0 — the restore-with-floor-downs shape. Model pricing is load-bearing:
+   the rooms this credits are satisfied (drawing below their caps), and Najat's L3→L1 prices at 7.2A
+   learned vs 4.0A model; with the learned figure a genuine 11A cliff computes as 3.8A unexplained and
+   **silently fails to latch** a real collapse.
+6. **Demand-side credit (`pressure.ts`).** `requiredAmps = max(0, raw − commandedCutCreditAmps)`
+   (`MeterView.commandedCutCreditAmps`, from the live `pendingCut` remainder). The EXTREME tier keys
+   off the credited figure too — escalating to a forced shed for amps already on their way out is the
+   double-cut being fixed; SEVERE still keys off the raw readings, and the credit expires
+   (`PENDING_CUT_MS`) and is spent as the meter absorbs it.
+7. **Post-raise jump debit (`AcView.unmeteredJumpAmps`, gen only).** A level raise never arms
+   `ramping` (that flag is for compressor starts), so nothing charged a raise's committed-but-unmetered
+   jump and the raise gate reopened ~35s later against a meter still catching up — the 2026-07-26 trip
+   shape, which the envelope cannot cover because it excludes non-AC load by design. The controller now
+   arms `{amps: priced jump, baseline, absorbed, until: +AC_RAMP_MS}` on each gen `set_level` UP,
+   ratchets absorption on the ESP cadence beside the ramp ratchet, and `rampDebitAmps` charges the
+   residual — but only for a NON-ramping AC, since a ramping one is already charged its whole steady
+   draw at the raised level.
+
+**Interaction worth knowing:** a fan restore now waits behind a fresh raise's jump debit (pinned by the
+fan-trim scenario, which moved from ~100s to ~275s). That is deliberate — fan restores riding phantom
+budget behind raises is exactly the 2026-07-26 trip.
+
+**On "the shed rooms took too long" (07:18–07:29 that morning):** not a bug. With both ACs off the
+meter still read ~12.3A of NON-AC house load on a 15A generator, so Abdu's 4.3A floor draw could not
+fit (12.3 + 4.3 = 16.6 > 14.9) while Najat's 2.3A probe could — she was restored in 60s, correctly.
+The 07:23:35 COLLAPSED latch was substantially legitimate (the meter fell a further ~7A with every AC
+already off — a real load cliff before the 07:29 grid changeover), and it predates that morning's
+phantom-collapse fix. Post-fix evidence the fix works: 16:31:44 shed Abdu = a −11.4A commanded cliff
+with **no latch**, restored 39s later.
+
+**Tests (each mutation-verified failing-first):** `reconciler.test.ts` unconfirmed-levels suite (8,
+incl. "a LATER demote send does not erase the earlier unconfirmed raise") · `raise.test.ts` "2026-07-28
+15:55 blind raise" + funding-swap suite (5) + jump-debit suite (5) · `reduce.test.ts` "2026-07-28 16:06
+replay" (3) · `demote.test.ts` (12) · `pipeline.test.ts` commandedCutAmps (4) + demote precedence (4) ·
+`pressure.test.ts` demand-side credit (4) · `sensing.test.ts` "a MODEL-priced demote credit cannot
+launder a real trip" · `scenarios.test.ts` "2026-07-28 evening budget hog" (5).
+
+**User decisions this session (don't re-litigate):**
+- **Demote runs on BOTH sources** — supersedes the v1 sketch's gen-only scoping. Grid demote is
+  consistent with GRID_FULL, which already clamps satisfied rooms to L1 at grid entry.
+- **Funding swap splits by blocker** — same-batch only when the meter already holds the amps. The user
+  chose this over unconditional same-batch after seeing the 15.65A trip math.
+
 ---
 
 ---
@@ -723,7 +853,7 @@ Three fixes (the "loaded spring" fix — a gen-only dormant-cap step-down for a 
 - **Fix 3 — force a shed at extreme overshoot (`ac-leveling.ts`, user-approved).** New `EMERGENCY_SHED_OVERSHOOT_AMPS` (3) / `EMERGENCY_SHED_OVERSHOOT_FRACTION` (0.2). `computeEmergencyReduction` sets `requireShed = required ≥ max(3, 0.2×limit)` (**3A/~20% on the 15A gen, 6A/20% on the 30A grid** — a flat 3A would force sheds at 10% overload on grid, contradicting the 2026-06-18 "a level-down beats a premature shed" rule). `selectReduction` gains a `requireShed` option: a covering plan that sheds NOTHING is treated as INFEASIBLE, so the lexicographic search escalates to the least-disruptive plan with ≥1 AC OFF (most-*satisfied* room first via the existing `shedNeed` ordering). Rationale: a compressor OFF removes its draw with certainty and near-instantly; a level cut only lowers a firmware cap the compressor throttles down to over seconds — too slow at 40% overload. The normal over-budget path (`fromFloor`) never passes `requireShed`; every invariant (never-level-0, manual-off pre-filter, anti-stacking discount) is preserved.
 - **Fix 4 — no manual-intent minting while a power collapse is latched (`ac-leveler.ts`).** In the shadow-drift loop, when `this.powerCollapse != null` the observation is re-adopted as `confirmedLevel` and the loop `continue`s — NO `manualCap`/`manualTarget` stamping (mirrors the obs-0 branch). `pendingLevel` is **kept** so a command that lands after recovery still confirms with no intent. Fixes the false "target L3" minted from a dead device's stuck shadow mid-trip. The real trigger is a **post-restart shadow jump**: the emergency confirmed low levels (so `pendingLevel` was already cleared), the breaker tripped, and the compressors restarted at their higher firmware defaults → `obs > confirmedLevel` → a bogus "external increment". Because the false mint happens *after* `pendingLevel` is gone, a `pendingLevel`-gated narrowing would miss it — the suppression must be broad (all managed devices while latched).
   - **Known limit (accepted tradeoff, flagged in review):** the collapse latch also fires on a **leveler-induced** big shed that lands the meter ≤ `POWER_COLLAPSE_FLOOR_AMPS` (5A) — documented as benign under "Anti-cycle + trip-guard hardening". In that sub-case the *surviving* AC(s) are still live, so a genuine **manual** gen-level change on a survivor during the ≤5-min latch is silently dropped (re-adopted as the new baseline, so it isn't re-detected after the latch clears) — a narrow violation of "manual wins" (AGENTS rule 7). It is NOT a breaker-safety issue (the allocator keeps pursuing the budget-fit target). A precise fix needs a dead-vs-alive-AC discriminator that isn't derivable from the single total-current meter, so it's left as-is; revisit if the leveler ever gains per-AC current sensing.
-- **DEFERRED — gen dormant-cap step-down ("loaded spring").** The meter-anchored fill (2026-06-21) makes "keep at current level" FREE while the meter has room, so a *satisfied* (cooled) room can hold a high unexercised gen cap (e.g. L3 ≈ 9A) whose compressor may exercise it the moment demand returns, surging past the limit before anything reacts. Sketch (gen-only): a one-term change in the reduce-ship gate (`ac-leveling.ts` `desiredLevels` loop) — a satisfied room (`needDelta ≤ nearTargetBandC`, no manual pin) steps its unexercised cap down to its need cap even without an over-limit streak (like `startAtFloors`); grid untouched; demanding rooms keep the free re-fill. **Not built** (user chose "ship the rest first"); revisit after observing the shipped fixes live. Note: in THIS incident Abdullah was demanding, so Fix 1 (not this) is the incident fix — the spring fix closes the adjacent class.
+- **DEFERRED — gen dormant-cap step-down ("loaded spring").** The meter-anchored fill (2026-06-21) makes "keep at current level" FREE while the meter has room, so a *satisfied* (cooled) room can hold a high unexercised gen cap (e.g. L3 ≈ 9A) whose compressor may exercise it the moment demand returns, surging past the limit before anything reacts. Sketch (gen-only): a one-term change in the reduce-ship gate (`ac-leveling.ts` `desiredLevels` loop) — a satisfied room (`needDelta ≤ nearTargetBandC`, no manual pin) steps its unexercised cap down to its need cap even without an over-limit streak (like `startAtFloors`); grid untouched; demanding rooms keep the free re-fill. **Not built in v1** (user chose "ship the rest first"); revisit after observing the shipped fixes live. → **BUILT IN v2 on 2026-07-28** as `server/src/leveling/demote.ts` (`planIdleDemotes`), with a dwell + hysteresis dead zone and on BOTH sources — see "2026-07-28 evening — the budget hog" in the v2 section. Note: in THIS incident Abdullah was demanding, so Fix 1 (not this) is the incident fix — the spring fix closes the adjacent class.
 - **Tests:** `collector.test.ts` "cold start into gen enforces floors" (fake-timer: floors an L3 AC on the first none→gen tick, re-asserts until confirm, resumes the climb; arms+self-clears at floor) + emergency-describe "cold start … does not lose the floor arming" (emergency early-return keeps the arm); `ac-leveling.test.ts` `computeEmergencyReduction` extreme-overshoot forces a shed / stays cuts-only below threshold / threshold scales 20% on grid; `collector.test.ts` power-collapse "does not mint a manual intent from a stuck shadow while latched, resumes after recovery". Existing steady-state gen tests were pre-seated onto gen (`primeGenSource` pokes `lastSource`, so their first reading isn't a cold start) and the two emergency meter-sizing tests were moved to grid (same amp model, +15A into `nonAcLoad`) to stay below the 6A grid shed threshold. **464 server tests green; server `tsc` clean.**
 
 ## Turn-on ramp window (`AC_RAMP_MS` 240s)
@@ -923,6 +1053,10 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
 | `raiseBufferAmps` (config) | 1A default (0–10 validated) | Raise-side hysteresis deadband; fills/restores use `budget − buffer`; clamps negative to 0 |
 | `comfortTargetC` (config) | 26°C default | Need target for ACs without an automation |
 | `nearTargetBandC` (config) | 0.5°C default (0–5 validated) | Near-target band: needDelta ≤ band → hard L1 cap; above → budget decides (no mild cap) |
+| `DEMOTE_HYSTERESIS_C` (v2 `demote.ts`) | 0.2°C | Demote fires at `needDelta ≤ nearTargetBandC − this`; the gap to the band is the anti-bounce dead zone (2 sensor LSBs) |
+| `DEMOTE_DWELL_MS` (v2 `demote.ts`) | 120 s | How long satisfaction must hold CONTINUOUSLY before a level is reclaimed |
+| `DEMOTE_RESEND_MS` (v2 `demote.ts`) | 60 s | Demote confirm-or-resend spacing — slower than `LEVEL_RESEND_SPACING_MS` so a lagging room can't rewind the shared calm clock |
+| `UNCONFIRMED_SEND_TTL_MS` (v2 `reconciler.ts`) | 25 min | How long an unconfirmed send keeps inflating the physics envelope (> the ≥15.8-min observed confirm lag) |
 | Source detection threshold | 0.1A | Line counts as active above this; larger line wins |
 | `AC_RAMP_MS` | **240s** (was 30s → 90s 2026-06-07 → 240s 2026-06-09) | Turn-on/changeover compressor ramp window; ramping AC's estimate not subtracted from measured |
 | `SETTLE_MS` | 30s | Post-command settle window for level/power batches; raises blocked inside it (unchanged 2026-06-09 — growing it would freeze the loop) |

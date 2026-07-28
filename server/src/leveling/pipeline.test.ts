@@ -6,6 +6,7 @@ import { describe, it, expect } from "vitest";
 import { plan, type PlanInput } from "./pipeline.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
 import { initialPacingState } from "./pacing.js";
+import { updateCost } from "./costs.js";
 import type { AcView, Command, MeterView } from "./types.js";
 
 const T = 1_000_000;
@@ -44,7 +45,10 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     rampBaselineAmps: null,
     rampAbsorbedAmps: null,
     reshedPenalized: false,
+    satisfiedForMs: 0,
+    unmeteredJumpAmps: 0,
     ...overrides,
+    envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 2,
   };
 }
 
@@ -60,6 +64,7 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     collapsed: false,
     frozen: false,
     derateAmps: 0,
+    commandedCutCreditAmps: 0,
     ...overrides,
   };
 }
@@ -199,5 +204,92 @@ describe("ramp debit fencing (2026-07-26 gen trip #1)", () => {
       meter({ smoothedAmps: 14.2, calmMs: 300_000, derateAmps: 1, overLimitBudget: 0, overLimitReadings: [14.2, 14.3] }),
     );
     expect(derated.reason).toMatch(/^over/);
+  });
+});
+
+describe("commandedCutAmps — the single collapse-credit source", () => {
+  it("an over-limit batch reports its cuts at MODEL price, not the learned jump", () => {
+    // a: base 2 step 2 → L3 6.0, L2 4.0. One step down = 2.0A of model.
+    // The learned book says the 2>3 jump was 5.5A; crediting THAT would let a
+    // real cliff hide behind our own cut.
+    const book = updateCost({}, "a", "gen", "level:2>3", 5.5, T);
+    const out = run([ac("a", { currentLevel: 3, needDelta: 2 })], overMeter([15.5]), { book });
+    expect(levelsFor(out.commands, "a")).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+    expect(out.commandedCutAmps).toBeCloseTo(2.0, 5);
+  });
+
+  it("a shed is credited its whole modeled draw", () => {
+    const out = run([ac("a", { currentLevel: 3, needDelta: 0 }), ac("b", { currentLevel: 1, needDelta: 4 })], overMeter([19, 19.5]));
+    expect(out.commands.some((c) => c.kind === "power_off" && c.deviceId === "a")).toBe(true);
+    expect(out.commandedCutAmps).toBeGreaterThanOrEqual(6.0);
+  });
+
+  it("a pure raise batch credits nothing (an up-move can never claim a cut)", () => {
+    const out = run([ac("a", { currentLevel: 1, needDelta: 3 })], meter({ smoothedAmps: 4, calmMs: 300_000 }));
+    expect(out.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+    expect(out.commandedCutAmps).toBe(0);
+  });
+
+  it("a restore that pulls a peer to floors credits the peer's cut (was invisible before)", () => {
+    // b is shed and can only return if a comes down; that batch reports a NET
+    // delta of 0, so the old `expectedDeltaAmps < 0` credit never fired for it.
+    const out = run(
+      [ac("a", { currentLevel: 3, needDelta: 0.2 }), ac("b", { on: false, shed: true, currentLevel: 1, needDelta: 5 })],
+      // 13.5 + b's 2.0 turn-on = 15.5 > the restore ceiling, so the restore is
+      // only feasible if a comes down to its floor first.
+      meter({ smoothedAmps: 13.5, calmMs: 300_000 }),
+    );
+    const cut = out.commands.find((c) => c.kind === "set_level" && c.deviceId === "a");
+    const restore = out.commands.find((c) => c.kind === "power_on" && c.deviceId === "b");
+    expect(cut).toBeDefined();
+    expect(restore).toBeDefined();
+    expect(out.expectedDeltaAmps).toBe(0); // net-zero on paper — the old blind spot
+    expect(out.commandedCutAmps).toBeGreaterThan(0);
+  });
+});
+
+describe("idle demote precedence in the calm branch", () => {
+  const satisfied = (id: string, o: Partial<AcView> = {}) =>
+    ac(id, { currentLevel: 3, needDelta: 0.2, satisfiedForMs: 300_000, fanSpeed: 1, ...o });
+
+  it("reclaims a satisfied room's dormant levels when there is nothing to raise", () => {
+    const out = run([satisfied("a")], meter({ smoothedAmps: 6, calmMs: 300_000 }));
+    expect(out.reason).toBe("demote");
+    expect(out.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 1 }]);
+    expect(out.commandedCutAmps).toBeGreaterThan(0);
+  });
+
+  it("a raise wins the batch — funding demotes ride with it, not against it", () => {
+    const out = run(
+      [satisfied("a"), ac("b", { currentLevel: 1, needDelta: 3 })],
+      meter({ smoothedAmps: 6, calmMs: 300_000 }),
+    );
+    expect(out.reason).toBe("raise");
+    expect(out.commands.some((c) => c.kind === "set_level" && c.deviceId === "b" && c.level === 2)).toBe(true);
+  });
+
+  it("PARKS under a restore reservation — a demote batch would rewind the shared calm clock", () => {
+    // b is shed and its restore is gated by calm, so it reserves amps. Even
+    // though demoting a would FREE amps, churning here re-arms the calm gate
+    // the parked restore is counting down.
+    const out = run(
+      [satisfied("a"), ac("b", { on: false, shed: true, currentLevel: 1, needDelta: 5 })],
+      meter({ smoothedAmps: 13.5, calmMs: 1_000 }),
+    );
+    expect(out.decisions.some((d) => d.blockedBy === "restore reservation")).toBe(true);
+    expect(out.commands.filter((c) => c.kind === "set_level" && c.deviceId === "a")).toHaveLength(0);
+    expect(out.reason).not.toBe("demote");
+  });
+
+  it("outranks a fan restore (dormant compressor levels are the cheaper amps)", () => {
+    const held = { a: { deviceId: "a", originalFan: 0, lastSetFan: 1, heldAt: T - 600_000 } };
+    const m = meter({ smoothedAmps: 6, calmMs: 600_000 });
+    // Control: with nothing to demote, that same hold DOES produce a fan step —
+    // so the assertion below is a real ordering, not an absent alternative.
+    const fanOnly = run([ac("a", { currentLevel: 1, fanSpeed: 1, needDelta: 0 })], m, { fanHolds: held });
+    expect(fanOnly.reason).toBe("fan_restore");
+
+    const out = run([satisfied("a")], m, { fanHolds: held });
+    expect(out.reason).toBe("demote");
   });
 });

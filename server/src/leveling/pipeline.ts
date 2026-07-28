@@ -12,11 +12,13 @@ import type { AcView, Command, Decision, MeterView, Mode, Plan, Severity } from 
 import type { LevelingConfigV2 } from "./config.js";
 import { effectiveLimit } from "./config.js";
 import type { CostBook } from "./costs.js";
+import { commandedCutAmpsOf } from "./costs.js";
 import { assessPressure } from "./pressure.js";
 import { planReduction } from "./reduce.js";
 import { invariantCorrections, planRaise, rampDebitAmps } from "./raise.js";
 import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
 import { ceilOf, floorOf } from "./needs.js";
+import { planIdleDemotes } from "./demote.js";
 import { attemptedWithin, canAttempt, RESTORE_CONFIRM_WAIT_MS, type PacingState } from "./pacing.js";
 
 /** Outcome-grading delays: when the batch's meter effect is judged. */
@@ -36,6 +38,13 @@ export interface PlanInput {
   fanHolds: FanHolds;
   /** Proactive projection extra (an AC just turned on near the limit). */
   projectedExtraAmps?: number;
+  /**
+   * Levels commanded to a device whose confirm has not been observed yet, with
+   * their send times — the reconciler's view, injected so the pipeline stays
+   * pure. Used for demote confirm-or-resend spacing. Defaults to "nothing in
+   * flight" when the caller does not supply it.
+   */
+  inFlight?: (deviceId: string) => ReadonlyArray<{ level: number; sentAt: number }>;
 }
 
 export interface PlanOutput extends Plan {
@@ -70,6 +79,7 @@ function emptyPlan(input: PlanInput, reason: string, decisions: Decision[] = [])
   return {
     commands: [],
     expectedDeltaAmps: 0,
+    commandedCutAmps: 0,
     compareAfter: 0,
     decisions,
     reason,
@@ -193,9 +203,11 @@ export function plan(input: PlanInput): PlanOutput {
         : []),
       ...corrections.decisions,
     ];
+    const finalCommands = dedupeCommands([...corrections.commands, ...commands]);
     return {
-      commands: dedupeCommands([...corrections.commands, ...commands]),
+      commands: finalCommands,
       expectedDeltaAmps: -reduction.estimatedSavingsAmps,
+      commandedCutAmps: commandedCutAmpsOf(finalCommands, onManaged, config, source),
       compareAfter: now + GRADE_LEVEL_MS,
       decisions,
       reason: `over_${pressure.severity}`,
@@ -305,9 +317,17 @@ export function plan(input: PlanInput): PlanOutput {
           fanHolds = recordGentleRestoreHold(fanHolds, cmd.deviceId, now, raisePlan.probeRestoreIds.includes(cmd.deviceId));
         }
       }
+      const raiseCommands = dedupeCommands([...corrections.commands, ...raisePlan.commands]);
       return {
-        commands: dedupeCommands([...corrections.commands, ...raisePlan.commands]),
+        commands: raiseCommands,
         expectedDeltaAmps: 0, // graded per-command by the journal, not batch-summed here
+        // A restore that pulls peers down to floors — and a funding swap —
+        // ship real cuts. Until now they were invisible to the collapse
+        // detector (this branch reports a net delta of 0, and the credit hung
+        // off `expectedDeltaAmps < 0`), so a large commanded fall here could
+        // latch a phantom collapse. Priced from the final list so a correction
+        // that overrode a cut cannot leave a stale credit behind.
+        commandedCutAmps: commandedCutAmpsOf(raiseCommands, acs, config, source),
         compareAfter: now + (raisePlan.isTurnOn ? GRADE_TURN_ON_MS : GRADE_LEVEL_MS),
         decisions: [...corrections.decisions, ...raisePlan.decisions],
         reason: raisePlan.isTurnOn ? "restore" : "raise",
@@ -318,7 +338,44 @@ export function plan(input: PlanInput): PlanOutput {
         fanOnly: false,
       };
     }
-    // Nothing to raise — a held fan may climb one sweet-spot step, but never
+    // Nothing to raise — walk any SATISFIED room parked above its need ceiling
+    // back down (the loaded spring). Ordered here deliberately:
+    //  - AFTER the raise phase, because a raise batch may already carry funding
+    //    demotes of its own and two producers must not fight over one device;
+    //  - BEFORE the fan restore, because reclaiming dormant compressor levels is
+    //    strictly better than spending headroom on a fan;
+    //  - and NEVER while a shed restore has amps reserved. A demote frees amps,
+    //    so parking it looks wrong at first glance — but every non-fan batch
+    //    rewinds the SHARED calm clock the parked restore is waiting on, and the
+    //    restore's own feasibility already prices peer floor-downs (floors sit
+    //    at or below ceilings). Letting demotes churn here would strand exactly
+    //    the room the reservation exists to bring back.
+    if (raisePlan.reservedAmps <= 0) {
+      const demotes = planIdleDemotes({
+        acs,
+        config,
+        source,
+        now,
+        inFlight: input.inFlight ?? (() => []),
+      });
+      if (demotes.commands.length > 0) {
+        return {
+          commands: demotes.commands,
+          expectedDeltaAmps: 0,
+          commandedCutAmps: demotes.cutAmps,
+          compareAfter: now + GRADE_LEVEL_MS,
+          decisions: [...raisePlan.decisions, ...demotes.decisions],
+          reason: "demote",
+          severity: null,
+          requiredAmps: null,
+          fanHolds: input.fanHolds,
+          attempts: [],
+          fanOnly: false,
+        };
+      }
+      raisePlan.decisions.push(...demotes.decisions);
+    }
+    // A held fan may climb one sweet-spot step, but never
     // into amps reserved for a pending shed restore (raises were parked; a fan
     // restore must not spend that headroom either) and never into amps a
     // ramping compressor is already committed to. Two fan restores 12s apart
@@ -335,6 +392,7 @@ export function plan(input: PlanInput): PlanOutput {
       return {
         commands: [fanStep.command],
         expectedDeltaAmps: 0,
+        commandedCutAmps: 0,
         compareAfter: now + GRADE_FAN_MS,
         decisions: [...raisePlan.decisions, { at: now, deviceId: fanStep.command.deviceId, action: "fan restore step" }],
         reason: "fan_restore",

@@ -5,7 +5,7 @@ type: Skill
 title: Smart AC Leveling — navigation + invariants
 tags: [home, leveling, power, claude-code, current]
 maintainer: claude-code
-timestamp: 2026-07-27
+timestamp: 2026-07-28
 ---
 
 # Smart AC Leveling
@@ -21,7 +21,7 @@ read that slice).
 `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns
 its own row; merged with id=2 winning; re-read every 30 s ⇒ **live-flippable**).
 
-Implementation: **`server/src/leveling/`** — 17 small modules, pure decision functions + one stateful
+Implementation: **`server/src/leveling/`** — 18 small modules, pure decision functions + one stateful
 shell. `controller: "v1" | "shadow" | "v2"`; in `shadow`, v1 acts while v2 journals every decision
 with `executed=false`.
 
@@ -68,6 +68,32 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
    price; the book showed MORE samples ⇒ LOWER cost). `PendingGrade` now has a separate **`learnAfter`**
    (full ramp) beside `compareAfter` (journal only), the sample is a **ratcheted peak**, and
    contamination is **direction-aware** (`batchLoadDirections()`) so a 4-min window is affordable.
+
+**Added 2026-07-28 evening after a satisfied room held 6.3 A of a 15 A gen while a hotter room sat at L1:**
+7. **The envelope prices peers at every level the firmware MIGHT be at**, not the confirmed shadow —
+   `AcView.envelopeLevel = worstCaseLevel([confirmed, ...unconfirmedLevels()])` (level 0 outranks L3).
+   Use `sendCounts`, **never `pendingLevel`** (one slot; a demote overwrites the raise still in flight
+   and re-opens the hole). TTL `UNCONFIRMED_SEND_TTL_MS` 25 min > the ≥15.8-min observed confirm lag.
+   `currentLevel` stays observation-only — that is what stops a lagging write minting a manual intent.
+8. **A satisfied room does not keep dormant levels** (the v1 "loaded spring", built in v2 as
+   `demote.ts`). Above `ceilOf` + satisfied for `DEMOTE_DWELL_MS` (120 s) at `needDelta ≤ band − 0.2`
+   → one `set_level` straight to the ceiling. BOTH sources. Need-triggered, never amps-triggered, so
+   the reduce trigger is untouched. Parks under a restore reservation; `DEMOTE_RESEND_MS` 60 s.
+9. **Never spend a saving that has not landed.** The funding swap is **split by blocker**:
+   envelope-blocked + meter already holds the amps → same batch; **meter-blocked → demote ALONE**,
+   raise next calm window. A satisfied compressor throttles down over minutes; the breaker tripped at
+   15.65 A on 2026-07-26.
+10. **Dormant levels are not comfort.** The +25 `topPriority` surcharge applies only to cuts ending
+    BELOW that AC's `ceilOf` (else it protects a cool room over a hot one — the tier-down version of
+    the complaint 2026-06-13 fixed for sheds).
+11. **One credit path, model-priced.** `Plan.commandedCutAmps` (every load-lowering batch shape) is
+    the sole input to `noteCommandedCut()`, priced at the MODEL steady delta — `max(model, learned)`
+    over-credits ~2× for satisfied rooms and can mask a real collapse. Demand side: `pressure.ts`
+    subtracts the live credit from `requiredAmps` (and from the EXTREME tier).
+12. **A level raise commits unmetered amps too.** Raises never arm `ramping`, so gen raises now arm
+    `AcView.unmeteredJumpAmps` (priced jump, absorbed-ratcheted, `AC_RAMP_MS`) which `rampDebitAmps`
+    charges to the next spender — the 2026-07-26 back-to-back-raise trip shape. Not double-charged
+    for a ramping AC. Consequence: a fan restore waits behind a fresh raise (deliberate).
 
 **Hard rules preserved from v1:** never level 0 · manual wins · slot caps · boost floors ·
 shed ≠ manual-off · warm restore · opt-out · collapse latch · leaky bucket ·

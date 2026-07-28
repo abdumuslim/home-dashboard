@@ -41,7 +41,10 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     rampBaselineAmps: null,
     rampAbsorbedAmps: null,
     reshedPenalized: false,
+    satisfiedForMs: 0,
+    unmeteredJumpAmps: 0,
     ...overrides,
+    envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 2,
   };
 }
 
@@ -242,5 +245,83 @@ describe("preferShed — undo the turn-on that caused this, never a bystander", 
     const p = plan(acs, 1.5, { preferShed: "hot" });
     expect(p.toShed).toEqual([]);
     expect(p.satisfied).toBe(true);
+  });
+});
+
+// 2026-07-28 16:06:07 Baghdad, gen 15A, over_severe needing 1.1A. Najat sat
+// SATISFIED at L3 (needDelta 0.5 → her own ceiling is L1) and, with Abdullah's
+// AC off, she was the first ON AC in priority order — so she inherited the
+// +25 top-priority surcharge. Cutting her: 1 step × 10 × (1+1.5×0.5) = 17.5,
+// +25 = 42.5. Cutting Abdu, whose room was 1.9°C hot: 10 × (1+1.5×1.9) = 38.5.
+// The reducer took the amps from the hot room and left three dormant levels
+// standing. It repeated at 16:38 and 16:40.
+describe("2026-07-28 16:06 replay — dormant levels are not comfort", () => {
+  const liveCfg: LevelingConfigV2 = {
+    ...cfg,
+    priority: ["abdullah", "najat", "abdu"],
+    genAmpModels: {
+      abdu: { baseAmps: 4.3, stepAmps: 2.5 },
+      najat: { baseAmps: 2.3, stepAmps: 2.0 },
+    },
+  };
+  // Priority-sorted with Abdullah OFF, exactly as the controller passes them.
+  const acs = [
+    ac("najat", { currentLevel: 3, needDelta: 0.5, fanSpeed: 1 }),
+    ac("abdu", { currentLevel: 3, needDelta: 1.9, fanSpeed: 1 }),
+  ];
+
+  it("cuts the satisfied room's dormant level, not the hot room", () => {
+    const p = planReduction({
+      acs,
+      requiredAmps: 1.14,
+      requireShed: false,
+      fanTrimEnabled: true,
+      book: {},
+      config: liveCfg,
+      source: "gen",
+      now: T,
+    });
+    expect(p.desiredLevels).toHaveProperty("najat");
+    expect(p.desiredLevels).not.toHaveProperty("abdu");
+    expect(p.satisfied).toBe(true);
+  });
+
+  it("still shields the top room's levels while its own need justifies them", () => {
+    // Same shape, but Najat is genuinely hot too — now the surcharge applies
+    // and the reducer must not single her out.
+    const hotTop = [
+      ac("najat", { currentLevel: 3, needDelta: 2.0, fanSpeed: 1 }),
+      ac("abdu", { currentLevel: 3, needDelta: 1.9, fanSpeed: 1 }),
+    ];
+    const p = planReduction({
+      acs: hotTop,
+      requiredAmps: 1.14,
+      requireShed: false,
+      fanTrimEnabled: true,
+      book: {},
+      config: liveCfg,
+      source: "gen",
+      now: T,
+    });
+    expect(p.desiredLevels).toHaveProperty("abdu");
+    expect(p.desiredLevels).not.toHaveProperty("najat");
+  });
+
+  it("a manual pin keeps full protection even when the room reads satisfied", () => {
+    const pinned = [
+      ac("najat", { currentLevel: 3, needDelta: 0.5, fanSpeed: 1, manualTarget: 3 }),
+      ac("abdu", { currentLevel: 3, needDelta: 1.9, fanSpeed: 1 }),
+    ];
+    const p = planReduction({
+      acs: pinned,
+      requiredAmps: 1.14,
+      requireShed: false,
+      fanTrimEnabled: true,
+      book: {},
+      config: liveCfg,
+      source: "gen",
+      now: T,
+    });
+    expect(p.desiredLevels).not.toHaveProperty("najat");
   });
 });

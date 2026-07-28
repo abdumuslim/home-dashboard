@@ -25,7 +25,10 @@ function ac(overrides: Partial<AcView> = {}): AcView {
     rampBaselineAmps: null,
     rampAbsorbedAmps: null,
     reshedPenalized: false,
+    satisfiedForMs: 0,
+    unmeteredJumpAmps: 0,
     ...overrides,
+    envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 1,
   };
 }
 

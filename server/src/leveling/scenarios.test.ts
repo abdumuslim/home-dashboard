@@ -287,8 +287,15 @@ describe("fans are last-resort trim (57% of v1 fan cuts fired with level cuts av
     const t1 = s.now;
     s.advance(40);
     expect(s.commandsSince(t1, "set_fan")).toHaveLength(0); // < FAN_RESTORE_CALM_MS
-    s.advance(60);
-    expect(s.commandsSince(t1, "set_fan").length).toBeGreaterThanOrEqual(1); // climbed after the gate
+    // The freed headroom also lets a level raise land (~t+35s), and a raise now
+    // arms the post-raise jump debit — committed amps the meter has not shown.
+    // That fences EVERY other spender, the fan restore included: two fan
+    // restores riding phantom budget behind fresh raises is exactly the
+    // 2026-07-26 gen trip. So the fan climbs back only once that window clears.
+    s.advance(300);
+    expect(s.commandsSince(t1, "set_fan").length).toBeGreaterThanOrEqual(1);
+    // …and it still never bounced inside the calm gate (the v1 61s failure).
+    expect(s.commandsSince(t1, "set_fan")[0].at - t1).toBeGreaterThan(60_000);
   });
 });
 
@@ -846,5 +853,85 @@ describe("the 2026-07-27 fan-restore stall", () => {
     const t0 = s.now;
     s.advance(180);
     expect(s.commandsSince(t0, "set_fan")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-07-28 evening, 15:35 → 16:40 Baghdad. Gen changeover at 15:35 with only
+// Najat on; she climbed to L3 by 15:39 while she still needed it. Abdu came on
+// at 15:49 into a hot room and climbed to L3 at 15:55 — admitted only because
+// Najat's L3 (sent 15:39:49) had not confirmed yet, so the envelope priced her
+// at L2. By 16:06 the house was over the limit, and the reducer took the amps
+// out of ABDU (need 1.9°C) instead of Najat's dormant levels (need 0.5°C),
+// because she inherited the +25 top-priority surcharge with Abdullah's AC off.
+// Abdu then sat pinned at L1/L2 for 35 minutes while she held 6.3A she no
+// longer needed.
+// ---------------------------------------------------------------------------
+describe("2026-07-28 evening budget hog (the loaded spring)", () => {
+  const hog = () =>
+    new Scenario(
+      cfg,
+      [
+        // Najat satisfied and parked high; Abdu hot and pinned low.
+        { ...NAJAT, level: 3, demandAmps: 2.4, needDelta: 0.2 },
+        { ...ABDU, level: 1, demandAmps: 6.0, needDelta: 1.9 },
+      ],
+      { nonAcAmps: 2.0, source: "gen" },
+    );
+
+  it("reclaims the satisfied room's dormant levels and gives them to the hot room", () => {
+    const s = hog();
+    const t0 = s.now;
+    s.advance(400);
+    const levels = setLevels(s, t0);
+    const najatDown = levels.find((l) => l.cmd.deviceId === "najat" && l.cmd.level < 3);
+    const abduUp = levels.find((l) => l.cmd.deviceId === "abdu" && l.cmd.level > 1);
+    expect(najatDown).toBeDefined();
+    expect(abduUp).toBeDefined();
+    // The hot room ends up above the satisfied one — the whole point.
+    expect(s.sim("abdu").level).toBeGreaterThan(s.sim("najat").level);
+  });
+
+  it("never crosses the breaker while doing it", () => {
+    const s = hog();
+    s.advance(400);
+    expect(s.events.some((e) => e.event.kind === "collapse")).toBe(false);
+    // Our own demote is a commanded cut, not a trip.
+    expect(s.plans.some((p) => p.reason === "collapsed")).toBe(false);
+  });
+
+  it("does not bounce the satisfied room back up while it stays satisfied", () => {
+    const s = hog();
+    const t0 = s.now;
+    s.advance(600);
+    const najatRaises = setLevels(s, t0).filter((l) => l.cmd.deviceId === "najat" && l.cmd.level > 1);
+    expect(najatRaises).toHaveLength(0);
+  });
+
+  it("gives the levels back when the room needs them again", () => {
+    const s = hog();
+    s.advance(400);
+    expect(s.sim("najat").level).toBe(1);
+    // The room heats up past the band again.
+    s.setDemand("najat", 3.0, 2.5);
+    const t1 = s.now;
+    s.advance(400);
+    expect(setLevels(s, t1).some((l) => l.cmd.deviceId === "najat" && l.cmd.level > 1)).toBe(true);
+  });
+
+  it("a manually pinned room is never harvested, even parked above its need", () => {
+    const s = new Scenario(
+      cfg,
+      [
+        { ...NAJAT, level: 3, demandAmps: 2.4, needDelta: 0.2 },
+        { ...ABDU, level: 1, demandAmps: 6.0, needDelta: 1.9 },
+      ],
+      { nonAcAmps: 2.0, source: "gen" },
+    );
+    s.pinLevel("najat", 3);
+    const t0 = s.now;
+    s.advance(400);
+    expect(setLevels(s, t0).some((l) => l.cmd.deviceId === "najat")).toBe(false);
+    expect(s.sim("najat").level).toBe(3);
   });
 });

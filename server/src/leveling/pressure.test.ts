@@ -23,6 +23,7 @@ function view(overrides: Partial<MeterView> = {}): MeterView {
     collapsed: false,
     frozen: false,
     derateAmps: 0,
+    commandedCutCreditAmps: 0,
     ...overrides,
   };
 }
@@ -79,5 +80,47 @@ describe("assessPressure", () => {
     expect(assessPressure(view({ smoothedAmps: 10, calmMs: 10_000 }), cfg, { projectedExtraAmps: 2 }).kind).toBe(
       "calm",
     );
+  });
+});
+
+// 2026-07-28 16:38 and 16:40: the reducer cut a room, the leaky bucket refilled
+// on the act and drained again ~30-60s later on readings the stopped compressor
+// had not yet left the meter — and the second pass, finding that room already
+// commanded, took the amps out of the HOT room instead.
+describe("demand-side commanded-cut credit", () => {
+  it("only demands what an in-flight cut does not already cover", () => {
+    const over = view({ overLimitBudget: 0, overLimitReadings: [16.5], smoothedAmps: 16.5 });
+    const raw = assessPressure(over, cfg);
+    expect(raw.kind).toBe("over");
+    const credited = assessPressure({ ...over, commandedCutCreditAmps: 1.0 }, cfg);
+    expect(credited.kind).toBe("over");
+    if (raw.kind !== "over" || credited.kind !== "over") throw new Error("expected over");
+    expect(credited.requiredAmps).toBeCloseTo(raw.requiredAmps - 1.0, 5);
+  });
+
+  it("demands nothing more once the cut fully covers the overshoot", () => {
+    const over = view({ overLimitBudget: 0, overLimitReadings: [16.5], smoothedAmps: 16.5 });
+    const p = assessPressure({ ...over, commandedCutCreditAmps: 10 }, cfg);
+    if (p.kind !== "over") throw new Error("expected over");
+    expect(p.requiredAmps).toBe(0);
+  });
+
+  it("does not escalate to a forced shed for amps already on their way out", () => {
+    const extreme = view({ overLimitBudget: 0, overLimitReadings: [19.5], smoothedAmps: 19.5 });
+    const raw = assessPressure(extreme, cfg);
+    if (raw.kind !== "over") throw new Error("expected over");
+    expect(raw.severity).toBe("extreme");
+    const credited = assessPressure({ ...extreme, commandedCutCreditAmps: 6 }, cfg);
+    if (credited.kind !== "over") throw new Error("expected over");
+    expect(credited.severity).not.toBe("extreme");
+  });
+
+  it("a credit that never lands stops excusing anything (expiry is upstream)", () => {
+    // pendingCutCredit already returns 0 past PENDING_CUT_MS / once absorbed —
+    // so a zero credit must reproduce the raw demand exactly.
+    const over = view({ overLimitBudget: 0, overLimitReadings: [16.5], smoothedAmps: 16.5 });
+    const a = assessPressure(over, cfg);
+    const b = assessPressure({ ...over, commandedCutCreditAmps: 0 }, cfg);
+    expect(a).toEqual(b);
   });
 });

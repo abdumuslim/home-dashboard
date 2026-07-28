@@ -49,9 +49,12 @@ import {
   reachableCapOf,
   shouldSendLevel,
   sweepExpiredMarks,
+  unconfirmedLevels,
+  unconfirmedSends,
   type ReconcilerState,
 } from "./reconciler.js";
-import { boostFloor, ceilOf, floorOf, nearTargetNeedCap } from "./needs.js";
+import { boostFloor, ceilOf, floorOf, nearTargetNeedCap, worstCaseLevel } from "./needs.js";
+import { DEMOTE_HYSTERESIS_C } from "./demote.js";
 import { raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, updateCost, type CostBook } from "./costs.js";
 import { LevelingStore } from "./store.js";
 import type { AcView, Command, MeterState, Mode, PowerSource } from "./types.js";
@@ -212,11 +215,21 @@ export class LevelingControllerV2 {
    * wherever `rampBaseline` is: the two are only meaningful together.
    */
   private rampAbsorbed = new Map<string, number>();
+  /**
+   * Level-RAISE commitments the meter has not shown yet, per device: the priced
+   * jump, the house load when it was sent, and the peak rise since. Same shape
+   * and same ratchet as the turn-on ramp pair above, but armed by a set_level
+   * UP on gen — see AcView.unmeteredJumpAmps for why raises need their own.
+   */
+  private jumpDebit = new Map<string, { amps: number; baseline: number | null; absorbed: number; until: number }>();
   /** Grid full-start windows: house amps measured just before this AC came on. */
   private startBaseline = new Map<string, { amps: number; until: number }>();
   private boostActive = new Map<string, boolean>();
+  /** When each room's current uninterrupted satisfied stretch began (demote dwell). */
+  private satisfiedSince = new Map<string, number>();
   private prevPowerStates = new Map<string, boolean>();
   private deviceNames = new Map<string, string>();
+  private deviceMaxLevel = new Map<string, number>();
   private armRampOnSourceChange = false;
   private freshlyOn: string[] = [];
   /**
@@ -634,6 +647,55 @@ export class LevelingControllerV2 {
       const risen = view.smoothedAmps - baseline;
       if (risen > (this.rampAbsorbed.get(id) ?? 0)) this.rampAbsorbed.set(id, risen);
     }
+    for (const [id, jump] of this.jumpDebit) {
+      if (jump.until <= now) {
+        this.jumpDebit.delete(id);
+        continue;
+      }
+      if (jump.baseline == null) continue;
+      const risen = view.smoothedAmps - jump.baseline;
+      if (risen > jump.absorbed) this.jumpDebit.set(id, { ...jump, absorbed: risen });
+    }
+  }
+
+  /**
+   * Charge a level RAISE we just sent on gen as committed-but-unmetered draw,
+   * so the next spender cannot be admitted against a meter that has not caught
+   * up with it yet (2026-07-26: two raises 35s apart on a lagging meter tripped
+   * the breaker). A cut arms nothing — reductions are never gated — and grid is
+   * excluded for the same reason the ramp debit excludes it: grid starts every
+   * AC full by directive and leans on the reducer as its safety.
+   */
+  private armJumpDebit(
+    deviceId: string,
+    level: number,
+    view: ReturnType<typeof meterView>,
+    now: number,
+  ): void {
+    if (view.source !== "gen") return;
+    const from = this.recon[deviceId]?.confirmedLevel;
+    if (from == null || from < 1 || level <= from) {
+      this.jumpDebit.delete(deviceId);
+      return;
+    }
+    const maxLevel = this.deviceMaxLevel.get(deviceId) ?? 3;
+    const jump = raiseJumpAmps(this.book, this.config, deviceId, "gen", from, level, maxLevel, now);
+    const baseline = view.sampleCount >= 2 && !view.frozen ? view.smoothedAmps : null;
+    this.jumpDebit.set(deviceId, {
+      amps: jump.amps,
+      baseline,
+      absorbed: 0,
+      until: now + AC_RAMP_MS,
+    });
+  }
+
+  /** Unmetered remainder of a recent level raise (0 when none / fully absorbed). */
+  private unmeteredJumpAmps(deviceId: string, now: number): number {
+    const jump = this.jumpDebit.get(deviceId);
+    if (jump == null || jump.until <= now) return 0;
+    // No baseline means we could not measure absorption — charge the whole
+    // jump, the same way an unknown ramp baseline charges the whole draw.
+    return Math.max(0, jump.amps - jump.absorbed);
   }
 
   /**
@@ -668,6 +730,7 @@ export class LevelingControllerV2 {
     this.freshlyOn = [];
     for (const { device, managed } of ctx) {
       this.deviceNames.set(device.id, device.name);
+      this.deviceMaxLevel.set(device.id, device.maxGeneratorLevel || 3);
       const prev = this.prevPowerStates.get(device.id);
       if (prev !== undefined && prev !== device.power) {
         if (device.power) {
@@ -844,6 +907,7 @@ export class LevelingControllerV2 {
       pacing: this.pacing,
       fanHolds: this.fanHolds,
       projectedExtraAmps,
+      inFlight: (deviceId) => unconfirmedSends(this.recon, deviceId, now),
     });
     this.fanHolds = out.fanHolds;
 
@@ -864,6 +928,37 @@ export class LevelingControllerV2 {
     this.fanHolds = releaseFanHold(this.fanHolds, deviceId);
     await this.pool.query("DELETE FROM ac_leveling_fan_hold WHERE device_id = $1", [deviceId]);
     log.info(`[leveler2] Fan hold released for ${this.deviceNames.get(deviceId) ?? deviceId} (${reason})`);
+  }
+
+  /**
+   * How long this room has held CONTINUOUS satisfaction, for the loaded-spring
+   * demote's dwell gate. Any reading above the threshold (or the AC going
+   * off/shed/unmanaged) restarts the clock from zero.
+   *
+   * No explicit stale-temperature guard is needed here: `needDelta` is derived
+   * upstream in `computeAcNeed`, which maps a missing or zero `currentTemp` to
+   * delta 1 — comfortably ABOVE the demote threshold — so a dead room sensor
+   * can never present as "satisfied". A stale-but-plausible cloud reading is
+   * the only residual, and it is self-correcting and low-harm: the outcome is
+   * an L1 cap (never an off), and the raise path lifts the room again within a
+   * calm window once the feed recovers.
+   */
+  private satisfiedForMs(
+    deviceId: string,
+    needDelta: number,
+    on: boolean,
+    managed: boolean,
+    shed: boolean,
+    now: number,
+  ): number {
+    const threshold = this.config.nearTargetBandC - DEMOTE_HYSTERESIS_C;
+    if (!on || !managed || shed || needDelta > threshold) {
+      this.satisfiedSince.delete(deviceId);
+      return 0;
+    }
+    const since = this.satisfiedSince.get(deviceId) ?? now;
+    this.satisfiedSince.set(deviceId, since);
+    return now - since;
   }
 
   /** Live grid full-start baseline for a device, or null once the window closed. */
@@ -900,9 +995,21 @@ export class LevelingControllerV2 {
         shed: this.shedIds.has(device.id),
         maxLevel: device.maxGeneratorLevel || 3,
         currentLevel: observed,
+        // Envelope pricing charges for every level the firmware might be at:
+        // the confirmed shadow OR any level we sent and never saw confirm.
+        // `currentLevel` deliberately stays observation-only (see AcView).
+        envelopeLevel: worstCaseLevel([observed, ...unconfirmedLevels(this.recon, device.id, now)]),
         fanSpeed: device.fanSpeed ?? null,
         fanExempt: this.fanExempt.has(device.id),
         needDelta,
+        satisfiedForMs: this.satisfiedForMs(
+          device.id,
+          needDelta,
+          device.power,
+          managed,
+          this.shedIds.has(device.id),
+          now,
+        ),
         minLevel: boost.minLevel,
         manualCap: this.manualCap.get(device.id) ?? null,
         manualTarget: this.manualTarget.get(device.id) ?? null,
@@ -913,6 +1020,7 @@ export class LevelingControllerV2 {
         rampBaselineAmps: ramping ? (this.rampBaseline.get(device.id) ?? null) : null,
         rampAbsorbedAmps: ramping ? (this.rampAbsorbed.get(device.id) ?? null) : null,
         startBaselineAmps: this.startBaselineFor(device.id, device.power, now),
+        unmeteredJumpAmps: this.unmeteredJumpAmps(device.id, now),
         reshedPenalized: reshedPenalized(this.pacing, device.id, now),
       };
     });
@@ -1010,6 +1118,7 @@ export class LevelingControllerV2 {
             await tcl.sendControl(cmd.deviceId, "set_generator_mode", cmd.level);
             const noted = noteLevelSend(this.recon, cmd.deviceId, cmd.level, now);
             this.recon = noted.state;
+            this.armJumpDebit(cmd.deviceId, cmd.level, view, now);
             if (noted.marked) {
               log.warn(`[leveler2] ${name}: firmware never confirmed L${cmd.level} after ${4} sends — marked unreachable, falling back to L${noted.fallback}`);
             }
@@ -1093,10 +1202,15 @@ export class LevelingControllerV2 {
     // anywhere from seconds to minutes after the send, so the drop arrives as
     // one cliff with nothing tying it to us — and a cliff past the collapse
     // floor is indistinguishable from a breaker trip (live 2026-07-28 07:23).
-    // The credit is the batch's own priced saving, so it can never exceed what
-    // the reducer believed it was cutting.
-    if (out.expectedDeltaAmps < 0) {
-      this.meterState = noteCommandedCut(this.meterState, -out.expectedDeltaAmps, now);
+    //
+    // `commandedCutAmps` is the SINGLE source for this credit: it is populated
+    // by every batch shape that lowers load (reducer, demote, funding swap, and
+    // the peer floor-downs bundled into a restore), priced at the model steady
+    // delta. It replaced the old `expectedDeltaAmps < 0` test, which silently
+    // missed every batch reporting a net delta of 0 — i.e. exactly the mixed
+    // batches where cuts and a turn-on cancel out on paper.
+    if (out.commandedCutAmps > 0) {
+      this.meterState = noteCommandedCut(this.meterState, out.commandedCutAmps, now);
     }
     // A turn-on changes the load picture wholesale: over-limit readings banked
     // BEFORE it are no longer evidence about the house that exists now, and
