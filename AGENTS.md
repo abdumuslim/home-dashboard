@@ -12,7 +12,21 @@ Browser → Cloudflare → Traefik (VPS) → dashboard container (port 8000) →
 
 ## Routing table — read the doc BEFORE working on the topic
 
-| If your task touches… | You MUST first read |
+**The trigger is the ARTIFACT you are about to produce, not the topic you think you are on.** About
+to write SQL → read `database.md` first, even if you call it "just a quick diagnostic query". About
+to SSH or curl the live system → `operations.md`, even if you call it "just checking a value". About
+to touch a test harness → `testing.md`. This binds on throwaway diagnostics and one-off commands
+exactly as hard as on feature work — that framing is what failed on 2026-07-28, when "I'm debugging
+leveling, not doing database work" produced SQL against invented column names while the real schema
+sat documented in `database.md`, and a live-debugging login was re-derived from scratch with the
+working recipe already in `operations.md`.
+
+**Corollary — verify, never invent.** If you are typing a table name, column name, endpoint path,
+container name, env var, or file path you have not seen with your own eyes *this session*, stop and
+read the doc or query the source. A plausible guess that happens to be wrong costs more than the
+lookup, every time.
+
+| If you are about to touch… | You MUST first read |
 |---|---|
 | System overview, collectors, data flow, MQTT/ESP payloads, auth (incl. Hermes agent API), push notifications, forecast/bias pipeline, logging, health, performance patterns, full per-file structure | `docs/agent/architecture.md` |
 | Database tables, migrations, schema conventions | `docs/agent/database.md` |
