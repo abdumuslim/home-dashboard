@@ -170,6 +170,49 @@ describe("power collapse (external trip — the dominant real-world event)", () 
     expect(s.plans[s.plans.length - 1].reason).toBe("collapsed");
   });
 
+  // 2026-07-28 07:18–07:23 Baghdad. Abdullah was manually off, so an over-limit
+  // episode shed the only two ACs left. Their compressors stopped ~1 min after
+  // the sends and gen fell 11.5A → 4.5A in one step — drop ≥6A landing under
+  // the 5A floor, i.e. exactly a trip. COLLAPSED latched: every raise and
+  // restore journaled "power collapse latched" for 5 minutes with ~9A of
+  // headroom free, and the gen limit derated to 14A on top. The generator was
+  // never in trouble; we had turned the load off ourselves.
+  // Outdoor-heat boost floors pin both rooms at L3, so no level cut is
+  // available and shedding is the only cover — the 07:18 / 07:22 pair. Both
+  // offs then travel for a minute before the compressors actually stop.
+  const PINNED_HOT = [
+    { ...ABDU, minLevel: 3, level: 3, demandAmps: 9.0, needDelta: 1.5, offLagMs: 60_000 },
+    { ...NAJAT, minLevel: 3, level: 3, demandAmps: 5.3, needDelta: 0.5, offLagMs: 60_000 },
+  ];
+
+  it("shedding the last ACs is NOT a power collapse — the drop we commanded is ours", () => {
+    // Base load alone sits under the 5A collapse floor, so the last shed to
+    // land is guaranteed to make a trip-shaped cliff.
+    const s = new Scenario(cfg, PINNED_HOT, { nonAcAmps: 4.3, source: "gen" });
+    const t0 = s.now;
+    s.advance(6 * 60);
+    expect(s.commandsSince(t0, "power_off").length).toBeGreaterThanOrEqual(2);
+    // The meter did fall past the collapse floor in one step (trip-shaped)…
+    const cliff = s.events.find((e) => e.event.kind === "collapse_suppressed");
+    expect(cliff?.event).toMatchObject({ kind: "collapse_suppressed" });
+    expect((cliff!.event as { toAmps: number }).toAmps).toBeLessThanOrEqual(5);
+    // …and none of it was read as a trip.
+    expect(s.events.some((e) => e.event.kind === "collapse")).toBe(false);
+    expect(s.meterState.derate).toBeNull();
+    // Not frozen: the controller is free to give the rooms back.
+    expect(s.plans[s.plans.length - 1].reason).not.toBe("collapsed");
+  });
+
+  it("a real trip while a shed is in flight still latches — the credit is not a blank cheque", () => {
+    const s = new Scenario(cfg, PINNED_HOT, { nonAcAmps: 4.3, source: "gen" });
+    s.advance(15); // one shed sent (≈5.9A priced), nowhere near landed
+    // The breaker goes while that off is still travelling: far more load
+    // vanishes than anything we commanded, so the remainder is unexplained.
+    s.trip();
+    s.advance(60);
+    expect(s.events.some((e) => e.event.kind === "collapse")).toBe(true);
+  });
+
   it("after recovery: no raise during the compressor ramp; the meter never crosses the breaker", () => {
     const s = settled();
     s.trip();

@@ -55,6 +55,20 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
    (5.8s–13 min) is when the collector's observed-off classifier minted a bogus manual-off lock.
    In-flight restores are parked by the `awaiting confirm` gate (60s, then confirm-or-resend).
 
+**Added 2026-07-28 after both remaining ACs sat shed through a blackout that never happened:**
+5. **A drop we commanded is not a breaker trip.** Every reducing batch credits the meter with its own
+   priced saving (`noteCommandedCut()` → `MeterState.pendingCut`); a collapse latches only on the
+   part of the fall that credit does NOT explain. With a cut live the fall is judged from the
+   **anchor** (the meter when cutting began), because median smoothing spreads one cliff over several
+   readings; absorption ratchets on the **smoothed** meter and the credit expires after
+   `PENDING_CUT_MS` (180 s).
+
+6. **A cost sample must outlive the compressor.** `GRADE_LEVEL_MS` (45 s) < `AC_RAMP_MS` (240 s) meant
+   every level-raise sample measured a fifth of the ramp (32/33 graded gen raises came in below their
+   price; the book showed MORE samples ⇒ LOWER cost). `PendingGrade` now has a separate **`learnAfter`**
+   (full ramp) beside `compareAfter` (journal only), the sample is a **ratcheted peak**, and
+   contamination is **direction-aware** (`batchLoadDirections()`) so a 4-min window is affordable.
+
 **Hard rules preserved from v1:** never level 0 · manual wins · slot caps · boost floors ·
 shed ≠ manual-off · warm restore · opt-out · collapse latch · leaky bucket ·
 requireShed ≥ max(3 A, 20%).

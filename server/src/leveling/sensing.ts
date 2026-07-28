@@ -30,6 +30,14 @@ export const POWER_COLLAPSE_FLOOR_AMPS = 5;
 export const POWER_COLLAPSE_RECOVER_GAP = 3;
 /** Safety cap on a collapse latch (never strand the controller). */
 export const POWER_COLLAPSE_MAX_MS = 300_000;
+/**
+ * How long a commanded cut stays creditable against a collapse-shaped drop.
+ * The send→compressor-stop lag is 6 s to minutes, so the credit must outlive
+ * the batch; it must NOT outlive it by so much that a genuine trip minutes
+ * later is laundered as "ours". Three minutes covers the observed lag (64 s on
+ * 2026-07-28) with margin and still latches anything later.
+ */
+export const PENDING_CUT_MS = 180_000;
 /** Reading older than this = no electricity (matches /api/current/power). */
 export const STALE_POWER_MS = 15_000;
 /** Same noise floor the power card uses to consider a line active. */
@@ -93,7 +101,36 @@ export function initialMeterState(): MeterState {
     lastMicroChangeAt: 0,
     frozen: false,
     derate: null,
+    pendingCut: null,
   };
+}
+
+/**
+ * Arm/extend the commanded-cut credit after a reducing batch was SENT.
+ * `amps` is the batch's own priced saving (learned/model), so the credit can
+ * never exceed what the pipeline believed it was cutting. Stacking sheds add
+ * up; the anchor re-bases on the meter as it stood when this batch went out.
+ */
+export function noteCommandedCut(state: MeterState, amps: number, now: number): MeterState {
+  if (!(amps > 0)) return state;
+  const live = state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut : null;
+  const carried = live != null ? Math.max(0, live.amps - live.absorbedAmps) : 0;
+  return {
+    ...state,
+    pendingCut: {
+      anchorAmps: smoothedAmps(state),
+      amps: carried + amps,
+      absorbedAmps: 0,
+      until: now + PENDING_CUT_MS,
+    },
+  };
+}
+
+/** Amps of commanded cut the meter has not shown yet (0 when none/expired). */
+export function pendingCutCredit(state: MeterState, now: number): number {
+  const cut = state.pendingCut;
+  if (cut == null || now >= cut.until) return 0;
+  return Math.max(0, cut.amps - cut.absorbedAmps);
 }
 
 /** Mirrors the power card's active-source logic. */
@@ -191,6 +228,8 @@ export function ingestReading(
       lastMicroChangeAt,
       frozen,
       derate: prev.derate,
+      // Amps on the OLD line — a cut we commanded there explains nothing here.
+      pendingCut: null,
     };
   }
 
@@ -212,6 +251,8 @@ export function ingestReading(
     }
   }
   const priorMedian = state.recent.length >= SMOOTH_WINDOW ? smoothedAmps(state) : null;
+  const liveCut = state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut : null;
+  const cutCredit = pendingCutCredit(state, now);
   if (
     collapse == null &&
     priorMedian != null &&
@@ -221,8 +262,32 @@ export function ingestReading(
     // by definition sits near the pre-collapse median, so this cannot co-fire.
     !events.some((e) => e.kind === "collapse_recovered")
   ) {
-    collapse = { preMedianAmps: priorMedian, until: now + POWER_COLLAPSE_MAX_MS };
-    events.push({ kind: "collapse", fromAmps: priorMedian, toAmps: measured, source });
+    // A shed we sent removes exactly this shape from the meter (drop past the
+    // floor, arriving as one cliff once the compressor finally stops). Only the
+    // part of the fall our own commands do NOT explain is evidence of a trip —
+    // an unexplained remainder still latches, so a genuine breaker going while
+    // a small cut is in flight is not laundered.
+    //
+    // With a cut in flight the fall is judged from the ANCHOR (the meter when
+    // we started cutting), not from this reading's step: median smoothing
+    // spreads one cliff across several readings, and judging each step on its
+    // own let the tail latch what the head had already explained (the raw
+    // 4.3A floor arrives instantly while the median is still draining 16 → 13
+    // → 9). Anchor-relative, the whole cliff is one comparison.
+    const unexplained =
+      liveCut != null ? liveCut.anchorAmps - measured - liveCut.amps : priorMedian - measured;
+    if (unexplained >= POWER_COLLAPSE_DROP_AMPS) {
+      collapse = { preMedianAmps: priorMedian, until: now + POWER_COLLAPSE_MAX_MS };
+      events.push({ kind: "collapse", fromAmps: priorMedian, toAmps: measured, source });
+    } else {
+      events.push({
+        kind: "collapse_suppressed",
+        fromAmps: priorMedian,
+        toAmps: measured,
+        creditAmps: cutCredit,
+        source,
+      });
+    }
   }
 
   // Walk the effective limit down on every collapse: the line just PROVED it
@@ -245,6 +310,23 @@ export function ingestReading(
   const limit = effectiveLimit(config, source, derateFor({ ...state, derate }, source, now));
 
   const recent = [...state.recent, measured].slice(-RECENT_RING);
+
+  // Spend the cut credit as the meter actually falls. One-way ratchet on the
+  // DEEPEST fall below the anchor: a peer turning on afterwards lifts the house
+  // again, but it cannot un-prove that the cut arrived. Absorption is read on
+  // the SMOOTHED meter — the yardstick every other limit decision uses — so a
+  // credit retires only once the smoothing window has digested the cut, not on
+  // the first raw reading of it. Dropped once fully absorbed or expired, so a
+  // stale credit never blinds the next episode.
+  let pendingCut = state.pendingCut;
+  if (pendingCut != null) {
+    if (now >= pendingCut.until) {
+      pendingCut = null;
+    } else {
+      const absorbedAmps = Math.max(pendingCut.absorbedAmps, pendingCut.anchorAmps - smoothedAmps(state));
+      pendingCut = absorbedAmps >= pendingCut.amps ? null : { ...pendingCut, absorbedAmps };
+    }
+  }
 
   let overLimitBudget = state.overLimitBudget;
   let overLimitReadings = state.overLimitReadings;
@@ -306,6 +388,7 @@ export function ingestReading(
       lastMicroChangeAt,
       frozen,
       derate,
+      pendingCut,
     },
     events,
   };

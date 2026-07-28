@@ -45,6 +45,7 @@ Deployment is a 3-step pipeline (tarball → scp/ssh rebuild → **regenerate mo
 3. **Range-slot fields:** any new field on automation range slots MUST be added to the `normalizeRangeSlots()` whitelist in `server/src/automation-slots.ts` or it is silently dropped on save.
 4. **Preset slots:** never hardcode preset slot arrays — derive from `PRESET_COUNT`/`PRESET_SLOTS` in `ac-widget.tsx` (slots are 1–10).
 5. **Managed ACs are never left at generator level 0** (unrestricted) — leveling invariants in `docs/agent/ac-leveling.md`.
+5b. **Never infer a physical event from meter shape alone, and never take a cost sample shorter than the physics it measures.** A drop we commanded looks exactly like a breaker trip (2026-07-28: shedding the last ACs latched a 5-min freeze + limit derate for a blackout that never happened), and a 45 s grade of a 240 s compressor ramp taught the cost model that raises are free. Both classes of bug are silent — the system reports healthy while acting on fiction. Full invariants in `docs/agent/ac-leveling.md`.
 6. **Never run `docker image prune -a` on the VPS** without reading the warning in `docs/agent/operations.md` (it deletes the on-demand `iraq-law-checker` image).
 7. **Smart-auto over built-in auto:** device built-in "auto" modes are replaced by server-computed delta logic (pure functions + tests); manual user changes always win over automation enforcement.
 8. **VPS clock is UTC, household is Baghdad (UTC+3, no DST)** — all time-window/prayer logic must convert; see the timezone gotcha in `docs/agent/architecture.md`.

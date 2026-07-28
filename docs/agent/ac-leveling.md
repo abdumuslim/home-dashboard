@@ -23,6 +23,12 @@ ramping, so every spender (raise, restore, fan restore) is charged the committed
 of ramping peers on gen; (b) the CONFIGURED limit is not the limit — a breaker that just tripped is
 derated for 20 min, so all limit math goes through `effectiveLimit()`, never `limitFor()`.
 
+**Third invariant added 2026-07-28:** (c) **a drop we commanded is not a breaker trip.** Every
+reducing batch credits the meter with its own priced saving (`noteCommandedCut()`), and a collapse
+latches only on the part of the fall that credit does NOT explain — otherwise shedding the last ACs
+on gen freezes the house for 5 min and derates the limit for a blackout that never happened. See the
+2026-07-28 incident section.
+
 **Key design (vs v1):** ONE graduated reducer at every severity (no separate mild/emergency planners); explicit mode machine NORMAL/SETTLING/FLOORS/COLLAPSED replaces ~15 latches (FLOORS arms on ANY entry into gen incl. cold start); **fans are last-resort trim only** (enumerable only at floor level; restore needs 5-min calm — v1 cut fans with level cuts available 57% of the time and bounced them at 61s median); one-step meter-anchored raises priced by a **persistent learned cost model** (`ac_leveling_costs` — per device × source × transition EWMA, survives deploys, config saves do NOT wipe it; explicit `POST /api/ac/leveling/costs/reset`); restore/raise retries use **evidence + capped backoff** (30s→2m→5m→15m — kills permanent strands); on gen only ONE raise command per batch; every batch is journaled + outcome-graded in **`ac_leveling_journal`** (`GET /api/ac/leveling/journal?hours=24` — durable forensics, docker logs rotate in ~1.5 days); single-actuator graded batches feed the cost model continuously. Hard rules all preserved (never level 0, manual wins, slot caps, boost floors, shed≠manual-off, warm restore, opt-out, collapse latch, leaky bucket, requireShed ≥ max(3A, 20%)).
 
 **Hardware truth (2026-07-23, user-verified + web specs):** Abdu = **2-ton** (caps ≈ 4.1/6.5/~9A at L1/2/3), Abdullah & Najat = **1-ton** (≈ 2.2/3.9/5.3A). The registry `model` field is protocol-inference only — its capacity digits are WRONG (see tcl-ac.md). Observed raise JUMPS (3.6–3.8A, incl. compressor duty change) exceed steady per-level steps — the cost model stores both (`level:1>2` jumps vs steady model ceilings).
@@ -390,6 +396,118 @@ Tests: `scenarios.test.ts` "the 2026-07-27 evening bounce loop" (2 — capAmps a
 the physics vs the belief); `raise.test.ts` probe/bounced-re-admission/awaiting-confirm (3);
 `controller.test.ts` shed-until-confirm + off-drop learning (2); `collector.test.ts` observed-off
 grace ×2. **739 server tests green, `tsc` clean.**
+
+### 2026-07-28 self-inflicted "power collapse" ("why are Najat and Abdu still shed?")
+
+**The incident (04:14–04:29 UTC / 07:14–07:29 Baghdad, gen):** Abdullah was turned off from the UI
+at 07:14, leaving only Najat and Abdu on the 15 A gen. 07:18:49 `over_extreme` shed **Najat**;
+07:18:54 `over_severe` shed **Abdu**; Najat was restored at 07:19:40 and re-shed at 07:22:29. Both
+offs were still travelling through the TCL cloud, so the meter kept carrying their draw — then at
+**07:23:33 the compressors actually stopped together and gen fell 11.5 A → 4.5 A in one step.** That
+is drop ≥ `POWER_COLLAPSE_DROP_AMPS` (6 A) landing ≤ `POWER_COLLAPSE_FLOOR_AMPS` (5 A), i.e. exactly
+a breaker trip, so **COLLAPSED latched**: every evaluation journaled
+`blockedBy: "power collapse latched"` for the full 5-minute `POWER_COLLAPSE_MAX_MS`, with ~9 A of
+headroom sitting unused, **and the gen limit derated 15 A → 14 A for 20 min** on top. The generator
+was never in trouble — we had turned the load off ourselves. (It had also fired at 05:37 the same
+morning, so this was the recurring failure, not a one-off.)
+
+**Root cause:** `sensing.ts` judged a collapse on **meter shape alone**. It had no idea the
+controller had just commanded that load off, and once the house is down to its base load (~4.3–4.9 A
+here) any shed of a 2-ton room clears both thresholds at once. The house's whole AC fleet going off
+under leveling is therefore *always* indistinguishable from a trip — the shape is the same; only
+provenance differs.
+
+**Fix — commanded-cut credit (`MeterState.pendingCut`, `noteCommandedCut()`, `pendingCutCredit()`):**
+the mirror of `rampAbsorbedAmps` for the falling direction. After any batch with a negative
+`expectedDeltaAmps` the shell credits the meter with that batch's **own priced saving** (so the
+credit can never exceed what the reducer believed it was cutting); stacked sheds accumulate while
+unabsorbed. A collapse candidate then latches only when the fall the credit does **not** explain is
+still ≥ 6 A — a real breaker going while a small cut is in flight still latches (2026-07-26 replay:
+11.7 A unexplained), and with no cut pending behaviour is byte-identical to before.
+
+Two details that are load-bearing:
+- **Anchor-relative, not step-relative.** With a cut live, the fall is measured from the meter as it
+  stood when cutting began, not from this reading's step. Median smoothing spreads one cliff over
+  several readings (16 → 13 → 9 while the raw value is already at 4.3), and judging each step alone
+  let the *tail* latch what the *head* had already explained.
+- **Absorption ratchets on the SMOOTHED meter**, the same yardstick every other limit decision uses,
+  so a credit retires only once the smoothing window has digested the cut — not on the first raw
+  reading of it. One-way (deepest fall wins): a peer turning back on cannot un-prove that the cut
+  arrived. Credit expires after `PENDING_CUT_MS` (180 s — covers the observed 64 s send→stop lag with
+  margin; a trip later than that is still a trip) and is dropped outright on a source change.
+
+Observability: a withheld latch emits `collapse_suppressed` and logs
+`… explained by our own cut (N.NA commanded off, not yet metered) — no collapse latched`.
+
+Harness: `scenario.ts` gained `SimAcSetup.offLagMs` — how long a compressor keeps drawing after a
+`power_off` is SENT (default 0, so existing scenarios are unchanged). Without it the sim turned ACs
+off instantly and could not express the incident at all.
+
+Tests: `sensing.test.ts` "commanded-cut credit" (7 — the live 11.5→4.5 numbers, a real trip with a
+small cut in flight, expiry, spend-once-shown, ratchet, stacking, changeover); `scenarios.test.ts`
+2 more under "power collapse" (boost floors pin both rooms at L3 so shedding is the only cover, both
+offs land late → suppressed, no derate; and a real trip mid-shed still latches). **748 server tests
+green, `tsc` clean.**
+
+### 2026-07-28 ramp-honest cost learning (the raise→overload→shed loop)
+
+**The pattern (24h to 2026-07-28, gen):** **42 over-limit episodes in one day.** The shape repeats —
+gen sits at ~12.0–12.2A, a raise is admitted, and the meter is over within 0.5–4 min (17:33, 18:35,
+18:38, 18:46, 18:52 …). **18 of 56 gen raises/restores were followed by an over-limit inside 5 min.**
+
+**Root cause — the grading window is shorter than the compressor:** `GRADE_LEVEL_MS` was **45 s**
+while `AC_RAMP_MS` is **240 s**, so every level-raise cost sample measured roughly the first fifth of
+the ramp. Live evidence: **32 of 33 graded gen raises came in BELOW what admission charged**
+(median **−1.12A**, mean −1.37A). Najat's 04:14:41 L1→L2 graded **+0.23A**; 3.6 min later the gen was
+at 16.18A and shedding her.
+
+Those samples feed the EWMA, so the book drifted down with use — and its own history proves it:
+
+| device | transition | learned | samples | true step |
+|---|---|---|---|---|
+| Abdullah | `level:1>2` | 2.98 | 2 | 1.7 |
+| Najat | `level:1>2` | 3.60 | 2 | 1.7 |
+| Najat | `level:2>3` | 1.08 | 9 | 1.4 |
+| Abdu | `level:2>3` | 1.65 | 20 | 2.5 |
+| Abdullah | `level:2>3` | 0.74 | 16 | 1.4 |
+
+**More samples ⇒ lower cost** — a biased estimator, not a converging one. The only two transitions
+still priced above their model are the two that stopped being sampled on 07-23/07-25.
+
+`raiseCostAmps()` takes `max(model, learned)`, so this was **masked, not dangerous**: learned costs
+simply never rose above the config model and **the learning loop was inert for raises** — the static
+`stepAmps` did all the work. That is why the bounce persisted: Abdu's real L1→L2 jump is ~2.9–3.0A
+(compressor duty change on top of the 2.4A cap step) against a 2.5A model, so a raise admitted at
+pre ≈ 12.1A with 2.78A of headroom lands at ~15.1A. The learning that should have pushed his price
+to 3.0A and refused the raise was exactly what was broken. (The `on@L*` costs — Abdu 5.05, Najat
+3.64 — were always honest, because the 07-27 off-drop learning measures an *instantaneous* drop.)
+
+**Fix — grade in two stages (`PendingGrade`):**
+1. **`compareAfter` (unchanged, 45 s) journals the row**; a new **`learnAfter`** gates the cost
+   sample at `max(compareAfter, now + AC_RAMP_MS)`. Forensics stay fast, learning waits out the
+   compressor. A shed's off-drop is instantaneous and keeps learning on the journal's schedule
+   (`learnAfter = compareAfter` when `single.negate`).
+2. **The sample is a ratcheted peak** (`peakDeltaAmps`), one-way in the window's own direction —
+   highest rise for a raise/turn-on, deepest drop for a shed. Mirrors `rampAbsorbedAmps`: once the
+   meter has proven a compressor's amps arrived, a peer's later reduction cannot un-prove it, so a
+   4-min window no longer under-reads.
+3. **Contamination is direction-aware** (`batchLoadDirections()`), because a 4-min window would
+   otherwise never survive — on a busy gen evening batches land every 30–60 s. A batch that only
+   REMOVES load cannot inflate a raise's peak; one that only ADDS load cannot deepen a shed's
+   trough. A `set_level` with no confirmed level counts both ways (trip-safe); `set_fan` counts in
+   its own direction (~0.1A/gear, below the 0.2A learn gate either way).
+
+Note `ATTEMPT_BLAME_WINDOW_MS` (300 s) exceeds the learn window, so a raise that bounces still
+contaminates its own sample — correct, and why the off-drop path remains the fast corrector.
+
+Tests (each verified failing-first): `controller.test.ts` "a raise is learned over the whole
+compressor ramp" (2 — with the old 45 s window the sample was **0.30A**; without the ratchet, 0.5A)
++ `batchLoadDirections` unit coverage (4). **754 server tests green, `tsc` clean.**
+
+> **Cost-book note:** the poisoned `level:*` rows are all BELOW their model step, so
+> `max(model, learned)` already ignores them — pricing is unaffected today and the EWMA climbs back
+> over ~4 honest samples. `POST /api/ac/leveling/costs/reset` only if faster convergence is wanted,
+> at the cost of the honest `on@L*` rows.
 
 ---
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { LevelingControllerV2 } from "./controller.js";
+import { LevelingControllerV2, batchLoadDirections } from "./controller.js";
 import type { LevelingDeps } from "./api.js";
 
 // Minimal in-memory mock of the Postgres pool the controller talks to. Only the
@@ -318,6 +318,160 @@ describe("LevelingControllerV2 — shed clears on confirmed ON, not at command s
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// Ramp-honest cost learning (2026-07-28). A level raise was graded 45s after
+// the command (GRADE_LEVEL_MS) while the compressor needs AC_RAMP_MS (4 min) to
+// reach its new steady draw, so every sample measured the first fifth of the
+// ramp. Live 24h: 32 of 33 graded gen raises came in BELOW what admission
+// charged (median −1.12A; Najat's L1→L2 graded +0.23A and the gen was shedding
+// her 3.6 min later), and the cost book showed MORE samples giving LOWER costs
+// — a biased estimator, not a converging one. max(model, learned) masked it, so
+// the learned model was simply inert for raises.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — a raise is learned over the whole compressor ramp", () => {
+  it("learns the settled rise, not the slice of ramp visible at the journal grade", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-07-28T04:14:00Z"));
+      const mock = createGradePool();
+      // Ceiling L2, so the raise under test is the ONLY one — a second raise
+      // would be a load-adding batch and would (correctly) contaminate it.
+      const device = { id: "a", name: "a", power: true, generatorMode: 1, maxGeneratorLevel: 2, fanSpeed: 1 };
+      const deps: LevelingDeps = {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({
+            sendControl: async (_id: string, cmd: string, value: number) => {
+              if (cmd === "set_generator_mode") device.generatorMode = value;
+            },
+            executeAcAction: async () => undefined,
+          }) as never,
+      };
+      const controller = new LevelingControllerV2(mock.pool, deps);
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: device as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+      ];
+      let flip = 1;
+      const run = async (genAmps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(5_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+
+      await run(8, 8); // calm ≥ raiseCalmSeconds → the raise ships
+      expect(device.generatorMode).toBe(2);
+      // The compressor has barely begun: this is all the old 45s window saw.
+      await run(8.3, 10);
+      // …then it settles at its real draw, well inside the 4-min ramp.
+      await run(11, 50);
+
+      const learned = mock.costs.filter((c) => c.deviceId === "a" && c.transition === "level:1>2");
+      expect(learned.length).toBeGreaterThan(0);
+      // 11.0 − 8.0 = 3.0A of real cost. The 45s slice was ~0.3A — the value
+      // that used to be folded into the EWMA, dragging the price DOWN with
+      // every raise until admission was running on the config model alone.
+      expect(learned[learned.length - 1].ewma).toBeGreaterThan(2.5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a mid-window REDUCTION does not under-read the raise (ratcheted peak)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-07-28T04:14:00Z"));
+      const mock = createGradePool();
+      const device = { id: "a", name: "a", power: true, generatorMode: 1, maxGeneratorLevel: 2, fanSpeed: 1 };
+      const deps: LevelingDeps = {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({
+            sendControl: async (_id: string, cmd: string, value: number) => {
+              if (cmd === "set_generator_mode") device.generatorMode = value;
+            },
+            executeAcAction: async () => undefined,
+          }) as never,
+      };
+      const controller = new LevelingControllerV2(mock.pool, deps);
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: device as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+      ];
+      let flip = 1;
+      const run = async (genAmps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(5_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+
+      await run(8, 8);
+      expect(device.generatorMode).toBe(2);
+      await run(11, 20); // the raise arrives in full: peak = +3.0A
+      await run(8.5, 40); // a non-AC load leaves; the window closes low
+      const learned = mock.costs.filter((c) => c.deviceId === "a" && c.transition === "level:1>2");
+      expect(learned.length).toBeGreaterThan(0);
+      // A plain end-of-window delta would read ~0.5A here. The ratchet keeps
+      // the proven peak: absorption is a one-way fact.
+      expect(learned[learned.length - 1].ewma).toBeGreaterThan(2.5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// Contamination is direction-aware so a full-ramp window is affordable: on a
+// busy gen evening batches land every 30–60s, and marking every one of them a
+// contaminant would mean nothing is ever learned. A batch that only REMOVES
+// load cannot inflate a raise's ratcheted peak; one that only ADDS load cannot
+// deepen a shed's trough.
+describe("batchLoadDirections", () => {
+  const at = (id: string) => (id === "known" ? 2 : null);
+
+  it("classifies each command kind", () => {
+    expect(batchLoadDirections([{ deviceId: "x", kind: "power_on", level: 1, reason: "restore" }], at))
+      .toEqual({ adds: true, removes: false });
+    expect(batchLoadDirections([{ deviceId: "x", kind: "power_off", reason: "shed" }], at))
+      .toEqual({ adds: false, removes: true });
+    expect(batchLoadDirections([{ deviceId: "known", kind: "set_level", level: 3 }], at))
+      .toEqual({ adds: true, removes: false });
+    expect(batchLoadDirections([{ deviceId: "known", kind: "set_level", level: 1 }], at))
+      .toEqual({ adds: false, removes: true });
+    expect(batchLoadDirections([{ deviceId: "x", kind: "set_fan", fan: 1, reason: "trim" }], at))
+      .toEqual({ adds: false, removes: true });
+    expect(batchLoadDirections([{ deviceId: "x", kind: "set_fan", fan: 3, reason: "trim_restore" }], at))
+      .toEqual({ adds: true, removes: false });
+  });
+
+  it("a set_level with no confirmed level counts BOTH ways (trip-safe)", () => {
+    expect(batchLoadDirections([{ deviceId: "unknown", kind: "set_level", level: 2 }], at))
+      .toEqual({ adds: true, removes: true });
+  });
+
+  it("a level held at its current value moves nothing", () => {
+    expect(batchLoadDirections([{ deviceId: "known", kind: "set_level", level: 2 }], at))
+      .toEqual({ adds: false, removes: false });
+  });
+
+  it("a mixed batch contaminates both directions", () => {
+    expect(
+      batchLoadDirections(
+        [
+          { deviceId: "known", kind: "set_level", level: 3 },
+          { deviceId: "y", kind: "power_off", reason: "shed" },
+        ],
+        at,
+      ),
+    ).toEqual({ adds: true, removes: true });
   });
 });
 

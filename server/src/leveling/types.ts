@@ -39,6 +39,8 @@ export type MeterEvent =
   | { kind: "esp_gap"; gapMs: number }
   | { kind: "collapse"; fromAmps: number; toAmps: number; source: PowerSource }
   | { kind: "collapse_recovered"; source: PowerSource }
+  /** A collapse-shaped drop the controller's own cut explains — latch withheld. */
+  | { kind: "collapse_suppressed"; fromAmps: number; toAmps: number; creditAmps: number; source: PowerSource }
   | { kind: "bucket_empty"; severity: "mild" | "severe" }
   | { kind: "meter_frozen"; frozenForMs: number; amps: number }
   | { kind: "meter_unfrozen"; frozenForMs: number };
@@ -79,6 +81,18 @@ export interface MeterState {
    * records which source it applies to.
    */
   derate: { source: PowerSource; amps: number; until: number } | null;
+  /**
+   * Load this controller has COMMANDED off/down but the meter has not shown yet
+   * — the mirror of `rampAbsorbedAmps` for the falling direction. A shed's
+   * compressor stops somewhere between 6 s and minutes after the send, so the
+   * drop lands as one cliff long after the batch; without this credit the
+   * collapse detector reads our own shed as a breaker trip (live 2026-07-28
+   * 07:23: gen 11.5A → 4.5A one minute after shedding the last two ACs, which
+   * latched COLLAPSED, froze every restore for 5 min and derated the gen limit).
+   * `absorbedAmps` ratchets on the deepest fall below `anchorAmps`, so credit is
+   * spent once the meter has actually shown the cut.
+   */
+  pendingCut: { anchorAmps: number; amps: number; absorbedAmps: number; until: number } | null;
 }
 
 /** What the decision pipeline needs to know about the meter, per evaluation. */

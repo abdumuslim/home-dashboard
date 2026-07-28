@@ -7,7 +7,7 @@
 
 import type { AcView, Command, MeterEvent, MeterState } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
-import { ingestReading, initialMeterState, meterView, refillBucket, resetCalm } from "./sensing.js";
+import { ingestReading, initialMeterState, meterView, noteCommandedCut, refillBucket, resetCalm } from "./sensing.js";
 import {
   applyMeterEvent,
   clearFloorsIfDone,
@@ -56,6 +56,14 @@ export interface SimAcSetup {
   surgeFactor?: number;
   /** Shadow confirm lag for level commands. */
   confirmDelayMs?: number;
+  /**
+   * How long the compressor keeps drawing after a `power_off` is SENT. The
+   * cloud round-trip means an off lands anywhere from ~6 s to minutes later
+   * (docs/agent/tcl-ac.md), so a shed's whole draw leaves the meter as one
+   * cliff well after the batch — the shape that used to be read as a breaker
+   * trip. Defaults to 0 (instant) so existing scenarios are unchanged.
+   */
+  offLagMs?: number;
   /** Firmware silently ignores these level commands (unreachable). */
   ignoreLevels?: number[];
 }
@@ -80,6 +88,8 @@ interface SimAc {
   rampBaseline: number | null;
   /** Peak rise above `rampBaseline` seen since it armed (shell: rampAbsorbed). */
   rampAbsorbed: number;
+  /** Compressor still spinning down after an off was sent (0 = already stopped). */
+  drawingUntil: number;
 }
 
 const STEP_MS = 5_000;
@@ -147,6 +157,7 @@ export class Scenario {
       startBaseline: null,
       rampBaseline: null,
       rampAbsorbed: 0,
+      drawingUntil: 0,
     }));
   }
 
@@ -286,7 +297,10 @@ export class Scenario {
   // ---- simulation core ----
 
   private drawOf(ac: SimAc): number {
-    if (!ac.on || this.lineDead) return 0;
+    if (this.lineDead) return 0;
+    // An off that has been sent but not yet delivered still costs amps — the
+    // draw holds at its last steady value until the compressor really stops.
+    if (!ac.on) return this.now < ac.drawingUntil ? this.lastSteadyDraw(ac) : 0;
     const cap = ac.level <= 0 ? Number.POSITIVE_INFINITY : ac.setup.capAmps[Math.min(ac.level, 3) - 1];
     const rampMs = ac.setup.rampSeconds * 1000;
     const sinceOn = this.now - ac.turnedOnAt;
@@ -297,6 +311,13 @@ export class Scenario {
     const rampFactor = ramping ? Math.max(0.2, sinceOn / rampMs) : 1;
     const fanExtra = ac.fan > 1 ? (ac.fan - 1) * 0.05 : 0;
     return steady * rampFactor + fanExtra;
+  }
+
+  /** Steady (post-ramp) draw of an AC whose off is still in flight. */
+  private lastSteadyDraw(ac: SimAc): number {
+    const cap = ac.level <= 0 ? Number.POSITIVE_INFINITY : ac.setup.capAmps[Math.min(ac.level, 3) - 1];
+    const fanExtra = ac.fan > 1 ? (ac.fan - 1) * 0.05 : 0;
+    return Math.min(ac.demandAmps, cap) + fanExtra;
   }
 
   private buildViews(): AcView[] {
@@ -358,6 +379,9 @@ export class Scenario {
           ac.shed = true;
           ac.warmStartLevel = null;
           ac.startBaseline = null;
+          // The controller's model of the device flips now; the physical
+          // compressor keeps drawing until the cloud actually delivers the off.
+          ac.drawingUntil = this.now + (ac.setup.offLagMs ?? 0);
           break;
         case "power_on":
           ac.on = true;
@@ -365,6 +389,7 @@ export class Scenario {
           ac.level = cmd.level;
           ac.shadowLevel = cmd.level;
           ac.shadowLevelAt = 0;
+          ac.drawingUntil = 0;
           this.startRamp(ac);
           // Gentle restore pins the fan; the hold itself rides in out.fanHolds
           // (recorded by the pipeline, assigned in step()).
@@ -457,6 +482,11 @@ export class Scenario {
       this.execute(out);
       this.modeState = noteBatch(this.modeState, { fanOnly: out.fanOnly }, this.now);
       if (!out.fanOnly) this.meterState = resetCalm(this.meterState);
+      // Shell parity: credit the meter with what this batch took off the line,
+      // so a shed's late arrival is not read as a breaker trip.
+      if (out.expectedDeltaAmps < 0) {
+        this.meterState = noteCommandedCut(this.meterState, -out.expectedDeltaAmps, this.now);
+      }
       // Shell parity: a turn-on invalidates banked over-limit readings.
       if (out.commands.some((c) => c.kind === "power_on")) {
         this.meterState = refillBucket(this.meterState);

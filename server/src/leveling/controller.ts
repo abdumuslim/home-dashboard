@@ -11,7 +11,7 @@ import pg from "pg";
 import { childLogger } from "../logger.js";
 import type { LevelerDeviceContext, LevelingDeps, LevelingStatusV2 } from "./api.js";
 import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, effectiveLimit, limitFor, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
-import { ingestReading, initialMeterState, meterView, refillBucket, resetCalm } from "./sensing.js";
+import { ingestReading, initialMeterState, meterView, noteCommandedCut, refillBucket, resetCalm } from "./sensing.js";
 import {
   applyMeterEvent,
   clearFloorsIfDone,
@@ -81,7 +81,35 @@ const BLOCKED_JOURNAL_THROTTLE_MS = 5 * 60_000;
 interface PendingGrade {
   journalId: number;
   compareAfter: number;
+  /**
+   * When the COST sample may be taken — separate from `compareAfter`, which
+   * only gates the journal row.
+   *
+   * A level raise was graded 45s after the command (`GRADE_LEVEL_MS`) while the
+   * compressor needs `AC_RAMP_MS` (4 min) to reach its new steady draw, so every
+   * sample measured roughly the first fifth of the ramp. Live 24h to 2026-07-28:
+   * 32 of 33 graded gen raises came in BELOW what admission charged (median
+   * −1.12A; Najat's L1→L2 graded +0.23A and the gen was shedding her 3.6 min
+   * later). The EWMA then dragged each transition down with every sample — the
+   * cost book's own history shows MORE samples giving LOWER costs
+   * (Abdullah level:2>3 = 0.74A over 16 samples against a ~1.4A true step),
+   * which is a biased estimator, not a converging one. `raiseCostAmps` takes
+   * max(model, learned), so the corruption was masked rather than dangerous:
+   * learned costs simply never rose above the config model, and the learning
+   * loop was inert for raises.
+   */
+  learnAfter: number;
   preAmps: number;
+  /**
+   * Ratcheted extreme of (smoothed − preAmps) over the learning window, in the
+   * direction this batch moves the meter: the peak RISE for a raise/turn-on,
+   * the deepest DROP for a shed. One-way, like `rampAbsorbedAmps` — once the
+   * meter has proven a compressor's amps arrived, a peer's later reduction
+   * cannot un-prove it, so a long window no longer under-reads.
+   */
+  peakDeltaAmps: number;
+  /** Journal row already graded — the window now lives only for the cost sample. */
+  journaled: boolean;
   source: PowerSource;
   /**
    * Set when the batch had exactly one meter-affecting command (cost learning).
@@ -94,11 +122,56 @@ interface PendingGrade {
   single: { deviceId: string; transition: string; negate?: boolean } | null;
   attempts: Array<{ deviceId: string; kind: "raise" | "restore" }>;
   /**
-   * A later batch moved the meter inside this window, so the observed delta is
-   * no longer attributable to this batch alone: journal it (post_amps is still
-   * useful forensics) and resolve its attempts, but never LEARN a cost from it.
+   * A later batch moved the meter inside this window IN THIS WINDOW'S OWN
+   * DIRECTION, so the observed extreme is no longer attributable to this batch
+   * alone: journal it (post_amps is still useful forensics) and resolve its
+   * attempts, but never LEARN a cost from it.
+   *
+   * Direction-aware because the measurement is a one-way ratchet: a batch that
+   * only REMOVES load cannot inflate a raise's peak rise (it just lowers the
+   * readings after it, and the peak already holds), and one that only ADDS load
+   * cannot deepen a shed's trough. Marking both as contamination is what made a
+   * full-ramp window unaffordable — on a busy gen evening batches land every
+   * 30–60s, so nothing would ever be learned.
    */
   contaminated: boolean;
+  /** Which direction of later batch can corrupt this window's measurement. */
+  direction: "up" | "down";
+}
+
+/** Whether a batch adds load, removes it, or both (contamination direction). */
+export function batchLoadDirections(
+  commands: readonly Command[],
+  confirmedLevel: (deviceId: string) => number | null,
+): { adds: boolean; removes: boolean } {
+  let adds = false;
+  let removes = false;
+  for (const cmd of commands) {
+    switch (cmd.kind) {
+      case "power_on":
+        adds = true;
+        break;
+      case "power_off":
+        removes = true;
+        break;
+      case "set_level": {
+        const from = confirmedLevel(cmd.deviceId);
+        // Unknown current level: assume it could go either way (trip-safe).
+        if (from == null) { adds = true; removes = true; }
+        else if (cmd.level > from) adds = true;
+        else if (cmd.level < from) removes = true;
+        break;
+      }
+      case "set_fan":
+        // ~0.1A/gear (mined 2026-07) — below the 0.2A learn threshold and deep
+        // inside the noise of a 2.5A raise measurement. A trim is still counted
+        // in its own direction rather than ignored outright.
+        if (cmd.reason === "trim") removes = true;
+        else adds = true;
+        break;
+    }
+  }
+  return { adds, removes };
 }
 
 export class LevelingControllerV2 {
@@ -405,6 +478,15 @@ export class LevelingControllerV2 {
           }
           break;
         }
+        case "collapse_suppressed":
+          // Not a trip: the fall is the shed we sent finally reaching the meter.
+          // Logged (not pushed) because nothing is wrong — but it is the one
+          // trace that explains why a trip-shaped drop did NOT freeze the house.
+          log.info(
+            `[leveler2] ${event.fromAmps.toFixed(1)}A → ${event.toAmps.toFixed(1)}A on ${event.source} ` +
+              `explained by our own cut (${event.creditAmps.toFixed(1)}A commanded off, not yet metered) — no collapse latched`,
+          );
+          break;
         case "collapse_recovered":
           // Compressors restarted with the line — re-arm the ramp windows.
           this.rearmRamp([...this.prevPowerStates.entries()].filter(([, on]) => on).map(([id]) => id));
@@ -1007,6 +1089,15 @@ export class LevelingControllerV2 {
 
     this.modeState = noteBatch(this.modeState, { fanOnly }, now);
     if (!fanOnly) this.meterState = resetCalm(this.meterState);
+    // Tell the meter what we just took OFF the line. A shed's compressor stops
+    // anywhere from seconds to minutes after the send, so the drop arrives as
+    // one cliff with nothing tying it to us — and a cliff past the collapse
+    // floor is indistinguishable from a breaker trip (live 2026-07-28 07:23).
+    // The credit is the batch's own priced saving, so it can never exceed what
+    // the reducer believed it was cutting.
+    if (out.expectedDeltaAmps < 0) {
+      this.meterState = noteCommandedCut(this.meterState, -out.expectedDeltaAmps, now);
+    }
     // A turn-on changes the load picture wholesale: over-limit readings banked
     // BEFORE it are no longer evidence about the house that exists now, and
     // letting them carry over meant a restore inherited a half-drained bucket
@@ -1072,29 +1163,49 @@ export class LevelingControllerV2 {
         }
       }
     }
-    // This batch moves the meter, so every window still open can no longer
-    // attribute its delta to one batch — mark them, but KEEP them: they still
-    // deserve a journal grade and their attempts still need resolving.
-    this.pendingGrades = this.pendingGrades.map((g) => (g.contaminated ? g : { ...g, contaminated: true }));
+    // This batch moves the meter, so an open window whose measurement runs the
+    // SAME way can no longer attribute its extreme to one batch — mark those,
+    // but KEEP them: they still deserve a journal grade and their attempts
+    // still need resolving. A window running the other way is untouched (see
+    // PendingGrade.contaminated).
+    const moved = batchLoadDirections(commands, (id) => this.recon[id]?.confirmedLevel ?? null);
+    this.pendingGrades = this.pendingGrades.map((g) =>
+      g.contaminated || !(g.direction === "up" ? moved.adds : moved.removes)
+        ? g
+        : { ...g, contaminated: true },
+    );
+    const compareAfter = out.compareAfter || now + GRADE_FAN_MS;
     this.pendingGrades.push({
       journalId,
-      compareAfter: out.compareAfter || now + GRADE_FAN_MS,
+      compareAfter,
+      // A shed's off-drop is instantaneous — the whole point of the 2026-07-27
+      // off-drop learning — so it learns on the journal's schedule. Anything
+      // ramp-shaped (level raise, turn-on) must wait out the compressor.
+      learnAfter: single?.negate === true ? compareAfter : Math.max(compareAfter, now + AC_RAMP_MS),
       preAmps: view.smoothedAmps,
+      peakDeltaAmps: 0,
+      journaled: false,
       source: view.source,
       single,
       attempts: out.attempts,
       contaminated: false,
+      direction: single?.negate === true ? "down" : "up",
     });
     if (this.pendingGrades.length > MAX_PENDING_GRADES) {
       this.pendingGrades = this.pendingGrades.slice(-MAX_PENDING_GRADES);
     }
   }
 
+  /**
+   * Two-stage: the journal row is graded at `compareAfter` (fast forensics,
+   * unchanged), the cost sample at `learnAfter` (the full compressor ramp).
+   * Windows therefore outlive their journal row when there is a cost to learn.
+   */
   private async gradePending(view: ReturnType<typeof meterView>, now: number): Promise<void> {
     if (this.pendingGrades.length === 0) return;
-    const due: PendingGrade[] = [];
     const keep: PendingGrade[] = [];
-    for (const g of this.pendingGrades) {
+    for (const prev of this.pendingGrades) {
+      let g = this.ratchetGrade(prev, view, now);
       // Long past due and still never gradeable — drop it rather than leak.
       if (now > g.compareAfter + GRADE_ABANDON_MS) continue;
       // Not ripe yet: KEEP it, without judging the source. An ESP gap makes the
@@ -1108,13 +1219,36 @@ export class LevelingControllerV2 {
       // Due, but the meter is on a different line than the batch ran on — a
       // source change already empties the queue, so this is a backstop.
       if (view.source !== g.source) continue;
-      due.push(g);
+
+      if (!g.journaled) {
+        await this.journalGrade(g, view, now);
+        g = { ...g, journaled: true };
+      }
+      // Nothing left to learn from — retire the window.
+      if (g.single == null || g.contaminated) continue;
+      if (now < g.learnAfter) {
+        keep.push(g);
+        continue;
+      }
+      await this.learnGrade(g, now);
     }
     this.pendingGrades = keep;
-    for (const grade of due) await this.gradeOne(grade, view, now);
   }
 
-  private async gradeOne(
+  /** One-way ratchet of the window's extreme, in its own measurement direction. */
+  private ratchetGrade(
+    g: PendingGrade,
+    view: ReturnType<typeof meterView>,
+    _now: number,
+  ): PendingGrade {
+    if (view.source !== g.source || view.frozen || view.collapsed || view.sampleCount < 2) return g;
+    const delta = view.smoothedAmps - g.preAmps;
+    const peak = g.direction === "up" ? Math.max(g.peakDeltaAmps, delta) : Math.min(g.peakDeltaAmps, delta);
+    return peak === g.peakDeltaAmps ? g : { ...g, peakDeltaAmps: peak };
+  }
+
+  /** Journal the batch outcome and resolve its pacing attempts (fast stage). */
+  private async journalGrade(
     grade: PendingGrade,
     view: ReturnType<typeof meterView>,
     now: number,
@@ -1123,33 +1257,38 @@ export class LevelingControllerV2 {
     if (grade.journalId > 0) {
       await this.store.gradeJournal(grade.journalId, now, view.smoothedAmps, observedDelta).catch(() => undefined);
     }
-    // Learn ONLY from a window no other batch disturbed — an overlapping batch
-    // makes the delta un-attributable, and a wrong learned cost is worse than
-    // no learned cost (it gates raise/restore admission).
-    const learnSample = grade.single?.negate ? -observedDelta : observedDelta;
-    if (grade.single != null && !grade.contaminated && grade.source !== "none" && learnSample > 0.2) {
-      this.book = updateCost(
-        this.book,
-        grade.single.deviceId,
-        grade.source,
-        grade.single.transition as never,
-        learnSample,
-        now,
-      );
-      const entry = this.book[`${grade.single.deviceId}|${grade.source}|${grade.single.transition}`];
-      if (entry != null) {
-        await this.store.upsertCost(grade.single.deviceId, grade.source, grade.single.transition, entry).catch(() => undefined);
-      }
-      log.info(
-        `[leveler2] Learned ${grade.single.transition} ≈ ${learnSample.toFixed(1)}A for ` +
-          `${this.deviceNames.get(grade.single.deviceId) ?? grade.single.deviceId} on ${grade.source}` +
-          (grade.single.negate ? " (from shed off-drop)" : ""),
-      );
-    }
     // Attempts that survived to grading without a failure are successes.
     for (const attempt of grade.attempts) {
       this.pacing = noteSuccess(this.pacing, attempt.deviceId, attempt.kind);
     }
+  }
+
+  /**
+   * Fold the window's ratcheted extreme into the cost book (slow stage).
+   * Reached only for an uncontaminated single-actuator batch past `learnAfter`,
+   * so the sample is the compressor's settled cost, not a slice of its ramp.
+   */
+  private async learnGrade(grade: PendingGrade, now: number): Promise<void> {
+    if (grade.single == null || grade.source === "none") return;
+    const learnSample = grade.single.negate ? -grade.peakDeltaAmps : grade.peakDeltaAmps;
+    if (!(learnSample > 0.2)) return;
+    this.book = updateCost(
+      this.book,
+      grade.single.deviceId,
+      grade.source,
+      grade.single.transition as never,
+      learnSample,
+      now,
+    );
+    const entry = this.book[`${grade.single.deviceId}|${grade.source}|${grade.single.transition}`];
+    if (entry != null) {
+      await this.store.upsertCost(grade.single.deviceId, grade.source, grade.single.transition, entry).catch(() => undefined);
+    }
+    log.info(
+      `[leveler2] Learned ${grade.single.transition} ≈ ${learnSample.toFixed(1)}A for ` +
+        `${this.deviceNames.get(grade.single.deviceId) ?? grade.single.deviceId} on ${grade.source}` +
+        (grade.single.negate ? " (from shed off-drop)" : " (peak over the compressor ramp)"),
+    );
   }
 
   private async persistFanHold(deviceId: string): Promise<void> {

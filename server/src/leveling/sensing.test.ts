@@ -6,11 +6,14 @@ import {
   COLLAPSE_DERATE_MS,
   METER_FROZEN_AFTER_MS,
   OVER_LIMIT_BUDGET,
+  PENDING_CUT_MS,
   POWER_COLLAPSE_MAX_MS,
   determineSource,
   ingestReading,
   initialMeterState,
   meterView,
+  noteCommandedCut,
+  pendingCutCredit,
   refillBucket,
 } from "./sensing.js";
 import { DEFAULT_LEVELING_CONFIG_V2, effectiveLimit, type LevelingConfigV2 } from "./config.js";
@@ -171,6 +174,83 @@ describe("power-collapse latch", () => {
     );
     expect(later.state.collapse).toBeNull();
     expect(later.events.some((e) => e.kind === "collapse_recovered")).toBe(false);
+  });
+});
+
+// 2026-07-28 07:23 Baghdad: leveling shed Najat then Abdu AC over three minutes;
+// their compressors actually stopped ~1 min after the last send and gen fell
+// 11.5A → 4.5A in one step. That is trip-shaped, so COLLAPSED latched, every
+// raise/restore froze for 5 min ("blockedBy: power collapse latched") and the
+// gen limit derated to 14A — for a generator that never tripped. A drop the
+// controller itself commanded is not evidence of a breaker.
+describe("commanded-cut credit (self-inflicted collapse suppression)", () => {
+  it("does NOT latch when our own shed explains the drop", () => {
+    const steady = feedGen([11.5, 11.6, 11.4, 11.5]);
+    // The reducer shed a room it priced at 3.5A (learned on@L1).
+    const cut = noteCommandedCut(steady.state, 3.5, steady.now);
+    const r = ingestReading(cut, { gridAmps: 0, genAmps: 4.5 }, cfg, steady.now + 60_000);
+    expect(r.events.some((e) => e.kind === "collapse")).toBe(false);
+    expect(r.state.collapse).toBeNull();
+    // …and no phantom derate: the limit stays at its rating.
+    expect(r.state.derate).toBeNull();
+    const suppressed = r.events.find((e) => e.kind === "collapse_suppressed");
+    expect(suppressed).toMatchObject({ toAmps: 4.5, creditAmps: 3.5 });
+  });
+
+  it("still latches when the drop is far bigger than what we commanded", () => {
+    // The 2026-07-26 gen trip: a 0.4A mild trim was in flight when the breaker
+    // went. 11.7A of the fall is unexplained — that is a trip.
+    const steady = feedGen([15.6, 15.7, 15.5, 15.6]);
+    const cut = noteCommandedCut(steady.state, 0.4, steady.now);
+    const r = ingestReading(cut, { gridAmps: 0, genAmps: 3.9 }, cfg, steady.now + 5_000);
+    expect(r.events.some((e) => e.kind === "collapse")).toBe(true);
+    expect(r.state.derate?.amps).toBe(COLLAPSE_DERATE_AMPS);
+  });
+
+  it("credit expires — a trip long after the shed is still a trip", () => {
+    const steady = feedGen([11.5, 11.6, 11.4, 11.5]);
+    const cut = noteCommandedCut(steady.state, 8, steady.now);
+    const r = ingestReading(cut, { gridAmps: 0, genAmps: 4.5 }, cfg, steady.now + PENDING_CUT_MS + 1);
+    expect(r.events.some((e) => e.kind === "collapse")).toBe(true);
+  });
+
+  it("credit is spent once the meter has shown the cut, so a later trip latches", () => {
+    const steady = feedGen([14, 14.1, 13.9, 14]);
+    const cut = noteCommandedCut(steady.state, 6, steady.now);
+    // The cut arrives gradually and lands above the collapse floor: absorbed.
+    const settled = feedGen([8, 8, 8, 8], { state: cut, startAt: steady.now + 5_000 });
+    expect(pendingCutCredit(settled.state, settled.now)).toBe(0);
+    const r = ingestReading(settled.state, { gridAmps: 0, genAmps: 1 }, cfg, settled.now + 5_000);
+    expect(r.events.some((e) => e.kind === "collapse")).toBe(true);
+  });
+
+  it("absorption ratchets — a peer turning back on does not re-arm spent credit", () => {
+    const steady = feedGen([14, 14.1, 13.9, 14]);
+    const cut = noteCommandedCut(steady.state, 6, steady.now);
+    // Partial arrival of the cut, then a peer's start lifts the house again.
+    const dipped = feedGen([10, 10], { state: cut, startAt: steady.now + 5_000 });
+    const spent = pendingCutCredit(dipped.state, dipped.now);
+    expect(spent).toBeLessThan(6);
+    const lifted = feedGen([14, 14, 14], { state: dipped.state, startAt: dipped.now + 5_000 });
+    expect(pendingCutCredit(lifted.state, lifted.now)).toBeLessThanOrEqual(spent);
+  });
+
+  it("stacked sheds accumulate credit while unabsorbed", () => {
+    const steady = feedGen([15, 15.1, 14.9, 15]);
+    const first = noteCommandedCut(steady.state, 6.5, steady.now);
+    // Nothing moved yet (the confirm lag) — a second shed adds to the credit.
+    const held = feedGen([15, 15, 15], { state: first, startAt: steady.now + 5_000 });
+    const second = noteCommandedCut(held.state, 3.5, held.now);
+    expect(pendingCutCredit(second, held.now)).toBeGreaterThan(9.8);
+    expect(pendingCutCredit(second, held.now)).toBeLessThanOrEqual(10);
+  });
+
+  it("a cut commanded on the old line credits nothing after a changeover", () => {
+    const steady = feedGen([11.5, 11.6, 11.4, 11.5]);
+    const cut = noteCommandedCut(steady.state, 6, steady.now);
+    const swapped = ingestReading(cut, { gridAmps: 12, genAmps: 0 }, cfg, steady.now + 5_000);
+    expect(swapped.state.pendingCut).toBeNull();
+    expect(pendingCutCredit(swapped.state, steady.now + 5_000)).toBe(0);
   });
 });
 
