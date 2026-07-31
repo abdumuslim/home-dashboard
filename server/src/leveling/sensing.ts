@@ -18,10 +18,23 @@ import { effectiveLimit } from "./config.js";
 export const OVER_LIMIT_BUDGET = 5;
 /** Points drained by a reading more than OVER_LIMIT_SEVERE_AMPS over the limit. */
 export const OVER_LIMIT_DRAIN_SEVERE = 3;
-/** Points drained by a reading within OVER_LIMIT_SEVERE_AMPS over the limit. */
+/**
+ * Points drained by a reading meaningfully — but not severely — over the limit.
+ *
+ * The drain used to be binary, 3 or 1, with the step at a full amp over. Live
+ * 2026-07-31 the gen sat at 15.93A on a 15A limit: 0.93A over, one point per
+ * reading, five readings to act — **52 seconds** before the first corrective
+ * command, on a breaker that had ~90 seconds left in it. Anything half an amp
+ * over is not meter noise, and this middle rung gets the first act out in
+ * ~2–3 readings without touching the noise tolerance the bucket exists for.
+ */
+export const OVER_LIMIT_DRAIN_MODERATE = 2;
+/** Points drained by a reading within OVER_LIMIT_MODERATE_AMPS over the limit. */
 export const OVER_LIMIT_DRAIN_MILD = 1;
 /** Amps above the raw limit that classify a reading as severely over. */
 export const OVER_LIMIT_SEVERE_AMPS = 1;
+/** Amps above the raw limit past which a reading is more than noise. */
+export const OVER_LIMIT_MODERATE_AMPS = 0.5;
 /** Sudden measured drop ≥ this (vs the prior median) is a candidate trip. */
 export const POWER_COLLAPSE_DROP_AMPS = 6;
 /** …AND the reading must land at/below this floor (the AC load vanished). */
@@ -75,17 +88,39 @@ export const COLLAPSE_DERATE_AMPS = 1;
 /** Ceiling on the stacked derate — a cascade must not starve the line to nothing. */
 export const COLLAPSE_DERATE_MAX_AMPS = 3;
 /**
- * How long a derate lasts; each new collapse refreshes it (and adds a step).
- * Longer than the observed 9–11 min between cascade trips, so a repeat trip
- * lands INSIDE the window and stacks rather than starting over at full rating.
+ * How long ONE rung of the derate lasts; each new collapse refreshes it (and
+ * adds a step). Longer than the observed 9–11 min between cascade trips, so a
+ * repeat trip lands INSIDE the window and stacks rather than starting over.
  */
 export const COLLAPSE_DERATE_MS = 20 * 60_000;
+/**
+ * How much of the derate the line earns back per quiet rung.
+ *
+ * The derate used to CLIFF-expire — one rung, then straight back to full
+ * rating. Live 2026-07-30: the gen tripped at 09:25:06 (derate → 14.0A), the
+ * rung ended at 09:45:06, and the leveler spent the reclaimed amps on a raise
+ * **2 seconds later**; it tripped again at 09:51:40. Worse, that second trip
+ * found `standing` back at 0 and re-armed at 1.0A instead of escalating — the
+ * "walk the limit down on every collapse" design defeated by its own expiry.
+ * Handing the rating back in steps keeps the ladder standing between trips, so
+ * a repeat trip escalates (0.5 → 1.5) the way it was meant to.
+ */
+export const COLLAPSE_DERATE_RECOVERY_STEP = 0.5;
 
-/** Live derate for `source`, or 0 (expired / different line / never tripped). */
+/**
+ * Live derate for `source`, or 0 (fully recovered / different line / never
+ * tripped). Pure function of time: `until` ends the CURRENT rung, and every
+ * further elapsed rung hands back one `COLLAPSE_DERATE_RECOVERY_STEP`. A line
+ * carrying nothing cools fastest, so recovery deliberately does not require
+ * readings — but it is still per-source, so a gen→grid→gen bounce cannot
+ * launder a breaker that only just tripped.
+ */
 export function derateFor(state: MeterState, source: PowerSource, now: number): number {
   const d = state.derate;
-  if (d == null || d.source !== source || now >= d.until) return 0;
-  return d.amps;
+  if (d == null || d.source !== source) return 0;
+  if (now < d.until) return d.amps;
+  const rungsElapsed = 1 + Math.floor((now - d.until) / COLLAPSE_DERATE_MS);
+  return Math.max(0, d.amps - rungsElapsed * COLLAPSE_DERATE_RECOVERY_STEP);
 }
 
 export function initialMeterState(): MeterState {
@@ -294,6 +329,8 @@ export function ingestReading(
   // cannot hold what it was carrying, and a repeat trip inside the window
   // proves the derate was still not enough (live 15.65A → 14.48A → 13.99A).
   // Stacking is capped so a cascade cannot starve the house to nothing.
+  // `standing` is the DECAYED rung, so a trip part-way up the recovery ladder
+  // escalates from where the line actually was rather than from full rating.
   let derate = state.derate;
   if (collapse != null && state.collapse == null) {
     const standing = derateFor(state, source, now);
@@ -302,7 +339,9 @@ export function ingestReading(
       amps: Math.min(COLLAPSE_DERATE_MAX_AMPS, standing + COLLAPSE_DERATE_AMPS),
       until: now + COLLAPSE_DERATE_MS,
     };
-  } else if (derate != null && now >= derate.until) {
+  } else if (derate != null && derateFor(state, derate.source, now) <= 0) {
+    // Fully recovered — drop the record (judged on ITS line, so a gen derate
+    // still retires while the house is on grid).
     derate = null;
   }
   // Classify this reading against the derated limit, so the leaky bucket and
@@ -343,8 +382,13 @@ export function ingestReading(
   if (measured > limit) {
     // Over the limit → drain, magnitude-weighted. Calm is broken.
     calmSince = null;
+    const over = measured - limit;
     const drain =
-      measured - limit > OVER_LIMIT_SEVERE_AMPS ? OVER_LIMIT_DRAIN_SEVERE : OVER_LIMIT_DRAIN_MILD;
+      over > OVER_LIMIT_SEVERE_AMPS
+        ? OVER_LIMIT_DRAIN_SEVERE
+        : over > OVER_LIMIT_MODERATE_AMPS
+          ? OVER_LIMIT_DRAIN_MODERATE
+          : OVER_LIMIT_DRAIN_MILD;
     overLimitBudget = Math.max(0, overLimitBudget - drain);
     overLimitReadings = [...overLimitReadings, measured].slice(-RECENT_RING);
     if (overLimitBudget <= 0) {
@@ -395,8 +439,19 @@ export function ingestReading(
 }
 
 /** Refill after the controller ACTED on an empty bucket (episode handled). */
-export function refillBucket(state: MeterState): MeterState {
-  return { ...state, overLimitBudget: OVER_LIMIT_BUDGET, overLimitReadings: [] };
+/**
+ * Points the bucket is refilled to after an over-limit act. Deliberately NOT
+ * full: a full refill made the second act wait out another five readings, and
+ * on 2026-07-31 those were the 38 seconds between a 0.4A fan trim (all the
+ * first act managed) and the level cut that should have come first. The
+ * anti-double-cut protection this refill exists for now lives in the demand
+ * side of invariant 11 — `commandedCutCreditAmps` subtracts amps that are
+ * already on their way out — so the bucket no longer has to carry it alone.
+ */
+export const OVER_LIMIT_BUDGET_AFTER_ACT = 2;
+
+export function refillBucket(state: MeterState, points = OVER_LIMIT_BUDGET): MeterState {
+  return { ...state, overLimitBudget: points, overLimitReadings: [] };
 }
 
 /** Break calm (e.g. after a command batch: post-command readings are not pre-raise evidence). */

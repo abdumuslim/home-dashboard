@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { FAN_RESTORE_CALM_MS, planFanRestore, recordFanCut, releaseFanHold, type FanHolds } from "./fan-trim.js";
+import {
+  FAN_RESTORE_AFTER_CUT_MS,
+  FAN_RESTORE_CALM_MS,
+  FAN_RESTORE_MAX_STEP,
+  planFanRestore,
+  recordFanCut,
+  releaseFanHold,
+  type FanHolds,
+} from "./fan-trim.js";
 import { updateCost } from "./costs.js";
 import type { AcView } from "./types.js";
 
@@ -56,47 +64,65 @@ describe("planFanRestore", () => {
     ...over,
   });
 
+  /** A cut old enough that only the calm gate and the cost can block. */
+  const cutLongAgo = (fanSpeed: number) =>
+    recordFanCut({}, ac("a", { fanSpeed }), 1, T - FAN_RESTORE_AFTER_CUT_MS);
+
   it("does nothing before the long calm gate (v1's 61s bounce median is the disease)", () => {
-    const holds = recordFanCut({}, ac("a", { fanSpeed: 6 }), 1, T);
-    expect(planFanRestore(holds, [ac("a", { fanSpeed: 1 })], opts({ calmMs: FAN_RESTORE_CALM_MS - 1 }))).toBeNull();
+    expect(
+      planFanRestore(cutLongAgo(6), [ac("a", { fanSpeed: 1 })], opts({ calmMs: FAN_RESTORE_CALM_MS - 1 })),
+    ).toBeNull();
   });
 
-  it("climbs to the sweet spot the learned cost fits, one AC per evaluation", () => {
-    // Learned 0.2A/step; headroom 0.7A; original 6, current 1 → full climb (5
-    // steps = 1.0A) doesn't fit; 4 steps to fan 4 does (0.8 > 0.7? no — 0.8 > 0.7,
-    // so 3 steps to fan 4 costs 0.6 ≤ 0.7 → target 4).
-    const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
-    const holds = recordFanCut({}, ac("a", { fanSpeed: 6 }), 1, T - FAN_RESTORE_CALM_MS);
-    const step = planFanRestore(holds, [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 0.7 }));
-    expect(step).not.toBeNull();
-    expect(step!.command).toMatchObject({ kind: "set_fan", fan: 4 });
-    expect(step!.final).toBe(false);
-    expect(step!.holds.a.lastSetFan).toBe(4);
+  it("holds a freshly-cut fan for the cut cooldown even when the meter is calm", () => {
+    // Live 2026-07-31: Abdu's fan was cut at 17:30:24 and fully restored at
+    // 17:31:44 — 80s. A fan-only batch never rewinds the shared calm clock, so
+    // the calm gate alone could not see the cut that had just happened.
+    const justCut = recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - 80_000);
+    expect(planFanRestore(justCut, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 5 }))).toBeNull();
+    const cooled = recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - FAN_RESTORE_AFTER_CUT_MS);
+    expect(planFanRestore(cooled, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 5 }))).not.toBeNull();
   });
 
-  it("reaches the original in one jump when it fits and marks the step final", () => {
+  it("climbs at most FAN_RESTORE_MAX_STEP gears, however much headroom there is", () => {
+    // The bug: the old search took the HIGHEST target whose cost fits, and a
+    // 6-gear swing prices at ~0.9A — so 1→7 fitted essentially always. Abdu ran
+    // 7→5→3→1→7→1→7→4 in nine minutes on 2026-07-31.
     const book = updateCost({}, "a", "gen", "fan:step", 0.1, T);
-    const holds = recordFanCut({}, ac("a", { fanSpeed: 6 }), 1, T - FAN_RESTORE_CALM_MS);
-    const step = planFanRestore(holds, [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 2 }));
-    expect(step!.command).toMatchObject({ fan: 6 });
+    const step = planFanRestore(cutLongAgo(7), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 99 }));
+    expect(step!.command).toMatchObject({ kind: "set_fan", fan: 1 + FAN_RESTORE_MAX_STEP });
+    expect(step!.final).toBe(false);
+    expect(step!.holds.a.lastSetFan).toBe(1 + FAN_RESTORE_MAX_STEP);
+  });
+
+  it("takes a smaller step when the bounded one does not fit", () => {
+    // Learned 0.2A/step, headroom 0.3A: 2 gears cost 0.4 (no), 1 gear 0.2 (yes).
+    const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
+    const step = planFanRestore(cutLongAgo(6), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 0.3 }));
+    expect(step!.command).toMatchObject({ fan: 2 });
+  });
+
+  it("marks the step final only when it actually reaches the original", () => {
+    const book = updateCost({}, "a", "gen", "fan:step", 0.1, T);
+    const step = planFanRestore(cutLongAgo(3), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 2 }));
+    expect(step!.command).toMatchObject({ fan: 3 });
     expect(step!.final).toBe(true);
   });
 
-  it("built-in auto restores as one indivisible jump", () => {
-    const holds = recordFanCut({}, ac("a", { fanSpeed: 0 }), 1, T - FAN_RESTORE_CALM_MS);
-    const step = planFanRestore(holds, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 2 }));
+  it("built-in auto restores as one indivisible jump (there is no half of auto)", () => {
+    const step = planFanRestore(cutLongAgo(0), [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 2 }));
     expect(step!.command).toMatchObject({ fan: 0 });
     expect(step!.final).toBe(true);
   });
 
   it("does not move when not even one step fits", () => {
     const book = updateCost({}, "a", "gen", "fan:step", 0.5, T);
-    const holds = recordFanCut({}, ac("a", { fanSpeed: 6 }), 1, T - FAN_RESTORE_CALM_MS);
-    expect(planFanRestore(holds, [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 0.3 }))).toBeNull();
+    expect(
+      planFanRestore(cutLongAgo(6), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 0.3 })),
+    ).toBeNull();
   });
 
   it("skips OFF ACs and ACs without holds", () => {
-    const holds = recordFanCut({}, ac("a", { fanSpeed: 6 }), 1, T - FAN_RESTORE_CALM_MS);
-    expect(planFanRestore(holds, [ac("a", { on: false }), ac("b")], opts())).toBeNull();
+    expect(planFanRestore(cutLongAgo(6), [ac("a", { on: false }), ac("b")], opts())).toBeNull();
   });
 });

@@ -58,6 +58,9 @@ function raise(acs: AcView[], overrides: Partial<RaiseInput> = {}) {
     headroomAmps: 2.6, // e.g. smoothed 12.1 vs resting ceiling 14.7
     smoothedAmps: 12.1,
     rampDebitAmps: 0,
+    // The AC-only envelope these cases were written against; the house term
+    // gets its own suite below.
+    nonAcAmps: 0,
     limitAmps: 15,
     calmMs: 60_000,
     config: cfg,
@@ -328,6 +331,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       headroomAmps: 4.3, // 14.7 − 10.4
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -355,6 +359,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       headroomAmps: 4.3,
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -376,6 +381,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       headroomAmps: 4.3,
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -394,6 +400,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       headroomAmps: 4.3,
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -424,6 +431,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       headroomAmps: 4.3,
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -448,6 +456,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       headroomAmps: 8,
       smoothedAmps: 6,
       rampDebitAmps: 0,
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -481,6 +490,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       headroomAmps: 8,
       smoothedAmps: 6,
       rampDebitAmps: 0,
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: heavyCfg,
@@ -499,6 +509,7 @@ describe("invariant corrections", () => {
     const { commands } = invariantCorrections(
       [ac("a", { currentLevel: 0 }), ac("b", { currentLevel: 1, minLevel: 2 }), ac("c", { currentLevel: 2 })],
       T,
+      "gen",
     );
     expect(commands).toEqual([
       { deviceId: "a", kind: "set_level", level: 3 },
@@ -510,8 +521,54 @@ describe("invariant corrections", () => {
     const { commands } = invariantCorrections(
       [ac("a", { currentLevel: 0, on: false }), ac("b", { currentLevel: 0, managed: false })],
       T,
+      "gen",
     );
     expect(commands).toHaveLength(0);
+  });
+});
+
+// Live 2026-07-30 05:51:07 Baghdad, 15A gen. Najat had been driven to L3 by the
+// grid full start, turned off, and came back on 33 minutes into a gen session —
+// long after FLOORS had ended. The TCL restored generatorMode 3, so 6.3A landed
+// on a 15A line with nothing admitting it; the house rode 16.77A and the user
+// hand-set both rooms to L1 two minutes later.
+describe("gen turn-on floor clamp (2026-07-30: came back at L3 on a 15A gen)", () => {
+  const startingAt = (level: number, overrides: Partial<AcView> = {}): AcView =>
+    ac("a", { currentLevel: level, startBaselineAmps: 13.2, ...overrides });
+
+  it("clamps an AC that came on above its floor down to the floor", () => {
+    const { commands, decisions } = invariantCorrections([startingAt(3)], T, "gen");
+    expect(commands).toEqual([{ deviceId: "a", kind: "set_level", level: 1 }]);
+    expect(decisions[0]).toMatchObject({ deviceId: "a", action: "gen start L1" });
+  });
+
+  it("is silent once the AC is at or below its floor (self-cancels on confirm)", () => {
+    expect(invariantCorrections([startingAt(1)], T, "gen").commands).toHaveLength(0);
+  });
+
+  it("never fires on grid — there the start window LIFTS instead", () => {
+    expect(invariantCorrections([startingAt(3)], T, "grid").commands).toHaveLength(0);
+  });
+
+  it("is silent once the start window has closed", () => {
+    const settled = ac("a", { currentLevel: 3, startBaselineAmps: null });
+    expect(invariantCorrections([settled], T, "gen").commands).toHaveLength(0);
+  });
+
+  it("clamps to the BOOST floor, not L1, when an outdoor boost is active", () => {
+    const { commands } = invariantCorrections([startingAt(3, { minLevel: 2 })], T, "gen");
+    expect(commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+  });
+
+  it("honours a manual cap below the boost floor (manual always wins)", () => {
+    const { commands } = invariantCorrections([startingAt(3, { minLevel: 2, manualCap: 1 })], T, "gen");
+    expect(commands).toEqual([{ deviceId: "a", kind: "set_level", level: 1 }]);
+  });
+
+  it("re-emits while unconfirmed — the clamp is its own confirm-or-resend", () => {
+    const inFlight = startingAt(3, { envelopeLevel: 3 });
+    expect(invariantCorrections([inFlight], T, "gen").commands).toHaveLength(1);
+    expect(invariantCorrections([inFlight], T + 60_000, "gen").commands).toHaveLength(1);
   });
 });
 
@@ -589,7 +646,19 @@ describe("grid turn-on full start (2026-07-25: L1 for 4m41s with 5A free)", () =
   it("gen turn-ons keep the floors-first policy — no full start", () => {
     const p = raise([ac("a", { currentLevel: 1, ramping: true, startBaselineAmps: 5 })], { calmMs: 60_000 });
     expect(p.commands).toHaveLength(0);
-    expect(p.decisions.some((d) => d.deviceId === "a" && d.blockedBy === "ramping")).toBe(true);
+    // Since 2026-07-30 the gen start window blocks the raise phase for this
+    // device outright (it owns the entry policy), so it answers before the
+    // ramping gate would have. Same outcome, more specific reason.
+    expect(p.decisions.some((d) => d.deviceId === "a" && d.blockedBy === "gen start floor")).toBe(true);
+  });
+
+  it("a warm restore cannot jump a gen turn-on back above its floor", () => {
+    // warmStartLevel is exempt from the calm AND ramping gates, so before the
+    // entry-policy guard it was the one raise that could undo the clamp inside
+    // the very batch that emitted it (dedupe keeps the last writer).
+    const p = raise([ac("a", { currentLevel: 1, warmStartLevel: 3, startBaselineAmps: 5 })], { calmMs: 60_000 });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions.some((d) => d.deviceId === "a" && d.blockedBy === "gen start floor")).toBe(true);
   });
 
   it("after the window closes the ordinary one-step meter-anchored path resumes", () => {
@@ -652,6 +721,7 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       headroomAmps: 4.59,
       smoothedAmps: 10.11,
       rampDebitAmps: rampDebitAmps(acs, 10.11, liveCfg, "gen"),
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -676,6 +746,7 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       headroomAmps: 4.59,
       smoothedAmps: 14.8, // Abdu's 4.3A is fully on the meter now
       rampDebitAmps: rampDebitAmps(acs, 14.8, liveCfg, "gen"),
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -729,6 +800,7 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       headroomAmps: 4.59,
       smoothedAmps: 10.11,
       rampDebitAmps: rampDebitAmps(acs, 10.11, liveCfg, "gen"),
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -762,6 +834,7 @@ describe("funding swap — dormant peer levels pay for a hot room", () => {
       headroomAmps: 3.0,
       smoothedAmps: 11.7,
       rampDebitAmps: 0,
+      nonAcAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -870,5 +943,97 @@ describe("post-raise jump debit (2026-07-26 back-to-back raises)", () => {
   it("ignores the jump for an off or shed AC", () => {
     expect(rampDebitAmps([ac("a", { on: false, unmeteredJumpAmps: 1.5 })], 10.0, cfg, "gen")).toBe(0);
     expect(rampDebitAmps([ac("a", { shed: true, on: false, unmeteredJumpAmps: 1.5 })], 10.0, cfg, "gen")).toBe(0);
+  });
+});
+
+// 2026-07-31, 15A gen. The envelope summed only the AC caps and admitted
+// Abdullah L2→L3 at a modeled 13.9A against a 14.9A ceiling — twice. The
+// journal then measured that exact end-state at 15.93–15.99A. The whole 2.0A
+// gap was the house the guard had never counted, and the breaker went.
+describe("house load in the raise envelope (2026-07-31 gen trip)", () => {
+  const liveCfg: LevelingConfigV2 = {
+    ...cfg,
+    genLimitAmps: 15,
+    genAmpModels: {
+      abdullah: { baseAmps: 2.3, stepAmps: 2.5 }, // L2 4.8, L3 7.3
+      najat: { baseAmps: 2.3, stepAmps: 2.0 },    // L1 2.3
+      abdu: { baseAmps: 4.3, stepAmps: 2.5 },     // L1 4.3
+    },
+  };
+  // The live state at 17:29:44: everyone at their floor except Abdullah, who
+  // wants L3. Abdullah's boost floor is L2, so nothing here is harvestable.
+  const incident = (overrides: Partial<RaiseInput> = {}) =>
+    planRaise({
+      acs: [
+        ac("abdullah", { currentLevel: 2, minLevel: 2, needDelta: 7 }),
+        ac("najat", { currentLevel: 1, needDelta: 1.1 }),
+        ac("abdu", { currentLevel: 1, needDelta: 2.4 }),
+      ],
+      headroomAmps: 4.79, // resting ceiling 14.7 − the 9.91A trough it was admitted on
+      smoothedAmps: 9.91,
+      rampDebitAmps: 0,
+      nonAcAmps: 0,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+      ...overrides,
+    });
+
+  it("reproduces the bug: with no house term the raise is admitted", () => {
+    expect(incident().commands).toEqual([{ deviceId: "abdullah", kind: "set_level", level: 3 }]);
+  });
+
+  it("vetoes the same raise once the measured house load is counted", () => {
+    // 13.9 AC + 1.6 house = 15.5 > 14.9.
+    const p = incident({ nonAcAmps: 1.6 });
+    expect(p.commands).toHaveLength(0);
+    const veto = p.decisions.find((d) => d.deviceId === "abdullah" && d.blockedBy === "physics envelope");
+    expect(veto?.detail).toContain("15.5");
+    expect(veto?.detail).toContain("1.6A house");
+  });
+
+  it("still admits it when the house is genuinely small", () => {
+    // 13.9 + 0.5 = 14.4 ≤ 14.9 — the guard tightens, it does not blanket-refuse.
+    expect(incident({ nonAcAmps: 0.5 }).commands).toEqual([
+      { deviceId: "abdullah", kind: "set_level", level: 3 },
+    ]);
+  });
+
+  it("degrades a multi-step target instead of stranding the room", () => {
+    // A warm restore to L3 is envelope-blocked at 15.5, but L2 (11.4 + 1.6 =
+    // 13.0) fits — the guard is monotonic in level, so it steps down.
+    const p = incident({
+      acs: [
+        ac("abdullah", { currentLevel: 1, needDelta: 7, warmStartLevel: 3 }),
+        ac("najat", { currentLevel: 1, needDelta: 1.1 }),
+        ac("abdu", { currentLevel: 1, needDelta: 2.4 }),
+      ],
+      nonAcAmps: 1.6,
+    });
+    expect(p.commands).toEqual([{ deviceId: "abdullah", kind: "set_level", level: 2 }]);
+  });
+
+  it("leaves shed RESTORES on the AC-only envelope — a room off is worse than a tight ride", () => {
+    // Abdullah shed. Peers at floors: 2.3 + 4.3 = 6.6, plus his floor 4.8 =
+    // 11.4 AC-only ≤ 14.9 → he comes back. Adding a 4A house would have vetoed
+    // it and stranded the room off entirely; the meter gate below is what keeps
+    // a genuinely unaffordable restore out.
+    const p = incident({
+      acs: [
+        ac("abdullah", { on: false, shed: true, minLevel: 2, needDelta: 7 }),
+        ac("najat", { currentLevel: 1, needDelta: 1.1 }),
+        ac("abdu", { currentLevel: 1, needDelta: 2.4 }),
+      ],
+      nonAcAmps: 4.0,
+      smoothedAmps: 8.0,
+      headroomAmps: 6.7,
+    });
+    expect(p.commands).toContainEqual(
+      expect.objectContaining({ deviceId: "abdullah", kind: "power_on", reason: "restore" }),
+    );
   });
 });

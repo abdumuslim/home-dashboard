@@ -39,6 +39,12 @@ export interface PlanInput {
   /** Proactive projection extra (an AC just turned on near the limit). */
   projectedExtraAmps?: number;
   /**
+   * Measured worst-case non-AC house load on this source (house-load.ts),
+   * added to the physics envelope for raises. Defaults to 0 — the AC-only
+   * envelope v2 shipped with, so an un-sampled house is never more permissive.
+   */
+  nonAcAmps?: number;
+  /**
    * Levels commanded to a device whose confirm has not been observed yet, with
    * their send times — the reconciler's view, injected so the pipeline stays
    * pure. Used for demote confirm-or-resend spacing. Defaults to "nothing in
@@ -110,7 +116,7 @@ export function plan(input: PlanInput): PlanOutput {
 
   const pressure = assessPressure(meter, config, { projectedExtraAmps: input.projectedExtraAmps });
   const onManaged = acs.filter((a) => a.on && a.managed && !a.shed);
-  const corrections = invariantCorrections(acs, now);
+  const corrections = invariantCorrections(acs, now, source);
 
   // ---- Over-limit: the one graduated reducer, at every severity ----
   if (pressure.kind === "over") {
@@ -279,6 +285,9 @@ export function plan(input: PlanInput): PlanOutput {
     return {
       ...emptyPlan(input, "settling", [{ at: now, action: "raises/restores", blockedBy: "settle window" }]),
       commands: corrections.commands,
+      // Corrections carry real down-moves (a level-0 re-cap, a gen start clamp),
+      // so they credit the collapse detector like every other cut — invariant 11.
+      commandedCutAmps: commandedCutAmpsOf(corrections.commands, onManaged, config, source),
       decisions: [...corrections.decisions, { at: now, action: "raises/restores", blockedBy: "settle window" }],
       compareAfter: corrections.commands.length > 0 ? now + GRADE_LEVEL_MS : 0,
     };
@@ -298,6 +307,9 @@ export function plan(input: PlanInput): PlanOutput {
       headroomAmps: pressure.headroomAmps,
       smoothedAmps: meter.smoothedAmps,
       rampDebitAmps: rampDebit,
+      // Gen only, the same split the envelope guard and ramp debit use: grid
+      // starts every AC full by directive and leans on the reducer as its safety.
+      nonAcAmps: source === "gen" ? (input.nonAcAmps ?? 0) : 0,
       limitAmps: limit,
       calmMs: meter.calmMs,
       config,
@@ -410,6 +422,7 @@ export function plan(input: PlanInput): PlanOutput {
   return {
     ...emptyPlan(input, "hold"),
     commands: corrections.commands,
+    commandedCutAmps: commandedCutAmpsOf(corrections.commands, onManaged, config, source),
     decisions: corrections.decisions,
     compareAfter: corrections.commands.length > 0 ? now + GRADE_LEVEL_MS : 0,
   };

@@ -5,7 +5,7 @@ type: Skill
 title: Smart AC Leveling — navigation + invariants
 tags: [home, leveling, power, claude-code, current]
 maintainer: claude-code
-timestamp: 2026-07-28
+timestamp: 2026-07-31
 ---
 
 # Smart AC Leveling
@@ -21,7 +21,7 @@ read that slice).
 `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns
 its own row; merged with id=2 winning; re-read every 30 s ⇒ **live-flippable**).
 
-Implementation: **`server/src/leveling/`** — 18 small modules, pure decision functions + one stateful
+Implementation: **`server/src/leveling/`** — 19 small modules, pure decision functions + one stateful
 shell. `controller: "v1" | "shadow" | "v2"`; in `shadow`, v1 acts while v2 journals every decision
 with `executed=false`.
 
@@ -40,7 +40,9 @@ rollback target.
 **Physics-envelope veto (GEN only, `raise.ts` `envelopeTotalAmps`):** refuse a raise/restore when the
 worst-case cap-model total of the commanded end-state exceeds `limit − margin`, regardless of the
 meter. Meter-anchored admission is blind to ramp lag and to frozen readings. Grid is deliberately NOT
-envelope-guarded (grid starts FULL by directive; the reducer is the safety).
+envelope-guarded (grid starts FULL by directive; the reducer is the safety). Since 2026-07-31 a RAISE
+is additionally charged the measured non-AC house load (`RaiseInput.nonAcAmps`, invariant 16);
+restores stay on the AC-only figure.
 
 **Frozen-meter detection (`sensing.ts`):** a live CT always micro-jitters. If neither raw channel
 moves ≥ `FROZEN_EPSILON_AMPS` (0.005) for `METER_FROZEN_AFTER_MS` (60 s), the meter is frozen — calm
@@ -95,6 +97,68 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     charges to the next spender — the 2026-07-26 back-to-back-raise trip shape. Not double-charged
     for a ramping AC. Consequence: a fan restore waits behind a fresh raise (deliberate).
 
+**Added 2026-07-30 after a room turned on at L3 on a 15 A gen, and two gen trips 26 min apart:**
+13. **A gen turn-on is not an admission.** The TCL restores the level it was last left at, and since
+    GRID_FULL that is **L3** (6.3 A). FLOORS only arms on *entry* into gen and ends in ≤5 min, so it
+    does not cover a room switched on later. `START_WINDOW_MS` now opens on BOTH sources — grid LIFTS
+    to the affordable ceiling, gen CLAMPS to `floorOf` via `invariantCorrections` (ships in every
+    non-COLLAPSED mode; a reduction, so it can never fight the reducer) — and `planRaise` stands down
+    for that device (`blockedBy: "gen start floor"`), or the raise wins the dedupe and hands the room
+    straight back. The over-limit start-window clear is **grid only**: on gen a turn-on is over-limit
+    by definition, so clearing retires the clamp on the tick it is needed.
+14. **Price a turn-on at the level it is REALLY at.** The freshly-on projection charged `floorOf` —
+    assuming the policy in 13 that did not exist — and sized the cut at 1.2 A when the honest deficit
+    was 4.6 A, small enough for the reducer to pay out of the newcomer and never touch a peer. Now
+    `envelopeLevel` (our own clamp does not shrink it before it confirms), held across the ramp with
+    absorption instead of one tick. Scope needs BOTH `ramping` (past the ramp the meter has it —
+    charging on top is a permanent phantom overload) and the start window (`ramping` alone is re-armed
+    for every AC on a changeover). A leveler restore still prices `restoreCostAmps(floor, {gentle})`.
+15. **A derate is handed back in steps, never in one jump.** The 20-min cliff restored full rating and
+    the leveler re-spent it **2 seconds later**; `standing` was 0 by then, so the repeat trip re-armed
+    at 1.0 A instead of compounding. `derateFor()` is a pure function of time, decaying one
+    `COLLAPSE_DERATE_RECOVERY_STEP` (0.5 A) per quiet rung. Recovery does not need readings (an idle
+    line cools fastest) but is still per-source.
+
+**Added 2026-07-31 after a gen trip that followed ten minutes of riding the limit:**
+16. **The physics envelope must count the HOUSE.** `envelopeTotalAmps` is AC-caps-only and priced
+    `{Abdullah L3, Najat L1, Abdu L1}` at 13.9 A against a 14.9 A ceiling; the journal measured that
+    exact end-state at **15.93–15.99 A**. `house-load.ts` keeps a rolling per-source **PEAK** of
+    `smoothed − Σ modeled draw of running ACs`, skipped while anything ramps and **tagged with the
+    running-AC set** (a residual sampled while a room was off counts that room as house, and would
+    double-count it on its return). `RaiseInput.nonAcAmps` adds it to RAISES only — a shed restore
+    stays AC-only, because refusing one strands a room off and its meter gate already sees the house.
+    This is also what carries memory across a **trough**: the fatal raise was admitted at 9.91 A when
+    that configuration's steady state had been 12.4–13.3 A for ten minutes.
+17. **Levels before fans, judged per PLAN — never globally.** The floor gate was per-AC, so a room at
+    its own floor offered its fan while a peer still held a level, and the comparator took the fan
+    every time (`w.fan` 1 vs `w.levelStep` 10 ⇒ cost 4.6 vs 140 live). A candidate plan may now cut a
+    fan only if **its own end-state** leaves every AC at its floor. ⚠️ Do NOT "simplify" this to *no
+    fan while any level exists anywhere* — that forces a **power_off** whenever levels alone fall
+    short of the deficit, which inverts the user's own "fans are the last try BEFORE turning off"
+    (guard: `reduce.test.ts` "combines a level cut WITH a fan trim rather than shedding a room").
+18. **A fan restore SPENDS; a fan cut does not.** A restore emitted one `set_fan`, reported
+    `commandedCutAmps: 0`, armed no debit and was `fanOnly` so it skipped `resetCalm` — both fatal
+    raises landed 12 s and 17 s after one. Restores now arm `fanDebit` (priced at exactly what
+    `planFanRestore` admitted, absorbed-ratcheted, `FAN_DEBIT_MS` 60 s) **and** reset calm; cuts still
+    do neither (a cut frees amps — stalling the reducer behind its own cut is how episodes drag).
+    The climb is bounded to `FAN_RESTORE_MAX_STEP` (2 gears) and owes `FAN_RESTORE_AFTER_CUT_MS`
+    (180 s) since the last cut; gentle-restore holds are exempt via `FanHold.fromCut: false`.
+    The old "sweet spot" search always reached the original — a 6-gear swing prices at ~0.9 A.
+19. **The drain rung was too coarse to catch a 0.9 A overload.** 15.93 A on a 15 A limit is under
+    `OVER_LIMIT_SEVERE_AMPS` (1.0), so it drained 1 point per reading — **52 s** to the first act —
+    and `noteActed` then refilled the bucket to FULL, costing another **38 s**. Now
+    `OVER_LIMIT_DRAIN_MODERATE` (2 points above `OVER_LIMIT_MODERATE_AMPS` 0.5 A) and
+    `OVER_LIMIT_BUDGET_AFTER_ACT` (2, not 5). The anti-double-cut job the full refill did is already
+    covered by the demand-side `commandedCutCreditAmps` credit (invariant 11).
+
+⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
+2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
+refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's
+ground-truth `nonAcAmps`. That mirror is what
+hid bug 14 for five days: the harness priced a turn-on at its real level while the shell priced the
+floor, so no harness test could disagree with the shell. Anything you change in one, change in the
+other — and put the guard in `controller.test.ts`, not only `scenarios.test.ts`.
+
 **Hard rules preserved from v1:** never level 0 · manual wins · slot caps · boost floors ·
 shed ≠ manual-off · warm restore · opt-out · collapse latch · leaky bucket ·
 requireShed ≥ max(3 A, 20%).
@@ -102,8 +166,10 @@ requireShed ≥ max(3 A, 20%).
 **Mode machine:** COLLAPSED > FLOORS > GRID_FULL > SETTLING > NORMAL. FLOORS arms on ANY entry into
 gen (incl. cold start); GRID_FULL on any entry into grid.
 
-**Fans are last-resort trim only** — enumerable only at floor level, restore needs 5-min calm. (v1 cut
-fans while level cuts were available 57% of the time, and bounced them at 61 s median.)
+**Fans are last-resort trim only** — a plan may cut a fan only if its end-state leaves EVERY AC at its
+floor (invariant 17); restores are bounded and cooldown-gated (invariant 18). (v1 cut fans while level
+cuts were available 57% of the time and bounced them at 61 s median; v2 reproduced the bounce at 80 s
+until 2026-07-31.)
 
 ## Hardware truth (2026-07-23, user-verified)
 

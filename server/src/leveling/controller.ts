@@ -11,7 +11,15 @@ import pg from "pg";
 import { childLogger } from "../logger.js";
 import type { LevelerDeviceContext, LevelingDeps, LevelingStatusV2 } from "./api.js";
 import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, effectiveLimit, limitFor, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
-import { ingestReading, initialMeterState, meterView, noteCommandedCut, refillBucket, resetCalm } from "./sensing.js";
+import {
+  ingestReading,
+  initialMeterState,
+  meterView,
+  noteCommandedCut,
+  OVER_LIMIT_BUDGET_AFTER_ACT,
+  refillBucket,
+  resetCalm,
+} from "./sensing.js";
 import {
   applyMeterEvent,
   clearFloorsIfDone,
@@ -23,9 +31,10 @@ import {
   type ModeState,
 } from "./modes.js";
 import { plan, type PlanOutput } from "./pipeline.js";
-import { GRADE_FAN_MS } from "./pipeline.js";
+import { GRADE_FAN_MS, GRADE_TURN_ON_MS } from "./pipeline.js";
 import {
   attemptedRecently,
+  attemptedWithin,
   cooldownRemainingMs,
   initialPacingState,
   noteAttempt,
@@ -36,6 +45,7 @@ import {
   type PacingState,
 } from "./pacing.js";
 import { planFanRestore, recordFanCut, releaseFanHold, type FanHolds } from "./fan-trim.js";
+import { houseLoadAmps, initialHouseLoad, sampleHouseLoad, type HouseLoadState } from "./house-load.js";
 import {
   clearMarksOnManual,
   clearOnPowerOff,
@@ -55,7 +65,7 @@ import {
 } from "./reconciler.js";
 import { boostFloor, ceilOf, floorOf, nearTargetNeedCap, worstCaseLevel } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
-import { raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, updateCost, type CostBook } from "./costs.js";
+import { fanTrimSavings, raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, turnOnAmps, updateCost, type CostBook } from "./costs.js";
 import { LevelingStore } from "./store.js";
 import type { AcView, Command, MeterState, Mode, PowerSource } from "./types.js";
 
@@ -63,12 +73,24 @@ const log = childLogger("leveler2");
 
 const AC_RAMP_MS = 240_000;
 /**
- * How long a fresh turn-on on grid is treated as a "grid full start" (priced
- * against the house load measured just before it came on). Same window as the
- * compressor ramp — exactly the stretch where the ordinary meter-anchored raise
- * path is blind (the meter has not absorbed the new AC yet) and blocked.
+ * How long a fresh turn-on is treated as a "start" (priced against the house
+ * load measured just before it came on). Same window as the compressor ramp —
+ * exactly the stretch where the ordinary meter-anchored raise path is blind
+ * (the meter has not absorbed the new AC yet) and blocked.
+ *
+ * Opened on BOTH sources since 2026-07-30, but the policy inside it is opposite
+ * per line: on grid the AC is LIFTED to the highest level that fits
+ * ("start all to full"), on gen it is CLAMPED to its floor (the per-device form
+ * of FLOORS — see `invariantCorrections`).
  */
-const GRID_START_MS = AC_RAMP_MS;
+const START_WINDOW_MS = AC_RAMP_MS;
+/**
+ * How long a fan restore's amps stay charged as committed-but-unmetered. A fan
+ * gear changes almost immediately — nothing like the 4-minute compressor ramp —
+ * so this only has to outlive the ESP cadence plus a tick, and the absorption
+ * ratchet retires it as soon as the meter shows the rise.
+ */
+const FAN_DEBIT_MS = 60_000;
 const SHED_CLEAR_GRACE_MS = 15_000;
 const PUSH_THROTTLE_MS = 5 * 60_000;
 /** Grade a batch only when this many fresh readings arrived after compareAfter. */
@@ -189,6 +211,15 @@ export class LevelingControllerV2 {
   private recon: ReconcilerState = initialReconcilerState();
   private fanHolds: FanHolds = {};
   private book: CostBook = {};
+  /**
+   * Rolling per-source samples of `meter − Σ modeled AC draw` — the non-AC
+   * house load the physics envelope was missing when it admitted the raise that
+   * tripped the gen on 2026-07-31 (see house-load.ts). In-memory only: a peak
+   * re-measures itself within a tick or two of a restart, and 0 (the fallback)
+   * is exactly the AC-only envelope v2 shipped with, so a cold start is never
+   * more permissive than the code it replaced.
+   */
+  private houseLoad: HouseLoadState = initialHouseLoad();
 
   private shedIds = new Set<string>();
   private shedTimes = new Map<string, number>();
@@ -200,7 +231,7 @@ export class LevelingControllerV2 {
   /**
    * Ramp baselines: house amps measured just before this AC's compressor
    * started, for every ramp we arm on either source. Distinct from
-   * `startBaseline` on purpose — that one is the grid full-start POLICY window
+   * `startBaseline` on purpose — that one is the turn-on POLICY window
    * and gets cleared by an over-limit batch, a manual level or a source change,
    * while this one is pure physics accounting (see rampDebitAmps) and must
    * survive all of those: the un-metered load is still arriving regardless of
@@ -222,7 +253,18 @@ export class LevelingControllerV2 {
    * UP on gen — see AcView.unmeteredJumpAmps for why raises need their own.
    */
   private jumpDebit = new Map<string, { amps: number; baseline: number | null; absorbed: number; until: number }>();
-  /** Grid full-start windows: house amps measured just before this AC came on. */
+  /**
+   * The same accounting for a fan RESTORE, which spends amps nothing used to
+   * charge: it emits one `set_fan`, reports `commandedCutAmps: 0`, arms no ramp
+   * (a fan is not a compressor), and is `fanOnly` — so it does not even rewind
+   * the calm clock. Both raises that tripped the gen on 2026-07-31 landed
+   * within 17s of a fan restore, admitted against a meter that had not yet seen
+   * it (17:29:32 Abdu 1→7 then 17:29:44 Abdullah L2→L3; 17:31:44 and 17:32:01
+   * the same pair again). Kept in its own map because a device can carry a fan
+   * restore and a level jump at once, and they are additive draws.
+   */
+  private fanDebit = new Map<string, { amps: number; baseline: number | null; absorbed: number; until: number }>();
+  /** Turn-on start windows: house amps measured just before this AC came on. */
   private startBaseline = new Map<string, { amps: number; until: number }>();
   private boostActive = new Map<string, boolean>();
   /** When each room's current uninterrupted satisfied stretch began (demote dwell). */
@@ -639,7 +681,10 @@ export class LevelingControllerV2 {
    * actually landed, and a peer reduction later erases the instantaneous view.
    */
   private noteRampAbsorption(now: number): void {
-    if (this.rampBaseline.size === 0) return;
+    // All three debit kinds ratchet here. The guard used to test `rampBaseline`
+    // alone, so a level jump with no compressor start alongside it never
+    // absorbed and stayed charged for its whole window.
+    if (this.rampBaseline.size === 0 && this.jumpDebit.size === 0 && this.fanDebit.size === 0) return;
     const view = meterView(this.meterState, now);
     if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return;
     for (const [id, baseline] of this.rampBaseline) {
@@ -647,14 +692,16 @@ export class LevelingControllerV2 {
       const risen = view.smoothedAmps - baseline;
       if (risen > (this.rampAbsorbed.get(id) ?? 0)) this.rampAbsorbed.set(id, risen);
     }
-    for (const [id, jump] of this.jumpDebit) {
-      if (jump.until <= now) {
-        this.jumpDebit.delete(id);
-        continue;
+    for (const debits of [this.jumpDebit, this.fanDebit]) {
+      for (const [id, debit] of debits) {
+        if (debit.until <= now) {
+          debits.delete(id);
+          continue;
+        }
+        if (debit.baseline == null) continue;
+        const risen = view.smoothedAmps - debit.baseline;
+        if (risen > debit.absorbed) debits.set(id, { ...debit, absorbed: risen });
       }
-      if (jump.baseline == null) continue;
-      const risen = view.smoothedAmps - jump.baseline;
-      if (risen > jump.absorbed) this.jumpDebit.set(id, { ...jump, absorbed: risen });
     }
   }
 
@@ -689,31 +736,76 @@ export class LevelingControllerV2 {
     });
   }
 
-  /** Unmetered remainder of a recent level raise (0 when none / fully absorbed). */
-  private unmeteredJumpAmps(deviceId: string, now: number): number {
-    const jump = this.jumpDebit.get(deviceId);
-    if (jump == null || jump.until <= now) return 0;
-    // No baseline means we could not measure absorption — charge the whole
-    // jump, the same way an unknown ramp baseline charges the whole draw.
-    return Math.max(0, jump.amps - jump.absorbed);
+  /**
+   * Charge a fan RESTORE we just sent on gen, at exactly the price
+   * `planFanRestore` admitted it for, so the next tick cannot spend the same
+   * amps on a level raise before the meter has shown them.
+   */
+  private armFanDebit(
+    deviceId: string,
+    from: number | null,
+    to: number,
+    view: ReturnType<typeof meterView>,
+    now: number,
+  ): void {
+    if (view.source !== "gen") return;
+    // Fan 0 is built-in auto — an unknown gear, priced as a full swing (the
+    // same convention planFanRestore uses).
+    const steps = to === 0 || from == null ? 6 : to - from;
+    if (steps <= 0) {
+      this.fanDebit.delete(deviceId);
+      return;
+    }
+    const baseline = view.sampleCount >= 2 && !view.frozen ? view.smoothedAmps : null;
+    this.fanDebit.set(deviceId, {
+      amps: fanTrimSavings(this.book, deviceId, "gen", steps, now),
+      baseline,
+      absorbed: 0,
+      until: now + FAN_DEBIT_MS,
+    });
   }
 
   /**
-   * Open a grid full-start window for an AC that just came on: remember the
-   * house load measured just BEFORE it started, so the raise planner can lift
-   * it straight to its ceiling ("on grid, start all to full" — user
-   * 2026-07-23) instead of waiting out the ramp gate and creeping up one step
-   * per batch (2026-07-25: 4m41s to reach L3 with ~5A of headroom free).
-   * Gen has no equivalent by design — entering gen means FLOORS.
+   * Unmetered remainder of a recent level raise AND fan restore (0 when none /
+   * fully absorbed). Additive: a room can be climbing its fan and its level at
+   * once, and both draws are still on their way to the meter.
+   */
+  private unmeteredJumpAmps(deviceId: string, now: number): number {
+    let owed = 0;
+    for (const debits of [this.jumpDebit, this.fanDebit]) {
+      const debit = debits.get(deviceId);
+      // No baseline means we could not measure absorption — charge the whole
+      // amount, the same way an unknown ramp baseline charges the whole draw.
+      if (debit != null && debit.until > now) owed += Math.max(0, debit.amps - debit.absorbed);
+    }
+    return owed;
+  }
+
+  /**
+   * Open a start window for an AC that just came on: remember the house load
+   * measured just BEFORE it started. On grid the raise planner uses it to lift
+   * the AC straight to its ceiling ("on grid, start all to full" — user
+   * 2026-07-23) instead of creeping up one step per batch behind the ramp gate
+   * (2026-07-25: 4m41s to reach L3 with ~5A free).
+   *
+   * **Gen opens the same window since 2026-07-30**, for the opposite policy.
+   * The old "gen needs no equivalent — entering gen means FLOORS" assumption
+   * died when GRID_FULL shipped: a TCL restores the generator level it was last
+   * left at, and after a grid session that level is L3. Live 05:51 Baghdad,
+   * Najat came back on a 15A gen at L3 (6.3A modeled) 33 minutes into the gen
+   * session — long after FLOORS had ended — with no admission control at all,
+   * and the house rode 16.77A until the user hand-fixed it. `raise.ts` still
+   * gates its LIFT on grid; `invariantCorrections` owns the gen clamp.
+   *
    * First writer wins: the routes-level user hook fires a tick before the
    * observed power flip, and its reading is the cleaner baseline.
    */
   private noteTurnOn(deviceId: string, now: number): void {
     const view = meterView(this.meterState, now);
-    if (view.source !== "grid" || view.sampleCount < 2) return;
+    if (view.source === "none" || view.sampleCount < 2) return;
     const open = this.startBaseline.get(deviceId);
     if (open != null && open.until > now) return;
-    this.startBaseline.set(deviceId, { amps: view.smoothedAmps, until: now + GRID_START_MS });
+    this.startBaseline.set(deviceId, { amps: view.smoothedAmps, until: now + START_WINDOW_MS });
   }
 
   // ---------- tick ----------
@@ -872,29 +964,84 @@ export class LevelingControllerV2 {
     this.modeState = { ...this.modeState, collapsed: this.meterState.collapse != null };
     const mode = deriveMode(this.modeState, now);
 
-    // Proactive projection for freshly-on managed ACs (near-limit turn-on).
-    // Priced with restoreCostAmps so a room WE just restored gently (fan pinned)
-    // is re-priced at exactly the cost its restore was admitted at — the two
-    // disagreed on 2026-07-24→25 (2.3A admitted, 3.7A projected) and every gen
-    // restore then declared itself over-limit and got shed ~10s later.
-    // An automation/user turn-on still slams the fan, so it keeps the full cost.
+    // Proactive projection for freshly-on managed ACs (near-limit turn-on): the
+    // draw a compressor has committed that the meter has not absorbed yet.
+    //
+    // Priced two different ways, on purpose:
+    //  - a room WE restored is priced with `restoreCostAmps` at the floor WE
+    //    commanded, carrying the gentle flag, so the projection re-prices
+    //    exactly what admission charged. The two disagreed on 2026-07-24→25
+    //    (2.3A admitted, 3.7A projected) and every gen restore then declared
+    //    itself over-limit and got shed ~10s later.
+    //  - a USER/AUTOMATION turn-on is priced by `turnOnAmps` at the level the
+    //    firmware actually came back at (`envelopeLevel` — the worst case of the
+    //    shadow and anything in flight), because nobody chose that level.
+    //    Pricing it at `floorOf()` assumed a gen floor policy that did not exist
+    //    until today: live 05:51 Baghdad, Najat came back at L3 and this charged
+    //    her on@L1 (2.86A), sizing the cut at 1.2A when the honest figure was
+    //    4.6A. A 1.2A deficit the reducer could pay out of the newcomer alone is
+    //    exactly why it never touched a peer.
+    //
+    //    `turnOnAmps`, NOT bare `steadyDraw`: the trip-safe max(model, learned
+    //    on@L) is the whole point of the cost book here. Live 12:42 the same
+    //    day, Najat came on at L1 and the projection took the model 2.3A while
+    //    her learned on@L1 was 2.86A and the meter delivered 2.9A. The bare
+    //    model draw is the PROBE price (`restoreCostAmps` gentle) and it belongs
+    //    only to a restore WE admitted at that price — never to a turn-on nobody
+    //    admitted at all.
+    //
+    // Held for the whole RAMP and ratcheted down as the meter absorbs the draw
+    // (the same accounting as `rampDebitAmps`), because a single-tick projection
+    // left Najat's real L3 draw unpriced for the next 100 seconds. Our own
+    // clamp-to-floor does not shrink it early: `envelopeLevel` keeps charging L3
+    // until the shadow confirms L1.
+    //
+    // Both conditions are load-bearing. `ramping` is what makes the draw
+    // UNMETERED — past the ramp the meter has it, and charging on top would
+    // double-count into a permanent phantom overload. The start window is what
+    // keeps this scoped to turn-ons: `ramping` alone is re-armed for every
+    // running AC on a changeover and on collapse recovery, and projecting the
+    // whole house there would run the reducer instead of the entry policy.
     let projectedExtraAmps: number | undefined;
-    if (this.freshlyOn.length > 0 && view.source !== "none") {
-      projectedExtraAmps = this.freshlyOn.reduce((sum, id) => {
-        const ac = acs.find((a) => a.deviceId === id);
-        if (ac == null) return sum;
-        const cost = restoreCostAmps(
-          this.book,
-          this.config,
-          id,
-          view.source as Exclude<PowerSource, "none">,
-          floorOf(ac),
-          ac.maxLevel,
-          now,
-          { gentle: this.fanHolds[id]?.gentle === true },
-        );
-        return sum + cost.amps;
-      }, 0);
+    if (view.source !== "none") {
+      const source = view.source as Exclude<PowerSource, "none">;
+      const starting = acs.filter(
+        (a) =>
+          a.on &&
+          a.managed &&
+          !a.shed &&
+          a.ramping &&
+          (a.startBaselineAmps != null || this.freshlyOn.includes(a.deviceId)),
+      );
+      if (starting.length > 0) {
+        projectedExtraAmps = starting.reduce((sum, ac) => {
+          const ours = attemptedWithin(this.pacing, ac.deviceId, "restore", GRADE_TURN_ON_MS, now);
+          const committed = ours
+            ? restoreCostAmps(this.book, this.config, ac.deviceId, source, floorOf(ac), ac.maxLevel, now, {
+                gentle: this.fanHolds[ac.deviceId]?.gentle === true,
+              }).amps
+            : turnOnAmps(this.book, this.config, ac.deviceId, source, ac.envelopeLevel, ac.maxLevel, now).amps;
+          const absorbed =
+            ac.rampBaselineAmps == null
+              ? 0
+              : Math.max(0, view.smoothedAmps - ac.rampBaselineAmps, ac.rampAbsorbedAmps ?? 0);
+          return sum + Math.max(0, committed - absorbed);
+        }, 0);
+      }
+    }
+
+    // Measure the non-AC split BEFORE planning, so the envelope guard is judged
+    // against the house this tick actually sees. Sampling is free of any gate:
+    // it is an observation, and `houseLoadResidual` decides on its own whether
+    // the reading is usable (see house-load.ts).
+    if (view.source !== "none" && view.sampleCount >= 2 && !view.frozen) {
+      this.houseLoad = sampleHouseLoad(this.houseLoad, {
+        source: view.source,
+        at: now,
+        smoothedAmps: view.smoothedAmps,
+        acs,
+        config: this.config,
+      });
     }
 
     const out = plan({
@@ -907,11 +1054,12 @@ export class LevelingControllerV2 {
       pacing: this.pacing,
       fanHolds: this.fanHolds,
       projectedExtraAmps,
+      nonAcAmps: houseLoadAmps(this.houseLoad, view.source, now, acs),
       inFlight: (deviceId) => unconfirmedSends(this.recon, deviceId, now),
     });
     this.fanHolds = out.fanHolds;
 
-    await this.executeAndJournal(out, view, mode, now, tcl);
+    await this.executeAndJournal(out, view, mode, now, tcl, acs);
     this.lastStatus = this.buildStatus(acs, view, mode, out, now);
 
     // Opportunistic journal retention prune (once a day).
@@ -961,7 +1109,7 @@ export class LevelingControllerV2 {
     return now - since;
   }
 
-  /** Live grid full-start baseline for a device, or null once the window closed. */
+  /** Live turn-on start baseline for a device, or null once the window closed. */
   private startBaselineFor(deviceId: string, on: boolean, now: number): number | null {
     const open = this.startBaseline.get(deviceId);
     if (open == null) return null;
@@ -1072,6 +1220,8 @@ export class LevelingControllerV2 {
     mode: Mode,
     now: number,
     tcl: NonNullable<ReturnType<LevelingDeps["getTclCloud"]>>,
+    /** The views this plan was built from — the pre-command fan/level picture. */
+    acs: AcView[],
   ): Promise<void> {
     if (out.commands.length === 0) {
       await this.journalBlocked(out, view, mode, now);
@@ -1110,6 +1260,8 @@ export class LevelingControllerV2 {
 
     let sentAny = false;
     let fanOnly = true;
+    /** A fan-only batch that SPENT (restore) rather than freed (trim). */
+    let spentOnFan = false;
     for (const cmd of commands) {
       const name = this.deviceNames.get(cmd.deviceId) ?? cmd.deviceId;
       try {
@@ -1173,10 +1325,21 @@ export class LevelingControllerV2 {
             break;
           }
           case "set_fan": {
+            const priorFan = acs.find((a) => a.deviceId === cmd.deviceId)?.fanSpeed ?? null;
             await tcl.sendControl(cmd.deviceId, "set_fan_speed", cmd.fan);
             this.recon = noteFanSend(this.recon, cmd.deviceId, cmd.fan, now);
             this.deps.onLevelerFanCommand(cmd.deviceId, cmd.fan);
             await this.persistFanHold(cmd.deviceId);
+            if (cmd.reason === "trim_restore") {
+              // A restore SPENDS. Charge it, and rewind the calm clock so the
+              // next tick cannot admit a raise against a meter that has not
+              // shown these amps yet (2026-07-31: two raises, 12s and 17s after
+              // a fan restore, on the same headroom the fan had already taken).
+              // A fan CUT deliberately does neither — it frees amps, and
+              // stalling the reducer behind its own cut is how episodes drag.
+              this.armFanDebit(cmd.deviceId, priorFan, cmd.fan, view, now);
+              spentOnFan = true;
+            }
             // Accepted: the hold releases on SEND of the original-fan restore,
             // not on shadow confirm. The reconciler keeps re-sending an
             // unconfirmed fan while the hold lives, so an ignored final send is
@@ -1197,7 +1360,7 @@ export class LevelingControllerV2 {
     if (!sentAny) return;
 
     this.modeState = noteBatch(this.modeState, { fanOnly }, now);
-    if (!fanOnly) this.meterState = resetCalm(this.meterState);
+    if (!fanOnly || spentOnFan) this.meterState = resetCalm(this.meterState);
     // Tell the meter what we just took OFF the line. A shed's compressor stops
     // anywhere from seconds to minutes after the send, so the drop arrives as
     // one cliff with nothing tying it to us — and a cliff past the collapse
@@ -1222,11 +1385,17 @@ export class LevelingControllerV2 {
       this.meterState = refillBucket(this.meterState);
     }
     if (out.reason.startsWith("over")) {
-      this.meterState = refillBucket(this.meterState);
+      // PARTIAL — see OVER_LIMIT_BUDGET_AFTER_ACT. A reduction that did not go
+      // deep enough must be allowed to escalate in seconds, not in another
+      // five readings.
+      this.meterState = refillBucket(this.meterState, OVER_LIMIT_BUDGET_AFTER_ACT);
       // The meter objected: the reducer's judgment beats the entry policy, so
       // no grid start may re-assert a ceiling it just trimmed (same rule that
-      // ends GRID_FULL on bucket_empty — modes.ts).
-      this.startBaseline.clear();
+      // ends GRID_FULL on bucket_empty — modes.ts). GEN IS EXEMPT: its start
+      // policy is a floor CLAMP, which can only ever agree with the reducer —
+      // and a gen turn-on is over-limit by definition on a 15A line, so
+      // clearing there would retire the clamp on the very tick it is needed.
+      if (view.source === "grid") this.startBaseline.clear();
     }
 
     // Failure attribution: an over-limit cut/shed of a recently-attempted AC.

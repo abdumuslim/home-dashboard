@@ -5,6 +5,7 @@ import { describe, it, expect } from "vitest";
 import { Scenario, type SimAcSetup } from "./scenario.js";
 import { meterView } from "./sensing.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
+import { FAN_RESTORE_AFTER_CUT_MS } from "./fan-trim.js";
 import type { Command } from "./types.js";
 
 const cfg: LevelingConfigV2 = {
@@ -777,14 +778,42 @@ describe("the 2026-07-26 triple gen trip", () => {
     expect(meterView(s.meterState, s.now).derateAmps).toBe(2);
   });
 
-  it("releases the derate once the window passes without another trip", () => {
+  // 2026-07-30 09:25:06 / 09:51:40 Baghdad. The gen tripped at a sustained
+  // 14.2A, derated to 14.0A — and the derate CLIFF-expired at 09:45:06, handing
+  // back the full 15A rating in one jump. The leveler raised Abdu L1→L2 two
+  // seconds later and the gen went again at 14.7A. Because the first derate had
+  // already retired, that second trip re-armed at 1.0A instead of compounding:
+  // the "walk the limit down on every collapse" design defeated by its own
+  // expiry. The rating is now handed back one COLLAPSE_DERATE_RECOVERY_STEP per
+  // quiet rung, so the ladder is still standing when the next trip lands.
+  it("hands the rating back in steps, never in one jump", () => {
     const s = postTrip();
     s.advance(5 * 60);
     s.trip();
     s.advance(30);
     s.recoverLine();
-    s.advance(21 * 60); // past COLLAPSE_DERATE_MS
+    expect(meterView(s.meterState, s.now).derateAmps).toBe(1);
+    s.advance(21 * 60); // one rung past COLLAPSE_DERATE_MS
+    expect(meterView(s.meterState, s.now).derateAmps).toBe(0.5);
+    s.advance(21 * 60); // and the next
     expect(meterView(s.meterState, s.now).derateAmps).toBe(0);
+    expect(s.meterState.derate).toBeNull();
+  });
+
+  it("a trip part-way up the recovery ladder escalates from where the line was", () => {
+    const s = postTrip();
+    s.advance(5 * 60);
+    s.trip();
+    s.advance(30);
+    s.recoverLine();
+    s.advance(21 * 60); // decayed to 0.5A — the live 09:45 state
+    expect(meterView(s.meterState, s.now).derateAmps).toBe(0.5);
+    s.trip();
+    s.advance(30);
+    s.recoverLine();
+    // Live it re-armed at 1.0A (limit back to 14.0) because `standing` had
+    // retired to 0. Compounding from the standing rung tightens it further.
+    expect(meterView(s.meterState, s.now).derateAmps).toBe(1.5);
   });
 });
 
@@ -816,11 +845,23 @@ describe("the 2026-07-27 fan-restore stall", () => {
     return s;
   };
 
-  /** Abdu comes out of an over-limit trim holding fan 1, owing a climb back to 7. */
+  /**
+   * Abdu comes out of an over-limit trim holding fan 1, owing a climb back to 7.
+   * The cut is dated past FAN_RESTORE_AFTER_CUT_MS on purpose: this suite is
+   * about the ramp-absorption ratchet, so the cut cooldown must not be what
+   * decides the outcome.
+   */
   const holdAbduFan = (s: Scenario): void => {
     s.sim("abdu").fan = 1;
     s.fanHolds = {
-      abdu: { deviceId: "abdu", originalFan: 7, lastSetFan: 1, heldAt: s.now },
+      abdu: {
+        deviceId: "abdu",
+        originalFan: 7,
+        lastSetFan: 1,
+        heldAt: s.now - FAN_RESTORE_AFTER_CUT_MS,
+        fromCut: true,
+        lastCutAt: s.now - FAN_RESTORE_AFTER_CUT_MS,
+      },
     };
   };
 
@@ -837,9 +878,12 @@ describe("the 2026-07-27 fan-restore stall", () => {
     const dropAt = s.now;
     s.advance(90);
 
+    // The climb is bounded to a few gears per step since 2026-07-31, so the
+    // regression is "it starts climbing before the ramp expires", not "it
+    // reaches 7 in one command".
     const restore = s
       .commandsSince(dropAt, "set_fan")
-      .find((e) => e.cmd.deviceId === "abdu" && e.cmd.kind === "set_fan" && e.cmd.fan === 7);
+      .find((e) => e.cmd.deviceId === "abdu" && e.cmd.kind === "set_fan" && e.cmd.fan > 1);
     expect(restore).toBeDefined();
     expect(restore!.at).toBeLessThan(rampEndsAt);
   });
@@ -933,5 +977,249 @@ describe("2026-07-28 evening budget hog (the loaded spring)", () => {
     s.advance(400);
     expect(setLevels(s, t0).some((l) => l.cmd.deviceId === "najat")).toBe(false);
     expect(s.sim("najat").level).toBe(3);
+  });
+});
+
+// Live 2026-07-30 05:51:07 Baghdad, 15A gen. The house had been on generator
+// for 33 minutes — long past FLOORS — with Abdullah at L3 and Abdu at L1,
+// ≈13.2A total. The user turned Najat on. Nothing admitted her: the grid full
+// start had driven her to L3 before she was switched off, the TCL restored
+// generatorMode 3, and 6.3A of modeled draw landed on the line.
+//
+// The reducer did fire — and asked for 1.2A. That figure came from the
+// freshly-on projection pricing her at floorOf() (her on@L1 EWMA, 2.86A):
+// 13.205 + 2.86 − 15 + 0.1 = 1.165A, the exact number in journal row for
+// 05:51:15. Priced at the L3 she was actually at, the honest deficit was 4.6A —
+// more than cutting Najat alone can cover, so a peer HAD to move. Instead the
+// house rode 16.77A for two minutes and the user hand-set Abdullah → L1 and
+// Najat → L1 at 05:53:07 / 05:53:15.
+describe("the 2026-07-30 gen turn-on at L3 (nothing admitted the newcomer)", () => {
+  const HOT_ABDULLAH: SimAcSetup = {
+    deviceId: "abdullah",
+    capAmps: [2.2, 3.9, 5.3],
+    demandAmps: 5.5,
+    needDelta: 1.5,
+    level: 3,
+    rampSeconds: 30,
+  };
+  const SETTLED_ABDU: SimAcSetup = {
+    deviceId: "abdu",
+    capAmps: [4.1, 6.5, 9.0],
+    demandAmps: 6.0,
+    needDelta: 1.6,
+    level: 1,
+    rampSeconds: 30,
+  };
+  // Off, and holding the L3 the grid full start left her at.
+  const NAJAT_OFF: SimAcSetup = {
+    deviceId: "najat",
+    capAmps: [2.2, 3.9, 5.3],
+    demandAmps: 5.5,
+    needDelta: 0.9,
+    level: 3,
+    on: false,
+    rampSeconds: 240,
+  };
+
+  const evening = (): Scenario =>
+    new Scenario(cfg, [SETTLED_ABDU, HOT_ABDULLAH, NAJAT_OFF], { nonAcAmps: 3.5, source: "gen" });
+
+  /** Advance in single steps, returning the highest total the line ever carried. */
+  const peakOver = (s: Scenario, seconds: number): number => {
+    let peak = s.totalAmps();
+    for (let i = 0; i < seconds / 5; i++) {
+      s.advance(5);
+      peak = Math.max(peak, s.totalAmps());
+    }
+    return peak;
+  };
+
+  it("clamps the newcomer to its floor instead of adopting the level it came back at", () => {
+    const s = evening();
+    s.advance(120);
+    const t0 = s.now;
+    s.turnOn("najat", 3); // the TCL restores generatorMode 3
+    s.advance(60);
+
+    const clamp = s.commandsSince(t0, "set_level").filter((e) => e.cmd.deviceId === "najat");
+    expect(clamp.length).toBeGreaterThan(0);
+    expect(clamp[0].cmd).toMatchObject({ kind: "set_level", level: 1 });
+    expect(s.plans.some((p) => p.decisions.some((d) => d.action === "gen start L1"))).toBe(true);
+  });
+
+  it("sizes the deficit off the level she is really at, not her floor", () => {
+    const s = evening();
+    s.advance(120);
+    s.turnOn("najat", 3);
+    s.advance(10);
+
+    const over = s.plans.filter((p) => p.reason.startsWith("over"));
+    expect(over.length).toBeGreaterThan(0);
+    // The bug asked for ~1.2A — small enough that cutting the newcomer alone
+    // covered it, which is exactly why Abdullah was never touched.
+    expect(over[0].requiredAmps).toBeGreaterThan(2);
+  });
+
+  it("takes the amps from a peer too — the user should not have to do it by hand", () => {
+    const s = evening();
+    s.advance(120);
+    const t0 = s.now;
+    s.turnOn("najat", 3);
+    s.advance(5 * 60);
+
+    const peerCuts = s
+      .commandsSince(t0, "set_level")
+      .filter((e) => e.cmd.deviceId !== "najat" && e.cmd.kind === "set_level" && e.cmd.level < 3);
+    expect(peerCuts.length).toBeGreaterThan(0);
+    expect(s.sim("abdullah").level).toBeLessThan(3);
+  });
+
+  it("never rides the 16.8A the live house did, and keeps every room on", () => {
+    const s = evening();
+    s.advance(120);
+    s.turnOn("najat", 3);
+    expect(peakOver(s, 10 * 60)).toBeLessThan(16);
+    expect(s.acsOn()).toEqual(["abdu", "abdullah", "najat"]);
+    expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps);
+  });
+
+  it("does not re-lift her while the start window is open", () => {
+    const s = evening();
+    s.advance(120);
+    s.turnOn("najat", 3);
+    s.advance(3 * 60);
+    // The clamp and the raise phase both target this room; if the raise wins the
+    // dedupe, the entry policy is decorative.
+    expect(s.sim("najat").level).toBe(1);
+    expect(
+      s.plans.some((p) => p.decisions.some((d) => d.deviceId === "najat" && d.blockedBy === "gen start floor")),
+    ).toBe(true);
+  });
+
+  it("grid is untouched — a turn-on there still starts FULL", () => {
+    const s = new Scenario(cfg, [SETTLED_ABDU, HOT_ABDULLAH, NAJAT_OFF], { nonAcAmps: 3.5, source: "grid" });
+    s.advance(120);
+    const t0 = s.now;
+    s.turnOn("najat", 1);
+    s.advance(60);
+    const lifts = s
+      .commandsSince(t0, "set_level")
+      .filter((e) => e.cmd.deviceId === "najat" && e.cmd.kind === "set_level" && e.cmd.level > 1);
+    expect(lifts.length).toBeGreaterThan(0);
+  });
+});
+
+// 2026-07-31 Baghdad, 15A gen. Everyone was already at their floor and the
+// meter had ridden 12.4–15.4A for ten minutes — five over-limit episodes, four
+// fan trims and a whole-AC shed. The controller nonetheless found budget for a
+// level, twice, and the second one took the breaker:
+//
+//   17:29:32  Abdu fan 1→7   (fan restore — spends, and nothing charged it)
+//   17:29:44  Abdullah L2→L3 (12s later, admitted on a 9.91A trough)
+//   17:30:24  Abdu fan 7→1   17:30:30 Abdullah L3→L2   (both undone)
+//   17:31:44  Abdu fan 1→7   17:32:01 Abdullah L2→L3   (both redone) → 15.93A
+//   17:32:53  Abdu fan 7→4   (52s of overload later, and it picked a FAN)
+//   17:33:31  Abdullah L3→L2 (90s in) — the gen was already gone
+//
+// Abdullah carries a live L2 boost floor, so the room the controller wanted to
+// raise was also the one holding the most dormant amps.
+describe("the 2026-07-31 gen trip", () => {
+  // Model floors: abdullah L2 4.1, najat L1 2.7, abdu L1 4.5 → 11.3A modeled.
+  // Sim floors: 3.9 + 2.2 + 4.1 = 10.2A actually drawn.
+  const atFloors = (nonAcAmps: number): Scenario =>
+    new Scenario(
+      cfg,
+      [
+        { ...ABDULLAH, level: 2, minLevel: 2, demandAmps: 5.3, needDelta: 7 },
+        { ...NAJAT, level: 1, demandAmps: 3.9, needDelta: 1.1 },
+        { ...ABDU, level: 1, demandAmps: 9.0, needDelta: 2.4, fan: 7 },
+      ],
+      { nonAcAmps, source: "gen" },
+    );
+
+  it("refuses a raise on a TROUGH, because the envelope remembers the real house", () => {
+    // Settled at 13.8A (house 3.6): measured non-AC residual ≈ 2.5A.
+    const s = atFloors(3.6);
+    s.advance(5 * 60);
+    // Now the house dips — the live shape was a shed-and-restore leaving the
+    // meter 2.5A below the steady state of this very configuration. Meter-side
+    // admission alone sees 3.2A of headroom against a 1.6A step and says yes.
+    s.setNonAc(1.2);
+    const t0 = s.now;
+    s.advance(3 * 60);
+    // Envelope: 12.9A of caps + the 2.5A house peak = 15.4 > 14.8 → refused.
+    expect(s.sim("abdullah").level).toBe(2);
+    expect(setLevels(s, t0).filter((c) => c.cmd.level > 2)).toHaveLength(0);
+    expect(
+      s.plans.some((p) =>
+        p.decisions.some((d) => d.deviceId === "abdullah" && d.blockedBy === "physics envelope"),
+      ),
+    ).toBe(true);
+  });
+
+  it("still raises when the house is genuinely, durably small", () => {
+    // Same rooms, same trough mechanics — but the house has been 1.2A all along,
+    // so there is no stale peak and the raise is honestly affordable.
+    const s = atFloors(1.2);
+    s.advance(8 * 60);
+    expect(s.sim("abdullah").level).toBeGreaterThan(2);
+    expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps);
+  });
+
+  it("answers an over-limit with a LEVEL while one is available, never a fan", () => {
+    const s = atFloors(3.0);
+    s.advance(60);
+    // Abdullah is above his floor and the house goes over: a 1.6A level cut is
+    // on the table and Abdu is sitting at fan 7. Live, the reducer took the fan.
+    s.sim("abdullah").level = 3;
+    s.sim("abdullah").shadowLevel = 3;
+    s.setNonAc(4.4);
+    const t0 = s.now;
+    s.advance(2 * 60);
+    const first = s.commandsSince(t0).find((e) => e.cmd.kind === "set_fan" || e.cmd.kind === "set_level");
+    expect(first?.cmd.kind).toBe("set_level");
+  });
+
+  it("acts within ~15s of a clear overload, not 52s", () => {
+    const s = atFloors(3.0);
+    s.advance(60);
+    s.sim("abdullah").level = 3;
+    s.sim("abdullah").shadowLevel = 3;
+    s.setNonAc(4.4); // ≈ 15.6A — 0.7A over: past the moderate rung, under severe
+    const t0 = s.now;
+    s.advance(2 * 60);
+    const first = s.commandsSince(t0, "set_level")[0];
+    expect(first).toBeDefined();
+    expect(first.at - t0).toBeLessThanOrEqual(20_000);
+  });
+
+  it("does not play the fan up and down (the 7→5→3→1→7→1→7→4 cascade)", () => {
+    // Everyone pinned at their floor so fans are the ONLY lever, then a house
+    // that keeps crossing and re-crossing the limit — the live 10-minute shape.
+    const s = atFloors(3.0);
+    s.advance(60);
+    const t0 = s.now;
+    for (let i = 0; i < 8; i++) {
+      s.setNonAc(4.6); // over
+      s.advance(75);
+      s.setNonAc(2.6); // back under, calm rebuilds
+      s.advance(75);
+    }
+    const fans = s
+      .commandsSince(t0, "set_fan")
+      .filter((e) => e.cmd.deviceId === "abdu")
+      .map((e) => (e.cmd as Extract<Command, { kind: "set_fan" }>).fan);
+    // Direction reversals are the bounce; a staged climb is not.
+    let reversals = 0;
+    for (let i = 2; i < fans.length; i++) {
+      const prev = Math.sign(fans[i - 1] - fans[i - 2]);
+      const curr = Math.sign(fans[i] - fans[i - 1]);
+      if (prev !== 0 && curr !== 0 && prev !== curr) reversals++;
+    }
+    expect(reversals).toBeLessThanOrEqual(3);
+    // And no full-swing restore: 1→7 in one command was the disease.
+    for (let i = 1; i < fans.length; i++) {
+      expect(fans[i] - fans[i - 1]).toBeLessThanOrEqual(2);
+    }
   });
 });

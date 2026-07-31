@@ -97,6 +97,45 @@ describe("levels before fans (user complaint B — 57% of v1 fan cuts fired with
     const p = plan([ac("hot", { currentLevel: 1, fanSpeed: 7, fanExempt: true, needDelta: 0.2 })], 0.3);
     expect(p.fanCuts).toHaveLength(0);
   });
+
+  it("a PEER above its floor blocks the fan — levels are set-wide, not per-AC (2026-07-31 trip)", () => {
+    // Live 17:32:53: gen 1.0A over its limit. Abdullah sat at L3 (floor L2) with
+    // a 2.5A cut on the table; Abdu was at his floor with fan 7. The per-AC
+    // floor gate offered Abdu's fan, the comparator took it (cost 4.6 vs 140),
+    // and the level did not come down for another 38s — the breaker went first.
+    const atFloorWithFan = ac("cool", { currentLevel: 1, fanSpeed: 7, needDelta: 2.4 });
+    const aboveFloor = ac("hot", { currentLevel: 3, minLevel: 2, fanSpeed: 3, needDelta: 7 });
+    const p = plan([aboveFloor, atFloorWithFan], 0.45);
+    expect(p.fanCuts).toHaveLength(0);
+    expect(p.desiredLevels.hot).toBe(2);
+    expect(p.satisfied).toBe(true);
+  });
+
+  it("combines a level cut WITH a fan trim rather than shedding a room", () => {
+    // The trap in the first version of this rule: gating fans on "no level cut
+    // exists anywhere" made the reducer unable to reach the fan while a level
+    // remained, so a deficit that levels alone could not cover escalated
+    // straight to a power_off. "Fans are the last try BEFORE turning off" means
+    // levels+fans must always be reachable first.
+    // Model step 2A; required 2.3A. One level cut (2A) is short, and the plan
+    // that ends with everyone at their floor may add the fan to close it.
+    const aboveFloor = ac("hot", { currentLevel: 2, fanSpeed: 1, needDelta: 5 });
+    const atFloorWithFan = ac("cool", { currentLevel: 1, fanSpeed: 7, needDelta: 0.4 });
+    const p = plan([aboveFloor, atFloorWithFan], 2.3);
+    expect(p.toShed).toHaveLength(0);
+    expect(p.desiredLevels.hot).toBe(1);
+    expect(p.fanCuts.length).toBeGreaterThan(0);
+    expect(p.satisfied).toBe(true);
+  });
+
+  it("once every AC is at its floor the fan is back on the table", () => {
+    const atFloorWithFan = ac("cool", { currentLevel: 1, fanSpeed: 7, needDelta: 2.4 });
+    const alsoAtFloor = ac("hot", { currentLevel: 2, minLevel: 2, fanSpeed: 3, needDelta: 7 });
+    const p = plan([alsoAtFloor, atFloorWithFan], 0.45);
+    expect(p.desiredLevels).toEqual({});
+    expect(p.toShed).toHaveLength(0);
+    expect(p.fanCuts.length).toBeGreaterThan(0);
+  });
 });
 
 describe("graduated cuts + learned costs (the 4.3A-shed-for-0.3A regression)", () => {

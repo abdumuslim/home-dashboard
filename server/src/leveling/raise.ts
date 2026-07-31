@@ -1,6 +1,7 @@
 // Headroom spending for leveling v2: shed restores, warm restores, one-step
 // level raises, and the hard-invariant corrections (never level 0, boost
-// floors). Pure — pacing gates are consulted here but mutated by the caller.
+// floors, gen start clamp). Pure — pacing gates are consulted here but mutated
+// by the caller.
 //
 // Ordering (ported user decisions): a feasible shed RESTORE outranks every
 // raise ("all ACs on beats higher levels"); a restore gated only by pacing
@@ -29,9 +30,14 @@ import {
  * meter only shows that minutes later (or never, when the ESP hangs frozen).
  * This is the number that already knew "expected 16.9A > 15A" when the
  * 2026-07-23 double-L3 batch shipped and tripped the gen breaker.
- * Non-AC load is deliberately excluded: the cap models over-state cool-room
- * draw and v2 has no trustworthy non-AC split; the meter-side admission stays
- * the primary gate — this is the catastrophic-end-state backstop.
+ *
+ * AC-ONLY by construction. The non-AC term is supplied separately by the
+ * caller (see `RaiseInput.nonAcAmps` and house-load.ts) because the two
+ * consumers want different answers: a RAISE must be priced against the whole
+ * house, while a shed RESTORE is deliberately left on the AC-only figure —
+ * refusing a restore strands a room off entirely, which the user has ranked
+ * worse than riding near the limit, and the restore path already has a
+ * meter-anchored gate that includes the house load by definition.
  */
 export function envelopeTotalAmps(
   entries: Array<{ deviceId: string; level: number; maxLevel: number }>,
@@ -151,6 +157,13 @@ export interface RaiseInput {
    * a valid anchor while load it has not seen is still arriving.
    */
   rampDebitAmps: number;
+  /**
+   * Measured worst-case non-AC house load on this source (house-load.ts). Added
+   * to the physics envelope for RAISES only — the 2026-07-31 gen trip was an
+   * envelope of 13.9A admitting an end-state that measured 15.95A, and the
+   * whole 2.0A gap was the house the guard never counted.
+   */
+  nonAcAmps: number;
   limitAmps: number;
   calmMs: number;
   config: LevelingConfigV2;
@@ -190,9 +203,30 @@ export interface RaisePlan {
  * Hard-invariant corrections that ship regardless of calm/pacing (but not in
  * COLLAPSED — no commands into a dead line): an ON managed AC observed at
  * level 0 is re-capped at its top commandable level; an AC below its boost
- * floor is lifted to it.
+ * floor is lifted to it; and on GEN an AC still inside its turn-on window is
+ * clamped down to its floor.
+ *
+ * **Gen start clamp (2026-07-30).** A TCL restores the generator level it was
+ * last left at, and since GRID_FULL shipped that level is L3 — so a room turned
+ * on mid-gen-session arrives at 6.3A on a 15A line with nothing admitting it.
+ * FLOORS only arms on ENTRY into gen and ends within 5 minutes, so it does not
+ * cover this (live 05:51 Baghdad: Najat came on at L3 33 minutes in, the house
+ * rode 16.77A, and the user hand-set both rooms to L1 two minutes later).
+ *
+ * This is the per-device form of FLOORS, and it lives here rather than in the
+ * raise planner for three reasons: it must ship in EVERY non-COLLAPSED mode
+ * (a gen turn-on is over-limit by definition, so the raise phase never runs);
+ * it is a reduction, so it can never fight the reducer; and `dedupeCommands`
+ * gives the reducer the last word if it wants to cut deeper. Re-emitting while
+ * unconfirmed is deliberate — same contract as FLOORS, and it doubles as the
+ * confirm-or-resend Najat's firmware needs. It self-cancels once the shadow
+ * confirms at or below the floor, and `floorOf` honours manual/slot/boost caps.
  */
-export function invariantCorrections(acs: AcView[], now: number): { commands: Command[]; decisions: Decision[] } {
+export function invariantCorrections(
+  acs: AcView[],
+  now: number,
+  source: PowerSource,
+): { commands: Command[]; decisions: Decision[] } {
   const commands: Command[] = [];
   const decisions: Decision[] = [];
   for (const ac of acs) {
@@ -207,6 +241,16 @@ export function invariantCorrections(acs: AcView[], now: number): { commands: Co
     if (ac.currentLevel < floor) {
       commands.push({ deviceId: ac.deviceId, kind: "set_level", level: floor });
       decisions.push({ at: now, deviceId: ac.deviceId, action: `floor L${floor}`, detail: "below boost floor" });
+      continue;
+    }
+    if (source === "gen" && ac.startBaselineAmps != null && ac.currentLevel > floor) {
+      commands.push({ deviceId: ac.deviceId, kind: "set_level", level: floor });
+      decisions.push({
+        at: now,
+        deviceId: ac.deviceId,
+        action: `gen start L${floor}`,
+        detail: `came on at L${ac.currentLevel} — gen turn-ons enter at their floor`,
+      });
     }
   }
   return { commands, decisions };
@@ -247,6 +291,14 @@ export function planRaise(input: RaiseInput): RaisePlan {
       config,
       source,
     );
+  /**
+   * The envelope a RAISE is judged against: the AC caps plus the measured
+   * house. Restores keep using `envelopeWith` bare — see envelopeTotalAmps.
+   */
+  const raiseEnvelope = (
+    overrides: Record<string, number>,
+    extra?: { deviceId: string; level: number; maxLevel: number },
+  ): number => envelopeWith(overrides, extra) + input.nonAcAmps;
 
   // ---- Restore phase: most-needy shed AC first, no queue jumping ----
   // Restores are exempt from the resting buffer (a whole room off is worse
@@ -499,6 +551,17 @@ export function planRaise(input: RaiseInput): RaisePlan {
   };
 
   for (const { ac, ceil } of candidates) {
+    // A gen start window is an ENTRY POLICY, and entry policy outranks the
+    // raise phase for that device — the same rule FLOORS gets. Without this the
+    // clamp and the raise phase fight inside one batch: `invariantCorrections`
+    // emits L1, the raise emits L2/L3, and dedupe (last writer wins) hands the
+    // room straight back to the level nobody admitted. A warm restore would win
+    // it even mid-ramp, since `warmStartLevel` is exempt from the ramping gate.
+    // The room climbs normally once the window closes and the meter agrees.
+    if (source === "gen" && ac.startBaselineAmps != null) {
+      decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "gen start floor" });
+      continue;
+    }
     // Grid turn-on full start (user directive "on grid start all to full"):
     // an AC that just came on restores its last gen level (usually L1 from the
     // previous gen episode) — lift it to the affordable ceiling in ONE command
@@ -550,7 +613,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // the highest safe level instead of stranding the AC.
     if (envelopeGuard) {
       const desired = target;
-      while (target > ac.currentLevel && envelopeWith({ [ac.deviceId]: target }) > envelopeCeiling) target--;
+      while (target > ac.currentLevel && raiseEnvelope({ [ac.deviceId]: target }) > envelopeCeiling) target--;
       if (target === ac.currentLevel) {
         // FUNDING SWAP, envelope-blocked case. The cap models object, but the
         // METER may already hold the amps — and the peers standing in the way
@@ -567,7 +630,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
         const swapOverrides: Record<string, number> = { [ac.deviceId]: desired };
         for (const { ac: peer, ceil: peerCeil } of peers) swapOverrides[peer.deviceId] = peerCeil;
         const swapJump = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, desired, ac.maxLevel, now);
-        if (peers.length > 0 && envelopeWith(swapOverrides) <= envelopeCeiling) {
+        if (peers.length > 0 && raiseEnvelope(swapOverrides) <= envelopeCeiling) {
           if (swapJump.amps <= available) {
             // The meter already holds the amps — only the cap models objected,
             // and they are objecting about rooms that are satisfied (drawing
@@ -603,7 +666,9 @@ export function planRaise(input: RaiseInput): RaisePlan {
           deviceId: ac.deviceId,
           action: `raise L${desired}`,
           blockedBy: "physics envelope",
-          detail: `worst case ${envelopeWith({ [ac.deviceId]: desired }).toFixed(1)}A > ${envelopeCeiling.toFixed(1)}A on ${source}`,
+          detail:
+            `worst case ${raiseEnvelope({ [ac.deviceId]: desired }).toFixed(1)}A ` +
+            `(incl. ${input.nonAcAmps.toFixed(1)}A house) > ${envelopeCeiling.toFixed(1)}A on ${source}`,
         });
         continue;
       }

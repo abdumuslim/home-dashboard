@@ -214,10 +214,12 @@ export interface AcView {
   /**
    * The highest level this AC might ACTUALLY be drawing at right now: its
    * confirmed shadow, or any level we sent and never saw confirm (whichever is
-   * larger). For PHYSICS-ENVELOPE pricing of PEERS only — control decisions
-   * still key off `currentLevel`, because a command in flight is not an
-   * observation (that distinction is what stops a lagging write minting a false
-   * manual intent).
+   * larger). For WORST-CASE PRICING only — the physics envelope's peer terms,
+   * and the freshly-on turn-on projection (which must keep charging the level
+   * the firmware came back at until our clamp-to-floor actually confirms).
+   * Control decisions still key off `currentLevel`, because a command in flight
+   * is not an observation (that distinction is what stops a lagging write
+   * minting a false manual intent).
    *
    * Why it exists: 2026-07-28 15:55:36 admitted Abdu L2→L3 at a 13.6A envelope
    * because Najat's L3 (sent 15:39:49) had not confirmed yet; by 16:06 her
@@ -258,14 +260,18 @@ export interface AcView {
   /** Compressor still inside its ~4-min post-start ramp window. */
   ramping: boolean;
   /**
-   * House load measured just BEFORE this AC turned on, while its grid
-   * full-start window is open (null otherwise). A TCL restores the generator
-   * level it was last left at — typically L1 from the previous gen episode —
-   * so a turn-on on grid must be lifted to its ceiling ("on grid, start all to
-   * full" — user 2026-07-23) instead of creeping up one step at a time behind
-   * the ramp gate. Sizing that lift off the live meter would over-credit
-   * headroom (during the ramp the meter has not absorbed this AC's own draw
-   * yet), so the pre-start baseline is the anchor.
+   * House load measured just BEFORE this AC turned on, while its start window
+   * is open (null otherwise). A TCL restores the generator level it was last
+   * left at, so a turn-on always arrives at a level nobody chose — and the
+   * right correction is opposite per line:
+   *  - GRID: lift it to its ceiling ("on grid, start all to full" — user
+   *    2026-07-23) instead of creeping up a step at a time behind the ramp
+   *    gate. Sizing that lift off the live meter would over-credit headroom
+   *    (mid-ramp the meter has not absorbed this AC's own draw), so the
+   *    pre-start baseline is the anchor.
+   *  - GEN: clamp it DOWN to its floor (`invariantCorrections`). Since
+   *    GRID_FULL shipped, the retained level is L3 — 6.3A onto a 15A line with
+   *    nothing admitting it (live 2026-07-30 05:51).
    */
   startBaselineAmps: number | null;
   /**

@@ -7,11 +7,10 @@
 //   1. Savings are priced by the persistent cost model (costs.ts): a level cut
 //      is credited at max(model delta, learned jump) — the static model
 //      under-crediting cuts is what shed a 4.3A room to cover 0.3A.
-//   2. Fan moves attach ONLY to an AC's floor-level move (and only when no
-//      shed is being forced): the search therefore exhausts graduated level
-//      cuts before it ever touches a fan, and a fan trim beats a shed only for
-//      the small residual deficit — the user's "fans are a last-resort trim"
-//      decision. (v1 priced fans 10× cheaper than levels and cut them FIRST —
+//   2. Fan moves are enumerable only when the WHOLE candidate set has run out
+//      of level cuts (and only when no shed is being forced): levels first,
+//      fans as the last try before turning a room off — the user's 2026-07-31
+//      directive. (v1 priced fans 10× cheaper than levels and cut them FIRST —
 //      57% of live fan cuts fired with level cuts still available.)
 //   3. v1's fromFloor mode is gone — one pipeline always reduces from observed
 //      levels, graduated.
@@ -96,6 +95,8 @@ interface AcMove {
   commands: number;
   disturbed: boolean;
   shedNeed: number;
+  /** This move leaves the AC running ABOVE its floor — a level is still on offer. */
+  aboveFloor: boolean;
 }
 
 interface ComboScore {
@@ -149,6 +150,22 @@ export function planReduction(input: ReduceInput): ReducePlan {
   const needWeight = (ac: AcView): number => 1 + w.needK * Math.max(0, ac.needDelta);
   const topId = acs[0]?.deviceId ?? null;
 
+  // "Reduce the levels, then the fan speed as the last try before turning off"
+  // (user, 2026-07-31). The floor gate used to be PER-AC: a room already at its
+  // own floor offered its fan while a PEER still had a whole level to give, and
+  // the comparator then took the fan every time — w.fan (1) against w.levelStep
+  // (10) is a 100×-ish gap once needWeight is applied. Live 17:32:53 on a gen
+  // 1.0A over its limit: Abdullah sat at L3 with a 2.5A cut available and the
+  // reducer trimmed 0.4A off Abdu's fan instead. The level came down 38s later,
+  // by which time the breaker had gone.
+  //
+  // The gate is now per-PLAN, enforced at the leaf (see `recurse`): a candidate
+  // plan may cut a fan only if its own end-state leaves every AC at its floor.
+  // Deliberately not a global "no fan while any level exists anywhere" — that
+  // reading forces a SHED whenever levels alone fall a little short of the
+  // deficit, which is the opposite of "fans are the last try BEFORE turning
+  // off". Levels + fans together must always be reachable before a room dies.
+
   const perAc = acs.map((ac, index) => {
     const floor = floorOf(ac);
     // Upper candidate level: the observed level, except an unrestricted (0) AC
@@ -167,9 +184,10 @@ export function planReduction(input: ReduceInput): ReducePlan {
 
     const fanChoices = (level: number): Array<{ target: number | null; savings: number }> => {
       const choices: Array<{ target: number | null; savings: number }> = [{ target: null, savings: 0 }];
-      // Fans are last-resort trim: only enumerable at the AC's floor level,
-      // only when no shed is forced, and only when the user hasn't touched
-      // the fan this episode.
+      // Fans are last-resort trim: only at this AC's floor level, only when no
+      // shed is forced, and only when the user hasn't touched the fan this
+      // episode. Whether the PLAN as a whole has earned a fan is decided at the
+      // leaf, where the peers' end-states are known.
       if (!input.fanTrimEnabled || requireShed || level !== floor) return choices;
       if (ac.fanExempt || ac.fanSpeed == null || (ac.fanSpeed !== 0 && ac.fanSpeed <= 1)) return choices;
       if (ac.fanSpeed === 0) {
@@ -222,6 +240,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
           commands: (levelChanged ? 1 : 0) + (fanDrop ? 1 : 0),
           disturbed: levelChanged || fanDrop,
           shedNeed: 0,
+          aboveFloor: level > floor,
         });
       }
     }
@@ -241,6 +260,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
         commands: 1,
         disturbed: true,
         shedNeed: Math.max(0, ac.needDelta),
+        aboveFloor: false, // a room that is off is not withholding a level
       });
     }
     return { ac, moves };
@@ -258,8 +278,16 @@ export function planReduction(input: ReduceInput): ReducePlan {
     disturbed: number,
     shedNeed: number,
     sheds: number,
+    fanCuts: number,
+    aboveFloor: number,
   ): void => {
     if (i === perAc.length) {
+      // Levels before fans, judged on the PLAN: a candidate that trims a fan
+      // while its own end-state still parks a room above that room's floor has
+      // skipped a lever. Discard it outright rather than pricing it — the
+      // comparator's cost terms are per-AC need-weighted and a satisfied room's
+      // fan will always undercut a hot room's level (live: 4.6 vs 140).
+      if (fanCuts > 0 && aboveFloor > 0) return;
       // ≤3 ACs, so scanning the leaf is cheaper than threading two more counters.
       const shedIds = combo.flatMap((mv, idx) => (mv.level == null ? [perAc[idx].ac.deviceId] : []));
       const candidate: ComboScore = {
@@ -288,10 +316,12 @@ export function planReduction(input: ReduceInput): ReducePlan {
         disturbed + (mv.disturbed ? 1 : 0),
         shedNeed + mv.shedNeed,
         sheds + (mv.level == null ? 1 : 0),
+        fanCuts + (mv.fanTarget != null ? 1 : 0),
+        aboveFloor + (mv.aboveFloor ? 1 : 0),
       );
     }
   };
-  recurse(0, 0, 0, 0, 0, 0, 0);
+  recurse(0, 0, 0, 0, 0, 0, 0, 0, 0);
 
   const chosen: ComboScore =
     best ?? {

@@ -7,7 +7,15 @@
 
 import type { AcView, Command, MeterEvent, MeterState } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
-import { ingestReading, initialMeterState, meterView, noteCommandedCut, refillBucket, resetCalm } from "./sensing.js";
+import {
+  ingestReading,
+  initialMeterState,
+  meterView,
+  noteCommandedCut,
+  OVER_LIMIT_BUDGET_AFTER_ACT,
+  refillBucket,
+  resetCalm,
+} from "./sensing.js";
 import {
   applyMeterEvent,
   clearFloorsIfDone,
@@ -17,9 +25,10 @@ import {
   noteBatch,
   type ModeState,
 } from "./modes.js";
-import { plan, type PlanOutput } from "./pipeline.js";
+import { GRADE_TURN_ON_MS, plan, type PlanOutput } from "./pipeline.js";
 import {
   attemptedRecently,
+  attemptedWithin,
   initialPacingState,
   noteAttempt,
   noteFailure,
@@ -31,9 +40,10 @@ import {
 } from "./pacing.js";
 import type { FanHolds } from "./fan-trim.js";
 import type { CostBook } from "./costs.js";
-import { raiseJumpAmps, restoreCostAmps, turnOnAmps } from "./costs.js";
+import { fanTrimSavings, raiseJumpAmps, restoreCostAmps, turnOnAmps } from "./costs.js";
 import { ceilOf, floorOf, worstCaseLevel } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
+import { houseLoadAmps, initialHouseLoad, sampleHouseLoad, type HouseLoadState } from "./house-load.js";
 
 export interface SimAcSetup {
   deviceId: string;
@@ -102,6 +112,8 @@ interface SimAc {
   drawingUntil: number;
   /** Shell parity: a level RAISE's committed-but-unmetered amps (gen only). */
   jumpDebit: { amps: number; baseline: number | null; absorbed: number; until: number } | null;
+  /** Shell parity: the same accounting for a fan RESTORE's un-metered amps. */
+  fanDebit: { amps: number; baseline: number | null; absorbed: number; until: number } | null;
   /** User-pinned level (manual wins over every automation ceiling). */
   manualTarget: number | null;
 }
@@ -109,6 +121,8 @@ interface SimAc {
 const STEP_MS = 5_000;
 /** Mirrors the controller shell's grid full-start window (AC_RAMP_MS). */
 const GRID_START_MS = 240_000;
+/** Mirrors the controller shell's FAN_DEBIT_MS. */
+const FAN_DEBIT_MS = 60_000;
 
 export class Scenario {
   now = 1_000_000_000;
@@ -124,6 +138,8 @@ export class Scenario {
   private acs: SimAc[];
   /** Shell parity: when each room's uninterrupted satisfied stretch began. */
   private satisfiedSince = new Map<string, number>();
+  /** Shell parity: the MEASURED non-AC split (never the sim's ground truth). */
+  private houseLoad: HouseLoadState = initialHouseLoad();
   private nonAcAmps: number;
   private line: "grid" | "gen" | "none";
   private lineDead = false;
@@ -132,7 +148,8 @@ export class Scenario {
   private noiseFlip = 1;
   private espFrozen = false;
   private lastSentReading: { gridAmps: number; genAmps: number } | null = null;
-  private pendingProjection: number | null = null;
+  /** Devices the controller shell would have in `freshlyOn` on the next tick. */
+  private freshlyOn: string[] = [];
   private attempts: Array<{ deviceId: string; kind: AttemptKind; at: number }> = [];
 
   constructor(
@@ -177,6 +194,7 @@ export class Scenario {
       rampAbsorbed: 0,
       drawingUntil: 0,
       jumpDebit: null,
+      fanDebit: null,
       manualTarget: null,
     }));
   }
@@ -198,10 +216,12 @@ export class Scenario {
     const view = meterView(this.meterState, this.now);
     if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return;
     for (const ac of this.acs) {
-      if (ac.jumpDebit != null) {
-        if (ac.jumpDebit.until <= this.now) ac.jumpDebit = null;
-        else if (ac.jumpDebit.baseline != null) {
-          ac.jumpDebit.absorbed = Math.max(ac.jumpDebit.absorbed, view.smoothedAmps - ac.jumpDebit.baseline);
+      for (const key of ["jumpDebit", "fanDebit"] as const) {
+        const debit = ac[key];
+        if (debit == null) continue;
+        if (debit.until <= this.now) ac[key] = null;
+        else if (debit.baseline != null) {
+          debit.absorbed = Math.max(debit.absorbed, view.smoothedAmps - debit.baseline);
         }
       }
       if (ac.rampBaseline == null || !this.isRamping(ac)) continue;
@@ -263,12 +283,12 @@ export class Scenario {
     ac.level = level;
     ac.shadowLevel = level;
     this.startRamp(ac);
-    const source = this.line === "none" ? "gen" : this.line;
-    this.pendingProjection = turnOnAmps(this.book, this.cfg, deviceId, source, level, 3, this.now).amps;
-    // Mirror the shell: on grid a turn-on opens a full-start window anchored on
-    // the house load measured just before the compressor started.
+    this.freshlyOn.push(deviceId);
+    // Mirror the shell: a turn-on opens a start window on EITHER source,
+    // anchored on the house load measured just before the compressor started.
+    // Grid uses it to lift to the ceiling, gen to clamp down to the floor.
     const view = meterView(this.meterState, this.now);
-    if (this.line === "grid" && view.sampleCount >= 2) {
+    if (this.line !== "none" && view.sampleCount >= 2) {
       ac.startBaseline = { amps: view.smoothedAmps, until: this.now + GRID_START_MS };
     }
   }
@@ -409,13 +429,49 @@ export class Scenario {
           ac.on && ac.startBaseline != null && ac.startBaseline.until > this.now
             ? ac.startBaseline.amps
             : null,
-        unmeteredJumpAmps:
-          ac.jumpDebit != null && ac.jumpDebit.until > this.now
-            ? Math.max(0, ac.jumpDebit.amps - ac.jumpDebit.absorbed)
-            : 0,
+        // Additive across both debit kinds — shell parity with unmeteredJumpAmps().
+        unmeteredJumpAmps: [ac.jumpDebit, ac.fanDebit].reduce(
+          (sum, d) => sum + (d != null && d.until > this.now ? Math.max(0, d.amps - d.absorbed) : 0),
+          0,
+        ),
         reshedPenalized: reshedPenalized(this.pacing, ac.setup.deviceId, this.now),
       };
     });
+  }
+
+  /**
+   * Shell parity (controller.ts): the committed-but-unmetered draw of ACs that
+   * are inside their start window AND still ramping, ratcheted down as the
+   * meter absorbs it. A room WE restored is priced at the floor we commanded
+   * (gentle flag included) so the projection matches its admission; a
+   * user/automation turn-on is priced at the level the firmware came back at.
+   */
+  private projectedExtraAmps(views: AcView[]): number | undefined {
+    if (this.line === "none") return undefined;
+    const source = this.line;
+    const view = meterView(this.meterState, this.now);
+    const starting = views.filter(
+      (v) =>
+        v.on &&
+        v.managed &&
+        !v.shed &&
+        v.ramping &&
+        (v.startBaselineAmps != null || this.freshlyOn.includes(v.deviceId)),
+    );
+    if (starting.length === 0) return undefined;
+    return starting.reduce((sum, v) => {
+      const ours = attemptedWithin(this.pacing, v.deviceId, "restore", GRADE_TURN_ON_MS, this.now);
+      const committed = ours
+        ? restoreCostAmps(this.book, this.cfg, v.deviceId, source, floorOf(v), v.maxLevel, this.now, {
+            gentle: this.fanHolds[v.deviceId]?.gentle === true,
+          }).amps
+        : turnOnAmps(this.book, this.cfg, v.deviceId, source, v.envelopeLevel, v.maxLevel, this.now).amps;
+      const absorbed =
+        v.rampBaselineAmps == null
+          ? 0
+          : Math.max(0, view.smoothedAmps - v.rampBaselineAmps, v.rampAbsorbedAmps ?? 0);
+      return sum + Math.max(0, committed - absorbed);
+    }, 0);
   }
 
   private execute(out: PlanOutput): void {
@@ -469,27 +525,41 @@ export class Scenario {
           // (recorded by the pipeline, assigned in step()).
           if (cmd.fan != null) ac.fan = cmd.fan;
           // Shell parity: the controller sees this AC flip off→on on the NEXT
-          // tick, adds it to `freshlyOn` and arms the proactive projection —
-          // exactly like an automation turn-on. Without this the harness could
-          // not reproduce the 2026-07-24/25 restore-bounce storm, where the
+          // tick, adds it to `freshlyOn` and opens its start window — exactly
+          // like an automation turn-on. Without this the harness could not
+          // reproduce the 2026-07-24/25 restore-bounce storm, where the
           // projection re-priced a just-admitted restore and declared it over.
-          // A restore is projected at the same price its admission charged —
-          // the recorded hold's gentle flag says which (shell parity:
-          // fanHolds[id].gentle marks a probe-priced restore).
-          this.pendingProjection = restoreCostAmps(
-            this.book,
-            this.cfg,
-            cmd.deviceId,
-            this.line === "none" ? "gen" : this.line,
-            cmd.level,
-            3,
-            this.now,
-            { gentle: out.fanHolds[cmd.deviceId]?.gentle === true },
-          ).amps;
+          // `projectedExtraAmps()` is what decides the price; a restore is
+          // recognised there by its pacing attempt and re-priced at exactly
+          // what admission charged.
+          this.freshlyOn.push(cmd.deviceId);
+          if (this.line !== "none") {
+            const onView = meterView(this.meterState, this.now);
+            if (onView.sampleCount >= 2) {
+              ac.startBaseline = { amps: onView.smoothedAmps, until: this.now + GRID_START_MS };
+            }
+          }
           break;
-        case "set_fan":
+        case "set_fan": {
+          // Shell parity (executeAndJournal): a fan RESTORE spends, so it is
+          // charged as committed-but-unmetered and rewinds calm. A fan CUT
+          // frees amps and does neither.
+          if (cmd.reason === "trim_restore" && this.line === "gen") {
+            const view = meterView(this.meterState, this.now);
+            const steps = cmd.fan === 0 ? 6 : cmd.fan - ac.fan;
+            ac.fanDebit =
+              steps > 0
+                ? {
+                    amps: fanTrimSavings(this.book, ac.setup.deviceId, "gen", steps, this.now),
+                    baseline: view.sampleCount >= 2 && !view.frozen ? view.smoothedAmps : null,
+                    absorbed: 0,
+                    until: this.now + FAN_DEBIT_MS,
+                  }
+                : null;
+          }
           ac.fan = cmd.fan;
           break;
+        }
       }
     }
   }
@@ -537,42 +607,67 @@ export class Scenario {
     this.modeState = { ...this.modeState, collapsed: this.meterState.collapse != null };
 
     const mode = deriveMode(this.modeState, this.now);
+    const view = meterView(this.meterState, this.now);
+    // Shell parity (controller.tick): the planner does NOT get told `nonAcAmps`
+    // — it must MEASURE the split off the simulated meter exactly the way the
+    // shell does. Handing it the sim's ground truth would be the scenario.ts
+    // mirror bug all over again (2026-07-30, bug 14): the harness would price a
+    // house the shell cannot see, and no harness test could ever disagree.
+    if (view.source !== "none" && view.sampleCount >= 2 && !view.frozen) {
+      this.houseLoad = sampleHouseLoad(this.houseLoad, {
+        source: view.source,
+        at: this.now,
+        smoothedAmps: view.smoothedAmps,
+        acs: views,
+        config: this.cfg,
+      });
+    }
     const out = plan({
       now: this.now,
       config: this.cfg,
       mode,
-      meter: meterView(this.meterState, this.now),
+      meter: view,
       acs: views,
       book: this.book,
       pacing: this.pacing,
       fanHolds: this.fanHolds,
-      projectedExtraAmps: this.pendingProjection ?? undefined,
+      projectedExtraAmps: this.projectedExtraAmps(views),
+      nonAcAmps: houseLoadAmps(this.houseLoad, view.source, this.now, views),
       inFlight: (deviceId) => {
         const ac = this.acs.find((a) => a.setup.deviceId === deviceId);
         return ac == null ? [] : ac.sentLevels.map((level) => ({ level, sentAt: ac.lastLevelSentAt }));
       },
     });
-    this.pendingProjection = null;
+    this.freshlyOn = [];
     this.plans.push(out);
     this.fanHolds = out.fanHolds;
 
     if (out.commands.length > 0) {
       this.execute(out);
       this.modeState = noteBatch(this.modeState, { fanOnly: out.fanOnly }, this.now);
-      if (!out.fanOnly) this.meterState = resetCalm(this.meterState);
+      // Shell parity: a fan-only batch that SPENT (restore) still rewinds calm.
+      const spentOnFan = out.commands.some((c) => c.kind === "set_fan" && c.reason === "trim_restore");
+      if (!out.fanOnly || spentOnFan) this.meterState = resetCalm(this.meterState);
       // Shell parity: credit the meter with what this batch took off the line,
-      // so a shed's late arrival is not read as a breaker trip.
-      if (out.expectedDeltaAmps < 0) {
-        this.meterState = noteCommandedCut(this.meterState, -out.expectedDeltaAmps, this.now);
+      // so a shed's late arrival is not read as a breaker trip. `commandedCutAmps`
+      // is the single credit path (invariant 11) — `expectedDeltaAmps` is only
+      // set by reduce batches and silently missed demotes, funding swaps, and
+      // the gen start clamp.
+      if (out.commandedCutAmps > 0) {
+        this.meterState = noteCommandedCut(this.meterState, out.commandedCutAmps, this.now);
       }
       // Shell parity: a turn-on invalidates banked over-limit readings.
       if (out.commands.some((c) => c.kind === "power_on")) {
         this.meterState = refillBucket(this.meterState);
       }
       if (out.reason.startsWith("over")) {
-        this.meterState = refillBucket(this.meterState);
-        // The reducer's judgment beats the entry policy (shell parity).
-        for (const ac of this.acs) ac.startBaseline = null;
+        // Shell parity: PARTIAL after an over-limit act, so an under-sized
+        // reduction can escalate in seconds rather than another five readings.
+        this.meterState = refillBucket(this.meterState, OVER_LIMIT_BUDGET_AFTER_ACT);
+        // The reducer's judgment beats the entry policy — GRID only (shell
+        // parity): gen's start policy is a floor clamp, which can only agree
+        // with the reducer, and a gen turn-on is over-limit by definition.
+        if (this.line === "grid") for (const ac of this.acs) ac.startBaseline = null;
       }
       // Failure attribution: a reduction that undoes a recent raise/restore is
       // that attempt's failure (the bounce, hybrid-backoff side).

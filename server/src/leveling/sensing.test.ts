@@ -6,6 +6,7 @@ import {
   COLLAPSE_DERATE_MS,
   METER_FROZEN_AFTER_MS,
   OVER_LIMIT_BUDGET,
+  OVER_LIMIT_BUDGET_AFTER_ACT,
   PENDING_CUT_MS,
   POWER_COLLAPSE_MAX_MS,
   determineSource,
@@ -115,6 +116,38 @@ describe("leaky bucket", () => {
     const refilled = refillBucket(state);
     expect(refilled.overLimitBudget).toBe(OVER_LIMIT_BUDGET);
     expect(refilled.overLimitReadings).toHaveLength(0);
+  });
+
+  // 2026-07-31: a raise put the gen at 15.93A on a 15A limit — 0.93A over, one
+  // point per reading under the old binary drain, so the FIRST corrective
+  // command came 52 seconds later. The breaker had about 90 seconds left.
+  it("a clearly-over reading drains the moderate rung, not the noise rung", () => {
+    // Limit 15, margin 1 in this file → 15.9 is 0.9 over: past MODERATE (0.5),
+    // under SEVERE (1.0).
+    const { events, state } = feedGen([15.9, 15.95]);
+    expect(state.overLimitBudget).toBe(OVER_LIMIT_BUDGET - 4);
+    const { events: third } = feedGen([15.9], { state, startAt: 1_000_000 + 15_000 });
+    expect([...events, ...third].filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
+  });
+
+  it("still tolerates genuine noise just over the line", () => {
+    // 15.3 is 0.3 over — inside the moderate threshold, so it stays on the
+    // 1-point rung and five readings are still required.
+    const { events } = feedGen([15.3, 15.3, 15.3, 15.3]);
+    expect(events.filter((e) => e.kind === "bucket_empty")).toHaveLength(0);
+  });
+
+  it("the post-act refill is PARTIAL — an under-sized cut escalates in seconds", () => {
+    // The live 38-second gap: the first act was a 0.4A fan trim, the bucket
+    // went back to full, and the level cut that should have come first waited
+    // out another five readings.
+    const { state } = feedGen([16.5, 16.6]);
+    expect(state.overLimitBudget).toBe(0);
+    const acted = refillBucket(state, OVER_LIMIT_BUDGET_AFTER_ACT);
+    expect(acted.overLimitBudget).toBe(OVER_LIMIT_BUDGET_AFTER_ACT);
+    // One more severe reading (drain 3) empties it again immediately.
+    const { events } = feedGen([16.7], { state: acted, startAt: 1_000_000 + 15_000 });
+    expect(events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
   });
 });
 

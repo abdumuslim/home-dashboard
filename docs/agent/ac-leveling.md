@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: 'Smart AC Leveling & Per-AC Calibration'
-description: 'A ground-up rewrite lives in server/src/leveling/ (18 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands,…'
+description: 'A ground-up rewrite lives in server/src/leveling/ (19 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands,…'
 tags: [home, dashboard, claude-code, current]
 maintainer: claude-code
 timestamp: 2026-07-28
@@ -15,7 +15,7 @@ timestamp: 2026-07-28
 
 > **Status:** v2 is the **acting controller** (config `controller: "v2"` in `ac_leveling_config` row id=2). v1 (`ac-leveler.ts` + `ac-leveling.ts`) is kept only as the **instant rollback target** — flip the flag back to `"v1"` via `PUT /api/ac/leveling` and `docker compose restart` (v1's boot-once state is stale after v2 acted). After a ≥1-week soak, delete v1 and its tests and fold this section's history into the main doc. **Everything below the "TL;DR (v1)" divider documents v1 — historical, rollback-only.**
 
-A ground-up rewrite lives in **`server/src/leveling/`** (18 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
+A ground-up rewrite lives in **`server/src/leveling/`** (19 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
 **Two invariants added 2026-07-26 after three gen trips in 25 minutes — read the incident section
 before touching admission:** (a) the meter is NOT a valid budget anchor while a compressor is
@@ -38,6 +38,35 @@ spring", now built and running on BOTH sources), and its levels are cheap for th
 (the `topPriority` surcharge applies only BELOW `ceilOf`); (f) **never spend a saving that has not
 landed** — the funding swap ships same-batch only when the METER already holds the amps, and a level
 raise now arms its own unmetered-jump debit (`AcView.unmeteredJumpAmps`) the way a turn-on does.
+
+**Two more added 2026-07-30 (the gen turn-on incident + two gen trips — read that section before
+touching the start window, the freshly-on projection, or the derate):** (g) **a gen turn-on is not an
+admission.** A TCL restores the generator level it was last left at, and since GRID_FULL shipped that
+level is L3 — so a room switched on mid-gen-session arrives at 6.3A on a 15A line with nothing
+admitting it. `invariantCorrections` now clamps it to its floor (the per-device form of FLOORS) and
+the raise phase stands down for that device while its start window is open. (h) **a derate is handed
+back in steps, never in one jump.** The 20-min cliff expiry restored full rating instantly, and the
+leveler spent the reclaimed amps on a raise **2 seconds later**; because the first derate had already
+retired, the repeat trip re-armed at 1.0A instead of compounding.
+
+**Four more added 2026-07-31 (the gen trip after ten minutes of riding the limit — read that section
+before touching the envelope, the reducer's fan gate, the fan restore, or the leaky bucket):**
+(i) **the physics envelope must count the HOUSE, not just the ACs.** It summed cap models only, priced
+`{Abdullah L3, Najat L1, Abdu L1}` at 13.9A against a 14.9A ceiling and admitted the raise — the
+journal measured that exact end-state at **15.93–15.99A**. `house-load.ts` now tracks the peak
+`meter − Σ modeled AC draw` per source and `RaiseInput.nonAcAmps` adds it to the raise envelope
+(restores stay AC-only on purpose). (j) **levels before fans, judged per PLAN.** The floor gate was
+per-AC, so a room already at its floor offered its fan while a peer still held a whole level, and the
+comparator took the fan every time (cost 4.6 vs 140). A candidate plan may now cut a fan only if its
+own end-state leaves every AC at its floor — *not* a global "no fan while any level exists", which
+forces a shed whenever levels alone fall short. (k) **a fan restore SPENDS.** It emitted one
+`set_fan`, reported `commandedCutAmps: 0`, armed no debit and was `fanOnly` so it did not even rewind
+calm — both fatal raises landed 12s and 17s after one. It now arms `fanDebit` (priced at exactly what
+`planFanRestore` admitted) and resets calm; the climb is bounded to `FAN_RESTORE_MAX_STEP` gears and
+owes `FAN_RESTORE_AFTER_CUT_MS` since the last cut. (l) **the drain rung was too coarse to catch a
+0.9A overload.** 15.93A on a 15A limit drained 1 point per reading → 52s to the first act, and the
+post-act refill went back to FULL → another 38s to the second. There is now a moderate rung
+(`OVER_LIMIT_DRAIN_MODERATE`) and the post-act refill is partial (`OVER_LIMIT_BUDGET_AFTER_ACT`).
 
 **Key design (vs v1):** ONE graduated reducer at every severity (no separate mild/emergency planners); explicit mode machine NORMAL/SETTLING/FLOORS/COLLAPSED replaces ~15 latches (FLOORS arms on ANY entry into gen incl. cold start); **fans are last-resort trim only** (enumerable only at floor level; restore needs 5-min calm — v1 cut fans with level cuts available 57% of the time and bounced them at 61s median); one-step meter-anchored raises priced by a **persistent learned cost model** (`ac_leveling_costs` — per device × source × transition EWMA, survives deploys, config saves do NOT wipe it; explicit `POST /api/ac/leveling/costs/reset`); restore/raise retries use **evidence + capped backoff** (30s→2m→5m→15m — kills permanent strands); on gen only ONE raise command per batch; every batch is journaled + outcome-graded in **`ac_leveling_journal`** (`GET /api/ac/leveling/journal?hours=24` — durable forensics, docker logs rotate in ~1.5 days); single-actuator graded batches feed the cost model continuously. Hard rules all preserved (never level 0, manual wins, slot caps, boost floors, shed≠manual-off, warm restore, opt-out, collapse latch, leaky bucket, requireShed ≥ max(3A, 20%)).
 
@@ -158,8 +187,8 @@ already on **grid** with ~5A free. He came up at **L1** and stayed there — L1�
    could not ship until the ramp expired, then one step per batch behind the 30s settle + calm.
 
 **Fix — the "on grid, start all to full" directive now covers TURN-ONS, not just changeovers.** A
-managed AC that comes on while on grid opens a **grid full-start window** (`GRID_START_MS` =
-`AC_RAMP_MS`) carrying `startBaselineAmps`: the smoothed house load measured **just before it
+managed AC that comes on while on grid opens a **start window** (`START_WINDOW_MS` = `AC_RAMP_MS`;
+named `GRID_START_MS` until 2026-07-30, when gen started opening one too) carrying `startBaselineAmps`: the smoothed house load measured **just before it
 started**. Inside that window `raise.ts` `gridStartLevel()` drives it to the highest level that fits
 `baseline + steadyDraw(level) ≤ limit − margin − restingBuffer`, in ONE command, exempt from the calm
 and ramping gates (still pacing-gated, still clamped by `ceilOf` — near-target/manual/slot/reachable
@@ -177,9 +206,17 @@ cannot spend the same amps. Fan slam is not modeled (grid restores were already 
 the cleanest baseline) or the structural off→on branch in `tick()` for automation turn-ons (first
 writer wins); cleared on power-off, on a source change (baseline amps are per-source, and the entry
 mode owns the transition), on a manual gen-level change (AGENTS rule 7), after any over-limit batch
-(the reducer's judgment beats the entry policy — same rule that ends GRID_FULL on `bucket_empty`),
-and on expiry. **Gen is deliberately untouched:** entering gen means FLOORS, and a gen turn-on still
-starts at L1 and climbs meter-confirmed.
+**on grid only** (the reducer's judgment beats the entry policy — same rule that ends GRID_FULL on
+`bucket_empty`), and on expiry.
+
+> ⚠️ **This section used to end "Gen is deliberately untouched: entering gen means FLOORS, and a gen
+> turn-on still starts at L1 and climbs meter-confirmed." That was wrong, and it stayed wrong for
+> five days.** It was true only in the era before GRID_FULL — once "on grid, start all to full"
+> shipped (2026-07-24) the level a TCL retains is **L3**, and FLOORS arms only on *entry* into gen
+> and ends within 5 minutes. See the 2026-07-30 section: the window is now opened on BOTH sources,
+> with opposite policies (grid lifts, gen clamps). The gen clear-on-over-limit is deliberately
+> skipped because a gen turn-on is over-limit by definition on a 15A line — clearing there would
+> retire the clamp on the exact tick it is needed.
 
 Tests: `raise.test.ts` "grid turn-on full start" suite (8 — lift, degrade, baseline-not-meter,
 double-spend, cap clamp, near-target, gen policy, post-window); `scenarios.test.ts` "the 2026-07-25
@@ -228,7 +265,11 @@ Two independent controller bugs plus one wrong assumption:
    like an entry into gen. Grid recovers plain (GRID_FULL owns that entry).
 3. **Post-collapse limit derate (`sensing.ts` + `config.ts` `effectiveLimit`).** Each collapse takes
    `COLLAPSE_DERATE_AMPS` (1A) off the effective limit for that source for `COLLAPSE_DERATE_MS`
-   (20 min, refreshed by each new collapse), stacking to `COLLAPSE_DERATE_MAX_AMPS` (3A). Stored on
+   (20 min, refreshed by each new collapse), stacking to `COLLAPSE_DERATE_MAX_AMPS` (3A). **Since
+   2026-07-30 the rating is handed back one `COLLAPSE_DERATE_RECOVERY_STEP` (0.5A) per quiet rung
+   rather than cliff-expiring** — the cliff funded the next trip 2 seconds after it lifted, and left
+   `standing` at 0 so repeat trips could not compound (section B below). `derateFor()` is a pure
+   function of time, so a line carrying nothing still cools. Stored on
    `MeterState.derate` with its own source tag so it RIDES THROUGH the per-source episodic reset (a
    gen→grid→gen bounce must not launder a hot gen breaker back to full rating). Exposed as
    `MeterView.derateAmps`; **every** limit consumer goes through `effectiveLimit()` — sensing's leaky
@@ -638,6 +679,203 @@ launder a real trip" · `scenarios.test.ts` "2026-07-28 evening budget hog" (5).
   consistent with GRID_FULL, which already clamps satisfied rooms to L1 at grid entry.
 - **Funding swap splits by blocker** — same-batch only when the meter already holds the amps. The user
   chose this over unconditional same-batch after seeing the 15.65A trip math.
+
+### 2026-07-30 gen turn-on at L3 + two gen trips (the derate cliff)
+
+Two independent defects, both found from the journal + `ac_control_audit` + `power_readings`.
+
+#### A. "I turned Najat on and she started at L3, and it never lowered Abdullah"
+
+**The incident (05:51:07 Baghdad, 15A gen).** The house had been on generator for 33 minutes — long
+past FLOORS — with Abdullah at L3, Abdu at L1, ~13.2A total. The user switched Najat on. She came
+back at **L3**: the grid full start had driven her there at 04:29, she was switched off at 04:42, and
+the TCL `restoreLastState` re-applied `generatorMode: 3` on power-on. 6.3A of modeled draw landed on
+a 15A line with nothing admitting it. The house rode **16.77A** for two minutes; at 05:53:07/05:53:15
+the user hand-set Abdullah → L1 and Najat → L1. Same shape at 07:04 (gen).
+
+Two causes, and the second is why a peer was never touched:
+
+1. **No gen turn-on policy existed.** `noteTurnOn()` returned early unless the source was grid, and
+   `gridStartLevel()` only runs on grid. FLOORS arms on *entry* into gen and ends within
+   `FLOORS_MAX_MS` (5 min), so it does not cover a room switched on later. The doc asserted the
+   opposite (see the warning in the 2026-07-25 section) — true before GRID_FULL, false after it.
+2. **The freshly-on projection priced her at `floorOf()`, not the level she was at.** Arithmetic
+   against the journal: `13.205 + 2.86 (her on@L1 EWMA) − 15 + 0.1 = 1.165` → the row's
+   `reduce 1.2A (mild)`, exact. Priced at her real L3 (6.3A) the honest deficit is **4.6A** — more
+   than `Najat L3→L1` (4.0A) can cover, so the reducer would have had to move a peer. At 1.2A it
+   could pay out of the newcomer alone, and did. The projection was assuming the floor policy that
+   cause 1 shows did not exist.
+
+**Why no test caught it:** `scenario.ts` `turnOn()` priced `pendingProjection` at the **actual**
+level while the shell priced it at the floor. The harness could not disagree with the shell, so both
+sides now carry their own regression (`controller.test.ts` "a gen turn-on enters at its floor" is
+deliberately a SHELL test).
+
+**The fix.**
+- The start window opens on **both** sources (`START_WINDOW_MS`, was `GRID_START_MS`), carrying the
+  same pre-start `startBaselineAmps`. Grid LIFTS to the ceiling; gen CLAMPS to the floor.
+- `invariantCorrections(acs, now, source)` emits `set_level = floorOf(ac)` for an AC inside its gen
+  start window that is above its floor, journaled as `gen start L{n}`. It lives there rather than in
+  the raise planner because it must ship in every non-COLLAPSED mode (a gen turn-on is over-limit by
+  definition, so the raise phase never runs), it is a reduction so it cannot fight the reducer, and
+  `dedupeCommands` still gives a deeper reducer cut the last word. Re-emitted while unconfirmed —
+  same contract as FLOORS, and it doubles as Najat's confirm-or-resend.
+- `planRaise` **stands down for a device inside its gen start window** (`blockedBy: "gen start floor"`).
+  Without this the clamp and the raise fight inside one batch and the raise wins the dedupe; a warm
+  restore would win it even mid-ramp, since `warmStartLevel` is exempt from the ramping gate.
+- The over-limit batch clears start windows on **grid only**. On gen, clearing would retire the clamp
+  on the exact tick it is needed.
+- The projection prices a user/automation turn-on at **`envelopeLevel`** (worst case of shadow and
+  anything in flight, so our own clamp does not shrink it before it confirms) and holds it across the
+  whole ramp with absorption ratcheting, instead of one tick. A room WE restored still prices at
+  `restoreCostAmps(floor, {gentle})` — re-pricing a gentle restore at its plain cost is the
+  2026-07-24/25 bug where every gen restore declared itself over-limit and got shed ~10s later.
+  Both conditions on the filter are load-bearing: `ramping` is what makes the draw unmetered (past
+  the ramp the meter has it, and charging on top is a permanent phantom overload — this cost a test
+  cycle), and the start window is what keeps it scoped to turn-ons (`ramping` alone is re-armed for
+  every running AC on a changeover).
+
+Deliberately NOT done (user decision): no forced peer floor-downs on a turn-on. Honest sizing is the
+fix — the reducer decides who pays.
+
+#### B. Two gen trips 26 minutes apart — the derate cliff funded the second
+
+```
+09:20:29  raise Abdu L1→L2 "2.6A learned"   pre 10.23
+09:25:06  COLLAPSE 14.2 → 3.2A              derate → 14.0A for 20 min
+09:45:06  derate expires — full 15A rating restored in one jump
+09:45:08  raise Abdu L1→L2 "3.2A learned"   pre 10.695      <-- 2 seconds later
+09:51:40  COLLAPSE 14.7 → 3.4A              derate → 14.0A again (not 15.0 − 2)
+```
+
+**Neither trip produced a single `over_*` row.** The leveler was inside its own limit both times
+(ceiling 14.9A, resting point 14.7A); the gen simply cannot hold ~14.2–14.5A sustained, with ~3.5A of
+non-AC baseline. The user's 2026-07-26 decision stands — `genLimitAmps` stays 15 and the derate
+tracks reality — but the derate as built could not: it **cliff-expired**, so the line went straight
+back to full rating and the leveler re-spent it immediately. Worse, `standing` was 0 by then, so the
+repeat trip re-armed at 1.0A instead of compounding: the "walk the limit down on every collapse"
+design defeated by its own expiry.
+
+**The fix — a recovery ladder.** `derateFor()` is now a pure function of time: `until` ends the
+CURRENT rung, and every further elapsed rung hands back one `COLLAPSE_DERATE_RECOVERY_STEP` (0.5A).
+`15.0 → trip → 14.0 (20 min) → 14.5 (20 min) → 15.0`. Recovery deliberately does NOT require readings
+(a line carrying nothing cools fastest) but is still per-source, so a gen→grid→gen bounce cannot
+launder a breaker that only just tripped. Because the ladder is still standing when the next trip
+lands, the existing `min(MAX, standing + COLLAPSE_DERATE_AMPS)` escalation finally works: today's
+second trip would have landed at 2.0A (limit 13.0) instead of 1.0A.
+
+Also fixed in passing: the collapse credit in `scenario.ts` keyed off `expectedDeltaAmps`, which only
+reduce batches set — it silently missed demotes, funding swaps, and now the gen clamp. It uses
+`commandedCutAmps` (invariant 11, the single credit path) like the shell, and the SETTLING/hold
+branches of `pipeline.ts` populate it since corrections can carry real down-moves.
+
+#### C. A third trip the same day (12:46) — same family, different half
+
+12:42:32 the user turned Najat on again; the gen went at 12:46:01 (**14.9A → 3.4A**). She came on at
+**L1** this time (the leveler's 11:44 restore had left her there), so the L3 clamp was irrelevant —
+what was wrong was the PRICE. Two under-estimates compounded on a meter that went 13.0 → 12.3 → 15.25:
+
+- The projection charged her **2.3A** (the bare model draw) while her learned `on@L1` was 2.86A and
+  the meter delivered ~2.9A → it asked for 0.5A instead of 1.0A. The bare model draw is the *probe*
+  price and belongs only to a restore we admitted at that price; a turn-on nobody admitted gets
+  `turnOnAmps` — the trip-safe `max(model, learned)`. **This was a regression introduced by the fix in
+  A**, which corrected the LEVEL but silently downgraded the blend to model-only. Fixed the same day,
+  pinned by `controller.test.ts` "prices a user turn-on at the LEARNED on-cost".
+- The reducer credited `Abdu L3→L2` with **2.5A** of savings and the meter fell ~0.7A net. A gen level
+  is a CAP: cutting it frees nothing when the compressor was already drawing under it. Not fixed —
+  Najat's ramp was rising through the same window, so the two cannot be cleanly separated from the
+  minute medians. **Candidate, not a proven defect.**
+
+**Honest scorecard:** neither fix in A would have prevented this trip. Sized honestly the ask goes
+0.5A → 1.0A, and the reducer's chosen action (`Abdu L3→L2`) covers both. What actually killed it is
+the standing gen ceiling: three trips on 2026-07-30 at **14.2 / 14.5 / 14.9A**, none preceded by a
+single `over_*` row, against a resting point of 14.7A and a reduce trigger at 14.9A. The ladder in B
+walks the limit down *after* a trip; it does not stop the first one. If trips keep landing near 14A,
+lowering `genLimitAmps` is the remaining lever (user decision — see the decisions log).
+
+**Tests:** `raise.test.ts` "gen turn-on floor clamp" (7) + warm-restore guard; `pipeline.test.ts`
+"gen start clamp reaches the batch" (6 — over/calm/settling/hold/collapsed/dedupe);
+`controller.test.ts` "a gen turn-on enters at its floor" (4, shell-level); `scenarios.test.ts` "the
+2026-07-30 gen turn-on at L3" (6) and the derate ladder pair. **836 server tests green, `tsc` clean.**
+Each fix was verified failing first: 11 tests fail without the clamp, 2 shell + 2 harness tests fail
+with floor pricing, 2 fail on the old cliff expiry.
+
+### 2026-07-31 gen trip — a raise on a trough, a fan bounce, and a 90-second escalation
+
+**The incident (Baghdad time; gen entry 17:19:29, trip 17:33:31).** The house settled with every room
+at its floor — Abdullah L2 (boost floor), Najat L1, Abdu L1 — and the gen riding **12.4–15.4A on a
+15A line**. In the ten minutes before the trip: five over-limit episodes, four fan trims on Abdu, and
+a whole-AC shed (Najat, 17:26:48, restored 36s later). There was never any budget. The controller
+nonetheless found room for a level, twice:
+
+```
+17:29:32  Abdu fan 1→7          fan restore — spends, and nothing charged it
+17:29:44  Abdullah L2→L3        12s later, admitted against a 9.91A trough
+17:30:24  Abdu fan 7→1          17:30:30  Abdullah L3→L2      (both undone)
+17:31:44  Abdu fan 1→7          17:32:01  Abdullah L2→L3      (both redone) → 15.93A
+17:32:53  Abdu fan 7→4          52s of overload later — and it picked a FAN
+17:33:31  Abdullah L3→L2        90s in; observed −10.9A → 5.04  → COLLAPSED
+```
+
+**Four defects, each provable from the journal:**
+
+1. **The physics envelope had no house in it.** `envelopeTotalAmps` summed cap models only —
+   documented as deliberate ("v2 has no trustworthy non-AC split"). For the admitted end-state it
+   said **13.9A** (Abdullah L3 7.3 + Najat L1 2.3 + Abdu L1 4.3); the journal's own 17:30:18 row
+   confirms the arithmetic by pricing Abdu's L2 in that same state at 16.4 = 13.9 − 4.3 + 6.8. The
+   meter read **15.93–15.99A** for that configuration minutes later. The designated
+   catastrophic-end-state backstop under-predicted by ~2.0A and passed a state 1A over the breaker.
+   **Fix:** `house-load.ts` — a rolling per-source PEAK of `smoothed − Σ modeled draw of running
+   managed ACs`, skipped while anything is ramping, tagged with the running-AC set (a residual
+   sampled while a room was off silently counts that room as house, and would double-count it the
+   moment it returned). `RaiseInput.nonAcAmps` adds it to the raise envelope. Restores keep the
+   AC-only figure on purpose: refusing one strands a room off entirely, which the user ranks worse
+   than a tight ride, and the restore path already has a meter-anchored gate.
+2. **The meter gate was reading a trough, not a state.** Admission happened at 9.91A — Najat had been
+   shed three minutes earlier and her restart had not ramped. The steady state of that exact
+   configuration, watched for the previous ten minutes, was 12.4–13.3A. The house-load peak is what
+   now carries that memory across the dip.
+3. **A fan restore spent amps nothing charged.** One `set_fan`, `commandedCutAmps: 0`, no debit armed
+   (a fan is not a compressor, so `rearmRamp` never fires), and `fanOnly` so `resetCalm` was skipped.
+   Both fatal raises landed **12s and 17s** after a fan restore, on headroom the fan had already
+   taken. And the restore itself was a full swing: `planFanRestore` took the highest target whose
+   cost fits, and a 6-gear swing prices at ~0.15 × 6 = 0.9A, so 1→7 fitted essentially always. Abdu
+   ran **7→5→3→1→7→1→7→4 in nine minutes**; the cut→full-restore gap was 80s, because a fan-only
+   batch never rewinds the shared calm clock the 60s gate reads. **Fix:** `fanDebit` in the shell
+   (priced at exactly what `planFanRestore` admitted, absorbed-ratcheted, `FAN_DEBIT_MS` 60s), calm
+   reset on a fan RESTORE but never on a fan CUT (a cut frees amps — stalling the reducer behind its
+   own cut is how episodes drag), `FAN_RESTORE_MAX_STEP` 2 gears per step, and
+   `FAN_RESTORE_AFTER_CUT_MS` 180s measured from `FanHold.lastCutAt`. Gentle-restore holds are exempt
+   from the cut cooldown (`FanHold.fromCut: false`) — nothing was taken away there.
+4. **The reducer answered a real overload with a token fan, then waited out a full bucket.** 15.93A
+   is 0.93A over and `OVER_LIMIT_SEVERE_AMPS` is 1.0, so it classified mild and drained 1 point per
+   reading: **52s to the first act**. That act was a 0.4A fan trim on Abdu while Abdullah sat at L3
+   with a 2.5A cut available — the fan gate was per-AC (Abdu was at *his* floor), and the comparator
+   then priced the fan at 4.6 against 140 for the level. `noteActed` refilled the bucket to FULL, so
+   the level cut waited another five readings (**38s**). **Fix:** the fan gate is per-PLAN (a
+   candidate may cut a fan only if its own end-state leaves every AC at its floor), plus
+   `OVER_LIMIT_DRAIN_MODERATE` (2 points above `OVER_LIMIT_MODERATE_AMPS` 0.5A) and
+   `OVER_LIMIT_BUDGET_AFTER_ACT` (2, not 5) after an over-limit act — the anti-double-cut protection
+   the full refill existed for now lives in the demand-side credit of invariant 11.
+
+> ⚠️ **The fan gate is per-PLAN, never global.** The first attempt gated fans on "no level cut exists
+> anywhere in the candidate set". That reads like the user's directive and is wrong: when levels alone
+> fall short of the deficit and fans are off the table, the only feasible plan is a **power_off**. The
+> harness caught it immediately (a 1.7A deficit shed Najat where a level + a fan trim covered it).
+> "Fans are the last try BEFORE turning off" means levels+fans must always be reachable first.
+> Pinned by `reduce.test.ts` "combines a level cut WITH a fan trim rather than shedding a room".
+
+**Not changed (deliberate).** Abdullah's configured gen model is `base 2.3 / step 2.5` → L3 = 7.3A,
+but he is a 1-ton unit (hardware truth ≈ 2.2/3.9/5.3) and the learned book agrees: `level:2>3` = 1.44A
+over 24 samples. Correcting it would make raise pricing honest **and** the envelope more permissive at
+the same moment, so it waits for one clean gen session on the house-load term. See the decisions log.
+
+**Tests:** `house-load.test.ts` (11); `raise.test.ts` "house load in the raise envelope" (5, incl. a
+test that reproduces the bug with `nonAcAmps: 0`); `reduce.test.ts` levels-before-fans (3 new, incl.
+the forced-shed guard); `fan-trim.test.ts` (rewritten for the bounded climb + cut cooldown);
+`sensing.test.ts` drain rungs + partial refill (3); `scenarios.test.ts` "the 2026-07-31 gen trip" (5).
+**866 server tests green, `tsc` clean.** Every fix verified failing first — the trough regression
+admits the raise with the house term at 0 and refuses it at 1.6A.
 
 ---
 
@@ -1056,7 +1294,15 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
 | `DEMOTE_HYSTERESIS_C` (v2 `demote.ts`) | 0.2°C | Demote fires at `needDelta ≤ nearTargetBandC − this`; the gap to the band is the anti-bounce dead zone (2 sensor LSBs) |
 | `DEMOTE_DWELL_MS` (v2 `demote.ts`) | 120 s | How long satisfaction must hold CONTINUOUSLY before a level is reclaimed |
 | `DEMOTE_RESEND_MS` (v2 `demote.ts`) | 60 s | Demote confirm-or-resend spacing — slower than `LEVEL_RESEND_SPACING_MS` so a lagging room can't rewind the shared calm clock |
+| `START_WINDOW_MS` (v2 `controller.ts`) | `AC_RAMP_MS` (240 s) | Turn-on policy window, opened on BOTH sources since 2026-07-30 (was `GRID_START_MS`, grid only). Grid LIFTS to the affordable ceiling; gen CLAMPS to the floor and stands the raise phase down for that device |
+| `COLLAPSE_DERATE_RECOVERY_STEP` (v2 `sensing.ts`) | 0.5A (2026-07-30) | Amps handed back per quiet `COLLAPSE_DERATE_MS` rung. Replaces a cliff expiry that restored full rating in one jump and funded the next trip 2 s later |
 | `UNCONFIRMED_SEND_TTL_MS` (v2 `reconciler.ts`) | 25 min | How long an unconfirmed send keeps inflating the physics envelope (> the ≥15.8-min observed confirm lag) |
+| `HOUSE_LOAD_WINDOW_MS` (v2 `house-load.ts`) | 15 min (2026-07-31) | How far back the non-AC PEAK looks. Long enough to span a compressor duty cycle, so a satisfied trough can't make the raise envelope permissive. Samples are per-source and tagged with the running-AC set |
+| `FAN_DEBIT_MS` (v2 `controller.ts`) | 60 s (2026-07-31) | How long a fan RESTORE's amps stay charged as committed-but-unmetered. A gear changes almost instantly, unlike a compressor, so this only has to outlive the ESP cadence plus a tick; the absorption ratchet retires it sooner |
+| `FAN_RESTORE_MAX_STEP` (v2 `fan-trim.ts`) | 2 gears (2026-07-31) | Ceiling on ONE restore step. The unbounded "sweet spot" search always reached the original — a 6-gear swing prices at only ~0.9A — which is how Abdu ran 7→5→3→1→7→1→7→4 in nine minutes |
+| `FAN_RESTORE_AFTER_CUT_MS` (v2 `fan-trim.ts`) | 180 s (2026-07-31) | Quiet time owed after the last CUT before that fan may climb. `FAN_RESTORE_CALM_MS` alone never covered it: a fan-only batch does not rewind the shared calm clock, so a cut came all the way back 80 s later. Gentle-restore holds are exempt (`FanHold.fromCut`) |
+| `OVER_LIMIT_MODERATE_AMPS` / `OVER_LIMIT_DRAIN_MODERATE` (v2 `sensing.ts`) | 0.5A / 2 points (2026-07-31) | Middle drain rung. The binary 3-or-1 drain stepped at a full amp over, so 15.93A on a 15A gen took five readings (**52 s**) to reach the first act |
+| `OVER_LIMIT_BUDGET_AFTER_ACT` (v2 `sensing.ts`) | 2 of 5 (2026-07-31) | Bucket level after an over-limit act. A FULL refill made an under-sized reduction wait out another five readings (**38 s** live). The anti-double-cut protection now lives in the demand-side `commandedCutCreditAmps` credit |
 | Source detection threshold | 0.1A | Line counts as active above this; larger line wins |
 | `AC_RAMP_MS` | **240s** (was 30s → 90s 2026-06-07 → 240s 2026-06-09) | Turn-on/changeover compressor ramp window; ramping AC's estimate not subtracted from measured |
 | `SETTLE_MS` | 30s | Post-command settle window for level/power batches; raises blocked inside it (unchanged 2026-06-09 — growing it would freeze the loop) |
@@ -1138,6 +1384,23 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
 - **2026-06-11 (5-issue batch, root-caused from live gen→grid logs):** **Near-target band** — "if it is near [the target] by 0.5, it should not use more than L1, above that it is ok to use any level based on budget" → configurable `nearTargetBandC` (default 0.5), replaces the mild-tier `ceil(max/2)` cap. **Fan curve stays 0.3°C/step** (user keep). **Range fan is ALWAYS smart auto unless the slot fixes 1–7** — "it should always be on A unless the user specify"; the preset fan no longer drives range enforcement (automation side: ac-automations.md). **Shed restore made fast**: floor credit for ramping ACs in nonAcLoad, restores exempt from blind raise-hold blocking (expectation + batch-savings math), restore-priority over raises/warm-starts (Abdu's 20-min shed: Najat's 270s hold + Abdullah's preempting L3 raise + ramp-inflated budgets). **Unreachable un-mark on ANY late confirm** (Najat's L4/L5/L6 false marks). **UI command verify-resend 5s × 3** — user: "find the root cause and fix, and if not able, make 5 sec for retry for 3 times"; the root cause is her firmware, so the retry layer is the fix (tcl-ac.md).
 - **2026-06-13 (gen over-raise trip):** live 15A-gen breaker trip from the leveler raising Abdu L1→L2→L3 into a demand-driven compressor surge the gen amp model under-stated (logged observed L1→L2 step ~2.9A vs model 1.1A). Verified NOT caused by the same-day cost-aware optimizer (reduce-only). User chose to **fix the gen model**: gen STEP retuned to the observed surge (Abdu/Najat 2.9, Abdullah 2.0), bases kept — raises now need measured ≤ ~10.9A. Also implemented **guard B** (power-collapse raise-freeze + ramp re-arm, user-approved) so the leveler can't raise into a tripped/collapsed line. Still open: fan-restore buffer-gating, bounce-expiry re-raise. (See "Generator over-raise trip & gen-step retune".)
 - **2026-07-24 (v2 cutover + restore-vs-raise fix):** live incident — after the user turned a peer AC off to free budget, the leveler raised a running AC (Abdu→L3) instead of restoring the shed hot room (Najat). User decisions: **flip the controller to v2 this session** (live, rollback = flip to v1 + restart); **restore outranks raises** — a feasible-but-gated shed restore reserves its amps and parks raises (both controllers had the bug; v2 got the durable fix, v1 left as rollback-only); **gentle gen restores** — a shed room returns with its fan pinned to 1 so its surge fits (the fan-slam was the un-modeled cost); a managed peer-off resets calm so the freed headroom is the pending restore's, not a raise's. Also: this cutover delivers the standing **"grid entry → all ACs to max, then drop"** directive (v2's GRID_FULL, absent from v1). Hygiene: debug captures (`ssh_*.txt`, `*_out.json`) are gitignored and must be cleared at session end (see CLAUDE.md). (See "2026-07-24 restore-vs-raise fix set".)
+- **2026-07-30 (gen turn-on at L3 + two gen trips):** live — the user turned Najat on mid-gen-session and she came up at **L3** (the level the grid full start left her at, restored by the TCL firmware); the leveler trimmed only her and never touched Abdullah, and the house rode 16.77A until the user hand-set both rooms to L1. Decisions asked and answered: **`genLimitAmps` stays 15** — the derate tracks reality, but it now **recovers in steps** instead of cliff-expiring (the cliff handed back full rating and was re-spent 2 seconds later, and left `standing` at 0 so repeat trips could not compound); **a gen turn-on enters at its FLOOR** (the per-device form of FLOORS — picked over a gen mirror of the grid "highest level that fits"); **no forced peer floor-downs** — the reducer decides who pays, once the deficit is sized honestly (it asked for 1.2A because the projection priced the newcomer at her floor; the honest figure was 4.6A, which no single-room cut covers). (See "2026-07-30 gen turn-on at L3 + two gen trips".)
+- **2026-07-31 (the trip after ten minutes of riding the limit):** user — *"it should not raise
+  Abdullah AC to L3 as it is clear we don't have enough budget as we kept hitting the limit, or it
+  should reduce it earlier"*, and *"when hitting a limit, we should reduce the levels, then we can
+  reduce the fan speed as the last try before turning off"*. Decisions asked and answered:
+  **the non-AC house term is MEASURED, not configured** — a rolling peak of `meter − Σ modeled AC
+  draw`, ratcheted and per-source, chosen over a hand-tuned `nonAcReserveAmps` knob (self-calibrating,
+  nothing to maintain, and it can only ever make the guard stricter); **it applies to RAISES only** —
+  a shed restore stays on the AC-only envelope, because refusing one strands a room off entirely and
+  the restore path already has a meter-anchored gate that includes the house by definition;
+  **the fan gate is per-PLAN, not global** — "no fan while any level exists anywhere" forces a shed
+  whenever levels alone fall short, which inverts the user's own ordering; **Abdullah's amp model is
+  NOT corrected this session** — his configured `base 2.3 / step 2.5` says L3 = 7.3A while the
+  hardware is 1-ton (≈5.3A) and the learned `level:2>3` is 1.44A over 24 samples, but fixing it makes
+  the envelope more permissive at the same moment the house term makes it stricter, and two errors
+  moving at once cannot be attributed. Revisit after one clean gen session.
+  (See "2026-07-31 gen trip — a raise on a trough, a fan bounce, and a 90-second escalation".)
 
 ## Gotchas & test notes
 

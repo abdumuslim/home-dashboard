@@ -293,3 +293,67 @@ describe("idle demote precedence in the calm branch", () => {
     expect(out.reason).toBe("demote");
   });
 });
+
+// The clamp lives in invariantCorrections, so it must reach the batch from
+// every non-COLLAPSED branch — which is the whole point of putting it there.
+// A gen turn-on is over-limit by definition on a 15A line, so the branch that
+// matters most is the reducer's (live 2026-07-30 05:51: the only batches that
+// ran for the next two minutes were `over_mild` and `over_severe`).
+describe("gen start clamp reaches the batch (2026-07-30)", () => {
+  const starting = (overrides: Partial<AcView> = {}) =>
+    ac("a", { currentLevel: 3, startBaselineAmps: 13.2, ...overrides });
+
+  it("ships inside an over-limit batch, and converges on the floor after it", () => {
+    // The documented precedence stands: one command per device, and the
+    // REDUCER's choice is the one that lands (dedupe keeps the last writer).
+    // A shallower reducer cut is not a lost clamp — the window stays open, so
+    // the very next non-over tick finishes the job.
+    const over = run([starting(), ac("b", { currentLevel: 1 })], overMeter([15.5]));
+    expect(over.reason).toBe("over_mild");
+    const cut = levelsFor(over.commands, "a");
+    expect(cut).toHaveLength(1);
+    expect(cut[0].level).toBeLessThan(3);
+
+    const after = run(
+      [starting({ currentLevel: cut[0].level }), ac("b", { currentLevel: 1 })],
+      meter({ smoothedAmps: 6, calmMs: 600_000 }),
+    );
+    expect(levelsFor(after.commands, "a")).toEqual([{ deviceId: "a", kind: "set_level", level: 1 }]);
+  });
+
+  it("ships on a calm tick, alongside the raise phase", () => {
+    const out = run([starting(), ac("b", { currentLevel: 1 })], meter({ smoothedAmps: 6, calmMs: 600_000 }));
+    expect(levelsFor(out.commands, "a")).toEqual([{ deviceId: "a", kind: "set_level", level: 1 }]);
+  });
+
+  it("ships while SETTLING, and credits the collapse detector for what it cut", () => {
+    const out = run([starting()], meter(), { mode: "SETTLING" });
+    expect(out.reason).toBe("settling");
+    expect(levelsFor(out.commands, "a")).toEqual([{ deviceId: "a", kind: "set_level", level: 1 }]);
+    // L3 → L1 on a base-2/step-2 model = 4A off the line. Uncredited, a fall
+    // that size is what a phantom collapse latches on (invariant 11).
+    expect(out.commandedCutAmps).toBeCloseTo(4, 5);
+  });
+
+  it("ships on a hold tick (the deliberate near-limit ride)", () => {
+    const out = run([starting()], meter({ smoothedAmps: 14.95, calmMs: 0 }));
+    expect(out.reason).toBe("hold");
+    expect(levelsFor(out.commands, "a")).toHaveLength(1);
+    expect(out.commandedCutAmps).toBeGreaterThan(0);
+  });
+
+  it("never fires into a collapsed line", () => {
+    const out = run([starting()], meter(), { mode: "COLLAPSED" });
+    expect(out.commands).toHaveLength(0);
+  });
+
+  it("loses the dedupe to a reducer that wants to cut deeper", () => {
+    // Both producers target this AC; the executor sends in array order, so the
+    // LAST command must be the reducer's — never the clamp re-lifting a room
+    // the meter just objected to.
+    const out = run([starting({ minLevel: 2, needDelta: 4 })], overMeter([18]));
+    const levels = levelsFor(out.commands, "a");
+    expect(levels).toHaveLength(1);
+    expect(levels[0].level).toBeLessThanOrEqual(2);
+  });
+});
