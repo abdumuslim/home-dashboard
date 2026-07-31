@@ -148,8 +148,12 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     `OVER_LIMIT_SEVERE_AMPS` (1.0), so it drained 1 point per reading — **52 s** to the first act —
     and `noteActed` then refilled the bucket to FULL, costing another **38 s**. Now
     `OVER_LIMIT_DRAIN_MODERATE` (2 points above `OVER_LIMIT_MODERATE_AMPS` 0.5 A) and
-    `OVER_LIMIT_BUDGET_AFTER_ACT` (2, not 5). The anti-double-cut job the full refill did is already
-    covered by the demand-side `commandedCutCreditAmps` credit (invariant 11).
+    `OVER_LIMIT_BUDGET_AFTER_ACT` = `OVER_LIMIT_DRAIN_SEVERE + 1` (**4**, not 5).
+    ⚠️ **The post-act bucket must stay ABOVE the severe drain.** Shipped at 2 and double-shed within
+    20 minutes: one lingering severe reading — still inside the 4-wide smoothing window from before
+    the FIRST shed landed — emptied it alone and shed a second room at a smoothed 12.555 A. The
+    `commandedCutCreditAmps` credit cannot cover this case; the fall that reading preceded had already
+    absorbed the credit in full.
 
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket

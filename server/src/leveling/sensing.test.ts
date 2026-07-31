@@ -7,6 +7,7 @@ import {
   METER_FROZEN_AFTER_MS,
   OVER_LIMIT_BUDGET,
   OVER_LIMIT_BUDGET_AFTER_ACT,
+  OVER_LIMIT_DRAIN_SEVERE,
   PENDING_CUT_MS,
   POWER_COLLAPSE_MAX_MS,
   determineSource,
@@ -145,9 +146,26 @@ describe("leaky bucket", () => {
     expect(state.overLimitBudget).toBe(0);
     const acted = refillBucket(state, OVER_LIMIT_BUDGET_AFTER_ACT);
     expect(acted.overLimitBudget).toBe(OVER_LIMIT_BUDGET_AFTER_ACT);
-    // One more severe reading (drain 3) empties it again immediately.
-    const { events } = feedGen([16.7], { state: acted, startAt: 1_000_000 + 15_000 });
+    // Two moderate readings (2 + 2) escalate — five were needed before.
+    const { events } = feedGen([15.8, 15.8], { state: acted, startAt: 1_000_000 + 15_000 });
     expect(events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
+  });
+
+  // Shipped at 2 for twenty minutes on 2026-07-31 and immediately double-shed:
+  // 18:21:10 shed Najat at 15.32A; 16s later ONE lingering ~16.5A reading, still
+  // inside the 4-wide smoothing window from before that shed landed, emptied the
+  // 2-point bucket by itself and shed Abdu at a SMOOTHED 12.555A. The commanded-
+  // cut credit could not help — the fall from 15.32 to 12.5 had already absorbed
+  // it in full, so the stale reading was priced as a fresh breach.
+  it("a SINGLE severe reading can never empty the post-act bucket", () => {
+    expect(OVER_LIMIT_BUDGET_AFTER_ACT).toBeGreaterThan(OVER_LIMIT_DRAIN_SEVERE);
+    const { state } = feedGen([16.5, 16.6]);
+    const acted = refillBucket(state, OVER_LIMIT_BUDGET_AFTER_ACT);
+    const one = feedGen([16.5], { state: acted, startAt: 1_000_000 + 15_000 });
+    expect(one.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(0);
+    // A second one still escalates — the point is a partner, not a veto.
+    const two = feedGen([16.5], { state: one.state, startAt: 1_000_000 + 20_000 });
+    expect(two.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
   });
 });
 

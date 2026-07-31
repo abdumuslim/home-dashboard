@@ -870,6 +870,18 @@ but he is a 1-ton unit (hardware truth ≈ 2.2/3.9/5.3) and the learned book agr
 over 24 samples. Correcting it would make raise pricing honest **and** the envelope more permissive at
 the same moment, so it waits for one clean gen session on the house-load term. See the decisions log.
 
+**Post-deploy regression, same evening (fixed within 20 min).** `OVER_LIMIT_BUDGET_AFTER_ACT` shipped
+at **2**, which is below `OVER_LIMIT_DRAIN_SEVERE` (3) — so one severe reading could empty the bucket
+by itself. Live 18:21:10 the reducer shed Najat at 15.32A; **16 seconds later** a single ~16.5A
+reading, still inside the 4-wide smoothing window from *before* that shed landed, acted again and shed
+Abdu at a **smoothed 12.555A**. `commandedCutCreditAmps` could not stop it: the meter's fall from
+15.32 to 12.5 had already absorbed Najat's whole 2.3A credit, so the stale reading was priced as a
+fresh breach. (v2 self-corrected — Abdu was restored 38 s later at 18:22:04 — but the shed was wrong.)
+**The post-act bucket must always exceed the severe drain**, so it is now
+`OVER_LIMIT_DRAIN_SEVERE + 1` = 4: a severe reading still needs a partner exactly as it did at 5,
+while a moderate pair or four mild readings act sooner — which is where the latency actually was.
+Pinned by `sensing.test.ts` "a SINGLE severe reading can never empty the post-act bucket".
+
 **Tests:** `house-load.test.ts` (11); `raise.test.ts` "house load in the raise envelope" (5, incl. a
 test that reproduces the bug with `nonAcAmps: 0`); `reduce.test.ts` levels-before-fans (3 new, incl.
 the forced-shed guard); `fan-trim.test.ts` (rewritten for the bounded climb + cut cooldown);
@@ -1302,7 +1314,7 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
 | `FAN_RESTORE_MAX_STEP` (v2 `fan-trim.ts`) | 2 gears (2026-07-31) | Ceiling on ONE restore step. The unbounded "sweet spot" search always reached the original — a 6-gear swing prices at only ~0.9A — which is how Abdu ran 7→5→3→1→7→1→7→4 in nine minutes |
 | `FAN_RESTORE_AFTER_CUT_MS` (v2 `fan-trim.ts`) | 180 s (2026-07-31) | Quiet time owed after the last CUT before that fan may climb. `FAN_RESTORE_CALM_MS` alone never covered it: a fan-only batch does not rewind the shared calm clock, so a cut came all the way back 80 s later. Gentle-restore holds are exempt (`FanHold.fromCut`) |
 | `OVER_LIMIT_MODERATE_AMPS` / `OVER_LIMIT_DRAIN_MODERATE` (v2 `sensing.ts`) | 0.5A / 2 points (2026-07-31) | Middle drain rung. The binary 3-or-1 drain stepped at a full amp over, so 15.93A on a 15A gen took five readings (**52 s**) to reach the first act |
-| `OVER_LIMIT_BUDGET_AFTER_ACT` (v2 `sensing.ts`) | 2 of 5 (2026-07-31) | Bucket level after an over-limit act. A FULL refill made an under-sized reduction wait out another five readings (**38 s** live). The anti-double-cut protection now lives in the demand-side `commandedCutCreditAmps` credit |
+| `OVER_LIMIT_BUDGET_AFTER_ACT` (v2 `sensing.ts`) | `OVER_LIMIT_DRAIN_SEVERE + 1` = **4** of 5 (2026-07-31) | Bucket level after an over-limit act. A FULL refill made an under-sized reduction wait out another five readings (**38 s** live). **Must stay above `OVER_LIMIT_DRAIN_SEVERE`** — shipped at 2 and double-shed within 20 minutes (see the incident section) |
 | Source detection threshold | 0.1A | Line counts as active above this; larger line wins |
 | `AC_RAMP_MS` | **240s** (was 30s → 90s 2026-06-07 → 240s 2026-06-09) | Turn-on/changeover compressor ramp window; ramping AC's estimate not subtracted from measured |
 | `SETTLE_MS` | 30s | Post-command settle window for level/power batches; raises blocked inside it (unchanged 2026-06-09 — growing it would freeze the loop) |

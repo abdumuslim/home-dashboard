@@ -443,12 +443,22 @@ export function ingestReading(
  * Points the bucket is refilled to after an over-limit act. Deliberately NOT
  * full: a full refill made the second act wait out another five readings, and
  * on 2026-07-31 those were the 38 seconds between a 0.4A fan trim (all the
- * first act managed) and the level cut that should have come first. The
- * anti-double-cut protection this refill exists for now lives in the demand
- * side of invariant 11 — `commandedCutCreditAmps` subtracts amps that are
- * already on their way out — so the bucket no longer has to carry it alone.
+ * first act managed) and the level cut that should have come first.
+ *
+ * But it MUST stay above `OVER_LIMIT_DRAIN_SEVERE`, so that no single reading
+ * can empty it. Shipped at 2 for twenty minutes on 2026-07-31 and immediately
+ * double-shed: 18:21:10 shed Najat at 15.32A, and 16s later ONE lingering
+ * ~16.5A reading — still inside the 4-wide smoothing window from before that
+ * shed landed — drained 3 points, emptied the bucket alone, and shed Abdu at a
+ * SMOOTHED 12.555A. The `commandedCutCreditAmps` credit could not save it: the
+ * meter's fall from 15.32 to 12.5 had already absorbed the whole credit, so the
+ * stale reading was priced as a fresh breach. Restored 38s later.
+ *
+ * At 4 a severe reading still needs a partner (as it did at 5), while a
+ * moderate pair or four mild readings act sooner — which is where the live
+ * latency actually was.
  */
-export const OVER_LIMIT_BUDGET_AFTER_ACT = 2;
+export const OVER_LIMIT_BUDGET_AFTER_ACT = OVER_LIMIT_DRAIN_SEVERE + 1;
 
 export function refillBucket(state: MeterState, points = OVER_LIMIT_BUDGET): MeterState {
   return { ...state, overLimitBudget: points, overLimitReadings: [] };
