@@ -28,7 +28,7 @@ timestamp: 2026-07-27
 - `ac-auto-fan.test.ts` — smart auto fan: delta→level boundaries (uses 1e-9 epsilon in the mapping — FP error like `1.2 − 1.0 = 0.19999…` would otherwise push exact boundaries up a level), down-hysteresis hold/drop, out-of-range previousLevel
 - `automation-slots.test.ts` — slot selection (timed > all-day, overnight), overlap/threshold/fan_speed validation, gen_level validation (1–3 since 2026-06, 0 and 4+ rejected) + the normalizeRangeSlots whitelist regression
 - `power-stats.test.ts` — pure power-source logic (`power-stats.ts`): minute classification, flicker smoothing (heal ≤2-min, keep 3-min/edge/changeover gaps), session reconstruction, current-session resolution (tail-match / fresh switch / blackout edge), Baghdad date/hour keys, 24h grid minutes, avg session length (`averageSessionHours`: complete grid/gen stretches only, ignore none + running tail + pre-window switches), weighted median, and `predictRemainingMinutes` (temp-kernel weighting, missing-temp down-weight, wrong-source skip, right-censoring of the final session, 24h clamp, blackout-end prediction) + `dayBreakdownForWindow` (partial day, midnight split, complete day)
-- `leveling/*.test.ts` — **Leveling v2** (the acting controller). Pure modules each have their own file (`sensing`, `modes`, `raise`, `reduce`, `pacing`, `needs`, `pressure`, `fan-trim`, `costs`, `config`, `reconciler`). Three carry the integration weight: `scenarios.test.ts` replays live incidents against the physics harness (`scenario.ts`), `controller.test.ts` covers the stateful shell (grade queue, shed-until-confirm, off-drop and ramp-honest cost learning, `batchLoadDirections`), `pipeline.test.ts` the emission-layer rules a whole-house sim can't isolate (batch dedupe, inrush blanking). Incident provenance for each block lives in [ac-leveling.md](ac-leveling.md) — the test comment names the incident, the doc explains it.
+- `leveling/*.test.ts` — **Leveling v2** (the acting controller). Pure modules each have their own file (`sensing`, `modes`, `raise`, `reduce`, `pacing`, `needs`, `pressure`, `fan-trim`, `costs`, `config`, `reconciler`, `house-load`). Three carry the integration weight: `scenarios.test.ts` replays live incidents against the physics harness (`scenario.ts`), `controller.test.ts` covers the stateful shell (grade queue, shed-until-confirm, off-drop and ramp-honest cost learning, `batchLoadDirections`), `pipeline.test.ts` the emission-layer rules a whole-house sim can't isolate (batch dedupe, inrush blanking). Incident provenance for each block lives in [ac-leveling.md](ac-leveling.md) — the test comment names the incident, the doc explains it.
 - `power-stats-routes.test.ts` — HTTP shape for `GET /api/power/stats` (full payload, source "none" when latestPower null) and `GET /api/power/day-breakdown` (days+totals, all RANGE_MAP keys accepted, bogus range → 400), via the `push-routes.test.ts` fake-pool + live `createRouter` harness
 
 ## Harness notes (read before editing collector/calibration tests)
@@ -58,12 +58,33 @@ timestamp: 2026-07-27
   always cut on its own device ("its own turn-on caused this"). Don't try to stage a *peer* being
   reduced inside a raise's grade window — test that logic through the pure
   `batchLoadDirections()` unit instead.
+- **The harness must MEASURE what the shell measures — never be handed the sim's ground truth.**
+  `Scenario.nonAcAmps` is the simulated *physical* house load; the planner gets
+  `houseLoadAmps(this.houseLoad, …)`, sampled off the simulated meter exactly the way
+  `controller.tick()` samples off the real one. Passing `this.nonAcAmps` straight through would be the
+  2026-07-30 mirror bug again in a new place: the harness would price a house the shell cannot see, so
+  no harness test could ever disagree with the shell. Same rule for the fan debit, calm-on-fan-restore
+  and the partial bucket refill — all four were mirrored on 2026-07-31.
+- **`scenarios.test.ts`'s `cfg` is NOT the live config** (its models are gentler and its limit is
+  14.9). A scenario written by copying live *levels* can therefore leave real headroom the live house
+  did not have, and the test then passes for the wrong reason. Check the arithmetic: sum
+  `nonAcAmps` + the sim `capAmps` at the levels you set, and confirm it actually reproduces the
+  pressure the incident had. The first draft of the 2026-07-31 regression sat at 11.8A on a 14.9A
+  limit — comfortably affordable — and "proved" a raise was refused when nothing was refusing it.
 
 **Verifying a fix is real (used for both 2026-07-28 fixes):** after the test passes, re-break the
 single line the fix hinges on and confirm the test fails with the *expected number*, then restore.
 That caught what a green suite could not — the old 45s grading window learns exactly **0.30A** for a
 3.0A raise, which is the live poisoning reproduced in-harness. Two separate breaks proved the two
 halves (window vs ratchet) each guard something.
+
+**A green suite is not a shipped-safe suite (2026-07-31).** 866 tests passed and `tsc` was clean, and
+the deploy still double-shed a room within 20 minutes: `OVER_LIMIT_BUDGET_AFTER_ACT` was set to 2
+while `OVER_LIMIT_DRAIN_SEVERE` is 3, and *no test compared the two constants* — every test asserted
+against literal readings, so the relationship nobody wrote down was the one that broke. When a change
+introduces a threshold, add an assertion **relating it to the other constants it must outrank**
+(`expect(OVER_LIMIT_BUDGET_AFTER_ACT).toBeGreaterThan(OVER_LIMIT_DRAIN_SEVERE)`), not just a scenario
+that happens to exercise the current value. See hard rule 5c in AGENTS.md.
 
 ## Coverage philosophy
 

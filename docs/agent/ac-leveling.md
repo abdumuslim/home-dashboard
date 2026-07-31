@@ -865,6 +865,23 @@ nonetheless found room for a level, twice:
 > "Fans are the last try BEFORE turning off" means levels+fans must always be reachable first.
 > Pinned by `reduce.test.ts` "combines a level cut WITH a fan trim rather than shedding a room".
 
+**Reading the residual correctly.** `houseLoadResidual` is **house minus model error**, not the
+physical non-AC load. With all three rooms at their floors it reads ~1.3–1.8A while the true house is
+several amps — because the cap models over-state what the compressors actually draw, and the
+difference is netted out of the residual. That is deliberate and self-consistent: the envelope adds
+the residual back to *the same over-stating models*, so the sum tracks reality. Do **not** "correct"
+it against a wattmeter reading, and do not be alarmed by a large figure on a small running set (with
+one AC on, the residual carries the whole rest of the house — 5–7A is normal there).
+
+**Known limitation, safe direction, NOT fixed.** A sample is tagged with the running-AC set, but a
+compressor keeps drawing for seconds-to-minutes after its `power_off` lands (the same lag `offLagMs`
+models in the harness). So a residual taken just after a room turns off attributes that room's
+spin-down to "house" and pins a too-high peak for the whole `HOUSE_LOAD_WINDOW_MS`. Seen live
+2026-07-31 18:23:08 — `worst case 18.6A (incl. 7.0A house)` moments after Abdullah went off. It can
+only ever refuse raises it could have allowed, so it never threatens the breaker; the cost is up to 15
+minutes of over-conservatism after a turn-off. The clean fix is to skip sampling for a cooldown after
+the running set changes (same rationale as skipping ramping ACs). Left for a session with soak time.
+
 **Not changed (deliberate).** Abdullah's configured gen model is `base 2.3 / step 2.5` → L3 = 7.3A,
 but he is a 1-ton unit (hardware truth ≈ 2.2/3.9/5.3) and the learned book agrees: `level:2>3` = 1.44A
 over 24 samples. Correcting it would make raise pricing honest **and** the envelope more permissive at
