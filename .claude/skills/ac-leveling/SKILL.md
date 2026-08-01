@@ -167,7 +167,10 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     anyone; a sample missing a running room is still never reused). Raises need no cooldown — the
     model rises ahead of the meter and a dipped residual never wins a max. This fix is also what lets
     invariant 21's funding demote work: its wind-down would otherwise book phantom house and block
-    the raise it funded.
+    the raise it funded. The SHELL additionally holds off sampling for one cooldown after BOOT
+    (`firstTickAt`, mirrored as `scenario.ts` `firstStepAt`) — the first post-deploy tick sampled
+    half-loaded views and booked 11.1 A of "house"; the guard lives at the call site so the pure
+    layer keeps first-sample semantics.
 21. **The extra level follows the hotter room — floor receivers only, noise-proof funding.** The
     07-28 funding swap only harvested SATISFIED donors, so a warm room (above the band ⇒ ceilOf =
     max) held its spare level while a hotter room sat at its floor (user ask, 2026-08-01).

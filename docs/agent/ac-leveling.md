@@ -958,6 +958,16 @@ room sat at its floor. Now `planRaise` has a second donor pool, `rebalanceDonors
   meter-blocked → demote ALONE, raise next calm window. `emitDemotes` now takes explicit
   `{ac, target}` (satisfied → ceilOf, donor → one step).
 
+**Post-deploy find, same evening (the 20-min watch again).** The very first gen tick after the
+deploy's boot sampled while device views/amp models were still half-loaded and booked **11.1A of
+"house"** (real ~4.1A) — safe direction, and it self-corrected once honest same-set samples outranked
+the carried peak (the 18:25:15 raise shipped on the honest figure), but that is up to 15 min of
+refused raises after every restart. Hardening: the SHELL holds off sampling until
+`HOUSE_SAMPLE_COOLDOWN_MS` after its first tick (`firstTickAt`; `scenario.ts` mirrors it as
+`firstStepAt`). The carry pool is empty at boot anyway, so the cost is 2 min of the pre-07-31
+AC-only envelope, once per boot. Kept at the CALL SITE, not inside `sampleHouseLoad` — the pure
+layer stays boot-agnostic and its unit tests keep first-sample semantics.
+
 **Tests:** `house-load.test.ts` "turn-off decay contamination" (3) + the superset/partial-overlap
 guards; `controller.test.ts` "a turn-off's decay is not house" (SHELL guard — scenario.ts mirrors the
 sampling call, both sides need their own, per the 07-30 lesson); `scenarios.test.ts` "the 2026-08-01
