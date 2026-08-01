@@ -1223,3 +1223,88 @@ describe("the 2026-07-31 gen trip", () => {
     }
   });
 });
+
+// 2026-08-01 Baghdad, 15A gen. At 17:25 the envelope was honest ("incl. 2.6A
+// house"); at ~17:27 Abdullah's AC went off, and the tick after read the
+// smoothed meter — still carrying his dying compressor — against a model he
+// had already left: 7.1A of "house" (real: ~4.1A). The only sample tagged
+// with the new set, so it WAS the 15-minute peak: every raise refused at
+// "worst case 16.2A > 14.9A" while the meter sat at 11–12A, until the user
+// raised Abdu to L2 by hand at 17:44.
+describe("the 2026-08-01 phantom house (a turn-off books its own decay)", () => {
+  const genHouse = (): Scenario =>
+    new Scenario(
+      cfg,
+      [
+        { ...ABDULLAH, level: 2, minLevel: 2, demandAmps: 3.5, needDelta: 0.6 },
+        { ...NAJAT, level: 1, demandAmps: 3.0, needDelta: 1.1 },
+        { ...ABDU, level: 1, demandAmps: 9.0, needDelta: 2.4 },
+      ],
+      { nonAcAmps: 3.4, source: "gen" },
+    );
+
+  it("spends a turn-off's freed headroom on the hot room instead of fencing it behind the ghost", () => {
+    const s = genHouse();
+    s.advance(6 * 60); // honest same-set samples accumulate (~2.2A house)
+    expect(s.sim("abdu").level).toBe(1); // nothing fits while all three run
+    s.turnOff("abdullah");
+    const t0 = s.now;
+    s.advance(4 * 60);
+    // ~3.6A really left the meter; the envelope must see the honest house and
+    // hand the hot room its level — the live system sat blocked for 14 minutes.
+    expect(s.sim("abdu").level).toBe(2);
+    expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps);
+    // And nobody paid for it: the raise fit, so no reducer episode followed.
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(0);
+  });
+});
+
+// User request 2026-08-01: with the house stable, an extra level parked on a
+// warm room must migrate to a clearly hotter room at base level — donor steps
+// down first (its saving must LAND before the raise spends it, invariant 9),
+// the hot room climbs in the next calm window, and the trade never reverses
+// while the need ordering holds.
+describe("the 2026-08-01 level rebalance (the extra level follows the hotter room)", () => {
+  it("hands Najat's extra level to a hotter 2-ton Abdu — demote first, raise after it lands, no churn", () => {
+    const s = new Scenario(
+      cfg,
+      [
+        { ...NAJAT, level: 2, demandAmps: 4.2, needDelta: 0.8 },
+        { ...ABDU, level: 1, demandAmps: 9.0, needDelta: 2.4 },
+      ],
+      { nonAcAmps: 4.4, source: "gen" },
+    );
+    const t0 = s.now;
+    s.advance(8 * 60);
+    expect(s.sim("najat").level).toBe(1);
+    expect(s.sim("abdu").level).toBe(2);
+    // Invariant 9: the donor's cut ships before the raise, never together.
+    const cmds = setLevels(s, t0);
+    const demote = cmds.find((c) => c.cmd.deviceId === "najat" && c.cmd.level === 1);
+    const raise = cmds.find((c) => c.cmd.deviceId === "abdu" && c.cmd.level === 2);
+    expect(demote).toBeDefined();
+    expect(raise).toBeDefined();
+    expect(raise!.at).toBeGreaterThan(demote!.at);
+    expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps);
+    // Settled: the needs still order the same way, so the trade must hold.
+    const settled = s.commandsSince(t0, "set_level").length;
+    s.advance(12 * 60);
+    expect(s.commandsSince(t0, "set_level").length).toBe(settled);
+  });
+
+  it("near-equal rooms do not trade — the gap is the anti-bounce hysteresis", () => {
+    // House heavy enough that neither raise fits the meter: the only way Abdu
+    // could climb is by taking Najat's level — and at a 0.4°C gap he must not.
+    const s = new Scenario(
+      cfg,
+      [
+        { ...NAJAT, level: 2, demandAmps: 4.2, needDelta: 2.0 },
+        { ...ABDU, level: 1, demandAmps: 9.0, needDelta: 2.4 },
+      ],
+      { nonAcAmps: 5.2, source: "gen" },
+    );
+    s.advance(10 * 60);
+    expect(s.sim("najat").level).toBe(2);
+    expect(s.sim("abdu").level).toBe(1);
+  });
+});

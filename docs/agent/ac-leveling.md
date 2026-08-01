@@ -873,14 +873,11 @@ the residual back to *the same over-stating models*, so the sum tracks reality. 
 it against a wattmeter reading, and do not be alarmed by a large figure on a small running set (with
 one AC on, the residual carries the whole rest of the house — 5–7A is normal there).
 
-**Known limitation, safe direction, NOT fixed.** A sample is tagged with the running-AC set, but a
-compressor keeps drawing for seconds-to-minutes after its `power_off` lands (the same lag `offLagMs`
-models in the harness). So a residual taken just after a room turns off attributes that room's
-spin-down to "house" and pins a too-high peak for the whole `HOUSE_LOAD_WINDOW_MS`. Seen live
-2026-07-31 18:23:08 — `worst case 18.6A (incl. 7.0A house)` moments after Abdullah went off. It can
-only ever refuse raises it could have allowed, so it never threatens the breaker; the cost is up to 15
-minutes of over-conservatism after a turn-off. The clean fix is to skip sampling for a cooldown after
-the running set changes (same rationale as skipping ramping ACs). Left for a session with soak time.
+**Known limitation at ship time — residual contamination after a turn-off.** Flagged here on
+2026-07-31 ("left for a session with soak time"), it produced the predicted incident the very next
+evening and was **fixed 2026-08-01** — see that section. The sampling now pauses for
+`HOUSE_SAMPLE_COOLDOWN_MS` after any modeled-total drop, and a set change carries the previous
+superset peak instead of trusting its own first (contaminated) sample.
 
 **Not changed (deliberate).** Abdullah's configured gen model is `base 2.3 / step 2.5` → L3 = 7.3A,
 but he is a 1-ton unit (hardware truth ≈ 2.2/3.9/5.3) and the learned book agrees: `level:2>3` = 1.44A
@@ -905,6 +902,68 @@ the forced-shed guard); `fan-trim.test.ts` (rewritten for the bounded climb + cu
 `sensing.test.ts` drain rungs + partial refill (3); `scenarios.test.ts` "the 2026-07-31 gen trip" (5).
 **866 server tests green, `tsc` clean.** Every fix verified failing first — the trough regression
 admits the raise with the house term at 0 and refuses it at 1.6A.
+
+### 2026-08-01 — the phantom house after a turn-off + comparative-need rebalance
+
+Two changes, separate commits. The first is the predicted incident from the 07-31 "known
+limitation"; the second is a user feature request from the same evening.
+
+**1. A turn-off booked its own decay as house and froze the raise path for 14 minutes.**
+Journal, Baghdad time: at 17:25:52 the envelope was honest (`incl. 2.6A house`); at ~17:27 Abdullah's
+AC went off (meter 13.9 → 11.1A); at 17:27:57 the first sample tagged with the new running set read
+the smoothed meter — still carrying his dying compressor — against a modeled side he had already
+left: **7.1A of "house"** (true residual ≈ 4.1A). Being the only same-set sample, it WAS the 15-min
+peak: every raise refused at `worst case 16.2A > 14.9A` while the meter sat at 11–12A, until the user
+raised Abdu to L2 by hand at ~17:44 (the post-raise meter, 13.23A, proves the refusals were wrong).
+
+**Fix (`house-load.ts`):**
+- **One drop detector for turn-off, shed, and level cut** — they share the physics (the model falls
+  instantly, the meter follows over the compressor wind-down plus the smoothing window). Any drop of
+  the modeled running total > `MODELED_DROP_EPSILON_AMPS` (0.05) pauses sampling for
+  `HOUSE_SAMPLE_COOLDOWN_MS` (2 min); a second drop re-arms it. Raises need no cooldown: the model
+  RISES ahead of the meter, the residual dips, and a dip never wins a max.
+- **Superset carry:** while the current set has no samples of its own (its first minutes fall inside
+  the cooldown), `houseLoadAmps` stands in the peak among samples whose set MODELED every room now
+  running — a superset sample cannot double-count anyone, keeps the envelope honest across the gap,
+  and preserves the 07-31 trough memory (pre-shed full-set samples cover the restore). A sample
+  missing a currently-running room is still never reused (the double-count guard).
+- `HouseLoadState` is now per-source `{ samples, lastModeledAmps, cooldownUntil }`. A ramping tick
+  still returns the state untouched (and deliberately does not advance the drop detector — the
+  modeled side already carries draw the meter has not seen).
+- The fix is why the funding swap works at all: a funding demote's wind-down would otherwise book
+  phantom house and block the very raise it funded.
+
+**2. Comparative-need rebalance — "the extra level should switch to the hotter room" (user).**
+The 07-28 funding swap harvested only SATISFIED peers (`currentLevel > ceilOf`), so a warm-but-not-
+satisfied room (needDelta above the band ⇒ ceilOf = max) held its extra level while a much hotter
+room sat at its floor. Now `planRaise` has a second donor pool, `rebalanceDonorsFor` (raise.ts):
+
+- **Receiver must sit AT ITS FLOOR** (the user's literal "the other on the base level"). Load-bearing:
+  letting an above-floor receiver trade re-broke the resting-point quiet acceptance (a warm L2 room
+  endlessly milked a milder L2 peer for an L3 it could never fund).
+- **Donor:** on, managed, not shed/ramping, `manualTarget == null` (a pin is user intent, not spare
+  capacity), `currentLevel > floorOf` (boost floors sacred), and `donor.needDelta +
+  REBALANCE_NEED_GAP_C (0.7°C) ≤ raiser.needDelta`. One step per trade, coolest room first, only as
+  many donors as the deficit needs. The gap doubles as anti-bounce hysteresis (7 sensor LSBs; a
+  reverse trade needs the rooms to genuinely cross by the same margin), and an unconfirmed donor
+  demote cannot ratchet — `currentLevel` moves only on confirm, so a re-plan re-emits the same target.
+- **Noise-proof funding check** (`REBALANCE_FUND_MARGIN_AMPS` 0.5): donors join only when the
+  receiver's raise fits AFTER the cuts land with margin to spare — `jump ≤ max(0, available) + freed
+  − 0.5` — in BOTH blocked branches. Without it, the ±0.5A resting-point noise armed a trade on every
+  dip, the freed amps fit the DONOR's cheaper re-raise but not the receiver's step, and the level
+  bounced donor↔receiver on a 35s period (caught by the quiet acceptance test; the debug dump showed
+  52 commands in 30 min). Satisfied-only funding keeps its old unconditional behavior — dormant
+  levels are not comfort.
+- Invariant 9 unchanged: envelope-blocked + meter already holds the amps → same batch;
+  meter-blocked → demote ALONE, raise next calm window. `emitDemotes` now takes explicit
+  `{ac, target}` (satisfied → ceilOf, donor → one step).
+
+**Tests:** `house-load.test.ts` "turn-off decay contamination" (3) + the superset/partial-overlap
+guards; `controller.test.ts` "a turn-off's decay is not house" (SHELL guard — scenario.ts mirrors the
+sampling call, both sides need their own, per the 07-30 lesson); `scenarios.test.ts` "the 2026-08-01
+phantom house" + "the 2026-08-01 level rebalance" (incl. the near-equal no-trade guard);
+`raise.test.ts` "need rebalance" (9). **884 server tests green, `tsc` clean.** Every fix verified
+failing-first; the house unit test reproduces the literal live 7.1A.
 
 ---
 

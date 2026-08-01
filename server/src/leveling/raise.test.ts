@@ -899,6 +899,123 @@ describe("funding swap — dormant peer levels pay for a hot room", () => {
   });
 });
 
+// User request 2026-08-01: "when everything is stable and one AC runs on an
+// extra level but the other is on base level and the room is HOTTER, switch
+// the extra level to that one." The satisfied-harvest above cannot do this —
+// a donor above the near-target band keeps ceilOf = max and is untouchable,
+// so a warm-but-not-hot room held its level while a much hotter room sat at
+// base forever. Comparative need arbitrates instead: a peer ≥ the need gap
+// COOLER may donate ONE step (never past its floor, never a manual pin),
+// coolest room first, only as many donors as the deficit needs.
+describe("need rebalance — the extra level follows the hotter room", () => {
+  const liveCfg: LevelingConfigV2 = {
+    ...cfg,
+    genLimitAmps: 15,
+    genAmpModels: {
+      abdu: { baseAmps: 4.3, stepAmps: 2.5 },
+      najat: { baseAmps: 2.3, stepAmps: 2.0 },
+    },
+  };
+  // Najat warm (0.8°C — above the band, so NOT satisfied) holding L2; Abdu's
+  // 2-ton room 2.4°C hot at L1. The live 2026-08-01 evening shape.
+  const rebal = (overrides: Partial<RaiseInput> = {}) =>
+    planRaise({
+      acs: [ac("najat", { currentLevel: 2, needDelta: 0.8 }), ac("abdu", { currentLevel: 1, needDelta: 2.4 })],
+      headroomAmps: 1.9,
+      smoothedAmps: 12.7,
+      rampDebitAmps: 0,
+      nonAcAmps: 0,
+      limitAmps: 15,
+      calmMs: 60_000,
+      config: liveCfg,
+      book: {},
+      source: "gen",
+      now: T,
+      pacing: initialPacingState("gen"),
+      ...overrides,
+    });
+
+  it("meter-blocked: the cooler room's step ships ALONE, the raise follows once it lands", () => {
+    // Abdu's 2.5A step vs 1.9A available — deficit 0.6A, Najat's step frees 2.0A.
+    const p = rebal();
+    expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 1 }]);
+    expect(p.cutAmps).toBeCloseTo(2.0, 5);
+    expect(p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "awaiting demote")).toBe(true);
+  });
+
+  it("envelope-blocked but meter-funded: donor step and raise ship in ONE batch", () => {
+    // House 4.0A breaks the envelope (11.1 + 4.0 = 15.1 > 14.9); with Najat at
+    // L1 it is 9.1 + 4.0 = 13.1, and the meter already holds Abdu's 2.5A step.
+    const p = rebal({ nonAcAmps: 4.0, headroomAmps: 3.0, smoothedAmps: 11.6 });
+    expect(p.commands).toEqual([
+      { deviceId: "najat", kind: "set_level", level: 1 },
+      { deviceId: "abdu", kind: "set_level", level: 2 },
+    ]);
+    expect(p.decisions.some((d) => d.action.includes("funded by peer demote"))).toBe(true);
+  });
+
+  it("one step per swap — a donor two levels up still gives only one", () => {
+    const p = rebal({
+      acs: [ac("najat", { currentLevel: 3, needDelta: 0.8 }), ac("abdu", { currentLevel: 1, needDelta: 2.4 })],
+      headroomAmps: 1.0,
+      smoothedAmps: 13.6,
+    });
+    expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 2 }]);
+  });
+
+  it("inside the need gap nothing moves — near-equal rooms must not trade levels", () => {
+    const p = rebal({
+      acs: [ac("najat", { currentLevel: 2, needDelta: 1.9 }), ac("abdu", { currentLevel: 1, needDelta: 2.4 })],
+    });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "no headroom")).toBe(true);
+  });
+
+  it("a manual pin is never donated", () => {
+    const p = rebal({
+      acs: [
+        ac("najat", { currentLevel: 2, needDelta: 0.8, manualTarget: 2 }),
+        ac("abdu", { currentLevel: 1, needDelta: 2.4 }),
+      ],
+    });
+    expect(p.commands).toHaveLength(0);
+  });
+
+  it("a boost floor is never donated", () => {
+    const p = rebal({
+      acs: [
+        ac("najat", { currentLevel: 2, needDelta: 0.8, minLevel: 2 }),
+        ac("abdu", { currentLevel: 1, needDelta: 2.4 }),
+      ],
+    });
+    expect(p.commands).toHaveLength(0);
+  });
+
+  it("a receiver already above its floor does not trade — it competes through the budget", () => {
+    // Abdu at L2 wanting L3: he already holds an extra level. Letting him milk
+    // a milder peer for a step he cannot fund is the resting-point limit cycle.
+    const p = rebal({
+      acs: [ac("najat", { currentLevel: 2, needDelta: 0.8 }), ac("abdu", { currentLevel: 2, needDelta: 2.4 })],
+    });
+    expect(p.commands).toHaveLength(0);
+  });
+
+  it("a trade never arms on a noise dip — the raise must fit with margin after the cut", () => {
+    // 0.9A available: Najat's 2.0A step leaves 2.9A < 2.5A + 0.5A margin.
+    const p = rebal({ headroomAmps: 0.9, smoothedAmps: 13.7 });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "no headroom")).toBe(true);
+  });
+
+  it("comfort is not spent for nothing — donors that cannot cover the deficit stay put", () => {
+    // Zero headroom: Abdu needs the whole 2.5A step and Najat can free only
+    // 2.0A. Demoting her would cool a warm room and still not fund the raise.
+    const p = rebal({ headroomAmps: 0, smoothedAmps: 14.6 });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "no headroom")).toBe(true);
+  });
+});
+
 // 2026-07-26: Najat was raised L1→L2 and then L2→L3 just 35s apart, both
 // admitted against a meter that had absorbed almost none of the first jump —
 // a level raise never arms `ramping`, so nothing charged its committed draw.

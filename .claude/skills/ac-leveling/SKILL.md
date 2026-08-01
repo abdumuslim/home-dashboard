@@ -155,6 +155,31 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     `commandedCutCreditAmps` credit cannot cover this case; the fall that reading preceded had already
     absorbed the credit in full.
 
+**Added 2026-08-01 after a turn-off froze the raise path for 14 min (the predicted 07-31 limitation):**
+20. **A modeled DROP pauses house sampling.** Turn-off, shed, and level cut share one physics — the
+    model falls instantly, the meter follows over the wind-down plus the smoothing window — and every
+    tick in between reads the dying draw as house. Live 17:27: Abdullah's off booked **7.1 A of
+    "house"** (real ~4.1 A), the only sample tagged with the new set, hence the 15-min peak; every
+    raise refused at "worst case 16.2 A > 14.9 A" on an 11–12 A meter until the user acted by hand.
+    Now any drop of the modeled total (> 0.05 A) pauses sampling `HOUSE_SAMPLE_COOLDOWN_MS` (2 min,
+    re-armed by a second drop), and while the new set has no samples `houseLoadAmps` carries the peak
+    among **superset-tagged** samples (a set that modeled every room now running cannot double-count
+    anyone; a sample missing a running room is still never reused). Raises need no cooldown — the
+    model rises ahead of the meter and a dipped residual never wins a max. This fix is also what lets
+    invariant 21's funding demote work: its wind-down would otherwise book phantom house and block
+    the raise it funded.
+21. **The extra level follows the hotter room — floor receivers only, noise-proof funding.** The
+    07-28 funding swap only harvested SATISFIED donors, so a warm room (above the band ⇒ ceilOf =
+    max) held its spare level while a hotter room sat at its floor (user ask, 2026-08-01).
+    `rebalanceDonorsFor` (raise.ts): donor is unpinned, unramping, above ITS floor, and
+    `REBALANCE_NEED_GAP_C` (0.7 °C) cooler than the raiser; ONE step per trade, coolest first.
+    ⚠️ Two guards are load-bearing, both caught by the acceptance suite before shipping: the
+    **receiver must sit at its floor** (an above-floor receiver endlessly milked a milder peer for a
+    step it could never fund), and donors join only when the raise fits AFTER the cuts land with
+    `REBALANCE_FUND_MARGIN_AMPS` (0.5 A) to spare — a deficit read off a ±0.5 A-noisy meter armed a
+    trade on every dip and bounced the level donor↔receiver at a 35 s period. Invariant 9's split by
+    blocker is unchanged; satisfied harvest keeps its old unconditional behavior.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's

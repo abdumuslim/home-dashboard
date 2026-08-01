@@ -145,6 +145,26 @@ export function gridStartLevel(
   return target > ac.currentLevel ? target : null;
 }
 
+/**
+ * How much HOTTER (°C above its own target) a blocked raiser must run than a
+ * peer before the peer's standing level is traded over (user, 2026-08-01:
+ * "the extra level should switch to the hotter room"). At the 0.1°C sensor
+ * granularity this is seven whole LSBs — reading noise cannot arm a trade, and
+ * a reverse trade needs the rooms to genuinely cross by the same margin.
+ */
+export const REBALANCE_NEED_GAP_C = 0.7;
+
+/**
+ * A comparative-need trade must leave the receiver's raise fitting with this
+ * much to SPARE once the donor's cut lands. The deficit is read off a noisy
+ * meter — the acceptance suite's ±0.5A resting-point noise armed a trade on
+ * every dip, and because the freed amps then fit the DONOR's cheaper re-raise
+ * but not the receiver's step, the level bounced donor↔receiver on a 35s
+ * period. Sized to the observed noise band so a trade can only arm when it
+ * fits across the whole band.
+ */
+export const REBALANCE_FUND_MARGIN_AMPS = 0.5;
+
 export interface RaiseInput {
   /** ALL managed AC views (on and off/shed), pre-sorted by priority. */
   acs: AcView[];
@@ -535,17 +555,55 @@ export function planRaise(input: RaiseInput): RaisePlan {
    * room that is actually waiting on these amps is evidence enough. `ceilOf`
    * honours manualTarget, so a user-pinned room is never harvested.
    */
-  const harvestableFor = (raiser: AcView): Array<{ ac: AcView; ceil: number }> =>
+  const harvestableFor = (raiser: AcView): Array<{ ac: AcView; target: number }> =>
     onManaged
       .filter((a) => a.deviceId !== raiser.deviceId && !a.ramping && a.currentLevel >= 1)
-      .map((a) => ({ ac: a, ceil: ceilOf(a, config.nearTargetBandC) }))
-      .filter(({ ac: peer, ceil }) => peer.currentLevel > ceil);
+      .map((a) => ({ ac: a, target: ceilOf(a, config.nearTargetBandC) }))
+      .filter(({ ac: peer, target }) => peer.currentLevel > target);
 
-  const emitDemotes = (peers: Array<{ ac: AcView; ceil: number }>): number => {
+  /**
+   * Comparative-need donors (user, 2026-08-01): peers holding a level above
+   * their FLOOR whose room is at least `REBALANCE_NEED_GAP_C` cooler than the
+   * blocked raiser — ONE step each, coolest room first. Unlike the satisfied
+   * harvest, a donor is still paying for cooling it wants, so the gap is the
+   * whole justification: the hotter room's need outranks it. The gap doubles
+   * as the anti-bounce hysteresis — after the trade the receiver runs at least
+   * gap-hotter than the donor, so the reverse trade cannot arm until the rooms
+   * genuinely cross by the same margin. Never past the floor, never a manual
+   * pin (a pinned level is user intent, not spare capacity), never a ramping
+   * compressor. An unconfirmed donor demote does not ratchet: `currentLevel`
+   * moves only on confirm, so a re-plan re-emits the SAME target (a resend).
+   *
+   * Only a receiver sitting AT ITS FLOOR may take a trade — that is the user's
+   * literal ask ("the other on the base level"), and it is load-bearing: a
+   * receiver already holding an extra level competes through the ordinary
+   * budget, and letting it trade re-broke the resting-point quiet acceptance
+   * (a warm L2 room endlessly milked a milder L2 peer for an L3 it could
+   * never actually fund).
+   */
+  const rebalanceDonorsFor = (raiser: AcView): Array<{ ac: AcView; target: number }> => {
+    if (raiser.currentLevel > floorOf(raiser)) return [];
+    return onManaged
+      .filter(
+        (a) =>
+          a.deviceId !== raiser.deviceId &&
+          !a.ramping &&
+          a.manualTarget == null &&
+          a.currentLevel > floorOf(a) &&
+          a.needDelta + REBALANCE_NEED_GAP_C <= raiser.needDelta,
+      )
+      .sort((x, y) => x.needDelta - y.needDelta)
+      .map((a) => ({ ac: a, target: Math.max(floorOf(a), a.currentLevel - 1) }));
+  };
+
+  const cutOfFunding = (f: { ac: AcView; target: number }): number =>
+    modelCutAmps(config, f.ac.deviceId, source, f.ac.currentLevel, f.target, f.ac.maxLevel);
+
+  const emitDemotes = (peers: Array<{ ac: AcView; target: number }>): number => {
     let cut = 0;
-    for (const { ac: peer, ceil } of peers) {
-      commands.push({ deviceId: peer.deviceId, kind: "set_level", level: ceil });
-      cut += modelCutAmps(config, peer.deviceId, source, peer.currentLevel, ceil, peer.maxLevel);
+    for (const { ac: peer, target } of peers) {
+      commands.push({ deviceId: peer.deviceId, kind: "set_level", level: target });
+      cut += modelCutAmps(config, peer.deviceId, source, peer.currentLevel, target, peer.maxLevel);
     }
     return cut;
   };
@@ -619,30 +677,48 @@ export function planRaise(input: RaiseInput): RaisePlan {
         // METER may already hold the amps — and the peers standing in the way
         // are satisfied, i.e. drawing well under the caps the envelope charges
         // them for. Pull them to their own ceilings in the SAME batch and
-        // re-check the end-state.
+        // re-check the end-state. When the satisfied harvest alone cannot fix
+        // the end-state, comparative-need donors join one at a time (coolest
+        // room first) — never more comfort spent than the envelope needs.
         //
         // Same-batch is only sound here. When the meter itself is short (the
         // branch below) the raise would be riding savings that have not landed,
         // and a satisfied compressor can take minutes to throttle down — on a
         // breaker that tripped at 15.65A on 2026-07-26 that is a real breach,
         // not a modelling nicety.
-        const peers = harvestableFor(ac);
-        const swapOverrides: Record<string, number> = { [ac.deviceId]: desired };
-        for (const { ac: peer, ceil: peerCeil } of peers) swapOverrides[peer.deviceId] = peerCeil;
+        const funding = harvestableFor(ac);
+        const satCount = funding.length;
+        const donors = rebalanceDonorsFor(ac).filter(
+          (d) => !funding.some((f) => f.ac.deviceId === d.ac.deviceId),
+        );
+        const overridesOf = (list: Array<{ ac: AcView; target: number }>): Record<string, number> => {
+          const o: Record<string, number> = { [ac.deviceId]: desired };
+          for (const f of list) o[f.ac.deviceId] = f.target;
+          return o;
+        };
+        while (donors.length > 0 && raiseEnvelope(overridesOf(funding)) > envelopeCeiling) {
+          funding.push(donors.shift()!);
+        }
         const swapJump = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, desired, ac.maxLevel, now);
-        if (peers.length > 0 && raiseEnvelope(swapOverrides) <= envelopeCeiling) {
+        // A donor-funded await must also clear the conservative fund check —
+        // a satisfied-only harvest is comfort-free and keeps its old
+        // unconditional behavior.
+        const freedByFunding = funding.reduce((sum, f) => sum + cutOfFunding(f), 0);
+        const donorFundOk =
+          funding.length === satCount ||
+          swapJump.amps <= Math.max(0, available) + freedByFunding - REBALANCE_FUND_MARGIN_AMPS;
+        if (funding.length > 0 && raiseEnvelope(overridesOf(funding)) <= envelopeCeiling && donorFundOk) {
           if (swapJump.amps <= available) {
-            // The meter already holds the amps — only the cap models objected,
-            // and they are objecting about rooms that are satisfied (drawing
-            // well under the caps charged to them). Ship it as one batch.
-            cutAmps += emitDemotes(peers);
+            // The meter already holds the amps — only the cap models objected.
+            // Ship it as one batch.
+            cutAmps += emitDemotes(funding);
             commands.push({ deviceId: ac.deviceId, kind: "set_level", level: desired });
             attempts.push({ deviceId: ac.deviceId, kind: "raise" });
             decisions.push({
               at: now,
               deviceId: ac.deviceId,
               action: `raise L${ac.currentLevel}→L${desired} funded by peer demote`,
-              detail: `${peers.map((p) => `${p.ac.deviceId}→L${p.ceil}`).join(", ")}; ${swapJump.amps.toFixed(1)}A ${swapJump.confidence}`,
+              detail: `${funding.map((f) => `${f.ac.deviceId}→L${f.target}`).join(", ")}; ${swapJump.amps.toFixed(1)}A ${swapJump.confidence}`,
             });
             available -= swapJump.amps;
             if (source === "gen") break;
@@ -650,14 +726,14 @@ export function planRaise(input: RaiseInput): RaisePlan {
           }
           // The swap fixes the envelope but the METER is short: free the amps
           // now, raise in a later calm window once they have actually landed.
-          const freed = emitDemotes(peers);
+          const freed = emitDemotes(funding);
           cutAmps += freed;
           decisions.push({
             at: now,
             deviceId: ac.deviceId,
             action: `raise L${desired}`,
             blockedBy: "awaiting demote",
-            detail: `freeing ~${freed.toFixed(1)}A from ${peers.map((p) => `${p.ac.deviceId}→L${p.ceil}`).join(", ")}`,
+            detail: `freeing ~${freed.toFixed(1)}A from ${funding.map((f) => `${f.ac.deviceId}→L${f.target}`).join(", ")}`,
           });
           break;
         }
@@ -684,16 +760,37 @@ export function planRaise(input: RaiseInput): RaisePlan {
       // however long the demoted compressor takes to actually throttle down
       // (seconds to minutes on this firmware). The raise follows in the next
       // calm window, against a meter that has really fallen.
-      const peers = harvestableFor(ac);
-      if (peers.length > 0) {
-        const freed = emitDemotes(peers);
+      //
+      // Satisfied rooms are demoted regardless of coverage (dormant levels are
+      // not comfort); a comparative-need donor pays real comfort, so donors
+      // join only while the deficit is still uncovered — and when even every
+      // donor cannot cover it, none of them pay.
+      const satisfied = harvestableFor(ac);
+      const donors = rebalanceDonorsFor(ac).filter(
+        (d) => !satisfied.some((f) => f.ac.deviceId === d.ac.deviceId),
+      );
+      // Conservative funding target: the raise must fit AFTER the cuts land
+      // with REBALANCE_FUND_MARGIN_AMPS to spare — the deficit is read off a
+      // noisy meter, and a trade armed on a noise dip is the donor↔receiver
+      // limit cycle the acceptance suite caught.
+      const needed = jump.amps - Math.max(0, available) + REBALANCE_FUND_MARGIN_AMPS;
+      let covered = satisfied.reduce((sum, f) => sum + cutOfFunding(f), 0);
+      const picked: Array<{ ac: AcView; target: number }> = [];
+      for (const d of donors) {
+        if (covered >= needed) break;
+        picked.push(d);
+        covered += cutOfFunding(d);
+      }
+      const funding = picked.length === 0 || covered >= needed ? [...satisfied, ...picked] : satisfied;
+      if (funding.length > 0) {
+        const freed = emitDemotes(funding);
         cutAmps += freed;
         decisions.push({
           at: now,
           deviceId: ac.deviceId,
           action: `raise L${target}`,
           blockedBy: "awaiting demote",
-          detail: `freeing ~${freed.toFixed(1)}A from ${peers.map((p) => `${p.ac.deviceId}→L${p.ceil}`).join(", ")}`,
+          detail: `freeing ~${freed.toFixed(1)}A from ${funding.map((f) => `${f.ac.deviceId}→L${f.target}`).join(", ")}`,
         });
         break;
       }
