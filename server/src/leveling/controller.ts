@@ -45,7 +45,13 @@ import {
   type PacingState,
 } from "./pacing.js";
 import { planFanRestore, recordFanCut, releaseFanHold, type FanHolds } from "./fan-trim.js";
-import { houseLoadAmps, initialHouseLoad, sampleHouseLoad, type HouseLoadState } from "./house-load.js";
+import {
+  HOUSE_SAMPLE_COOLDOWN_MS,
+  houseLoadAmps,
+  initialHouseLoad,
+  sampleHouseLoad,
+  type HouseLoadState,
+} from "./house-load.js";
 import {
   clearMarksOnManual,
   clearOnPowerOff,
@@ -287,6 +293,8 @@ export class LevelingControllerV2 {
   private lastPushAt = 0;
   private lastStatus: LevelingStatusV2 | null = null;
   private lastPruneAt = 0;
+  /** First tick timestamp — house sampling holds off until inputs are warm. */
+  private firstTickAt: number | null = null;
   private lastConfigReloadAt = 0;
   /** Controller flavor at the last reload — detects a live flip to acting v2. */
   private prevFlavor: ControllerFlavor | null = null;
@@ -1031,10 +1039,19 @@ export class LevelingControllerV2 {
     }
 
     // Measure the non-AC split BEFORE planning, so the envelope guard is judged
-    // against the house this tick actually sees. Sampling is free of any gate:
-    // it is an observation, and `houseLoadResidual` decides on its own whether
-    // the reading is usable (see house-load.ts).
-    if (view.source !== "none" && view.sampleCount >= 2 && !view.frozen) {
+    // against the house this tick actually sees. `houseLoadResidual` decides on
+    // its own whether the reading is usable (see house-load.ts) — but the shell
+    // additionally holds off for the first cooldown after BOOT: device views
+    // and amp models can be half-loaded on the first ticks, and the 2026-08-01
+    // deploy's very first gen sample read 11.1A of "house" (real ~4.1A), an
+    // over-blocking peak that stood until honest same-set samples outranked it.
+    if (this.firstTickAt == null) this.firstTickAt = now;
+    if (
+      view.source !== "none" &&
+      view.sampleCount >= 2 &&
+      !view.frozen &&
+      now - this.firstTickAt >= HOUSE_SAMPLE_COOLDOWN_MS
+    ) {
       this.houseLoad = sampleHouseLoad(this.houseLoad, {
         source: view.source,
         at: now,

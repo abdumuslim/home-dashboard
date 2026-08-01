@@ -43,7 +43,13 @@ import type { CostBook } from "./costs.js";
 import { fanTrimSavings, raiseJumpAmps, restoreCostAmps, turnOnAmps } from "./costs.js";
 import { ceilOf, floorOf, worstCaseLevel } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
-import { houseLoadAmps, initialHouseLoad, sampleHouseLoad, type HouseLoadState } from "./house-load.js";
+import {
+  HOUSE_SAMPLE_COOLDOWN_MS,
+  houseLoadAmps,
+  initialHouseLoad,
+  sampleHouseLoad,
+  type HouseLoadState,
+} from "./house-load.js";
 
 export interface SimAcSetup {
   deviceId: string;
@@ -140,6 +146,8 @@ export class Scenario {
   private satisfiedSince = new Map<string, number>();
   /** Shell parity: the MEASURED non-AC split (never the sim's ground truth). */
   private houseLoad: HouseLoadState = initialHouseLoad();
+  /** Mirror of the shell's boot quiet (`firstTickAt`). */
+  private firstStepAt: number | null = null;
   private nonAcAmps: number;
   private line: "grid" | "gen" | "none";
   private lineDead = false;
@@ -613,7 +621,14 @@ export class Scenario {
     // shell does. Handing it the sim's ground truth would be the scenario.ts
     // mirror bug all over again (2026-07-30, bug 14): the harness would price a
     // house the shell cannot see, and no harness test could ever disagree.
-    if (view.source !== "none" && view.sampleCount >= 2 && !view.frozen) {
+    // Mirror of the shell's boot quiet: no sampling for the first cooldown.
+    if (this.firstStepAt == null) this.firstStepAt = this.now;
+    if (
+      view.source !== "none" &&
+      view.sampleCount >= 2 &&
+      !view.frozen &&
+      this.now - this.firstStepAt >= HOUSE_SAMPLE_COOLDOWN_MS
+    ) {
       this.houseLoad = sampleHouseLoad(this.houseLoad, {
         source: view.source,
         at: this.now,
