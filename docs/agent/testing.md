@@ -4,7 +4,7 @@ title: 'Testing'
 description: 'Pure logic (allocator, auto-fan, slots, calibration helpers, alert sustain) is fully unit-tested with no I/O. Stateful integration (collector loop, leveler, calibrator) is tested against mocked TCL/DB/timers in…'
 tags: [home, dashboard, claude-code, current]
 maintainer: claude-code
-timestamp: 2026-07-27
+timestamp: 2026-08-01
 ---
 
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
@@ -71,6 +71,24 @@ timestamp: 2026-07-27
   `nonAcAmps` + the sim `capAmps` at the levels you set, and confirm it actually reproduces the
   pressure the incident had. The first draft of the 2026-07-31 regression sat at 11.8A on a 14.9A
   limit — comfortably affordable — and "proved" a raise was refused when nothing was refusing it.
+
+- **The noise acceptance test is the churn gate for every new spend/trade path (2026-08-01).**
+  "quiet at the resting point (±0.5A noise → ZERO commands for 30 minutes)" caught both load-bearing
+  guards of the comparative-need rebalance before shipping: a deficit judged on a single noisy
+  reading armed a trade on every dip, and the freed amps then fit the DONOR's cheaper re-raise but
+  not the receiver's step — a 35s donor↔receiver limit cycle, 52 commands in 30 sim-minutes, while
+  every targeted rebalance test stayed green. Any new path that spends or trades amps must be run
+  under that noise scene before it ships; a margin sized to the noise band
+  (`REBALANCE_FUND_MARGIN_AMPS`) is what makes a threshold noise-proof.
+- **Seeing WHAT a failing scenario did:** vitest swallows `console.log` from scenario runs. The
+  fast pattern is a throwaway `src/leveling/_debug.test.ts` that replays the scene and writes
+  `s.commandsSince(t0)` + the non-empty `s.plans` decisions to a file via `node:fs`, then Read it —
+  the 35s cycle above was invisible in the assertion output ("expected 52 to be 0") and obvious in
+  the dump. Delete the file before committing.
+- **The harness boot mirrors the shell's boot quiet (2026-08-01):** both hold house sampling for
+  `HOUSE_SAMPLE_COOLDOWN_MS` after their first tick (`firstTickAt` / `firstStepAt`), so no scenario
+  can rely on house samples from its first 2 sim-minutes — settle scenes that need an honest house
+  peak must `advance()` past the quiet before staging the incident.
 
 **Verifying a fix is real (used for both 2026-07-28 fixes):** after the test passes, re-break the
 single line the fix hinges on and confirm the test fails with the *expected number*, then restore.
