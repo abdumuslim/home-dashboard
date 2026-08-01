@@ -155,6 +155,20 @@ describe("houseLoadAmps — the rolling PEAK", () => {
     expect(houseLoadAmps(s, "gen", T, live())).toBe(0);
   });
 
+  it("a partial overlap is no better than a different set — every running room must have been modeled", () => {
+    // Sampled with {abdullah, najat}: any abdu draw in that reading was booked
+    // as house. Reusing it while abdu runs would double-count him.
+    const withoutAbdu = [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("najat", { currentLevel: 1 })];
+    const s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 8.6,
+      acs: withoutAbdu,
+      config: cfg,
+    });
+    expect(houseLoadAmps(s, "gen", T, [ac("najat"), ac("abdu")])).toBe(0);
+  });
+
   it("prunes as it writes — a long session stays bounded", () => {
     let s = initialHouseLoad();
     for (let i = 0; i < 600; i++) {
@@ -166,6 +180,118 @@ describe("houseLoadAmps — the rolling PEAK", () => {
         config: cfg,
       });
     }
-    expect((s.gen ?? []).length).toBeLessThanOrEqual(400);
+    expect((s.gen?.samples ?? []).length).toBeLessThanOrEqual(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-01, 15A gen (live 17:27 Baghdad). Abdullah's AC turned off; the next
+// tick's smoothed meter still carried his dying compressor, the modeled side
+// had already dropped him, and the residual booked 7.1A of "house" (real:
+// ~4.1A). That single sample was the only one tagged with the new set, so it
+// WAS the 15-minute peak — every raise was refused at "worst case 16.2A >
+// 14.9A" while the meter sat at 11–12A, until the user raised Abdu by hand.
+// The fix: a modeled DROP (turn-off, shed, level cut — the model falls before
+// the meter can follow) pauses sampling for a cooldown, and while the new set
+// has no samples of its own the envelope carries the peak from samples whose
+// set modeled every room now running (a superset cannot double-count anyone).
+// ---------------------------------------------------------------------------
+
+// Mirrors HOUSE_SAMPLE_COOLDOWN_MS — the tests spell it out so a constant edit
+// is a conscious re-verification, not a silent retune.
+const COOLDOWN_MS = 2 * 60_000;
+
+describe("turn-off decay contamination (2026-08-01)", () => {
+  const afterOff = () => [ac("najat", { currentLevel: 1 }), ac("abdu", { currentLevel: 1 })]; // modeled 6.6
+
+  it("never books the dying compressor as house — the honest pre-off peak carries instead", () => {
+    // Settled honest sample: 13.9 − 11.4 = 2.5A of real house.
+    let s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 13.9,
+      acs: live(),
+      config: cfg,
+    });
+    // Abdullah goes off. Model: 6.6. Smoothed: still 13.7 → the live 7.1 shape.
+    s = sampleHouseLoad(s, {
+      source: "gen",
+      at: T + 60_000,
+      smoothedAmps: 13.7,
+      acs: afterOff(),
+      config: cfg,
+    });
+    expect(houseLoadAmps(s, "gen", T + 60_000, afterOff())).toBeCloseTo(2.5, 5);
+    // Still cooling 30s later — the sampler stays paused.
+    s = sampleHouseLoad(s, {
+      source: "gen",
+      at: T + 90_000,
+      smoothedAmps: 12.4,
+      acs: afterOff(),
+      config: cfg,
+    });
+    expect(houseLoadAmps(s, "gen", T + 90_000, afterOff())).toBeCloseTo(2.5, 5);
+    // Past the cooldown the meter has settled: 11.1 − 6.6 = 4.5 honest amps,
+    // and the new set's own samples take over from the carried peak.
+    const resumed = T + 60_000 + COOLDOWN_MS + 1_000;
+    s = sampleHouseLoad(s, {
+      source: "gen",
+      at: resumed,
+      smoothedAmps: 11.1,
+      acs: afterOff(),
+      config: cfg,
+    });
+    expect(houseLoadAmps(s, "gen", resumed, afterOff())).toBeCloseTo(4.5, 5);
+  });
+
+  it("a level cut's wind-down is skipped the same way — the model fell, the meter has not", () => {
+    const before = [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("najat"), ac("abdu", { currentLevel: 2 })]; // 13.9
+    const after = [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("najat"), ac("abdu", { currentLevel: 1 })]; // 11.4
+    let s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 15.4, // honest 1.5
+      acs: before,
+      config: cfg,
+    });
+    // Abdu's demote confirms; the compressor is still throttling down.
+    s = sampleHouseLoad(s, {
+      source: "gen",
+      at: T + 30_000,
+      smoothedAmps: 15.2, // would book 3.8 phantom amps
+      acs: after,
+      config: cfg,
+    });
+    // Same members, same tag — the pre-cut sample IS the peak.
+    expect(houseLoadAmps(s, "gen", T + 30_000, after)).toBeCloseTo(1.5, 5);
+    const resumed = T + 30_000 + COOLDOWN_MS + 1_000;
+    s = sampleHouseLoad(s, {
+      source: "gen",
+      at: resumed,
+      smoothedAmps: 13.0, // settled: 1.6 honest
+      acs: after,
+      config: cfg,
+    });
+    expect(houseLoadAmps(s, "gen", resumed, after)).toBeCloseTo(1.6, 5);
+  });
+
+  it("a second drop re-arms the cooldown — a double shed stays unsampled to the end", () => {
+    const soloAbdu = () => [ac("abdu", { currentLevel: 1 })]; // modeled 4.3
+    let s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 13.9, // honest 2.5
+      acs: live(),
+      config: cfg,
+    });
+    s = sampleHouseLoad(s, { source: "gen", at: T + 60_000, smoothedAmps: 13.7, acs: afterOff(), config: cfg });
+    // Najat goes too, 90s later — inside the first cooldown.
+    s = sampleHouseLoad(s, { source: "gen", at: T + 150_000, smoothedAmps: 9.9, acs: soloAbdu(), config: cfg });
+    // The first cooldown alone would have expired here; the re-arm must not have.
+    s = sampleHouseLoad(s, { source: "gen", at: T + 200_000, smoothedAmps: 9.7, acs: soloAbdu(), config: cfg });
+    expect(houseLoadAmps(s, "gen", T + 200_000, soloAbdu())).toBeCloseTo(2.5, 5);
+    const resumed = T + 150_000 + COOLDOWN_MS + 1_000;
+    s = sampleHouseLoad(s, { source: "gen", at: resumed, smoothedAmps: 8.4, acs: soloAbdu(), config: cfg });
+    expect(houseLoadAmps(s, "gen", resumed, soloAbdu())).toBeCloseTo(4.1, 5);
   });
 });

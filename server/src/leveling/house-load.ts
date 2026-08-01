@@ -28,13 +28,26 @@
 // has seen it, so the residual dips and would just be noise under the max.
 //
 // Samples are tagged with the SET of ACs that were running when they were
-// taken, and only same-set samples count toward the peak. An AC that is off
-// contributes nothing to the modeled side, so its absence lands silently in the
-// residual — and the moment it comes back that sample describes a house that no
-// longer exists (it would double-count the room, once as "house" and once as a
-// cap). Same reasoning as the bucket refill on `power_on`: a turn-on changes the
-// load picture wholesale. Level changes do NOT invalidate a sample; the model
-// already tracks those.
+// taken. Same-set samples are the peak of record; when the current set has no
+// samples of its own yet, the peak among samples whose set MODELED every room
+// now running (a superset) stands in — such a sample cannot double-count
+// anyone, and it is what carries the honest house across a set change. A
+// sample missing a room that is running now is never reused: any draw of that
+// room at sample time was booked as house, and the envelope would charge it
+// again as a cap. Same reasoning as the bucket refill on `power_on`: a turn-on
+// changes the load picture wholesale.
+//
+// Sampling PAUSES for a cooldown whenever the modeled total DROPS (turn-off,
+// shed, level cut — one detector for all three, because they share the
+// physics: the model falls instantly, the meter follows over the compressor
+// wind-down plus the smoothing window, and every tick in between reads the
+// dying draw as house). 2026-08-01, 17:27 Baghdad: Abdullah's off left the
+// smoothed meter at 13.7A against a 6.6A model — 7.1A of "house" (real:
+// ~4.1A), the only sample tagged with the new set, and therefore the
+// 15-minute peak. Every raise was refused at "worst case 16.2A > 14.9A"
+// while the meter sat at 11–12A, until the user raised Abdu to L2 by hand.
+// Raises need no cooldown: the modeled side RISES ahead of the meter, the
+// residual dips, and a dip never wins a max.
 
 import type { AcView, PowerSource } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
@@ -44,6 +57,13 @@ import { modelFor, steadyDraw } from "./costs.js";
 export const HOUSE_LOAD_WINDOW_MS = 15 * 60_000;
 /** Ring bound — the tick is ~3–5s, so the window holds ~200–300 samples. */
 const MAX_SAMPLES = 400;
+/**
+ * Sampling pause after the modeled total drops: covers the compressor
+ * wind-down (~1 min observed) plus the meter's smoothing window, with margin.
+ */
+export const HOUSE_SAMPLE_COOLDOWN_MS = 2 * 60_000;
+/** Modeled totals move by whole steps; anything under this is float noise. */
+const MODELED_DROP_EPSILON_AMPS = 0.05;
 
 export interface HouseLoadSample {
   at: number;
@@ -61,11 +81,33 @@ export function runningSetOf(acs: readonly AcView[]): string {
     .join(",");
 }
 
-/** Per-source sample rings. Sources never share: a gen residual says nothing about grid. */
-export type HouseLoadState = Readonly<Record<string, readonly HouseLoadSample[]>>;
+interface SourceHouseLoad {
+  readonly samples: readonly HouseLoadSample[];
+  /** Modeled running total at the last usable tick — the drop detector. */
+  readonly lastModeledAmps: number;
+  /** Sampling resumes here after a modeled drop. */
+  readonly cooldownUntil: number;
+}
+
+/** Per-source records. Sources never share: a gen residual says nothing about grid. */
+export type HouseLoadState = Readonly<Record<string, SourceHouseLoad>>;
 
 export function initialHouseLoad(): HouseLoadState {
   return {};
+}
+
+function modeledRunningAmps(
+  acs: readonly AcView[],
+  config: LevelingConfigV2,
+  source: Exclude<PowerSource, "none">,
+): number {
+  return acs
+    .filter((a) => a.on && a.managed && !a.shed)
+    .reduce(
+      (sum, a) =>
+        sum + steadyDraw(a.currentLevel, a.maxLevel, modelFor(config, a.deviceId, source)),
+      0,
+    );
 }
 
 /**
@@ -80,12 +122,7 @@ export function houseLoadResidual(
 ): number | null {
   const running = acs.filter((a) => a.on && a.managed && !a.shed);
   if (running.some((a) => a.ramping)) return null;
-  const modeled = running.reduce(
-    (sum, a) =>
-      sum + steadyDraw(a.currentLevel, a.maxLevel, modelFor(config, a.deviceId, source)),
-    0,
-  );
-  return Math.max(0, smoothedAmps - modeled);
+  return Math.max(0, smoothedAmps - modeledRunningAmps(acs, config, source));
 }
 
 export function sampleHouseLoad(
@@ -98,22 +135,42 @@ export function sampleHouseLoad(
     config: LevelingConfigV2;
   },
 ): HouseLoadState {
-  const amps = houseLoadResidual(opts.smoothedAmps, opts.acs, opts.config, opts.source);
-  if (amps == null) return state;
-  const runningSet = runningSetOf(opts.acs);
-  const kept = (state[opts.source] ?? [])
+  const running = opts.acs.filter((a) => a.on && a.managed && !a.shed);
+  // A ramping tick is unusable AND must not advance the drop detector — the
+  // modeled side already carries draw the meter has not seen.
+  if (running.some((a) => a.ramping)) return state;
+  const modeled = modeledRunningAmps(opts.acs, opts.config, opts.source);
+  const rec = state[opts.source];
+  const dropped = rec != null && modeled < rec.lastModeledAmps - MODELED_DROP_EPSILON_AMPS;
+  const cooldownUntil = dropped ? opts.at + HOUSE_SAMPLE_COOLDOWN_MS : (rec?.cooldownUntil ?? 0);
+  const kept = (rec?.samples ?? [])
     .filter((s) => opts.at - s.at < HOUSE_LOAD_WINDOW_MS)
     .slice(-(MAX_SAMPLES - 1));
-  return { ...state, [opts.source]: [...kept, { at: opts.at, amps, runningSet }] };
+  const samples =
+    opts.at < cooldownUntil
+      ? kept
+      : [
+          ...kept,
+          {
+            at: opts.at,
+            amps: Math.max(0, opts.smoothedAmps - modeled),
+            runningSet: runningSetOf(opts.acs),
+          },
+        ];
+  return { ...state, [opts.source]: { samples, lastModeledAmps: modeled, cooldownUntil } };
 }
 
 /**
- * Worst-case non-AC load on `source` — the peak residual still inside the
- * window and taken with the SAME set of ACs running, or 0 when nothing
- * comparable has been sampled. Zero is the honest answer for an unmeasured
- * house: it reproduces the old AC-only envelope rather than inventing a
- * reserve, so a fresh boot (or the tick after a turn-on) is never MORE
- * permissive than the code this replaced.
+ * Worst-case non-AC load on `source`. The peak residual still inside the
+ * window and taken with the SAME set of ACs running is the answer of record;
+ * when that set has no samples yet (its first minutes after a set change fall
+ * inside the cooldown), the peak among samples whose set modeled every room
+ * now running stands in — a superset sample cannot double-count anyone, and
+ * it is what keeps the envelope honest across a turn-off (and across the
+ * shed-and-restore trough of the 2026-07-31 trip). 0 when nothing comparable
+ * has been sampled: the honest answer for an unmeasured house, reproducing
+ * the old AC-only envelope rather than inventing a reserve, so a fresh boot
+ * is never MORE permissive than the code this replaced.
  */
 export function houseLoadAmps(
   state: HouseLoadState,
@@ -121,12 +178,20 @@ export function houseLoadAmps(
   now: number,
   acs: readonly AcView[],
 ): number {
+  const rec = state[source];
+  if (rec == null) return 0;
   const runningSet = runningSetOf(acs);
-  let peak = 0;
-  for (const s of state[source] ?? []) {
+  const members = runningSet === "" ? [] : runningSet.split(",");
+  let exactPeak = -1;
+  let carriedPeak = 0;
+  for (const s of rec.samples) {
     if (now - s.at >= HOUSE_LOAD_WINDOW_MS) continue;
-    if (s.runningSet !== runningSet) continue;
-    if (s.amps > peak) peak = s.amps;
+    if (s.runningSet === runningSet) {
+      if (s.amps > exactPeak) exactPeak = s.amps;
+    } else {
+      const sampled = s.runningSet.split(",");
+      if (members.every((id) => sampled.includes(id)) && s.amps > carriedPeak) carriedPeak = s.amps;
+    }
   }
-  return peak;
+  return exactPeak >= 0 ? exactPeak : carriedPeak;
 }

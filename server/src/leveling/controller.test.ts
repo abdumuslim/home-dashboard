@@ -818,3 +818,77 @@ describe("LevelingControllerV2 — a gen turn-on enters at its floor", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-08-01 (live 17:27 Baghdad, 15A gen). Abdullah's AC turned off, and the
+// tick after read the smoothed meter — still carrying his dying compressor —
+// against a modeled side he had already left: 7.1A of "house" (real: ~4.1A).
+// The only sample tagged with the new running set, so it WAS the 15-minute
+// peak: every raise refused at "worst case 16.2A > 14.9A" while the meter sat
+// at 11–12A, until the user raised Abdu to L2 by hand. SHELL test on purpose —
+// scenario.ts mirrors the sampling call, and both sides need their own guard.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — a turn-off's decay is not house", () => {
+  it("spends the freed headroom on the hot room instead of fencing it behind the ghost", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-01T14:20:00Z"));
+      const mock = createGradePool({
+        genAmpModels: {
+          abdullah: { baseAmps: 2.3, stepAmps: 2.5 },
+          najat: { baseAmps: 2.3, stepAmps: 2.0 },
+          abdu: { baseAmps: 4.3, stepAmps: 2.5 },
+        },
+      });
+      const sent: Array<{ deviceId: string; cmd: string; value: number }> = [];
+      const deps: LevelingDeps = {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({
+            sendControl: async (deviceId: string, cmd: string, value: number) => {
+              sent.push({ deviceId, cmd, value });
+            },
+            executeAcAction: async () => undefined,
+          }) as never,
+      };
+      const controller = new LevelingControllerV2(mock.pool, deps);
+      await controller.ensureLoaded();
+
+      const abdullah = { id: "abdullah", name: "abdullah", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+      const ctx = [
+        { device: abdullah as never, managed: true, needTier: "mild" as const, needDelta: 0.6, slotGenCap: null },
+        { device: acDevice("najat", true, 1), managed: true, needTier: "mild" as const, needDelta: 0.5, slotGenCap: null },
+        { device: acDevice("abdu", true, 1), managed: true, needTier: "full" as const, needDelta: 2.4, slotGenCap: null },
+      ];
+      let flip = 1;
+      const run = async (genAmps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(5_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+
+      // 6 min settled at 13.2A with all three at L1 (modeled 8.9 → honest house
+      // ≈ 4.3A). Nothing fits: any step puts the meter past 14.7.
+      await run(13.2, 72);
+      expect(sent.filter((c) => c.cmd === "set_generator_mode")).toHaveLength(0);
+
+      // The user turns Abdullah's room off. The first tick still smooths 13.2A
+      // against a modeled side of 6.6 — the contaminated moment.
+      abdullah.power = false;
+      await run(13.2, 1);
+      sent.length = 0;
+
+      // The meter settles at 10.7A: 2.5A of true headroom for Abdu's step, and
+      // the envelope sees an honest house (carried 4.3 → measured 4.1) — not
+      // the departed room's 6.6A ghost.
+      await run(10.7, 48);
+      expect(sent).toContainEqual({ deviceId: "abdu", cmd: "set_generator_mode", value: 2 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
