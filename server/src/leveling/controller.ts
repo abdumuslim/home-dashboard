@@ -934,6 +934,18 @@ export class LevelingControllerV2 {
       this.deviceNames.set(device.id, device.name);
       this.deviceMaxLevel.set(device.id, device.maxGeneratorLevel || 3);
       const prev = this.prevPowerStates.get(device.id);
+      // FIRST sight of this device since boot. A shed record is persisted so it
+      // survives a restart (a shed room must still be restored after a deploy)
+      // — but if the room is already ON there is no off→on flip left to clear
+      // it, and the flip below is the only path that does. The record then
+      // sticks forever: `shed` excludes the room from `onManaged`, so the
+      // leveler stops levelling it AND stops counting its draw, which lands in
+      // the house residual instead. Live 2026-08-02: Abdullah sat on=true
+      // shed=true after the 17:40 shed and a redeploy, drawing 2.3A the
+      // controller could not see, inflating "house" to 5.2A.
+      if (prev === undefined && device.power && managed && this.shedIds.has(device.id)) {
+        await this.clearShed(device.id, "already on at boot");
+      }
       if (prev !== undefined && prev !== device.power) {
         if (device.power) {
           this.rearmRamp([device.id]);
