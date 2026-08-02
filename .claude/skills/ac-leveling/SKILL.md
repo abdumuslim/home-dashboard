@@ -269,6 +269,19 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     ladder (and clear invariant 22's probe anchor) before the 300 s blame window
     closes.
 
+30. **A funding donor may not take its donation back.** The demote that funds a
+    peer's raise ships ALONE by design (invariant 9) — but a compressor takes
+    seconds to minutes to throttle down, and for that whole window the RECEIVER
+    still reads "not enough headroom" while the DONOR's own step is cheaper and
+    higher in priority. So the donor is first in line for the amps it just gave.
+    Live 2026-08-02 17:06–17:33: Najat cycled L1↔L2 every ~45 s, six times,
+    while Abdu — the room the demote was paying for — never climbed at all.
+    `FUNDING_COOLDOWN_MS` (120 s) bars the donor from re-taking that level:
+    long enough for the cut to land plus a calm window, short enough that a
+    receiver who still cannot afford it simply hands the level back.
+    ⚠️ Stamp only donors whose demote was actually **sent** (the filtered
+    command list), not the plan's wish list.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's

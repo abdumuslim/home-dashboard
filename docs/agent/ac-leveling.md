@@ -52,6 +52,24 @@ churn**.
 measured house peak — previously hard-null); over-branch journal decisions carry
 `smoothed X vs Y, flicker ±Z`.
 
+#### Follow-up the same evening: the funding-donor cycle (invariant 30)
+
+Caught on the live journal minutes after the deploy — and visible in the log from 17:06, *before*
+the rebuild, so it predates the work above. Najat was demoted L2→L1 to fund Abdu's raise, re-took
+the level ~40 s later, was demoted again, and cycled **L1↔L2 every ~45 s, six times**, while Abdu
+never climbed at all.
+
+The funding demote ships alone on purpose (invariant 9: never spend a saving that has not landed).
+But the receiver stays blocked — `needs 2.8A, 2.2A available` — for as long as the donor's
+compressor takes to throttle down, and in that window the donor's own step costs less (2.0 A), fits
+the same 2.2 A, and outranks the receiver in the priority list. The donor is simply first in line
+for the amps it just donated. Nobody gains a level; one compressor churns.
+
+`FUNDING_COOLDOWN_MS` (120 s) now bars a donor from re-taking the level it funded — the cut's
+landing time plus a calm window. If the receiver still cannot afford it after that, the donor gets
+its level back rather than being stranded. `RaisePlan.fundingDonors` reports who was demoted;
+the shell stamps only those whose demote was actually **sent**.
+
 **Two invariants added 2026-07-26 after three gen trips in 25 minutes — read the incident section
 before touching admission:** (a) the meter is NOT a valid budget anchor while a compressor is
 ramping, so every spender (raise, restore, fan restore) is charged the committed-but-unmetered draw
