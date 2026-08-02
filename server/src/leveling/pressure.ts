@@ -46,6 +46,12 @@ export function assessPressure(
   // readings against, so severity and the leaky bucket stay in agreement.
   const limit = effectiveLimit(config, view.source, view.derateAmps);
 
+  // Note: banked readings are cleared by sensing.ts the moment the meter shows
+  // genuine headroom AND the raw reading is supply noise — so an episode the
+  // meter has moved past cannot reach here at all. That gate deliberately lives
+  // there and not here: only the reducer's own view knows whether a LOW smoothed
+  // value means "the excursion is over" or "the median has not caught up with a
+  // rise yet", and `rawIsSupplyNoise` is what separates them.
   if (view.overLimitBudget <= 0 && view.overLimitReadings.length > 0) {
     // Demand side of invariant 5: readings taken while a cut we already
     // commanded is still landing describe a house that no longer exists. Only

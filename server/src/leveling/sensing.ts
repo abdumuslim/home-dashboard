@@ -488,6 +488,18 @@ export function ingestReading(
     // the freshly-latched collapse the old code guarded separately.)
     calmSince = null;
   } else if (smoothed <= limit - config.marginAmps && rawIsSupplyNoise) {
+    // The mean now has real headroom under it, so whatever the banked readings
+    // recorded is over. Drop them IMMEDIATELY — they are what sizes the deficit
+    // and sets the severity tier, and a stale set describes a house that no
+    // longer exists (live 2026-08-02: a room shed for a 0.5A "deficit" derived
+    // from readings 100s old, at a smoothed 6.5A against a 15A limit).
+    //
+    // The BUCKET deliberately still waits out CALM_REFILL_MS: that is the
+    // balanced-oscillation guard (a house cycling across the limit must not
+    // refill as fast as it drains). Clearing the readings without refilling
+    // leaves the controller armed — the next genuine over-limit reading acts at
+    // once, sized from evidence about the present.
+    overLimitReadings = [];
     calmSince = calmSince ?? now;
     if (now - calmSince >= CALM_REFILL_MS) {
       // Sustained calm = the over-limit episode is over. Episode-based refill,

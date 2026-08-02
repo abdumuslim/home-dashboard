@@ -161,6 +161,33 @@ describe("flicker-aware bucket & calm (the 2026-08-02 ratchet)", () => {
     expect(jump.state.calmSince).toBeNull();
   });
 
+  it("banked over-limit readings are dropped once the meter shows real headroom", () => {
+    // Live 2026-08-02 17:40:22. A turn-on's ramp spiked the meter to ~16.3A;
+    // its cuts landed and the meter fell to 6.455A. The readings from that
+    // excursion were still banked 100s later, the bucket was still empty, and
+    // the controller shed the TOP-priority room for a 0.5A "deficit" derived
+    // entirely from them — at a smoothed 6.5A against a 15A limit. Severity
+    // came from them too, which is what bypassed the inrush blanking and the
+    // escalation settle (both mild-only, deliberately).
+    const spiked = feedGen([16.3, 16.5, 16.4, 16.6, 16.3]);
+    expect(spiked.state.overLimitReadings.length).toBeGreaterThan(0);
+    expect(spiked.state.overLimitBudget).toBe(0);
+    const fell = feedGen([6.4, 6.5, 6.45], { state: spiked.state, startAt: spiked.now + 5_000 });
+    expect(fell.state.overLimitReadings).toHaveLength(0);
+    // …and the bucket still waits out the calm refill: clearing the evidence is
+    // not the same as declaring the episode closed, so a fresh breach still
+    // acts on the very next reading.
+    expect(fell.state.overLimitBudget).toBe(0);
+  });
+
+  it("a rising load KEEPS its readings while the median lags behind", () => {
+    // The case the clear must not break: during a genuine rise the raw readings
+    // are over the limit while the 4-wide median is still catching up. Those
+    // readings are evidence about the present and must survive.
+    const rising = feedGen([12, 12, 12, 12, 16.5, 16.6]);
+    expect(rising.state.overLimitReadings.length).toBeGreaterThan(0);
+  });
+
   it("a severe breach still drains the severe rung on the FIRST reading", () => {
     // The 2026-07-31 latency guard: flicker tolerance must not cost a real
     // overload its reaction time.
