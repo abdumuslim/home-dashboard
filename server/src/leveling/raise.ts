@@ -18,6 +18,7 @@ import { ceilCapOf, ceilOf, floorOf } from "./needs.js";
 import {
   attemptedWithin,
   canAttempt,
+  probeRearmed,
   RESTORE_CONFIRM_WAIT_MS,
   restoreFailures,
   type PacingState,
@@ -196,8 +197,9 @@ export interface RaiseInput {
 export interface RaisePlan {
   commands: Command[];
   decisions: Decision[];
-  /** Attempts to record in pacing (blame windows) — deviceId × kind. */
-  attempts: Array<{ deviceId: string; kind: "raise" | "restore" }>;
+  /** Attempts to record in pacing (blame windows) — deviceId × kind. Restore
+   *  attempts carry the committed meter admission saw (probe re-arm anchor). */
+  attempts: Array<{ deviceId: string; kind: "raise" | "restore"; meterAmps?: number }>;
   /** True when the batch turns an AC on (longer settle/ramp downstream). */
   isTurnOn: boolean;
   /**
@@ -279,7 +281,7 @@ export function invariantCorrections(
 export function planRaise(input: RaiseInput): RaisePlan {
   const { acs, config, book, source, now, pacing } = input;
   const decisions: Decision[] = [];
-  const attempts: Array<{ deviceId: string; kind: "raise" | "restore" }> = [];
+  const attempts: Array<{ deviceId: string; kind: "raise" | "restore"; meterAmps?: number }> = [];
   const commands: Command[] = [];
   /** Model-priced down-moves this plan emits (funding demotes, peer floor-downs). */
   let cutAmps = 0;
@@ -396,12 +398,22 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // further probes) and re-learns the on-cost from the shed's off-drop; a
     // probe that sticks re-grades the learned cost cheap. Both wrong beliefs
     // self-correct from the meter instead of stranding or storming.
+    //
+    // EVIDENCE RE-ARM (2026-08-02): a bounce is evidence about the house the
+    // probe bounced IN, not the house forever. Najat's probe failed at a
+    // committed 11.9A; the meter then sat at 10.8–11.2A for 17 minutes — room
+    // for her real ~3.5A cost — while the once-per-session rule left the
+    // learned 4.1A price to refuse every restore until the user acted by hand.
+    // A committed meter ≥ PROBE_REARM_DROP_AMPS below the failed attempt's own
+    // committed amps re-arms one probe (see probeRearmed — re-anchoring keeps
+    // retries bounded).
     if (
       !fits.plain &&
       !fits.atFloors &&
       gentleRestore &&
       plainCost.amps > probeCost.amps + 1e-9 &&
-      restoreFailures(pacing, candidate.deviceId) === 0
+      (restoreFailures(pacing, candidate.deviceId) === 0 ||
+        probeRearmed(pacing, candidate.deviceId, committedAmps))
     ) {
       const probeFits = fitsWith(probeCost.amps);
       if (probeFits.plain || probeFits.atFloors) {
@@ -494,7 +506,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       : undefined;
     if (fitsPlain) {
       commands.push(restoreCmd());
-      attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
+      attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: committedAmps });
       decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}`, detail: probeDetail });
       return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps };
     }
@@ -506,7 +518,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       }
     }
     commands.push(restoreCmd());
-    attempts.push({ deviceId: candidate.deviceId, kind: "restore" });
+    attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: committedAmps });
     decisions.push({
       at: now,
       deviceId: candidate.deviceId,

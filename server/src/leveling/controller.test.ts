@@ -543,6 +543,77 @@ describe("LevelingControllerV2 — a lone shed's off-drop grades the on-cost", (
   });
 });
 
+describe("LevelingControllerV2 — off-drop grade voided while a peer's drop still settles", () => {
+  it("the second of two back-to-back sheds does not learn (its drop absorbs the first's wind-down)", async () => {
+    // 2026-08-02 11:20: Abdu's L2→L1 cut and Najat's shed landed 5s apart.
+    // Najat's off-drop window then measured −4.03A against a −2.3A truth — the
+    // remainder was the peer's fall still landing through the median — and
+    // booked it into on@L1. That inflated price later refused restores the
+    // meter had real room for (17 min stranded, user rescue). A single-command
+    // window born while an earlier load-DROP is still settling must journal
+    // but never learn.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-02T08:20:00Z"));
+      const mock = createGradePool({
+        ampModels: { a: { baseAmps: 2, stepAmps: 2 }, b: { baseAmps: 2, stepAmps: 2 } },
+      });
+      const a = { id: "a", name: "a", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+      const b = { id: "b", name: "b", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+      const deps: LevelingDeps = {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({
+            sendControl: async () => undefined,
+            executeAcAction: async (id: string, action: { power?: number }) => {
+              if (action.power === 0) (id === "a" ? a : b).power = false;
+            },
+          }) as never,
+      };
+      const controller = new LevelingControllerV2(mock.pool, deps);
+      await controller.ensureLoaded();
+      // needDelta under the near-target band → no raises interfere.
+      const ctx = [
+        { device: a as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null },
+      ];
+      let flip = 1;
+      const run = async (genAmps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(5_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+
+      await run(10, 8); // settle; recon confirms both at L1
+      // Mild over: required ≈ 0.5A < one shed's 2A savings, so the reducer
+      // sheds ONE room (b — equal need, lower priority), not both in a batch.
+      await run(15.4, 6);
+      expect([a.power, b.power].filter((p) => !p)).toHaveLength(1);
+      // The commanded fall lands (credit absorbed, bucket refills on calm),
+      // then a fresh over-episode sheds the second room ~50s after the first —
+      // INSIDE the first drop's settle window, so its off-drop sample cannot
+      // be attributed to this batch alone.
+      await run(13.4, 7);
+      await run(16.6, 4);
+      expect(a.power).toBe(false);
+      expect(b.power).toBe(false);
+      // Honest post-drop meter; run the grade windows out.
+      await run(14.6, 20);
+
+      // The FIRST shed was isolated — its honest off-drop must still learn
+      // (the fix must not suppress clean samples). The SECOND was born inside
+      // the first drop's settle window: journaled, never learned.
+      expect(mock.costs.some((c) => c.deviceId === "b" && c.transition === "on@L1")).toBe(true);
+      expect(mock.costs.filter((c) => c.deviceId === "a" && c.transition.startsWith("on@"))).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Ramp-absorption ratchet (2026-07-27). `rampDebitAmps` credits a ramping AC
 // with what the meter has risen since its compressor started — a whole-house

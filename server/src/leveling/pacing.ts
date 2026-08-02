@@ -32,6 +32,15 @@ export interface AcPacing {
   cooldownUntil: number;
   /** Last attempt of this kind (blame window for bounce attribution). */
   lastAttemptAt: number;
+  /**
+   * Committed meter (smoothed + ramp debit) when the last restore attempt
+   * shipped — the evidence anchor for re-arming a probe after a bounce.
+   * 2026-08-02: Najat's probe bounced at a committed 11.9A; from 11:31 the
+   * meter sat at 10.8–11.2A but failures > 0 kept the probe off and the
+   * learned 4.1A price refused every restore until the user turned her on by
+   * hand 17 minutes later. Restore attempts only; cleared on success.
+   */
+  attemptMeterAmps?: number;
 }
 
 export interface PacingState {
@@ -68,9 +77,22 @@ export function cooldownRemainingMs(state: PacingState, deviceId: string, kind: 
   return Math.max(0, entry(state, deviceId, kind).cooldownUntil - now);
 }
 
-/** Record that an attempt shipped (opens the blame window). */
-export function noteAttempt(state: PacingState, deviceId: string, kind: AttemptKind, now: number): PacingState {
-  return withEntry(state, deviceId, kind, { ...entry(state, deviceId, kind), lastAttemptAt: now });
+/** Record that an attempt shipped (opens the blame window). `meterAmps` is the
+ *  committed meter the admission saw — restore attempts pass it (the probe
+ *  re-arm anchor), raises don't. */
+export function noteAttempt(
+  state: PacingState,
+  deviceId: string,
+  kind: AttemptKind,
+  now: number,
+  meterAmps?: number,
+): PacingState {
+  const prev = entry(state, deviceId, kind);
+  return withEntry(state, deviceId, kind, {
+    ...prev,
+    lastAttemptAt: now,
+    attemptMeterAmps: meterAmps ?? prev.attemptMeterAmps,
+  });
 }
 
 /**
@@ -81,17 +103,18 @@ export function noteFailure(state: PacingState, deviceId: string, kind: AttemptK
   const prev = entry(state, deviceId, kind);
   const failures = prev.failures + 1;
   return withEntry(state, deviceId, kind, {
+    ...prev, // keeps attemptMeterAmps — the failed attempt's anchor is what probeRearmed reads
     failures,
     cooldownUntil: now + backoffDelayMs(failures),
-    lastAttemptAt: prev.lastAttemptAt,
   });
 }
 
-/** The attempt survived (graded stable) — reset the ladder. */
+/** The attempt survived (graded stable) — reset the ladder (and the probe's
+ *  evidence anchor: a success means the next episode starts fresh). */
 export function noteSuccess(state: PacingState, deviceId: string, kind: AttemptKind): PacingState {
   const prev = entry(state, deviceId, kind);
   if (prev.failures === 0 && prev.cooldownUntil === 0) return state;
-  return withEntry(state, deviceId, kind, { ...prev, failures: 0, cooldownUntil: 0 });
+  return withEntry(state, deviceId, kind, { ...prev, failures: 0, cooldownUntil: 0, attemptMeterAmps: undefined });
 }
 
 /** Was `kind` attempted on this AC within the last `withinMs`? */
@@ -130,6 +153,26 @@ export function reshedPenalized(state: PacingState, deviceId: string, now: numbe
  */
 export function restoreFailures(state: PacingState, deviceId: string): number {
   return entry(state, deviceId, "restore").failures;
+}
+
+/**
+ * A committed meter this far below the failed attempt's own committed amps is
+ * evidence the house materially changed — not noise (smoothed wobble is ±0.3A).
+ */
+export const PROBE_REARM_DROP_AMPS = 1.0;
+
+/**
+ * Evidence re-arm for the restore probe (2026-08-02 strand): after a bounce
+ * the probe is off (failures > 0) and the plain learned price governs — but
+ * when the meter now sits ≥ PROBE_REARM_DROP_AMPS below the committed amps the
+ * failed attempt was admitted at, the physics that bounced it no longer hold.
+ * One more probe is justified. The new attempt re-anchors LOWER, so a bounce
+ * loop needs the meter to keep falling a full amp per retry — bounded, and
+ * each retry still rides the backoff ladder.
+ */
+export function probeRearmed(state: PacingState, deviceId: string, committedAmps: number): boolean {
+  const anchor = entry(state, deviceId, "restore").attemptMeterAmps;
+  return anchor != null && committedAmps <= anchor - PROBE_REARM_DROP_AMPS;
 }
 
 /** Source change: per-source physics — the ladder resets wholesale. */

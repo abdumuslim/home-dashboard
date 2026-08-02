@@ -134,6 +134,46 @@ describe("restore outranks raises", () => {
     expect(fits.probeRestoreIds).toEqual([]);
   });
 
+  it("a bounced probe re-arms once the meter sits a full amp below the failed attempt (2026-08-02 strand)", () => {
+    // Live 11:27: Najat's probe was admitted at a committed 11.9A and bounced.
+    // From 11:31 the meter sat at 10.8–11.2A — room for her REAL ~3.5A cost —
+    // but failures > 0 kept the probe off and the learned 4.1A refused every
+    // restore until the user turned her on by hand 17 minutes later. A meter
+    // ≥ PROBE_REARM_DROP_AMPS below the failed attempt's own committed amps is
+    // evidence the house materially changed: re-arm ONE probe. The new attempt
+    // re-anchors lower, so a bounce loop needs the meter to keep falling.
+    const book = updateCost({}, "b", "gen", "on@L1", 4.5, T);
+    const bounced = noteFailure(
+      noteAttempt(initialPacingState("gen"), "b", "restore", T - 95_000, 11.9),
+      "b",
+      "restore",
+      T - 31_000,
+    );
+    const shed = ac("b", { on: false, shed: true, needDelta: 4 });
+    // 11.2A: plain 15.7 > 14.9 blocks, and 11.2 > 11.9 − 1.0 — no re-arm.
+    const still = raise([ac("a"), shed], { smoothedAmps: 11.2, headroomAmps: 3.5, book, pacing: bounced });
+    expect(still.commands.every((c) => c.kind !== "power_on")).toBe(true);
+    expect(still.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "b", action: "restore", blockedBy: "no headroom" }),
+    );
+    // 10.8A ≤ 10.9: re-armed — the probe ships at the steady 2A price.
+    const rearmed = raise([ac("a"), shed], { smoothedAmps: 10.8, headroomAmps: 3.9, book, pacing: bounced });
+    expect(rearmed.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 });
+    expect(rearmed.probeRestoreIds).toEqual(["b"]);
+  });
+
+  it("a bounced attempt with no meter anchor never re-arms (pre-anchor pacing state)", () => {
+    const book = updateCost({}, "b", "gen", "on@L1", 4.5, T);
+    const bounced = noteFailure(initialPacingState("gen"), "b", "restore", T - 31_000);
+    const p = raise([ac("a"), ac("b", { on: false, shed: true, needDelta: 4 })], {
+      smoothedAmps: 10.8,
+      headroomAmps: 3.9,
+      book,
+      pacing: bounced,
+    });
+    expect(p.commands.every((c) => c.kind !== "power_on")).toBe(true);
+  });
+
   it("an in-flight restore (sent, shadow unconfirmed) reserves its amps and is not re-sent", () => {
     // Shed clears on shadow CONFIRM since 2026-07-27 (clearing at send let a
     // 5.8s shadow lag mint a bogus manual-off lock), so a just-sent restore is

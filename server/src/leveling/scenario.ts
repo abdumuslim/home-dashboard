@@ -701,7 +701,7 @@ export class Scenario {
       }
     }
     for (const attempt of out.attempts) {
-      this.pacing = noteAttempt(this.pacing, attempt.deviceId, attempt.kind, this.now);
+      this.pacing = noteAttempt(this.pacing, attempt.deviceId, attempt.kind, this.now, attempt.meterAmps);
       this.attempts.push({ ...attempt, at: this.now });
     }
     // Grade quiet attempts as successes once their blame window passes.

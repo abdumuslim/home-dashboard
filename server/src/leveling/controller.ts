@@ -102,6 +102,22 @@ const PUSH_THROTTLE_MS = 5 * 60_000;
 /** Grade a batch only when this many fresh readings arrived after compareAfter. */
 const GRADE_MIN_SAMPLES = 4;
 
+/**
+ * How long an earlier batch keeps the meter "out of step" for cost learning.
+ * A compressor ramps IN over AC_RAMP_MS; a cut/shed/turn-off winds DOWN and
+ * drains through the smoothing median for about two minutes (the same physics
+ * as house-load's modeled-drop cooldown). A single-command grade window BORN
+ * while an earlier batch is still settling in ITS OWN direction cannot
+ * attribute its extreme to itself: 2026-08-02 11:20, Najat's shed 5s after
+ * Abdu's level cut graded −4.03A (truth ≈ −2.3A) into on@L1, and that
+ * inflated price then refused every restore the meter had real room for
+ * (17 min stranded, user rescue). Such windows journal but never learn — the
+ * mirror of the existing `contaminated` sweep, which only covers a LATER
+ * batch moving into an open window.
+ */
+const LEARN_SETTLE_UP_MS = AC_RAMP_MS;
+const LEARN_SETTLE_DOWN_MS = 120_000;
+
 /** Hard cap on outstanding grade windows (runaway guard — normally 1–3). */
 const MAX_PENDING_GRADES = 20;
 /** Drop a grade window this long past its compare point (never graded, never leaks). */
@@ -288,6 +304,14 @@ export class LevelingControllerV2 {
    * `noteSuccess`, which pinned the backoff ladder at its 15-min rung.
    */
   private pendingGrades: PendingGrade[] = [];
+  /**
+   * When the last executed batch ADDED / REMOVED metered load (fan steps
+   * excluded — a ~0.1A trim must not suppress learning). Read at grade-arming
+   * time to void a single-command window born while an earlier batch is still
+   * settling its way (LEARN_SETTLE_UP_MS / LEARN_SETTLE_DOWN_MS).
+   */
+  private lastLoadAddAt = 0;
+  private lastLoadDropAt = 0;
   /** Throttle for durable blocked-decision rows, keyed `deviceId|blockedBy`. */
   private lastBlockedJournalAt = new Map<string, number>();
   private lastPushAt = 0;
@@ -1436,7 +1460,9 @@ export class LevelingControllerV2 {
         }
       }
     }
-    for (const attempt of out.attempts) this.pacing = noteAttempt(this.pacing, attempt.deviceId, attempt.kind, now);
+    for (const attempt of out.attempts) {
+      this.pacing = noteAttempt(this.pacing, attempt.deviceId, attempt.kind, now, attempt.meterAmps);
+    }
 
     // Arm outcome grading; single-actuator batches feed the cost model.
     // Single-actuator meter batches feed the cost model. Fan-only batches are
@@ -1474,6 +1500,19 @@ export class LevelingControllerV2 {
         ? g
         : { ...g, contaminated: true },
     );
+    // BORN contaminated: an EARLIER batch still settling in this window's own
+    // direction is already moving the meter, so the extreme this window will
+    // ratchet is not attributable to this batch alone (see LEARN_SETTLE_*).
+    // Timestamps are read BEFORE this batch stamps its own — a lone shed with
+    // a quiet meter behind it still learns.
+    const meterMoved = batchLoadDirections(meterCmds, (id) => this.recon[id]?.confirmedLevel ?? null);
+    const bornContaminated =
+      single != null &&
+      (single.negate === true
+        ? now < this.lastLoadDropAt + LEARN_SETTLE_DOWN_MS
+        : now < this.lastLoadAddAt + LEARN_SETTLE_UP_MS);
+    if (meterMoved.adds) this.lastLoadAddAt = now;
+    if (meterMoved.removes) this.lastLoadDropAt = now;
     const compareAfter = out.compareAfter || now + GRADE_FAN_MS;
     this.pendingGrades.push({
       journalId,
@@ -1488,7 +1527,7 @@ export class LevelingControllerV2 {
       source: view.source,
       single,
       attempts: out.attempts,
-      contaminated: false,
+      contaminated: bornContaminated,
       direction: single?.negate === true ? "down" : "up",
     });
     if (this.pendingGrades.length > MAX_PENDING_GRADES) {

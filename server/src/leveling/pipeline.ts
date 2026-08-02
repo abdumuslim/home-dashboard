@@ -58,8 +58,9 @@ export interface PlanOutput extends Plan {
   requiredAmps: number | null;
   /** Updated fan-hold records (cuts recorded, restore steps advanced). */
   fanHolds: FanHolds;
-  /** Raise/restore attempts to stamp into pacing (blame windows). */
-  attempts: Array<{ deviceId: string; kind: "raise" | "restore" }>;
+  /** Raise/restore attempts to stamp into pacing (blame windows). Restore
+   *  attempts carry the committed meter admission saw (probe re-arm anchor). */
+  attempts: Array<{ deviceId: string; kind: "raise" | "restore"; meterAmps?: number }>;
   /** True when this plan ships only fan commands (short settle window). */
   fanOnly: boolean;
 }
