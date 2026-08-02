@@ -183,6 +183,26 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     trade on every dip and bounced the level donor↔receiver at a 35 s period. Invariant 9's split by
     blocker is unchanged; satisfied harvest keeps its old unconditional behavior.
 
+**Added 2026-08-02 after Najat sat shed 17 min with room on the meter (user rescue):**
+22. **A bounce is evidence about the house it bounced IN, not the house forever.** The probe was
+    once-per-source-session; after it bounced at a committed 11.9 A, the meter spent 17 min at
+    10.8–11.2 A — under what even the REAL cost needed — while the plain learned price (4.12 A,
+    itself stale-high) refused every restore by 0.2–0.4 A. Restore attempts now record the committed
+    meter admission saw (`AcPacing.attemptMeterAmps`); `probeRearmed()` re-arms one probe when the
+    committed meter sits ≥ `PROBE_REARM_DROP_AMPS` (1.0) below that anchor. Each retry re-anchors
+    LOWER (bounded by physics) and still rides the backoff ladder. `noteFailure` must keep the
+    anchor — the failure is what makes it matter; `noteSuccess` clears it.
+23. **A cost sample must be attributable to its own batch — at BIRTH, not just later.** The
+    `contaminated` sweep only caught a LATER batch moving into an open window; the 11:20:41 shed was
+    born 5 s after a peer's cut and graded the peer's still-landing fall into `on@L1` (−4.03 vs
+    −2.3 true) — the inflated price is what invariant 22 then hit. The shell stamps
+    `lastLoadAddAt`/`lastLoadDropAt` per executed batch (fan steps excluded) and a single-command
+    window born inside `LEARN_SETTLE_DOWN_MS` (120 s) of a drop — or `LEARN_SETTLE_UP_MS`
+    (= `AC_RAMP_MS`) of an add — is born contaminated: journals, resolves attempts, never learns.
+    Consequence, deliberate: in a batch train only isolated events learn (the last window of a train
+    used to absorb every predecessor's tail — Abdu's gen `level:1>2` at 3.97 A over 50 samples).
+    Same "residual while model and meter are out of step" class as invariants 5b and 20.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's

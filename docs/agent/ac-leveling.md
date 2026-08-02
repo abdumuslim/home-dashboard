@@ -975,6 +975,59 @@ phantom house" + "the 2026-08-01 level rebalance" (incl. the near-equal no-trade
 `raise.test.ts` "need rebalance" (9). **884 server tests green, `tsc` clean.** Every fix verified
 failing-first; the house unit test reproduces the literal live 7.1A.
 
+### 2026-08-02 — the 17-minute strand: probe re-arm on evidence + off-drop grade hygiene
+
+**Incident (journal, Baghdad time).** Heavy-house gen morning — the non-AC load alone ran ~8A of the
+15A generator (with Najat L1 + Abdu L1 modeled at 6.6A the meter read 14.66A). At 11:20:36 a severe
+episode (17.4A peak) cut Abdu L2→L1 and shed Najat 5s later. The one allowed probe restore shipped at
+11:27:19 (`probe at 2.3A, learned 5.2A unproven`, committed 11.9A) and bounced at 11:28:02 (15.29A —
+"its own turn-on caused this"). From then on `restoreFailures = 1` disabled further probes for the
+source-session, and every restore was priced at the plain learned `on@L1` = **4.12A** against a meter
+floating 10.8–11.2A — refused by 0.2–0.4A each attempt (`no headroom: floors 15.1–15.3A vs 14.9A`)
+for 17 minutes until the user turned her on by hand at ~11:44. The manual turn-on measured **+3.5A**
+(11.1 → 14.66A): the learned price was ~0.6A above reality, in a regime where that was the whole
+margin.
+
+**Root causes, two, both fixed test-first:**
+
+**1. The probe was once-per-session, but a bounce is evidence about the house it bounced IN.**
+At 11:31 the committed meter sat a full amp below the failed attempt's own admission point — the
+physics that bounced the probe no longer held, and even the honest cost fit — but nothing could ever
+re-try cheap. Fix (`pacing.ts` + `raise.ts`): restore attempts now record the committed meter
+admission saw (`AcPacing.attemptMeterAmps`, kept by `noteFailure`, cleared by `noteSuccess`);
+`probeRearmed()` re-arms the probe when the current committed meter is ≥ `PROBE_REARM_DROP_AMPS`
+(1.0) below that anchor. Each re-armed probe re-anchors LOWER, so a bounce loop needs the meter to
+keep falling an amp per retry — bounded by physics — and every retry still rides the backoff ladder.
+Would have fired at 11:31:17 live (anchor 11.865, committed 10.835).
+
+**2. The off-drop grade that inflated `on@L1` was sampled while a peer's cut was still landing.**
+The 11:20:41 shed graded **−4.03A** (expected −2.3) into Najat's `on@L1`: Abdu's cut 5s earlier was
+still winding down through the median (his own grade caught −1.33 of an expected −2.5 — the missing
+amps landed in her window). Same "residual while model and meter are out of step" class as
+invariants 5b/20, in the grading path. The existing `contaminated` sweep only covered a LATER batch
+moving into an open window — the mirror case was open. Fix (`controller.ts`): the shell stamps
+`lastLoadAddAt`/`lastLoadDropAt` from each executed batch's meter commands (fan steps excluded — a
+~0.1A trim must not suppress learning), and a single-command window is **born contaminated** when an
+earlier batch is still settling in its own direction: `LEARN_SETTLE_DOWN_MS` (120s, the wind-down +
+median, same physics as house-load's modeled-drop cooldown) for negate/off-drop windows,
+`LEARN_SETTLE_UP_MS` (= `AC_RAMP_MS`) for raise/turn-on windows. Born-contaminated windows journal
+and resolve attempts normally — they just never learn. Side effect, deliberate: in a raise TRAIN only
+genuinely isolated batches learn now (previously the LAST window of a train learned all its
+predecessors' tails — how Abdu's gen `level:1>2` climbed to 3.97A over 50 samples).
+
+**Interplay:** fewer (but honest) cost samples means stale-high learned prices linger longer — which
+is exactly what the evidence re-arm now covers from the other side.
+
+**Not changed, deliberately:** the shed itself was correct (real 17.4A over-limit), plain-priced
+admission after a bounce stays (invariant 3), and the ~8A house was real — the refusals' arithmetic
+was right, only the price was stale. `scenario.ts` needed no mirror beyond passing `attempt.meterAmps`
+through its `noteAttempt` call (it does not grade costs).
+
+**Tests:** `raise.test.ts` "a bounced probe re-arms once the meter sits a full amp below the failed
+attempt" + "a bounced attempt with no meter anchor never re-arms"; `controller.test.ts` "off-drop
+grade voided while a peer's drop still settles" (asserts the isolated first shed STILL learns — the
+over-suppression guard). **887 server tests green, `tsc` clean**, both fixes verified failing-first.
+
 ---
 
 ---
