@@ -145,6 +145,8 @@ const STEP_MS = 5_000;
 const GRID_START_MS = 240_000;
 /** Mirrors the controller shell's FAN_DEBIT_MS. */
 const FAN_DEBIT_MS = 60_000;
+/** Mirrors the controller shell's FUNDING_COOLDOWN_MS. */
+const FUNDING_COOLDOWN_MS = 120_000;
 
 export class Scenario {
   now = 1_000_000_000;
@@ -184,6 +186,8 @@ export class Scenario {
   private freshlyOn: string[] = [];
   /** Shell parity: rooms on whose shadow has not confirmed (house sampling off). */
   private pendingOn = new Map<string, number>();
+  /** Shell parity: rooms that funded a peer's raise → when they were demoted. */
+  private fundingDemotedAt = new Map<string, number>();
   private attempts: Array<{ deviceId: string; kind: AttemptKind; at: number }> = [];
 
   constructor(
@@ -788,12 +792,25 @@ export class Scenario {
         const ac = this.acs.find((a) => a.setup.deviceId === deviceId);
         return ac == null ? [] : ac.sentLevels.map((level) => ({ level, sentAt: ac.lastLevelSentAt }));
       },
+      // Shell parity: a room that funded a peer's raise may not take the level
+      // back before the saving reaches the meter.
+      fundingCooldown: (deviceId) => {
+        const at = this.fundingDemotedAt.get(deviceId);
+        return at != null && this.now - at < FUNDING_COOLDOWN_MS;
+      },
     });
     this.freshlyOn = [];
     this.plans.push(out);
     this.fanHolds = out.fanHolds;
 
     if (out.commands.length > 0) {
+      // Shell parity: stamp the funding donors before executing, from the same
+      // command list that ships.
+      for (const deviceId of out.fundingDonors ?? []) {
+        if (out.commands.some((c) => c.deviceId === deviceId && c.kind === "set_level")) {
+          this.fundingDemotedAt.set(deviceId, this.now);
+        }
+      }
       this.execute(out);
       this.modeState = noteBatch(this.modeState, { fanOnly: out.fanOnly }, this.now);
       // Shell parity: a fan-only batch that SPENT (restore) still rewinds calm.

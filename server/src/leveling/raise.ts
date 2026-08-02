@@ -192,6 +192,17 @@ export interface RaiseInput {
   source: Exclude<PowerSource, "none">;
   now: number;
   pacing: PacingState;
+  /**
+   * Devices that recently gave up a level to fund a PEER's raise, and may not
+   * take it back yet. A funding demote deliberately ships alone — the raise it
+   * pays for waits for a meter that has really fallen — but a compressor takes
+   * seconds to minutes to throttle down, and until it does the donor's own step
+   * is the cheapest thing on the board. Live 2026-08-02: Najat was demoted to
+   * fund Abdu, re-took the level 40s later before the meter had moved, was
+   * demoted again, and cycled L1↔L2 indefinitely while Abdu never got his
+   * level. Defaults to "nothing cooling" when the caller does not supply it.
+   */
+  fundingCooldown?: (deviceId: string) => boolean;
 }
 
 export interface RaisePlan {
@@ -219,6 +230,12 @@ export interface RaisePlan {
    * restore peer floor-downs) — the collapse detector's credit.
    */
   cutAmps: number;
+  /**
+   * Devices demoted in THIS plan to fund a peer's raise. The shell stamps them
+   * so they cannot take the level straight back before the saving reaches the
+   * meter (see `RaiseInput.fundingCooldown`).
+   */
+  fundingDonors: string[];
 }
 
 /**
@@ -293,6 +310,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
   const commands: Command[] = [];
   /** Model-priced down-moves this plan emits (funding demotes, peer floor-downs). */
   let cutAmps = 0;
+  const fundingDonors: string[] = [];
 
   const onManaged = acs.filter((a) => a.on && a.managed && !a.shed);
 
@@ -516,7 +534,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       commands.push(restoreCmd());
       attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: committedAmps });
       decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}`, detail: probeDetail });
-      return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps };
+      return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors };
     }
     for (const a of onManaged) {
       const f = floorOf(a);
@@ -533,7 +551,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       action: `restore @L${floor} with peer floor-downs`,
       detail: probeDetail,
     });
-    return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps };
+    return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors };
   }
 
   // A feasible restore is reserved but gated (backoff/calm) — park the ENTIRE
@@ -550,7 +568,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       blockedBy: "restore reservation",
       detail: `${reservedAmps.toFixed(1)}A reserved`,
     });
-    return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps };
+    return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors };
   }
 
   // ---- Raise phase: one-step, meter-anchored, most-needy first ----
@@ -623,6 +641,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
     let cut = 0;
     for (const { ac: peer, target } of peers) {
       commands.push({ deviceId: peer.deviceId, kind: "set_level", level: target });
+      fundingDonors.push(peer.deviceId);
       cut += modelCutAmps(config, peer.deviceId, source, peer.currentLevel, target, peer.maxLevel);
     }
     return cut;
@@ -638,6 +657,16 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // The room climbs normally once the window closes and the meter agrees.
     if (source === "gen" && ac.startBaselineAmps != null) {
       decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "gen start floor" });
+      continue;
+    }
+    // This room just gave a level to a hotter peer. Until that saving reaches
+    // the meter the peer still cannot afford the raise it paid for — while this
+    // room's own step, being the cheapest thing on the board and higher in
+    // priority, would be admitted immediately. That is not a raise, it is the
+    // donor taking its donation back, and it cycles: live 2026-08-02 Najat went
+    // L1↔L2 every ~45s while Abdu, the room the demote was for, never climbed.
+    if (input.fundingCooldown?.(ac.deviceId) === true) {
+      decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "funding cooldown" });
       continue;
     }
     // Grid turn-on full start (user directive "on grid start all to full"):
@@ -848,5 +877,5 @@ export function planRaise(input: RaiseInput): RaisePlan {
     if (source === "gen") break;
   }
 
-  return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps };
+  return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors };
 }

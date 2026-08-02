@@ -110,6 +110,23 @@ const SHED_CLEAR_GRACE_MS = 15_000;
  */
 const FAN_RESEND_SPACING_MS = 30_000;
 const SHED_RESEND_SPACING_MS = 30_000;
+/**
+ * How long a room that gave up a level to fund a PEER's raise must wait before
+ * it may take that level back.
+ *
+ * A funding demote deliberately ships alone — the raise it pays for waits for a
+ * meter that has really fallen (invariant 9) — but a compressor takes seconds
+ * to minutes to throttle down. Until it does, the receiver still reads "not
+ * enough headroom" while the donor's own step, being cheaper AND higher in
+ * priority, is admitted immediately. Live 2026-08-02 17:06–17:32: Najat was
+ * demoted to fund Abdu, re-took the level ~40 s later, was demoted again, and
+ * cycled L1↔L2 roughly every 45 s while Abdu never climbed at all.
+ *
+ * Long enough for the cut to reach the meter plus one calm window; short enough
+ * that if the receiver still cannot afford it, the donor simply gets its level
+ * back rather than being stranded.
+ */
+const FUNDING_COOLDOWN_MS = 120_000;
 const PUSH_THROTTLE_MS = 5 * 60_000;
 /** Grade a batch only when this many fresh readings arrived after compareAfter. */
 const GRADE_MIN_SAMPLES = 4;
@@ -263,6 +280,8 @@ export class LevelingControllerV2 {
    * drawing amps the model does not know about, so house sampling stands down.
    */
   private pendingOn = new Map<string, number>();
+  /** Rooms that gave a level to fund a peer's raise → when (see FUNDING_COOLDOWN_MS). */
+  private fundingDemotedAt = new Map<string, number>();
   /** Last fan TRIM actually sent per device — the fan half of send dedupe. */
   private lastFanSent = new Map<string, { fan: number; at: number }>();
   /** Last shed actually sent per device — the power_off half of send dedupe. */
@@ -1178,6 +1197,10 @@ export class LevelingControllerV2 {
       projectedExtraAmps,
       nonAcAmps: houseLoadAmps(this.houseLoad, view.source, now, acs),
       inFlight: (deviceId) => unconfirmedSends(this.recon, deviceId, now),
+      fundingCooldown: (deviceId) => {
+        const at = this.fundingDemotedAt.get(deviceId);
+        return at != null && now - at < FUNDING_COOLDOWN_MS;
+      },
     });
     this.fanHolds = out.fanHolds;
 
@@ -1569,6 +1592,14 @@ export class LevelingControllerV2 {
     }
     for (const attempt of out.attempts) {
       this.pacing = noteAttempt(this.pacing, attempt.deviceId, attempt.kind, now, attempt.meterAmps);
+    }
+    // A room that just paid for a peer's raise may not take the level straight
+    // back — see FUNDING_COOLDOWN_MS. Stamped only for donors whose demote was
+    // actually SENT (the filtered `commands`, not the plan's wish list).
+    for (const deviceId of out.fundingDonors ?? []) {
+      if (commands.some((c) => c.deviceId === deviceId && c.kind === "set_level")) {
+        this.fundingDemotedAt.set(deviceId, now);
+      }
     }
 
     // Arm outcome grading; single-actuator batches feed the cost model.

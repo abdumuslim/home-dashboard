@@ -59,6 +59,8 @@ export interface PlanInput {
    * flight" when the caller does not supply it.
    */
   inFlight?: (deviceId: string) => ReadonlyArray<{ level: number; sentAt: number }>;
+  /** Devices that recently funded a peer's raise and may not re-take the level yet. */
+  fundingCooldown?: (deviceId: string) => boolean;
 }
 
 export interface PlanOutput extends Plan {
@@ -71,6 +73,8 @@ export interface PlanOutput extends Plan {
   attempts: Array<{ deviceId: string; kind: "raise" | "restore"; meterAmps?: number }>;
   /** True when this plan ships only fan commands (short settle window). */
   fanOnly: boolean;
+  /** Devices demoted to fund a peer's raise — the shell stamps their cooldown. */
+  fundingDonors?: string[];
 }
 
 /**
@@ -357,6 +361,7 @@ export function plan(input: PlanInput): PlanOutput {
       source,
       now,
       pacing,
+      fundingCooldown: input.fundingCooldown,
     });
     if (raisePlan.commands.length > 0 || corrections.commands.length > 0) {
       // A gentle restore (power_on carrying a pinned fan) records a fan hold so
@@ -388,6 +393,7 @@ export function plan(input: PlanInput): PlanOutput {
         fanHolds,
         attempts: raisePlan.attempts,
         fanOnly: false,
+        fundingDonors: raisePlan.fundingDonors,
       };
     }
     // Nothing to raise — walk any SATISFIED room parked above its need ceiling

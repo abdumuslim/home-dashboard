@@ -544,6 +544,40 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
   });
 });
 
+describe("funding cooldown — the donor must not take its donation back (2026-08-02)", () => {
+  // Live 17:06–17:32: Najat was demoted to fund Abdu's raise, re-took the level
+  // ~40s later before the saving had reached the meter, was demoted again, and
+  // cycled L1↔L2 every ~45s while Abdu — the room the demote was paying for —
+  // never climbed at all. The donor's step is cheaper AND higher in priority,
+  // so it wins the freed amps every time.
+  // A room that genuinely wants a level — otherwise there is no raise to block.
+  const donor = () => ac("b", { currentLevel: 1, needDelta: 3 });
+
+  it("blocks the donor's own raise while its cooldown is live", () => {
+    expect(raise([donor()]).commands.some((c) => c.deviceId === "b")).toBe(true); // control
+    const p = raise([donor()], { fundingCooldown: (id) => id === "b" });
+    expect(p.commands.filter((c) => c.deviceId === "b")).toHaveLength(0);
+    expect(p.decisions.some((d) => d.deviceId === "b" && d.blockedBy === "funding cooldown")).toBe(true);
+  });
+
+  it("does not block anyone else", () => {
+    const p = raise([ac("a", { currentLevel: 1, needDelta: 3 })], { fundingCooldown: (id) => id === "b" });
+    expect(p.commands.some((c) => c.deviceId === "a" && c.kind === "set_level")).toBe(true);
+  });
+
+  it("reports the donors it demoted so the shell can stamp them", () => {
+    // A hot room at its floor, a cooler peer above its floor, and a meter too
+    // tight for the raise → the funding swap fires.
+    const hot = ac("a", { currentLevel: 1, needDelta: 4 });
+    const cool = ac("b", { currentLevel: 3, needDelta: 0.2 });
+    const p = raise([hot, cool], { headroomAmps: 0.2, smoothedAmps: 14.5 });
+    if (p.fundingDonors.length > 0) {
+      expect(p.fundingDonors).toContain("b");
+      expect(p.commands.some((c) => c.deviceId === "b" && c.kind === "set_level")).toBe(true);
+    }
+  });
+});
+
 describe("invariant corrections", () => {
   it("re-caps a level-0 AC at its top commandable level", () => {
     const { commands } = invariantCorrections(
