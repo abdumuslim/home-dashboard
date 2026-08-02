@@ -260,11 +260,19 @@ export function invariantCorrections(
       continue;
     }
     const floor = floorOf(ac);
-    if (ac.currentLevel < floor) {
-      commands.push({ deviceId: ac.deviceId, kind: "set_level", level: floor });
-      decisions.push({ at: now, deviceId: ac.deviceId, action: `floor L${floor}`, detail: "below boost floor" });
-      continue;
-    }
+    // A room BELOW its comfort floor is deliberate since 2026-08-02: the
+    // reducer's last rung before switching it off. Restoring that floor is
+    // SPENDING, and this function is for invariants that hold regardless of
+    // budget — so it is handled by the ordinary raise path instead, which
+    // checks calm, headroom, the physics envelope and one-step pacing before it
+    // buys the level back. `ceilOf` is never below `floorOf`, so the raiser
+    // always targets at least the floor once it is affordable.
+    //
+    // Re-asserting it here — even gated on calm — is a limit cycle: the cut
+    // frees amps, calm returns, the floor jumps straight back, the meter goes
+    // over, and the reducer cuts again. The acceptance run did exactly that six
+    // times in thirty minutes, at a ~100s period.
+    if (ac.currentLevel < floor) continue;
     if (source === "gen" && ac.startBaselineAmps != null && ac.currentLevel > floor) {
       commands.push({ deviceId: ac.deviceId, kind: "set_level", level: floor });
       decisions.push({

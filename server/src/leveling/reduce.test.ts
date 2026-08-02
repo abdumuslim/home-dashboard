@@ -62,6 +62,72 @@ function plan(acs: AcView[], requiredAmps: number, overrides: Partial<ReduceInpu
   });
 }
 
+describe("one room at a time (user, 2026-08-02)", () => {
+  // Live 16:51:11 and 16:55:34/35: both remaining rooms went off together — the
+  // second pair one SECOND apart — to answer a 0.5A deficit. Bringing them back
+  // one by one then leaves each room heating while its compressor is off.
+  const atFloor = (id: string, need: number): AcView =>
+    ac(id, { currentLevel: 1, fanSpeed: 1, needDelta: need });
+
+  // Each room draws 2A at L1 under the test models.
+  it("sheds ONE room when one covers the deficit", () => {
+    const p = plan([atFloor("hot", 3), atFloor("cool", 0.3)], 1.5);
+    expect(p.toShed).toEqual(["cool"]); // least-needy first
+    expect(p.satisfied).toBe(true);
+  });
+
+  it("an extreme overshoot one room covers is still exactly one room", () => {
+    const p = plan([atFloor("hot", 3), atFloor("cool", 0.3)], 1.8, { requireShed: true });
+    expect(p.toShed).toHaveLength(1);
+  });
+
+  it("escalates to two ONLY when one genuinely cannot cover it", () => {
+    // 3.5A needed, 2A per room — the "big pump" case the user carved out.
+    const p = plan([atFloor("hot", 3), atFloor("cool", 0.3)], 3.5);
+    expect(p.toShed).toHaveLength(2);
+    expect(p.satisfied).toBe(true);
+  });
+});
+
+describe("the sub-floor rung — a comfort floor is not worth a power_off (2026-08-02)", () => {
+  // Live 19:27/19:32/19:36 Baghdad: the TOP-priority room sat at its L2 boost
+  // floor (outdoor ≥39°C) with both peers already at L1 and fan 1. Its own fan
+  // trim was worth 0.6A against a 1.14A deficit, so the only feasible plan the
+  // reducer could build was 4.8A of power_off — three times in ten minutes.
+  const boosted = (o: Partial<AcView> = {}): AcView =>
+    ac("hot", { minLevel: 2, currentLevel: 2, fanSpeed: 1, needDelta: 7, ...o });
+
+  it("drops below the boost floor instead of shedding the room", () => {
+    const p = plan([boosted(), ac("cool", { currentLevel: 1, fanSpeed: 1, needDelta: 0.3 })], 1.5);
+    expect(p.toShed).toHaveLength(0);
+    expect(p.desiredLevels.hot).toBe(1);
+    expect(p.satisfied).toBe(true);
+  });
+
+  it("still prefers a fan trim when the fan alone can cover it", () => {
+    const p = plan([boosted({ fanSpeed: 5 }), ac("cool", { currentLevel: 1, fanSpeed: 1, needDelta: 0.3 })], 0.2);
+    expect(p.desiredLevels).toEqual({});
+    expect(p.fanCuts.length).toBeGreaterThan(0);
+  });
+
+  it("prefers an ordinary above-floor level cut on a peer over going sub-floor", () => {
+    const p = plan([boosted(), ac("cool", { currentLevel: 3, fanSpeed: 1, needDelta: 0.3 })], 1.5);
+    expect(p.desiredLevels.hot).toBeUndefined();
+    expect(p.desiredLevels.cool).toBeLessThan(3);
+  });
+
+  it("never goes to level 0 — that is unrestricted draw, not a reduction", () => {
+    const p = plan([boosted({ minLevel: 3, currentLevel: 3 })], 99);
+    for (const level of Object.values(p.desiredLevels)) expect(level).toBeGreaterThanOrEqual(1);
+  });
+
+  it("sheds only once the sub-floor rung is exhausted too", () => {
+    // At L1 with fan 1 there is nothing left to give but the room itself.
+    const p = plan([ac("hot", { minLevel: 2, currentLevel: 1, fanSpeed: 1, needDelta: 7 })], 3);
+    expect(p.toShed).toContain("hot");
+  });
+});
+
 describe("levels before fans (user complaint B — 57% of v1 fan cuts fired with level cuts available)", () => {
   it("a small overshoot on an above-floor AC cuts ONE level, never a fan", () => {
     const p = plan([ac("hot", { currentLevel: 3 })], 1.5);

@@ -17,6 +17,41 @@ timestamp: 2026-07-28
 
 A ground-up rewrite lives in **`server/src/leveling/`** (19 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
+### 2026-08-02 (evening) — flicker-aware pressure, the sub-floor rung, one-room-at-a-time
+
+Six changes, one theme: **the generator is not a stable line, and the controller was treating its
+noise as load.** Invariants 24–29 in `.claude/skills/ac-leveling/SKILL.md` are the normative list;
+this is the incident record.
+
+| Live evidence (Baghdad) | Cause | Fix |
+|---|---|---|
+| Najat shed ×5 in 15 min at smoothed overshoots of **0.02–0.31 A**; one shed at smoothed **14.215 A against a 14.5 A effective limit** (mean 0.3 A UNDER) | Raw spikes drained the leaky bucket AND broke the calm that refills it → the bucket could only ratchet down | `flickerAmps()` estimator (2nd-largest consecutive jump, ring-based); drain classifies on `max(raw − limit − flicker, smoothedOver)`; **calm judged on the smoothed meter** |
+| A lone **16.04 A** raw reading against a **14.92 A** mean classified SEVERE — which skips inrush blanking — and shed the top-priority room | Severity keyed off raw readings with a fixed 1 A rung | `isSevereOverReading(r, limit, flicker)`, shared by sensing + pressure; severity also fires on a severe MEAN |
+| Fresh turn-ons shed the instant the smoothed meter crossed the limit by 0.02 A | Inrush blanking ended at exactly `limit` | Blanking now holds to `limit + OVER_LIMIT_MODERATE_AMPS` (mild only; severe/extreme untouched) |
+| **Abdullah** (top priority) shed ×3 in 10 min: at his L2 boost floor, peers at L1, fans at 1 → a 1.14 A deficit had only a 0.6 A fan trim or a **4.8 A power_off** | The reducer never enumerated a level BELOW `floorOf` | Sub-floor rung (`w.subFloorStep` 40) — levels to L1, never 0, between the fan rung and the shed rung |
+| 16:51 **both** rooms off in one batch for a deficit either covered alone | Nothing capped sheds per plan | Search runs at a one-shed ceiling and escalates only when nothing at that ceiling covers the deficit |
+| 16:55:29 fan trim → **16:55:34 and :35** two rooms shed, for a ~0.5 A deficit | `commandedCutAmpsOf` priced `set_fan` at **zero** while the planner claimed 0.5–0.6 A, so no credit armed; and a queued re-run started with zero delay on an un-moved meter | Fan trims credited at what the planner claimed; `escalationHold` on the shed rung; `LEVELING_RERUN_MIN_MS` (2.5 s); send-side dedupe for `set_fan`/`power_off` |
+| "worst case 17.6 A (incl. **6.0 A house**)" refusing every raise on an 11–12 A meter (real house ~2.7 A) | `runningSetOf` and `ramping` both key off the cloud SHADOW, so a room drawing with a lagging shadow books its compressor as house — tagged with the set that excludes it, the set that recurs on every re-shed | `pendingOn` stands sampling down until confirm; `voidSamples()` retro-drops without-set samples on discovery |
+| Najat's gen `on@L1` drifted 4.0 → 3.3 ("unproven") vs an empirical ~2.6–3.0, refusing restores | Every bounce shed graded a negated `on@L1` from a ramp-contaminated window; a room's own restore stamps the ADD clock, so the shed was "born clean" | No negated grade from a ramping/start-window shed; `bornContaminated` checks both clocks; external ONs stamp `lastLoadAddAt`; `GRADE_TURN_ON_MS` 270 s → 315 s (above the 300 s blame window) |
+
+**⚠️ The one that bit during development:** `invariantCorrections` re-asserted the boost floor
+unconditionally. With the sub-floor rung that is a **limit cycle** — cut frees amps, floor jumps
+back, meter goes over, cut again (six times in 30 min in the acceptance run). Gating it on calm was
+not enough; buying a comfort floor back is *spending* and belongs to the raise path, which checks
+calm, headroom, envelope and one-step pacing. `ceilOf` is never below `floorOf`, so the raiser
+restores it as soon as it is affordable.
+
+**Harness:** `scenario.ts` gained a seeded LCG, `setFlicker({baseAmps, spikeAmps, spikeEveryN})` with
+a **deterministic spike cadence** (a random one clusters — three spikes in one 4-wide window lift the
+median over the limit, which is a real excursion, not noise), and `externalTurnOn(id, shadowLagMs)`
+which splits physical draw from shadow state. Acceptance test: the live trio {Abdullah L2, Abdu L1,
+Najat L1} + ~4 A house on a 14.9 A gen holds **30 sim-minutes of flicker with zero sheds and zero
+churn**.
+
+**Observability:** `GET /api/ac/leveling` now reports `flickerAmps` and a real `nonAcLoadAmps` (the
+measured house peak — previously hard-null); over-branch journal decisions carry
+`smoothed X vs Y, flicker ±Z`.
+
 **Two invariants added 2026-07-26 after three gen trips in 25 minutes — read the incident section
 before touching admission:** (a) the meter is NOT a valid budget anchor while a compressor is
 ramping, so every spender (raise, restore, fan restore) is charged the committed-but-unmetered draw

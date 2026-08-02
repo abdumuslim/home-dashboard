@@ -224,6 +224,8 @@ export function commandedCutAmpsOf(
   acs: readonly AcView[],
   config: LevelingConfigV2,
   source: PowerSource,
+  book: CostBook = {},
+  now = 0,
 ): number {
   return commands.reduce((sum, cmd) => {
     const ac = acs.find((a) => a.deviceId === cmd.deviceId);
@@ -233,6 +235,19 @@ export function commandedCutAmpsOf(
     }
     if (cmd.kind === "set_level") {
       return sum + modelCutAmps(config, ac.deviceId, source, ac.currentLevel, cmd.level, ac.maxLevel);
+    }
+    // A fan TRIM takes real amps off the line, and pricing it at zero is what
+    // let the reducer escalate straight past it: the planner claimed 0.5–0.6A
+    // of savings, the credit armed nothing, `requiredAmps` never shrank, and
+    // the next evaluation — seconds later, before the trim could reach the
+    // meter — shed a whole room to buy amps that were already leaving. Live
+    // 2026-08-02 16:55:29 trim → 16:55:34/35 both rooms off, for a 0.5A
+    // deficit. Credited at exactly what the planner claimed, and bounded by a
+    // few tenths of an amp, which cannot mask the 6A collapse floor
+    // (invariant 11). A fan RESTORE adds load, so it credits nothing.
+    if (cmd.kind === "set_fan" && cmd.reason === "trim" && ac.fanSpeed != null) {
+      const steps = ac.fanSpeed === 0 ? 6 : ac.fanSpeed - cmd.fan;
+      return steps > 0 ? sum + fanTrimSavings(book, ac.deviceId, source, steps, now) : sum;
     }
     return sum;
   }, 0);

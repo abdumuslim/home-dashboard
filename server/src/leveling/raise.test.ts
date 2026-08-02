@@ -545,16 +545,28 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
 });
 
 describe("invariant corrections", () => {
-  it("re-caps a level-0 AC at its top commandable level and lifts below-floor ACs", () => {
+  it("re-caps a level-0 AC at its top commandable level", () => {
     const { commands } = invariantCorrections(
-      [ac("a", { currentLevel: 0 }), ac("b", { currentLevel: 1, minLevel: 2 }), ac("c", { currentLevel: 2 })],
+      [ac("a", { currentLevel: 0 }), ac("c", { currentLevel: 2 })],
       T,
       "gen",
     );
-    expect(commands).toEqual([
-      { deviceId: "a", kind: "set_level", level: 3 },
-      { deviceId: "b", kind: "set_level", level: 2 },
-    ]);
+    expect(commands).toEqual([{ deviceId: "a", kind: "set_level", level: 3 }]);
+  });
+
+  it("leaves a below-floor room alone — buying its comfort floor back is SPENDING", () => {
+    // The reducer parks a room below its boost floor as the last rung before
+    // switching it off (2026-08-02). Lifting it back here — with no budget
+    // check of any kind — is a limit cycle: the cut frees amps, the floor jumps
+    // straight back, the meter goes over, and the reducer cuts again. Six times
+    // in thirty minutes in the acceptance run. The raise path owns it instead.
+    const { commands } = invariantCorrections([ac("b", { currentLevel: 1, minLevel: 2 })], T, "gen");
+    expect(commands).toHaveLength(0);
+  });
+
+  it("…and the raise path buys it back once there is headroom for it", () => {
+    const p = raise([ac("b", { currentLevel: 1, minLevel: 2, needDelta: 0.1 })]);
+    expect(p.commands).toContainEqual({ deviceId: "b", kind: "set_level", level: 2 });
   });
 
   it("ignores off/unmanaged/shed ACs", () => {

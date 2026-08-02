@@ -46,10 +46,12 @@ import {
 } from "./pacing.js";
 import { planFanRestore, recordFanCut, releaseFanHold, type FanHolds } from "./fan-trim.js";
 import {
+  EXTERNAL_ON_VOID_MS,
   HOUSE_SAMPLE_COOLDOWN_MS,
   houseLoadAmps,
   initialHouseLoad,
   sampleHouseLoad,
+  voidSamples,
   type HouseLoadState,
 } from "./house-load.js";
 import {
@@ -65,6 +67,7 @@ import {
   reachableCapOf,
   shouldSendLevel,
   sweepExpiredMarks,
+  UNCONFIRMED_SEND_TTL_MS,
   unconfirmedLevels,
   unconfirmedSends,
   type ReconcilerState,
@@ -98,6 +101,15 @@ const START_WINDOW_MS = AC_RAMP_MS;
  */
 const FAN_DEBIT_MS = 60_000;
 const SHED_CLEAR_GRACE_MS = 15_000;
+/**
+ * Send-side spacing for fan trims and sheds — mirrors the reconciler's
+ * `LEVEL_RESEND_SPACING_MS`, which levels have always had and these two never
+ * did. Two evaluations landing back-to-back used to send the same command
+ * twice (live 2026-08-02: an identical `set_fan 5` 200ms apart, and two sheds
+ * one second apart).
+ */
+const FAN_RESEND_SPACING_MS = 30_000;
+const SHED_RESEND_SPACING_MS = 30_000;
 const PUSH_THROTTLE_MS = 5 * 60_000;
 /** Grade a batch only when this many fresh readings arrived after compareAfter. */
 const GRADE_MIN_SAMPLES = 4;
@@ -245,6 +257,16 @@ export class LevelingControllerV2 {
 
   private shedIds = new Set<string>();
   private shedTimes = new Map<string, number>();
+  /**
+   * Rooms commanded (or reported) ON whose shadow has not confirmed yet →
+   * when the send happened. While any entry is live the compressor may be
+   * drawing amps the model does not know about, so house sampling stands down.
+   */
+  private pendingOn = new Map<string, number>();
+  /** Last fan TRIM actually sent per device — the fan half of send dedupe. */
+  private lastFanSent = new Map<string, { fan: number; at: number }>();
+  /** Last shed actually sent per device — the power_off half of send dedupe. */
+  private lastOffSentAt = new Map<string, number>();
   private rememberedLevel = new Map<string, number>();
   private manualCap = new Map<string, number>();
   private manualTarget = new Map<string, number>();
@@ -477,6 +499,31 @@ export class LevelingControllerV2 {
     log.info(`[leveler2] Cleared shed for AC ${this.deviceNames.get(deviceId) ?? deviceId} (${reason})`);
   }
 
+  /**
+   * Drop house samples that modeled this room as OFF while it was physically
+   * drawing, and stop treating its ON as pending. `since` is the send time when
+   * we know it (our own restore, a dashboard tap) and the whole window when we
+   * do not (a room discovered already on — nothing tells us when it started).
+   */
+  private voidPhantomHouse(deviceId: string, now: number): void {
+    const sentAt = this.pendingOn.get(deviceId);
+    this.pendingOn.delete(deviceId);
+    const source = meterView(this.meterState, now).source;
+    if (source === "none") return;
+    const before = this.houseLoad[source]?.samples.length ?? 0;
+    this.houseLoad = voidSamples(this.houseLoad, source, {
+      excludeDeviceId: deviceId,
+      since: sentAt ?? now - EXTERNAL_ON_VOID_MS,
+    });
+    const dropped = before - (this.houseLoad[source]?.samples.length ?? 0);
+    if (dropped > 0) {
+      log.info(
+        `[leveler2] Voided ${dropped} ${source} house sample(s) taken while ` +
+          `${this.deviceNames.get(deviceId) ?? deviceId} was already drawing`,
+      );
+    }
+  }
+
   private async recordShed(deviceId: string, reason: string): Promise<void> {
     this.shedIds.add(deviceId);
     this.shedTimes.set(deviceId, Date.now());
@@ -488,6 +535,11 @@ export class LevelingControllerV2 {
   }
 
   async reconcileObservedOn(deviceId: string): Promise<void> {
+    // A live poll found this room ON. Whatever we thought, it has been drawing
+    // for an unknown stretch — void the house samples that modeled it off.
+    // Unconditional: a room whose shadow lagged is exactly the case that
+    // poisons the residual, and it does not have to have been shed to do it.
+    this.voidPhantomHouse(deviceId, Date.now());
     if (!this.shedIds.has(deviceId)) return;
     const shedAt = this.shedTimes.get(deviceId);
     if (shedAt != null && Date.now() - shedAt < SHED_CLEAR_GRACE_MS) return;
@@ -633,7 +685,14 @@ export class LevelingControllerV2 {
     this.rearmRamp([deviceId]);
     // Fires before the shadow flips — the meter here is still the pre-start
     // house load, the exact anchor the grid full start needs.
-    this.noteTurnOn(deviceId, Date.now());
+    const now = Date.now();
+    this.noteTurnOn(deviceId, now);
+    // The tap IS the earliest moment this room can be drawing, so nothing
+    // sampled before it is contaminated — register the pending ON (which stands
+    // house sampling down until the shadow confirms) but void nothing.
+    this.pendingOn.set(deviceId, now);
+    // Load arriving that our own command list will never show (see tick()).
+    this.lastLoadAddAt = now;
   }
 
   async onUserFanChange(deviceId: string): Promise<void> {
@@ -859,6 +918,11 @@ export class LevelingControllerV2 {
       if (prev !== undefined && prev !== device.power) {
         if (device.power) {
           this.rearmRamp([device.id]);
+          // This room has been DRAWING since some earlier moment we never saw —
+          // the shadow is only now catching up. Every house sample taken in the
+          // meantime booked its compressor as house load (invariant 20's
+          // rise-side twin), so drop the ones that could not have known.
+          if (managed) this.voidPhantomHouse(device.id, now);
           // A shed device flips ON in the shadow: OUR restore confirmed (or an
           // external hand did it) — THIS is where the shed clears, not at
           // command send (2026-07-27 bogus-lock incident). The OFF→ON flip
@@ -872,6 +936,11 @@ export class LevelingControllerV2 {
             // Automation turn-ons never pass through onUserPowerOn.
             this.noteTurnOn(device.id, now);
           }
+          // A room coming on is load ARRIVING, and `batchLoadDirections` only
+          // ever sees our OWN commands — so without this an external turn-on
+          // left the add-side settle clock untouched and the next cost sample
+          // measured its ramp as if the meter had been quiet.
+          if (managed) this.lastLoadAddAt = now;
         } else {
           this.startBaseline.delete(device.id);
           // No compressor, no ramp to account for.
@@ -1069,11 +1138,23 @@ export class LevelingControllerV2 {
     // and amp models can be half-loaded on the first ticks, and the 2026-08-01
     // deploy's very first gen sample read 11.1A of "house" (real ~4.1A), an
     // over-blocking peak that stood until honest same-set samples outranked it.
+    //
+    // It also holds off while ANY power_on is unconfirmed — ours or a user's.
+    // `AcView.ramping` is `rampUntil > now && device.power`, and `device.power`
+    // is the SHADOW, so the ramping guard inside house-load.ts does not cover
+    // the send→confirm window at all: for those minutes the compressor draws
+    // while the model still says the room is off, and the whole draw books as
+    // house. Sweeping the TTL first means a send whose confirm never arrives
+    // cannot starve sampling forever.
     if (this.firstTickAt == null) this.firstTickAt = now;
+    for (const [deviceId, sentAt] of this.pendingOn) {
+      if (now - sentAt >= UNCONFIRMED_SEND_TTL_MS) this.pendingOn.delete(deviceId);
+    }
     if (
       view.source !== "none" &&
       view.sampleCount >= 2 &&
       !view.frozen &&
+      this.pendingOn.size === 0 &&
       now - this.firstTickAt >= HOUSE_SAMPLE_COOLDOWN_MS
     ) {
       this.houseLoad = sampleHouseLoad(this.houseLoad, {
@@ -1270,9 +1351,29 @@ export class LevelingControllerV2 {
     }
 
     // Send-side dedupe: unconfirmed same-level re-sends respect the spacing.
-    const commands: Command[] = out.commands.filter((cmd) =>
-      cmd.kind === "set_level" ? shouldSendLevel(this.recon, cmd.deviceId, cmd.level, now) : true,
-    );
+    //
+    // Levels have had this since the reconciler shipped; fans and offs had
+    // nothing, and two evaluations landing back-to-back sent the same command
+    // twice. Live 2026-08-02 17:51:21 sent an identical `set_fan 5` twice 200ms
+    // apart, and 16:55:34/:35 shed two rooms one second apart. The scheduling
+    // race is fixed upstream (collector `runLevelingCheck`); this is the
+    // last-resort guard on the wire, where the level path already had one.
+    //
+    // Deliberate exemptions: a fan HOLD's staged resend goes through
+    // `fanResendDue`, not here, and a shed of a device not already in `shedIds`
+    // is a first send.
+    const commands: Command[] = out.commands.filter((cmd) => {
+      if (cmd.kind === "set_level") return shouldSendLevel(this.recon, cmd.deviceId, cmd.level, now);
+      if (cmd.kind === "set_fan" && cmd.reason === "trim") {
+        const last = this.lastFanSent.get(cmd.deviceId);
+        return !(last != null && last.fan === cmd.fan && now - last.at < FAN_RESEND_SPACING_MS);
+      }
+      if (cmd.kind === "power_off") {
+        const last = this.lastOffSentAt.get(cmd.deviceId);
+        return !(this.shedIds.has(cmd.deviceId) && last != null && now - last < SHED_RESEND_SPACING_MS);
+      }
+      return true;
+    });
     if (commands.length === 0) {
       await this.journalBlocked(out, view, mode, now);
       return;
@@ -1321,6 +1422,7 @@ export class LevelingControllerV2 {
           }
           case "power_off": {
             await tcl.executeAcAction(cmd.deviceId, { power: 0 });
+            this.lastOffSentAt.set(cmd.deviceId, now);
             await this.recordShed(
               cmd.deviceId,
               `over ${effectiveLimit(this.config, view.source === "none" ? "gen" : view.source, view.derateAmps)}A on ${view.source}`,
@@ -1346,6 +1448,10 @@ export class LevelingControllerV2 {
             // shed, every observed-off recorder and auto-on path keeps
             // skipping the device, however long the shadow lags.
             this.deps.setDevicePowerCache(cmd.deviceId, "on");
+            // The compressor starts now; the shadow confirms later. Until it
+            // does, this room's draw is on the meter but not in the model, so
+            // no house sample taken in that window is usable.
+            this.pendingOn.set(cmd.deviceId, now);
             this.recon = noteLevelSend(this.recon, cmd.deviceId, cmd.level, now).state;
             if (cmd.fan != null) {
               // Gentle restore: the room came back with its fan pinned. A hold is
@@ -1368,6 +1474,7 @@ export class LevelingControllerV2 {
           case "set_fan": {
             const priorFan = acs.find((a) => a.deviceId === cmd.deviceId)?.fanSpeed ?? null;
             await tcl.sendControl(cmd.deviceId, "set_fan_speed", cmd.fan);
+            if (cmd.reason === "trim") this.lastFanSent.set(cmd.deviceId, { fan: cmd.fan, at: now });
             this.recon = noteFanSend(this.recon, cmd.deviceId, cmd.fan, now);
             this.deps.onLevelerFanCommand(cmd.deviceId, cmd.fan);
             await this.persistFanHold(cmd.deviceId);
@@ -1483,8 +1590,19 @@ export class LevelingControllerV2 {
         // A lone shed measures the room's true ON draw as an instant drop —
         // learn on@L{level} from it (negated) so a restore admitted on a
         // wrong-low cost corrects after ONE bounce instead of storming.
+        //
+        // …but ONLY from a settled compressor. "Instant drop of a known steady
+        // draw" is the whole premise, and a room shed inside its own ramp has
+        // no steady draw yet: `preAmps` is its inrush peak, the sample ratchets
+        // to the post-shed trough, and the difference is peak-minus-trough, not
+        // the room's cost. Every bounce shed on 2026-08-02 was exactly that
+        // shape (shed ~3 min after its own turn-on), and `turnOnAmps` takes
+        // max(model, learned) — so the inflation is one-way and sticky for 30
+        // days, which is what then refused the next restore.
+        const ac = acs.find((a) => a.deviceId === cmd.deviceId);
+        const settled = ac != null && !ac.ramping && ac.startBaselineAmps == null;
         const level = this.recon[cmd.deviceId]?.confirmedLevel;
-        if (level != null && level >= 1) {
+        if (settled && level != null && level >= 1) {
           single = { deviceId: cmd.deviceId, transition: `on@L${level}`, negate: true };
         }
       }
@@ -1505,12 +1623,17 @@ export class LevelingControllerV2 {
     // ratchet is not attributable to this batch alone (see LEARN_SETTLE_*).
     // Timestamps are read BEFORE this batch stamps its own — a lone shed with
     // a quiet meter behind it still learns.
+    //
+    // Both directions are checked for BOTH kinds of window (2026-08-02): a
+    // down-sample is corrupted by an add still landing exactly as symmetrically
+    // as by a drop. The negate branch used to read only `lastLoadDropAt`, so a
+    // room's OWN restore — which stamps the ADD clock — left its bounce shed
+    // "born clean" and it learned the ramp's peak-minus-trough as the room's
+    // on-cost.
     const meterMoved = batchLoadDirections(meterCmds, (id) => this.recon[id]?.confirmedLevel ?? null);
     const bornContaminated =
       single != null &&
-      (single.negate === true
-        ? now < this.lastLoadDropAt + LEARN_SETTLE_DOWN_MS
-        : now < this.lastLoadAddAt + LEARN_SETTLE_UP_MS);
+      (now < this.lastLoadDropAt + LEARN_SETTLE_DOWN_MS || now < this.lastLoadAddAt + LEARN_SETTLE_UP_MS);
     if (meterMoved.adds) this.lastLoadAddAt = now;
     if (meterMoved.removes) this.lastLoadDropAt = now;
     const compareAfter = out.compareAfter || now + GRADE_FAN_MS;
@@ -1666,7 +1789,13 @@ export class LevelingControllerV2 {
       measuredAmps: view.sampleCount > 0 ? Number(view.smoothedAmps.toFixed(2)) : null,
       limitAmps: limit,
       budgetAmps: limit != null ? Number((limit - this.config.marginAmps - view.smoothedAmps).toFixed(2)) : null,
-      nonAcLoadAmps: null, // v2 is meter-anchored; the model-derived split is gone
+      // The MEASURED non-AC split (house-load.ts) — v2's own rolling peak, not
+      // v1's model-derived figure. Surfaced because an inflated house is what
+      // silently refuses every raise ("worst case … incl. N.NA house"), and
+      // there was no way to see it without reading the journal.
+      nonAcLoadAmps:
+        source === "none" ? null : Number(houseLoadAmps(this.houseLoad, source, now, acs).toFixed(2)),
+      flickerAmps: Number(view.flickerAmps.toFixed(2)),
       overLimitBudget: view.overLimitBudget,
       overLimitBudgetMax: 5,
       headroomStreak: Math.floor(view.calmMs / 5000), // v1-shaped approximation for the UI hint
@@ -1720,6 +1849,7 @@ export class LevelingControllerV2 {
         limitAmps: null,
         budgetAmps: null,
         nonAcLoadAmps: null,
+        flickerAmps: 0,
         overLimitBudget: 5,
         overLimitBudgetMax: 5,
         headroomStreak: 0,

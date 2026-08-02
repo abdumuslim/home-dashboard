@@ -203,6 +203,72 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     used to absorb every predecessor's tail — Abdu's gen `level:1>2` at 3.97 A over 50 samples).
     Same "residual while model and meter are out of step" class as invariants 5b and 20.
 
+**Added 2026-08-02 (evening) after a room was shed five times in 15 min, then the TOP-priority room three times in 10:**
+24. **A generator is not a stable line, so the meter's MEAN is the truth about
+    load and a raw spike is not.** `flickerAmps()` (sensing.ts) estimates supply
+    flicker as the **second-largest jump between consecutive ring readings** —
+    a spike goes up AND comes back (two jumps, survives); a genuine one-time
+    step (shed landing, compressor stopping) is ONE jump and is filtered out, so
+    a real event can never mint the tolerance that would hide it. Rounds to 0
+    below `FLICKER_MIN_AMPS` (0.2) and caps at `FLICKER_MAX_AMPS` (1.5); needs
+    `FLICKER_MIN_SAMPLES` (6) ring readings, so a fresh boot or source change is
+    never more permissive than before it existed. Three consumers: the bucket
+    drain classifies on `max(raw − limit − flicker, smoothedOver)`, **calm is
+    judged on the SMOOTHED meter** (raw spikes no longer break it — that was the
+    one-way ratchet: every spike drained the bucket and killed the calm that
+    refills it, so a house whose mean sat 0.3 A UNDER the limit still lost a
+    room), and `isSevereOverReading()` is the single severe definition shared
+    with `pressure.ts`. ⚠️ The smoothed overshoot is NEVER discounted — that is
+    what keeps a real overload's latency unchanged. A load step-up still breaks
+    calm immediately via `rawIsSupplyNoise` (it reads as low flicker), so the
+    median's 2-reading lag cannot refill the bucket it just drained.
+25. **A comfort floor is a preference; being switched off is worse than any
+    level.** The ladder gained a rung: levels → floor → fans → **sub-floor
+    levels (to L1, never 0)** → off, priced by `w.subFloorStep` (40, between fan
+    1 and shed 100). Live: the top-priority room sat at its L2 boost floor with
+    both peers at L1 and fans at 1, so a 1.14 A deficit had only a 0.6 A fan
+    trim or a 4.8 A power_off — and took the power_off, three times.
+    ⚠️ **`invariantCorrections` must NOT re-assert the boost floor.** Buying a
+    comfort floor back is SPENDING and belongs to the raise path (`ceilOf` is
+    never below `floorOf`, so it targets the floor once affordable). Re-asserting
+    it there — even gated on calm — is a limit cycle: cut frees amps, floor jumps
+    back, meter goes over, cut again (six times in 30 min in the acceptance run).
+26. **One room at a time, unless the arithmetic says one cannot do it.** The
+    reducer searches with a one-shed ceiling and raises it only when nothing at
+    that ceiling covers the deficit (user: "turn off one by one … unless the pump
+    is big that already need more than one"). Live 16:51 both rooms went off in
+    ONE batch for a deficit either covered alone; bringing them back one by one
+    then leaves each room heating with its compressor off.
+27. **A cut that has not reached the meter is late, not absent — and a fan trim
+    is a cut.** `commandedCutAmpsOf` priced `set_fan` at **zero** while the
+    planner claimed 0.5–0.6 A, so no credit armed, `requiredAmps` never shrank,
+    and the next evaluation escalated. Fan trims are now credited at exactly what
+    the planner claimed. Plus `escalationHold` (mild + SETTLING + live credit)
+    holds the SHED rung only, and the collector drops a queued re-run inside
+    `LEVELING_RERUN_MIN_MS` (2.5 s) so a follow-up always sees a fresh reading.
+    Send-side dedupe now covers `set_fan`/`power_off` (30 s), which only
+    `set_level` had. Live: trim at 16:55:29 → two rooms shed at :34 and :35.
+28. **An unconfirmed ON — ours or external — poisons the house residual.**
+    `runningSetOf` keys off the cloud shadow, so a room physically drawing with a
+    lagging shadow books its whole compressor as "house", tagged with the set
+    that EXCLUDES it (the set that recurs on every re-shed) — 6.0 A observed vs
+    ~2.7 A real, refusing every raise for 15 min. `AcView.ramping` is
+    shadow-gated too, so the existing ramp guard never covered send→confirm.
+    Now: `pendingOn` stands house sampling down until the shadow confirms, and
+    `voidSamples()` retro-drops without-set samples on discovery
+    (`EXTERNAL_ON_VOID_MS` = the full 15-min window when there is no anchor).
+    Rise-side twin of invariants 20 and 23.
+29. **A negated `on@L` grade needs a SETTLED compressor.** A lone shed of a room
+    still inside its own ramp/start window learns peak-minus-trough, not the
+    room's cost — and `turnOnAmps` takes `max(model, learned)`, so the inflation
+    is one-way and sticky for 30 days. `bornContaminated` now checks BOTH
+    settle clocks for BOTH window directions (a room's own restore stamps the ADD
+    clock, which used to leave its bounce shed "born clean"), external turn-ons
+    stamp `lastLoadAddAt` (`batchLoadDirections` only sees our own commands), and
+    `GRADE_TURN_ON_MS` moved 270 s → **315 s** so a success can never reset the
+    ladder (and clear invariant 22's probe anchor) before the 300 s blame window
+    closes.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's
@@ -217,6 +283,9 @@ requireShed ≥ max(3 A, 20%).
 
 **Mode machine:** COLLAPSED > FLOORS > GRID_FULL > SETTLING > NORMAL. FLOORS arms on ANY entry into
 gen (incl. cold start); GRID_FULL on any entry into grid.
+
+**Reduction ladder:** levels → floor → fans → **sub-floor levels** → ONE room off → (re-evaluate) →
+next room off (invariants 17, 18, 25, 26).
 
 **Fans are last-resort trim only** — a plan may cut a fan only if its end-state leaves EVERY AC at its
 floor (invariant 17); restores are bounded and cooldown-gated (invariant 18). (v1 cut fans while level

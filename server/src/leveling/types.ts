@@ -104,13 +104,20 @@ export interface MeterView {
   latestAmps: number;
   /** Number of readings in the smoothing window (trust gate). */
   sampleCount: number;
-  /** Milliseconds of uninterrupted genuine headroom (≤ limit − margin). */
+  /** Milliseconds of uninterrupted genuine headroom (SMOOTHED ≤ limit − margin). */
   calmMs: number;
   overLimitBudget: number;
   overLimitReadings: readonly number[];
   collapsed: boolean;
   /** Readings arrive but carry no micro-variation — hung sensor, value is a lie. */
   frozen: boolean;
+  /**
+   * Live supply-flicker estimate in amps (0 when unestimable or stale). A
+   * generator wobbles reading-to-reading where the grid does not; a raw
+   * reading within this much of the limit is supply noise, not load. Severity
+   * classification discounts by it — the smoothed mean never is.
+   */
+  flickerAmps: number;
   /**
    * Amps to subtract from the configured limit for the active source right now
    * (0 normally). Grows with each recent power collapse — see the derate note

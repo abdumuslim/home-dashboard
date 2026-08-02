@@ -4,6 +4,9 @@ import {
   COLLAPSE_DERATE_AMPS,
   COLLAPSE_DERATE_MAX_AMPS,
   COLLAPSE_DERATE_MS,
+  FLICKER_MAX_AMPS,
+  FLICKER_MIN_AMPS,
+  FLICKER_MIN_SAMPLES,
   METER_FROZEN_AFTER_MS,
   OVER_LIMIT_BUDGET,
   OVER_LIMIT_BUDGET_AFTER_ACT,
@@ -11,8 +14,10 @@ import {
   PENDING_CUT_MS,
   POWER_COLLAPSE_MAX_MS,
   determineSource,
+  flickerAmps,
   ingestReading,
   initialMeterState,
+  isSevereOverReading,
   meterView,
   noteCommandedCut,
   pendingCutCredit,
@@ -55,6 +60,114 @@ describe("determineSource", () => {
     expect(determineSource({ gridAmps: 9, genAmps: 8 }, 0)).toBe("grid");
     expect(determineSource({ gridAmps: 0.05, genAmps: 0.05 }, 0)).toBe("none");
     expect(determineSource({ gridAmps: 10, genAmps: 0 }, 20_000)).toBe("none");
+  });
+});
+
+describe("flicker estimator (2026-08-02: gen wobbles, grid does not)", () => {
+  it("is 0 until the ring can support an estimate — a fresh boot is never more permissive", () => {
+    const spiky = (n: number): number[] => Array.from({ length: n }, (_, i) => (i % 2 === 0 ? 12 : 13));
+    expect(flickerAmps(feedGen(spiky(FLICKER_MIN_SAMPLES - 1)).state)).toBe(0);
+    expect(flickerAmps(feedGen(spiky(FLICKER_MIN_SAMPLES)).state)).toBeGreaterThan(0);
+  });
+
+  it("a quiet line reports NO flicker — it keeps exactly today's classification", () => {
+    const { state } = feedGen([12, 12.01, 12, 12.01, 12, 12.01, 12, 12.01]);
+    expect(flickerAmps(state)).toBe(0);
+  });
+
+  it("ONE genuine step — a shed landing — does not inflate it", () => {
+    // A single cliff is exactly one large jump, and the second-largest filter
+    // drops it. This is what stops a real event minting the noise tolerance
+    // that would then hide the next one.
+    const { state } = feedGen([15, 15.01, 15, 15.01, 11, 11.01, 11, 11.01]);
+    expect(flickerAmps(state)).toBe(0);
+  });
+
+  it("a spiky supply reads its spike size (spikes go up AND come back)", () => {
+    const { state } = feedGen([12, 12.1, 13.1, 12.05, 12, 13.0, 12.1, 12]);
+    expect(flickerAmps(state)).toBeGreaterThan(0.8);
+    expect(flickerAmps(state)).toBeLessThanOrEqual(FLICKER_MAX_AMPS);
+  });
+
+  it("is capped, so noise tolerance can never grow without bound", () => {
+    const { state } = feedGen([5, 20, 5, 20, 5, 20, 5, 20]);
+    expect(flickerAmps(state)).toBe(FLICKER_MAX_AMPS);
+  });
+
+  it("a steady ramp reads LOW — small even steps are not flicker", () => {
+    const { state } = feedGen([9, 9.3, 9.6, 9.9, 10.2, 10.5, 10.8, 11.1]);
+    expect(flickerAmps(state)).toBeLessThan(0.5);
+  });
+
+  it("isSevereOverReading discounts by the live flicker", () => {
+    expect(isSevereOverReading(16.5, 15, 0)).toBe(true);
+    expect(isSevereOverReading(16.5, 15, 1.0)).toBe(false);
+    expect(isSevereOverReading(17.5, 15, 1.0)).toBe(true);
+  });
+});
+
+describe("flicker-aware bucket & calm (the 2026-08-02 ratchet)", () => {
+  // The live gen config: a 0.1A margin, so the near-limit ride the controller
+  // is supposed to hold is genuinely close to the ceiling.
+  const genCfg: LevelingConfigV2 = { ...cfg, marginAmps: 0.1 };
+  /**
+   * A generator riding under its limit with periodic spikes over it — the live
+   * 2026-08-02 shape. One spike per smoothing window, so the MEAN stays honest
+   * and only the raw readings cross.
+   */
+  const rideWithSpikes = (mean: number, spike: number, readings: number): number[] =>
+    Array.from({ length: readings }, (_, i) =>
+      i % 4 === 3 ? spike : mean + (i % 2 === 0 ? 0.1 : -0.1),
+    );
+
+  it("a spike over the limit against an UNDER-limit mean drains only the noise rung", () => {
+    const primed = feedGen(rideWithSpikes(13.5, 15.6, 8), { config: genCfg });
+    const before = primed.state.overLimitBudget;
+    const after = feedGen([13.6, 13.4, 13.6, 15.6], {
+      state: primed.state,
+      startAt: primed.now + 5_000,
+      config: genCfg,
+    });
+    expect(before - after.state.overLimitBudget).toBeLessThanOrEqual(1);
+  });
+
+  it("never acts while the MEAN sits under the limit — the shape that shed a room live", () => {
+    // Live 2026-08-02 17:59: smoothed 14.215 against a 14.5 effective limit,
+    // and a room was shed anyway, because every spike drained the bucket while
+    // breaking the calm that refills it. 60 readings ≈ 5 minutes of that ride.
+    const { events } = feedGen(rideWithSpikes(13.5, 15.6, 60), { config: genCfg });
+    expect(events.filter((e) => e.kind === "bucket_empty")).toHaveLength(0);
+  });
+
+  it("calm survives the spikes, so the bucket can refill at all", () => {
+    const { state, now } = feedGen(rideWithSpikes(13.5, 15.6, 30), { config: genCfg });
+    expect(meterView(state, now).calmMs).toBeGreaterThan(CALM_REFILL_MS);
+    expect(state.overLimitBudget).toBe(OVER_LIMIT_BUDGET);
+  });
+
+  it("a real overload still acts — the mean is never discounted", () => {
+    // Same spiky supply, but now the MEAN itself is over the limit.
+    const { events } = feedGen(rideWithSpikes(15.6, 16.6, 12), { config: genCfg });
+    expect(events.filter((e) => e.kind === "bucket_empty").length).toBeGreaterThan(0);
+  });
+
+  it("a genuine step-up breaks calm immediately — it does not wait for the median", () => {
+    // The load jump is one large jump, so it reads as LOW flicker and is not
+    // mistaken for supply noise. Without this the two readings the median takes
+    // to catch up would keep refilling the bucket they had just drained.
+    const calm = feedGen([8, 8.01, 8, 8.01, 8, 8.01, 8, 8.01]);
+    expect(calm.state.calmSince).not.toBeNull();
+    const jump = ingestReading(calm.state, { gridAmps: 0, genAmps: 16.5 }, cfg, calm.now + 5_000);
+    expect(jump.state.calmSince).toBeNull();
+  });
+
+  it("a severe breach still drains the severe rung on the FIRST reading", () => {
+    // The 2026-07-31 latency guard: flicker tolerance must not cost a real
+    // overload its reaction time.
+    const primed = feedGen([12, 12.1, 12, 12.1, 12, 12.1, 12, 12.1]);
+    const before = primed.state.overLimitBudget;
+    const breach = ingestReading(primed.state, { gridAmps: 0, genAmps: 19 }, cfg, primed.now + 5_000);
+    expect(before - breach.state.overLimitBudget).toBe(OVER_LIMIT_DRAIN_SEVERE);
   });
 });
 
@@ -346,10 +459,23 @@ describe("calm tracking & view", () => {
     expect(meterView(state, now).calmMs).toBe(20_000);
   });
 
-  it("a margin-band reading resets calm", () => {
+  // Calm is judged on the SMOOTHED mean since 2026-08-02, not on each raw
+  // reading: on a generator, single readings cross the band constantly while
+  // the house sits well under it, and breaking calm on those made the bucket a
+  // one-way ratchet (it could drain but never refill). The near-limit ride
+  // still has to break calm — it just has to actually BE where the meter
+  // lives.
+  it("a sustained margin-band ride resets calm", () => {
     const calm = feedGen([12, 12, 12]);
-    const ride = ingestReading(calm.state, { gridAmps: 0, genAmps: 14.5 }, cfg, calm.now + 5_000);
+    const ride = feedGen([14.5, 14.5, 14.5, 14.5], { state: calm.state, startAt: calm.now + 5_000 });
     expect(ride.state.calmSince).toBeNull();
+  });
+
+  it("a lone margin-band reading does NOT reset calm — one spike is not a ride", () => {
+    const calm = feedGen([12, 12, 12]);
+    const spike = ingestReading(calm.state, { gridAmps: 0, genAmps: 14.5 }, cfg, calm.now + 5_000);
+    expect(spike.state.calmSince).not.toBeNull();
+    expect(spike.state.calmSince).toBe(calm.state.calmSince);
   });
 
   it("view reports source none when the reading is stale", () => {

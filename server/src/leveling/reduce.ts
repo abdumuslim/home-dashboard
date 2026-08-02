@@ -33,6 +33,8 @@ export interface ReductionWeights {
   needK: number;
   topPriority: number;
   reshedPenalty: number;
+  /** Surcharge per level step taken BELOW an AC's comfort floor (see below). */
+  subFloorStep: number;
 }
 
 export const DEFAULT_REDUCTION_WEIGHTS: ReductionWeights = {
@@ -42,6 +44,10 @@ export const DEFAULT_REDUCTION_WEIGHTS: ReductionWeights = {
   needK: 1.5,
   topPriority: 25,
   reshedPenalty: 400,
+  // Between the fan rung (1) and the shed rung (100): the search exhausts
+  // levels and fans first, and still reaches for a sub-floor level before it
+  // will switch a room off.
+  subFloorStep: 40,
 };
 
 export interface ReducePlan {
@@ -188,7 +194,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
       // shed is forced, and only when the user hasn't touched the fan this
       // episode. Whether the PLAN as a whole has earned a fan is decided at the
       // leaf, where the peers' end-states are known.
-      if (!input.fanTrimEnabled || requireShed || level !== floor) return choices;
+      if (!input.fanTrimEnabled || requireShed || level > floor) return choices;
       if (ac.fanExempt || ac.fanSpeed == null || (ac.fanSpeed !== 0 && ac.fanSpeed <= 1)) return choices;
       if (ac.fanSpeed === 0) {
         // Built-in auto is indivisible — one binary drop to 1.
@@ -205,7 +211,22 @@ export function planReduction(input: ReduceInput): ReducePlan {
     };
 
     const moves: AcMove[] = [];
-    for (let level = floor; level <= upper; level++) {
+    // The comfort floor (`minLevel` — the outdoor-heat boost) is a PREFERENCE,
+    // and being switched off is worse for the occupant than any level. So the
+    // ladder has one more rung below the floor before a room dies: levels down
+    // to L1, surcharged so the search only reaches them once level cuts and fan
+    // trims are exhausted, and always before a shed.
+    //
+    // User, 2026-08-02: the TOP-priority room was shed three times in ten
+    // minutes while sitting at its L2 boost floor with both peers already at
+    // L1 and fan 1 — its own fan trim (0.6A) could not cover a 1.14A deficit,
+    // so the only feasible plan left was 4.8A of power_off to answer 1.1A. L1
+    // would have covered it with the room still running.
+    //
+    // Never level 0: that is UNRESTRICTED draw, not a reduction (hard rule).
+    const HARD_FLOOR = 1;
+    for (let level = HARD_FLOOR; level <= upper; level++) {
+      const belowFloorSteps = Math.max(0, floor - level);
       const steps = Math.max(0, effFrom - level);
       const levelChanged = level !== ac.currentLevel;
       const levelSavings = levelChanged && level < effFrom
@@ -215,7 +236,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
         : 0;
       for (const fanChoice of fanChoices(level)) {
         const fanDrop = fanChoice.target != null;
-        let cost = steps * w.levelStep * needWeight(ac);
+        let cost = (steps * w.levelStep + belowFloorSteps * w.subFloorStep) * needWeight(ac);
         if (fanDrop) cost += w.fan * needWeight(ac);
         // The top-priority surcharge protects a room's COMFORT, so it only
         // applies where comfort is actually at stake — a move that lands at or
@@ -269,6 +290,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
   // Exhaustive cartesian search — ≤3 ACs × ~10 moves ≈ a few hundred leaves.
   const EPS = 1e-9;
   let best: ComboScore | null = null;
+  let maxSheds = 1;
   const combo: AcMove[] = new Array(perAc.length);
   const recurse = (
     i: number,
@@ -307,6 +329,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
       return;
     }
     for (const mv of perAc[i].moves) {
+      if (mv.level == null && sheds >= maxSheds) continue;
       combo[i] = mv;
       recurse(
         i + 1,
@@ -321,7 +344,22 @@ export function planReduction(input: ReduceInput): ReducePlan {
       );
     }
   };
-  recurse(0, 0, 0, 0, 0, 0, 0, 0, 0);
+  // One room at a time, and only more when the arithmetic says one cannot do it
+  // (user, 2026-08-02): "it is not the best thing to turn off more than one then
+  // try to bring back one by one, as that duration will raise the room temp fast
+  // until the compressor works … it turn off one by one … unless the pump is big
+  // that already need more than one to off."
+  //
+  // Live 16:51:11 both remaining rooms went off in ONE batch to answer a 3.96A
+  // deficit that either room covered alone. So the search runs with a one-shed
+  // ceiling first and only raises it when nothing at that ceiling covers the
+  // deficit — which is exactly the "big pump" case, where waiting a pass would
+  // only prolong the overload.
+  for (maxSheds = 1; maxSheds <= perAc.length; maxSheds++) {
+    best = null;
+    recurse(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (best != null && (best as ComboScore).feasible) break;
+  }
 
   const chosen: ComboScore =
     best ?? {

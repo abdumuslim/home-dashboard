@@ -93,6 +93,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Minimum spacing between a leveling pass and a QUEUED follow-up. Below the ESP
+ * cadence (~2.7–5s), so the follow-up always sees at least one fresh reading
+ * but protection is never delayed by a whole cycle. See `runLevelingCheck`.
+ */
+const LEVELING_RERUN_MIN_MS = 2_500;
+
 const PRAYER_NAMES = VALID_PRAYER_NAMES;
 
 interface AlertRule {
@@ -2021,6 +2028,7 @@ export class Collector {
       try {
         do {
           this.levelingCheckQueued = false;
+          const passStartedAt = Date.now();
           // Deadline: a hung TCL call in a pass must not wedge the in-flight
           // promise — every later urgent (emergency) tick coalesces into it,
           // so a wedged pass means NO trip protection at all (the 2026-07-06
@@ -2038,6 +2046,20 @@ export class Collector {
             ]);
           } finally {
             clearTimeout(timer);
+          }
+          // A QUEUED follow-up used to run the instant this pass resolved.
+          // `bucket_empty` re-fires on every over-limit reading, so a pass that
+          // had just acted was immediately re-entered against the same device
+          // cache and a meter that had not moved — and acted again. Live
+          // 2026-08-02: 16:55:34 and :35 shed two rooms one SECOND apart for a
+          // 0.5A deficit; 17:51:21 sent the same fan trim twice, 200ms apart.
+          //
+          // Drop a follow-up that would re-decide within the ESP cadence. This
+          // never drops the episode: while the bucket is empty every reading
+          // re-fires the trigger, so the pass simply happens one reading later,
+          // against a meter that has actually moved.
+          if (this.levelingCheckQueued && Date.now() - passStartedAt < LEVELING_RERUN_MIN_MS) {
+            this.levelingCheckQueued = false;
           }
         } while (this.levelingCheckQueued);
       } finally {

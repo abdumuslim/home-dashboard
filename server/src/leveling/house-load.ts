@@ -195,3 +195,42 @@ export function houseLoadAmps(
   }
   return exactPeak >= 0 ? exactPeak : carriedPeak;
 }
+
+/**
+ * How far back a discovered turn-on invalidates samples. A cloud shadow can lag
+ * the physical compressor by anything from 5.8 s to 13 minutes (Najat's
+ * firmware), and nothing in a discovered ON says when the room actually
+ * started — so the honest window is the whole ring.
+ */
+export const EXTERNAL_ON_VOID_MS = HOUSE_LOAD_WINDOW_MS;
+
+/**
+ * Retroactively drop samples that could not have known `excludeDeviceId` was
+ * running — the RISE-side twin of the modeled-drop cooldown (invariant 20).
+ *
+ * `runningSetOf` keys off the cloud shadow, so a room that is physically
+ * drawing while its shadow still says off is missing from both the model and
+ * the tag: its entire draw lands in the residual as "house", tagged with the
+ * set that EXCLUDES it — which is exactly the set that recurs every time it is
+ * shed again, so the phantom becomes the peak of record for a full 15 minutes.
+ * Live 2026-08-02: 6.0A of "house" against a real ~2.7A, and every raise
+ * refused at "worst case 17.6A > 14.9A" on an 11–12A meter.
+ *
+ * Called the moment the shell learns the room was on — its own restore
+ * confirming, an external ON observed on the live poll, or the tick's
+ * structural flip. Samples taken with that room already in their set are kept:
+ * those were honest.
+ */
+export function voidSamples(
+  state: HouseLoadState,
+  source: Exclude<PowerSource, "none">,
+  opts: { excludeDeviceId: string; since: number },
+): HouseLoadState {
+  const rec = state[source];
+  if (rec == null) return state;
+  const samples = rec.samples.filter(
+    (s) => s.at < opts.since || s.runningSet.split(",").includes(opts.excludeDeviceId),
+  );
+  if (samples.length === rec.samples.length) return state;
+  return { ...state, [source]: { ...rec, samples } };
+}

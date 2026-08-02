@@ -6,7 +6,7 @@
 import type { MeterView, Pressure } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { effectiveLimit } from "./config.js";
-import { OVER_LIMIT_SEVERE_AMPS, median } from "./sensing.js";
+import { OVER_LIMIT_SEVERE_AMPS, isSevereOverReading, median } from "./sensing.js";
 
 /** Extreme-overshoot shed escalation (ported 2026-07-10 values). */
 export const EMERGENCY_SHED_OVERSHOOT_AMPS = 3;
@@ -18,12 +18,21 @@ export const EMERGENCY_SHED_OVERSHOOT_FRACTION = 0.2;
  * under the limit (never deep below — the anti-over-reduction rule).
  * Severe streaks size from min(severe readings) — every reading supports it,
  * one spike can't inflate it; an all-mild/oscillating episode sizes from the
- * median of the over-limit readings.
+ * median of the over-limit readings, discounted by the live flicker.
+ *
+ * The SMOOTHED overshoot is always a floor on the answer and is never
+ * discounted: whatever the raw readings look like, if the mean is over the
+ * limit that much really is owed. What the flicker discount removes is the
+ * 2026-08-02 failure — a lone 16.04A spike against a 14.92A mean sized a 1.14A
+ * demand, and the reducer paid it by shedding a 4.8A room.
  */
 export function requiredSavingsAmps(view: MeterView, limit: number, marginAmps: number): number {
   const over = view.overLimitReadings;
-  const severe = over.filter((r) => r - limit > OVER_LIMIT_SEVERE_AMPS);
-  const overshoot = severe.length > 0 ? Math.min(...severe) - limit : median([...over]) - limit;
+  const severe = over.filter((r) => isSevereOverReading(r, limit, view.flickerAmps));
+  const overshoot =
+    severe.length > 0
+      ? Math.min(...severe) - limit
+      : Math.max(view.smoothedAmps - limit, median([...over]) - limit - view.flickerAmps);
   return Math.max(0.1, overshoot) + marginAmps;
 }
 
@@ -55,11 +64,14 @@ export function assessPressure(
     const rawRequired = requiredSavingsAmps(view, limit, config.marginAmps);
     const required = Math.max(0, rawRequired - view.commandedCutCreditAmps);
     const extremeAt = Math.max(EMERGENCY_SHED_OVERSHOOT_AMPS, EMERGENCY_SHED_OVERSHOOT_FRACTION * limit);
-    const severity = required >= extremeAt
-      ? "extreme"
-      : view.overLimitReadings.some((r) => r - limit > OVER_LIMIT_SEVERE_AMPS)
-        ? "severe"
-        : "mild";
+    // Severe keys off the mean OR a reading that clears the rung by more than
+    // the live flicker. On a stable line (flicker 0, or its 0.2 floor) this is
+    // the old rule; on a flickering generator it stops one spike promoting a
+    // mild episode to the tier that skips inrush blanking and sheds a room.
+    const severe =
+      view.smoothedAmps - limit > OVER_LIMIT_SEVERE_AMPS ||
+      view.overLimitReadings.some((r) => isSevereOverReading(r, limit, view.flickerAmps));
+    const severity = required >= extremeAt ? "extreme" : severe ? "severe" : "mild";
     return { kind: "over", requiredAmps: required, severity };
   }
 

@@ -22,6 +22,7 @@ function view(overrides: Partial<MeterView> = {}): MeterView {
     overLimitReadings: [],
     collapsed: false,
     frozen: false,
+    flickerAmps: 0,
     derateAmps: 0,
     commandedCutCreditAmps: 0,
     ...overrides,
@@ -37,6 +38,20 @@ describe("requiredSavingsAmps", () => {
   it("sizes from the median for an all-mild episode", () => {
     expect(requiredSavingsAmps(view({ overLimitReadings: [15.3, 15.5, 15.4] }), 15, 0.1)).toBeCloseTo(0.5);
   });
+
+  it("discounts the flicker from a mild episode's median", () => {
+    // Same readings, but the supply is known to wobble ±0.4A — only what is
+    // left after the wobble is real demand.
+    const v = view({ overLimitReadings: [15.3, 15.5, 15.4], flickerAmps: 0.4, smoothedAmps: 14.6 });
+    expect(requiredSavingsAmps(v, 15, 0.1)).toBeCloseTo(0.2); // max(0.1, −0.4, 0.0) + 0.1
+  });
+
+  it("never sizes below the SMOOTHED overshoot, whatever the flicker", () => {
+    // The mean is the floor on the answer: if the house really is 0.6A over,
+    // that is owed no matter how noisy the line is.
+    const v = view({ overLimitReadings: [15.4], flickerAmps: 1.5, smoothedAmps: 15.6 });
+    expect(requiredSavingsAmps(v, 15, 0.1)).toBeCloseTo(0.7);
+  });
 });
 
 describe("assessPressure", () => {
@@ -45,6 +60,35 @@ describe("assessPressure", () => {
     expect(mild).toMatchObject({ kind: "over", severity: "mild" });
     const severe = assessPressure(view({ overLimitBudget: 0, overLimitReadings: [17.0, 17.1] }), cfg);
     expect(severe).toMatchObject({ kind: "over", severity: "severe" });
+  });
+
+  it("a lone spike inside the flicker band stays MILD (2026-08-02)", () => {
+    // Live 16:27 UTC: one raw 16.04A reading against a 14.92A mean on a
+    // flickering gen classified SEVERE, which skips inrush blanking — and the
+    // reducer shed the top-priority room to answer it.
+    const p = assessPressure(
+      view({ overLimitBudget: 0, overLimitReadings: [16.04], smoothedAmps: 14.92, flickerAmps: 1.0 }),
+      cfg,
+    );
+    expect(p).toMatchObject({ kind: "over", severity: "mild" });
+  });
+
+  it("the same overshoot on a QUIET line is still severe", () => {
+    // A quiet line estimates NO flicker, so this is the pre-2026-08-02 rule
+    // unchanged — the tolerance only exists where the meter demonstrated it.
+    const p = assessPressure(
+      view({ overLimitBudget: 0, overLimitReadings: [16.04], smoothedAmps: 14.92, flickerAmps: 0 }),
+      cfg,
+    );
+    expect(p).toMatchObject({ kind: "over", severity: "severe" });
+  });
+
+  it("a severe MEAN is severe however noisy the supply", () => {
+    const p = assessPressure(
+      view({ overLimitBudget: 0, overLimitReadings: [16.2, 16.4], smoothedAmps: 16.3, flickerAmps: 1.5 }),
+      cfg,
+    );
+    expect(p).toMatchObject({ kind: "over", severity: "severe" });
   });
 
   it("extreme severity at ≥ max(3A, 20% of limit) required", () => {

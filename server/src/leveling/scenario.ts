@@ -44,10 +44,12 @@ import { fanTrimSavings, raiseJumpAmps, restoreCostAmps, turnOnAmps } from "./co
 import { ceilOf, floorOf, worstCaseLevel } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
 import {
+  EXTERNAL_ON_VOID_MS,
   HOUSE_SAMPLE_COOLDOWN_MS,
   houseLoadAmps,
   initialHouseLoad,
   sampleHouseLoad,
+  voidSamples,
   type HouseLoadState,
 } from "./house-load.js";
 
@@ -87,7 +89,21 @@ export interface SimAcSetup {
 
 interface SimAc {
   setup: Required<Pick<SimAcSetup, "deviceId" | "capAmps" | "rampSeconds" | "confirmDelayMs">> & SimAcSetup;
+  /**
+   * What the cloud SHADOW reports — this is the only power state the planner
+   * ever sees (`AcView.on`). For every controller-driven path it flips together
+   * with `physicalOn`; `externalTurnOn` is what pulls them apart.
+   */
   on: boolean;
+  /**
+   * The real compressor state, which is what the METER sees. A room can be
+   * physically drawing while the shadow still says off (Najat's firmware
+   * confirms 5.8 s–13 min after the fact) — the window that books the room's
+   * whole draw as phantom "house" load.
+   */
+  physicalOn: boolean;
+  /** Shadow catches up with `physicalOn` at this timestamp (null = in sync). */
+  pendingShadowOn: number | null;
   shed: boolean;
   /** Firmware-applied level. */
   level: number;
@@ -154,10 +170,20 @@ export class Scenario {
   private residualAmps: number;
   private noise = 0;
   private noiseFlip = 1;
+  private flicker: { baseAmps: number; spikeAmps: number; spikeEveryN: number } | null = null;
+  private flickerTick = 0;
+  /**
+   * Seeded LCG. Deterministic on purpose — `Math.random()`/`Date.now()` would
+   * make a failing scenario unreproducible, and the sim is the only evidence a
+   * flicker rule works.
+   */
+  private rngState: number;
   private espFrozen = false;
   private lastSentReading: { gridAmps: number; genAmps: number } | null = null;
   /** Devices the controller shell would have in `freshlyOn` on the next tick. */
   private freshlyOn: string[] = [];
+  /** Shell parity: rooms on whose shadow has not confirmed (house sampling off). */
+  private pendingOn = new Map<string, number>();
   private attempts: Array<{ deviceId: string; kind: AttemptKind; at: number }> = [];
 
   constructor(
@@ -170,12 +196,15 @@ export class Scenario {
       residualAmps?: number;
       /** Keep the initial none→source transition (deploy/blackout cold start). */
       coldStart?: boolean;
+      /** Seed for the flicker PRNG — same seed ⇒ same meter trace, always. */
+      seed?: number;
     } = {},
   ) {
     this.book = opts.book ?? {};
     this.nonAcAmps = opts.nonAcAmps ?? 2;
     this.line = opts.source ?? "gen";
     this.residualAmps = opts.residualAmps ?? 4;
+    this.rngState = (opts.seed ?? 0x9e3779b9) >>> 0;
     if (!opts.coldStart) {
       // Prime the controller as already-settled on this source (most tests) —
       // otherwise the first reading is a none→gen cold start and FLOORS
@@ -186,6 +215,8 @@ export class Scenario {
     this.acs = setups.map((s) => ({
       setup: { rampSeconds: 120, confirmDelayMs: 10_000, name: s.deviceId, ...s },
       on: s.shed ? false : (s.on ?? true),
+      physicalOn: s.shed ? false : (s.on ?? true),
+      pendingShadowOn: null,
       shed: s.shed ?? false,
       level: s.level ?? 1,
       shadowLevel: s.level ?? 1,
@@ -257,7 +288,7 @@ export class Scenario {
     }
     if (line === "gen" || line === "grid") {
       // A real changeover restarts every running compressor.
-      for (const ac of this.acs) if (ac.on) this.startRamp(ac);
+      for (const ac of this.acs) if (ac.physicalOn) this.startRamp(ac);
     }
   }
 
@@ -269,7 +300,7 @@ export class Scenario {
   /** Power returns after a trip: compressors restart at their firmware levels. */
   recoverLine(): void {
     this.lineDead = false;
-    for (const ac of this.acs) if (ac.on) this.startRamp(ac);
+    for (const ac of this.acs) if (ac.physicalOn) this.startRamp(ac);
   }
 
   /** The user pins a level from the dashboard — manual beats every need cap. */
@@ -287,6 +318,8 @@ export class Scenario {
   turnOn(deviceId: string, level = 1): void {
     const ac = this.sim(deviceId);
     ac.on = true;
+    ac.physicalOn = true;
+    ac.pendingShadowOn = null;
     ac.shed = false;
     ac.level = level;
     ac.shadowLevel = level;
@@ -309,6 +342,8 @@ export class Scenario {
   turnOff(deviceId: string): void {
     const ac = this.sim(deviceId);
     ac.on = false;
+    ac.physicalOn = false;
+    ac.pendingShadowOn = null;
     ac.shed = false;
     ac.startBaseline = null;
     ac.rampBaseline = null;
@@ -324,6 +359,77 @@ export class Scenario {
 
   setNoise(amplitude: number): void {
     this.noise = amplitude;
+  }
+
+  /**
+   * Generator flicker: the shape `setNoise` cannot make. That one alternates
+   * ±amplitude every reading, so a 4-wide median lands exactly on the truth
+   * every time — pathologically well-behaved, and useless for testing a rule
+   * about spikes. Real gen flicker is asymmetric and bursty: a mostly-quiet
+   * line with occasional single readings a full amp high, which is what drains
+   * the leaky bucket and breaks calm while the MEAN sits comfortably under the
+   * limit (live 2026-08-02).
+   */
+  setFlicker(opts: { baseAmps: number; spikeAmps: number; spikeEveryN?: number }): void {
+    this.flicker = { spikeEveryN: 3, ...opts };
+  }
+
+  /** Deterministic LCG in [0, 1). */
+  private nextRandom(): number {
+    this.rngState = (Math.imul(this.rngState, 1664525) + 1013904223) >>> 0;
+    return this.rngState / 4294967296;
+  }
+
+  /**
+   * A household member turns an AC on at the wall or by remote: the compressor
+   * draws IMMEDIATELY while the cloud shadow the controller reads lags behind
+   * (5.8 s–13 min observed on Najat's firmware). In between, the shell models a
+   * room that is off while the meter carries its draw — the window that books
+   * that draw as phantom "house" load. `turnOn()` keeps its zero-lag behaviour.
+   */
+  externalTurnOn(deviceId: string, shadowLagMs: number, level = 1): void {
+    const ac = this.sim(deviceId);
+    ac.physicalOn = true;
+    ac.shed = false;
+    ac.level = level;
+    ac.shadowLevel = level;
+    ac.shadowLevelAt = 0;
+    ac.sentLevels = [];
+    ac.drawingUntil = 0;
+    this.startRamp(ac);
+    ac.pendingShadowOn = this.now + shadowLagMs;
+    // The shell only learns of this at the shadow flip, so it has no `since`
+    // anchor — mirror that by leaving `pendingOn` unset (the void then uses the
+    // whole window). Sampling still stands down because the room is ramping.
+  }
+
+  /**
+   * Shell parity: the controller only learns of an external turn-on when the
+   * shadow flips (its structural off→on scan), and everything it does about it
+   * — freshlyOn, the start window — happens on that tick, not when the
+   * compressor actually started.
+   */
+  private applyPendingShadowFlips(): void {
+    for (const ac of this.acs) {
+      if (ac.pendingShadowOn == null || this.now < ac.pendingShadowOn) continue;
+      ac.pendingShadowOn = null;
+      ac.on = true;
+      this.freshlyOn.push(ac.setup.deviceId);
+      const view = meterView(this.meterState, this.now);
+      if (this.line !== "none" && view.sampleCount >= 2) {
+        ac.startBaseline = { amps: view.smoothedAmps, until: this.now + GRID_START_MS };
+      }
+      // Shell parity (controller.voidPhantomHouse): everything sampled while
+      // this room was drawing-but-modeled-off counted its compressor as house.
+      const sentAt = this.pendingOn.get(ac.setup.deviceId);
+      this.pendingOn.delete(ac.setup.deviceId);
+      if (this.line !== "none") {
+        this.houseLoad = voidSamples(this.houseLoad, this.line, {
+          excludeDeviceId: ac.setup.deviceId,
+          since: sentAt ?? this.now - EXTERNAL_ON_VOID_MS,
+        });
+      }
+    }
   }
 
   /**
@@ -360,9 +466,11 @@ export class Scenario {
 
   private drawOf(ac: SimAc): number {
     if (this.lineDead) return 0;
+    // The METER follows the compressor, never the shadow: a physically-on room
+    // costs amps while the cloud still reports it off.
     // An off that has been sent but not yet delivered still costs amps — the
     // draw holds at its last steady value until the compressor really stops.
-    if (!ac.on) return this.now < ac.drawingUntil ? this.lastSteadyDraw(ac) : 0;
+    if (!ac.physicalOn) return this.now < ac.drawingUntil ? this.lastSteadyDraw(ac) : 0;
     const cap = ac.level <= 0 ? Number.POSITIVE_INFINITY : ac.setup.capAmps[Math.min(ac.level, 3) - 1];
     const rampMs = ac.setup.rampSeconds * 1000;
     const sinceOn = this.now - ac.turnedOnAt;
@@ -512,6 +620,8 @@ export class Scenario {
           break;
         case "power_off":
           ac.on = false;
+          ac.physicalOn = false;
+          ac.pendingShadowOn = null;
           ac.shed = true;
           ac.sentLevels = [];
           ac.warmStartLevel = null;
@@ -522,6 +632,8 @@ export class Scenario {
           break;
         case "power_on":
           ac.on = true;
+          ac.physicalOn = true;
+          ac.pendingShadowOn = null;
           ac.shed = false;
           ac.level = cmd.level;
           ac.shadowLevel = cmd.level;
@@ -579,7 +691,24 @@ export class Scenario {
     this.noiseFlip = -this.noiseFlip;
     // A live CT always micro-jitters (±0.005 here) — without it every steady
     // sim would read as a frozen sensor to the sensing reducer.
-    const measured = Math.max(0, total + (this.noise + 0.005) * this.noiseFlip);
+    const measured = Math.max(
+      0,
+      total +
+        (this.flicker != null
+          ? // Mostly-quiet line, with a periodic reading a full amp high. The
+            // spike CADENCE is deterministic and only its amplitude varies:
+            // supply ripple recurs, it does not arrive in random bursts — and a
+            // random one clusters, where three spikes inside one 4-wide median
+            // window genuinely lift the SMOOTHED meter over the limit. That is
+            // a real excursion the controller should answer, not the
+            // single-reading supply noise this is here to model.
+            (this.nextRandom() * 2 - 1) * this.flicker.baseAmps +
+            (this.flickerTick++ % Math.max(1, this.flicker.spikeEveryN) === 0
+              ? this.flicker.spikeAmps * (0.8 + 0.4 * this.nextRandom())
+              : 0) +
+            0.005 * this.noiseFlip
+          : (this.noise + 0.005) * this.noiseFlip),
+    );
     const live =
       this.line === "grid"
         ? { gridAmps: measured, genAmps: 0 }
@@ -598,6 +727,10 @@ export class Scenario {
       if (event.kind === "source_changed") this.pacing = resetPacing(this.pacing, event.to);
     }
     this.noteRampAbsorption();
+    // Shell parity: the structural off→on scan runs at tick start, so an
+    // external turn-on is discovered when its SHADOW flips, not when the
+    // compressor started.
+    this.applyPendingShadowFlips();
 
     // FLOORS / GRID_FULL exit checks against confirmed shadows + ramps.
     const views = this.buildViews();
@@ -623,10 +756,13 @@ export class Scenario {
     // house the shell cannot see, and no harness test could ever disagree.
     // Mirror of the shell's boot quiet: no sampling for the first cooldown.
     if (this.firstStepAt == null) this.firstStepAt = this.now;
+    // Shell parity: no house sampling while any ON is unconfirmed — the room
+    // draws before the shadow says so, and the residual would book it as house.
     if (
       view.source !== "none" &&
       view.sampleCount >= 2 &&
       !view.frozen &&
+      this.pendingOn.size === 0 &&
       this.now - this.firstStepAt >= HOUSE_SAMPLE_COOLDOWN_MS
     ) {
       this.houseLoad = sampleHouseLoad(this.houseLoad, {

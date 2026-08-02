@@ -5,6 +5,7 @@ import {
   houseLoadResidual,
   initialHouseLoad,
   sampleHouseLoad,
+  voidSamples,
 } from "./house-load.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
 import type { AcView } from "./types.js";
@@ -76,6 +77,56 @@ describe("houseLoadResidual", () => {
     const acs = [ac("abdu", { currentLevel: 1 }), ac("najat", { on: false, shed: true })];
     // Only Abdu's 4.3 is modeled; Najat contributes nothing to the AC side.
     expect(houseLoadResidual(6.0, acs, cfg, "gen")).toBeCloseTo(1.7, 5);
+  });
+});
+
+describe("voidSamples — a room that was drawing before we knew (2026-08-02)", () => {
+  // The rise-side twin of the turn-off decay contamination below: `runningSet`
+  // keys off the cloud SHADOW, so a room physically on with a lagging shadow
+  // books its whole compressor as "house", tagged with the set that excludes
+  // it — the same set that recurs on every re-shed. Live: 6.0A of "house"
+  // against a real ~2.7A, blocking every raise for 15 minutes.
+  const withoutNajat = () => [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("abdu")];
+
+  const poisoned = () => {
+    // 12.0A metered while the model only knows Abdullah 4.8 + Abdu 4.3 = 9.1;
+    // Najat's 2.9 lands in the residual.
+    const s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 12.0,
+      acs: withoutNajat(),
+      config: cfg,
+    });
+    expect(houseLoadAmps(s, "gen", T + 1_000, withoutNajat())).toBeCloseTo(2.9, 5);
+    return s;
+  };
+
+  it("drops samples that modeled the room off while it was drawing", () => {
+    const voided = voidSamples(poisoned(), "gen", { excludeDeviceId: "najat", since: T - 1 });
+    expect(houseLoadAmps(voided, "gen", T + 1_000, withoutNajat())).toBe(0);
+  });
+
+  it("keeps samples older than the window it can vouch for", () => {
+    const voided = voidSamples(poisoned(), "gen", { excludeDeviceId: "najat", since: T + 1 });
+    expect(houseLoadAmps(voided, "gen", T + 1_000, withoutNajat())).toBeCloseTo(2.9, 5);
+  });
+
+  it("keeps samples that DID model the room — those were honest", () => {
+    const s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 12.0,
+      acs: live(),
+      config: cfg,
+    });
+    const voided = voidSamples(s, "gen", { excludeDeviceId: "najat", since: T - 1 });
+    expect(houseLoadAmps(voided, "gen", T + 1_000, live())).toBeGreaterThan(0);
+  });
+
+  it("is a no-op for a source that has never been sampled", () => {
+    const s = poisoned();
+    expect(voidSamples(s, "grid", { excludeDeviceId: "najat", since: T - 1 })).toBe(s);
   });
 });
 

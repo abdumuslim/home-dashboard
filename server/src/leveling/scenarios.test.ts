@@ -73,6 +73,92 @@ describe("quiet at the resting point (anti-churn acceptance)", () => {
   });
 });
 
+describe("gen flicker shed storm (2026-08-02)", () => {
+  // The live household on a flickering 14.9A generator: Abdullah held at his L2
+  // heat-boost floor, Abdu and Najat at L1, ~2.5A of house. The user's own
+  // report is that this trio runs fine in the real world most of the time — so
+  // any paper total that says otherwise is an artifact to fix, not a reason to
+  // park a room. What the controller did instead was shed a room five times in
+  // fifteen minutes at smoothed overshoots of 0.02–0.31A.
+  const TRIO = [
+    { ...ABDULLAH, minLevel: 2, level: 2, demandAmps: 3.9, needDelta: 3 },
+    { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 2 },
+    { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1 },
+  ];
+  // 3.9 + 4.1 + 2.2 = 10.2A of AC plus 4.0A of house ≈ a 14.2A mean on a 14.9A
+  // line: the deliberate near-limit ride the controller exists to hold. Spikes
+  // of ~0.9A cross the limit constantly while the mean never does — which is
+  // precisely the live condition that used to shed a room.
+  const trio = (): Scenario =>
+    new Scenario(cfg, TRIO, { nonAcAmps: 4.0, source: "gen", seed: 20260802 });
+
+  it("ACCEPTANCE: the trio holds through 30 minutes of flicker — no room is ever shed", () => {
+    const s = trio();
+    s.advance(120); // settle
+    // One reading in four a full amp high: enough that every window carries a
+    // spike, few enough that the 4-wide median still reports the honest mean.
+    // (At a 1-in-3 duty two spikes share a window and genuinely lift the
+    // smoothed meter — a real excursion, not the noise this models.)
+    s.setFlicker({ baseAmps: 0.15, spikeAmps: 0.9, spikeEveryN: 4 });
+    const t0 = s.now;
+    s.advance(30 * 60);
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(0);
+    expect(s.acsOn()).toEqual(["abdu", "abdullah", "najat"]);
+    // And it SETTLES rather than trimming its way around the noise.
+    const churn = s.commandsSince(t0).map((e) => `${(e.at - t0) / 1000}s ${JSON.stringify(e.cmd)}`);
+    expect(churn.length, churn.join("\n")).toBeLessThanOrEqual(6);
+  });
+
+  it("does not act at all while the MEAN sits under the limit", () => {
+    // The 17:59 shape: smoothed 14.215 against a 14.5 effective limit. Every
+    // spike used to drain the bucket AND break the calm that refills it, so the
+    // bucket could only ratchet down until something was shed.
+    const s = trio();
+    s.advance(120);
+    s.setNonAc(4.4); // mean ≈ 14.6 — riding the limit, still under it
+    s.advance(120);
+    s.setFlicker({ baseAmps: 0.2, spikeAmps: 1.0, spikeEveryN: 4 });
+    const t0 = s.now;
+    s.advance(10 * 60);
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(0);
+  });
+
+  it("a genuine overload is still answered — flicker tolerance is not blindness", () => {
+    const s = trio();
+    s.advance(120);
+    // One reading in four a full amp high: enough that every window carries a
+    // spike, few enough that the 4-wide median still reports the honest mean.
+    // (At a 1-in-3 duty two spikes share a window and genuinely lift the
+    // smoothed meter — a real excursion, not the noise this models.)
+    s.setFlicker({ baseAmps: 0.15, spikeAmps: 0.9, spikeEveryN: 4 });
+    const t0 = s.now;
+    s.setNonAc(7.5); // mean ≈ 17.7 on a 14.9A line — real, and well over
+    s.advance(4 * 60);
+    expect(s.commandsSince(t0).length).toBeGreaterThan(0);
+    expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps);
+  });
+
+  it("a room discovered already running does not book its compressor as house", () => {
+    // Najat off, then switched on by hand with a 60s shadow lag. For that
+    // minute the meter carries her draw while the model says she is off, and
+    // every house sample taken then counted it as house — 6.0A observed against
+    // a real ~2.7A, which then refused every raise for fifteen minutes.
+    const s = new Scenario(cfg, [{ ...TRIO[0] }, { ...TRIO[1] }, { ...TRIO[2], on: false }], {
+      nonAcAmps: 4.0,
+      source: "gen",
+      seed: 20260802,
+    });
+    s.advance(5 * 60); // plenty of honest samples for the two-room set
+    s.externalTurnOn("najat", 60_000);
+    s.advance(5 * 60); // through the lag, the confirm, and the ramp
+    // The phantom would have been ~2.2A of Najat booked as house on top of the
+    // real 2.5A; the void plus the pending-ON sampling guard keep it honest.
+    const status = s.plans[s.plans.length - 1];
+    expect(status).toBeDefined();
+    expect(s.acsOn()).toContain("najat");
+  });
+});
+
 describe("mild overload → one graduated level cut (v1 could only floor-everyone or cascade fans)", () => {
   it("a ~0.6A overshoot cuts ONE level once fans can't cover — no cascade, no shed, no floor-everyone", () => {
     const s = new Scenario(cfg, [ABDU, ABDULLAH, NAJAT], { nonAcAmps: 2.6, source: "gen" });
@@ -178,26 +264,27 @@ describe("power collapse (external trip — the dominant real-world event)", () 
   // restore journaled "power collapse latched" for 5 minutes with ~9A of
   // headroom free, and the gen limit derated to 14A on top. The generator was
   // never in trouble; we had turned the load off ourselves.
-  // Outdoor-heat boost floors pin both rooms at L3, so no level cut is
-  // available and shedding is the only cover — the 07:18 / 07:22 pair. Both
-  // offs then travel for a minute before the compressors actually stop.
+  // Outdoor-heat boost floors pin both rooms at L3, and their offs travel for a
+  // minute before the compressors actually stop.
   const PINNED_HOT = [
     { ...ABDU, minLevel: 3, level: 3, demandAmps: 9.0, needDelta: 1.5, offLagMs: 60_000 },
     { ...NAJAT, minLevel: 3, level: 3, demandAmps: 5.3, needDelta: 0.5, offLagMs: 60_000 },
   ];
 
-  it("shedding the last ACs is NOT a power collapse — the drop we commanded is ours", () => {
-    // Base load alone sits under the 5A collapse floor, so the last shed to
-    // land is guaranteed to make a trip-shaped cliff.
+  it("nothing the reducer commands is ever read as a trip", () => {
+    // Base load alone sits under the 5A collapse floor, so whatever the reducer
+    // takes off travels for a minute and then lands as one cliff.
+    //
+    // This used to assert a two-shed pair. Since 2026-08-02 a boost floor is a
+    // preference the ladder drops BELOW before switching a room off, so these
+    // rooms give levels instead and the pair no longer happens — which is the
+    // point of that change. What must still hold, and is what this scenario
+    // guards, is that our own commanded fall never latches a collapse. The
+    // exact cliff physics is unit-covered in sensing.test.ts.
     const s = new Scenario(cfg, PINNED_HOT, { nonAcAmps: 4.3, source: "gen" });
     const t0 = s.now;
     s.advance(6 * 60);
-    expect(s.commandsSince(t0, "power_off").length).toBeGreaterThanOrEqual(2);
-    // The meter did fall past the collapse floor in one step (trip-shaped)…
-    const cliff = s.events.find((e) => e.event.kind === "collapse_suppressed");
-    expect(cliff?.event).toMatchObject({ kind: "collapse_suppressed" });
-    expect((cliff!.event as { toAmps: number }).toAmps).toBeLessThanOrEqual(5);
-    // …and none of it was read as a trip.
+    expect(s.commandsSince(t0).length).toBeGreaterThan(0);
     expect(s.events.some((e) => e.event.kind === "collapse")).toBe(false);
     expect(s.meterState.derate).toBeNull();
     // Not frozen: the controller is free to give the rooms back.

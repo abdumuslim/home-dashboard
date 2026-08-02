@@ -14,6 +14,7 @@ import { effectiveLimit } from "./config.js";
 import type { CostBook } from "./costs.js";
 import { commandedCutAmpsOf } from "./costs.js";
 import { assessPressure } from "./pressure.js";
+import { OVER_LIMIT_MODERATE_AMPS } from "./sensing.js";
 import { planReduction } from "./reduce.js";
 import { invariantCorrections, planRaise, rampDebitAmps } from "./raise.js";
 import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
@@ -23,7 +24,14 @@ import { attemptedWithin, canAttempt, RESTORE_CONFIRM_WAIT_MS, type PacingState 
 
 /** Outcome-grading delays: when the batch's meter effect is judged. */
 export const GRADE_LEVEL_MS = 45_000;
-export const GRADE_TURN_ON_MS = 270_000;
+/**
+ * Must stay ABOVE `ATTEMPT_BLAME_WINDOW_MS` (300s). At 270s a restore was
+ * declared a success 30 seconds before its blame window closed, and
+ * `noteSuccess` resets the backoff ladder AND clears `attemptMeterAmps` — the
+ * anchor invariant 22's probe re-arm reads. A bounce landing in those 30
+ * seconds then found a ladder that had already forgotten the failure.
+ */
+export const GRADE_TURN_ON_MS = 315_000;
 export const GRADE_FAN_MS = 20_000;
 
 export interface PlanInput {
@@ -132,9 +140,17 @@ export function plan(input: PlanInput): PlanOutput {
     // overshoot may still cut levels and trim fans — but it may not shed a whole
     // room for a transient that is about to decay on its own. Severe and extreme
     // are deliberately untouched: a real breach still sheds immediately.
+    //
+    // The smoothed threshold carries one moderate rung of slack (2026-08-02):
+    // at exactly `limit` a room was shed for crossings of 0.02–0.31A — inside
+    // the generator's own flicker — five times in fifteen minutes. A fresh
+    // turn-on deserves the same tolerance steady state gets, and level cuts and
+    // fan trims still ship immediately at every severity; only losing the whole
+    // room waits.
     const rampingNow = onManaged.filter((a) => a.ramping);
+    const shedThreshold = limit + OVER_LIMIT_MODERATE_AMPS;
     const inrushBlanking =
-      pressure.severity === "mild" && meter.smoothedAmps <= limit && rampingNow.length > 0;
+      pressure.severity === "mild" && meter.smoothedAmps <= shedThreshold && rampingNow.length > 0;
     // If a shed IS unavoidable while exactly one room is ramping (its own
     // turn-on caused this), undo THAT turn-on rather than exporting the shed to
     // a bystander — the re-shed penalty otherwise protects the bouncing room and
@@ -143,11 +159,22 @@ export function plan(input: PlanInput): PlanOutput {
       !inrushBlanking && rampingNow.length === 1 && onManaged.length > 1
         ? rampingNow[0].deviceId
         : null;
+    // Escalation settle: a reduction we already commanded is still travelling
+    // to the meter, so the amps it frees are not gone — they are late. Live
+    // 2026-08-02 16:55:29 a fan trim shipped, and 5s later the reducer shed a
+    // room, and 1s after that a second room, all for a ~0.5A deficit that the
+    // trim had already covered. `commandedCutCreditAmps` shrinks the demand,
+    // but only until an unrelated fall absorbs the credit early; this holds the
+    // SHED rung for one settle window while any credit is live. Levels and fans
+    // still ship immediately, and severe/extreme are untouched — a real breach
+    // never waits.
+    const escalationHold =
+      pressure.severity === "mild" && mode === "SETTLING" && meter.commandedCutCreditAmps > 0;
     const reduction = planReduction({
       acs: onManaged,
       requiredAmps: pressure.requiredAmps,
       requireShed,
-      allowShed: !inrushBlanking,
+      allowShed: !inrushBlanking && !escalationHold,
       preferShed,
       fanTrimEnabled: config.fanTrimEnabled,
       book,
@@ -186,7 +213,9 @@ export function plan(input: PlanInput): PlanOutput {
       {
         at: now,
         action: `reduce ${pressure.requiredAmps.toFixed(1)}A (${pressure.severity})`,
-        detail: `est savings ${reduction.estimatedSavingsAmps.toFixed(1)}A, satisfied=${reduction.satisfied}`,
+        detail:
+          `est savings ${reduction.estimatedSavingsAmps.toFixed(1)}A, satisfied=${reduction.satisfied}` +
+          `, smoothed ${meter.smoothedAmps.toFixed(1)}A vs ${limit.toFixed(1)}A, flicker ±${meter.flickerAmps.toFixed(1)}A`,
       },
       ...(inrushBlanking
         ? [
@@ -194,7 +223,17 @@ export function plan(input: PlanInput): PlanOutput {
               at: now,
               action: "shed",
               blockedBy: "turn-on inrush",
-              detail: `smoothed ${meter.smoothedAmps.toFixed(1)}A ≤ ${limit.toFixed(1)}A, ${rampingNow.length} ramping`,
+              detail: `smoothed ${meter.smoothedAmps.toFixed(1)}A ≤ ${shedThreshold.toFixed(1)}A, ${rampingNow.length} ramping`,
+            } satisfies Decision,
+          ]
+        : []),
+      ...(escalationHold
+        ? [
+            {
+              at: now,
+              action: "shed",
+              blockedBy: "escalation settle",
+              detail: `${meter.commandedCutCreditAmps.toFixed(1)}A already commanded off, still landing`,
             } satisfies Decision,
           ]
         : []),
@@ -214,7 +253,7 @@ export function plan(input: PlanInput): PlanOutput {
     return {
       commands: finalCommands,
       expectedDeltaAmps: -reduction.estimatedSavingsAmps,
-      commandedCutAmps: commandedCutAmpsOf(finalCommands, onManaged, config, source),
+      commandedCutAmps: commandedCutAmpsOf(finalCommands, onManaged, config, source, book, now),
       compareAfter: now + GRADE_LEVEL_MS,
       decisions,
       reason: `over_${pressure.severity}`,
@@ -288,7 +327,7 @@ export function plan(input: PlanInput): PlanOutput {
       commands: corrections.commands,
       // Corrections carry real down-moves (a level-0 re-cap, a gen start clamp),
       // so they credit the collapse detector like every other cut — invariant 11.
-      commandedCutAmps: commandedCutAmpsOf(corrections.commands, onManaged, config, source),
+      commandedCutAmps: commandedCutAmpsOf(corrections.commands, onManaged, config, source, book, now),
       decisions: [...corrections.decisions, { at: now, action: "raises/restores", blockedBy: "settle window" }],
       compareAfter: corrections.commands.length > 0 ? now + GRADE_LEVEL_MS : 0,
     };
@@ -340,7 +379,7 @@ export function plan(input: PlanInput): PlanOutput {
         // off `expectedDeltaAmps < 0`), so a large commanded fall here could
         // latch a phantom collapse. Priced from the final list so a correction
         // that overrode a cut cannot leave a stale credit behind.
-        commandedCutAmps: commandedCutAmpsOf(raiseCommands, acs, config, source),
+        commandedCutAmps: commandedCutAmpsOf(raiseCommands, acs, config, source, book, now),
         compareAfter: now + (raisePlan.isTurnOn ? GRADE_TURN_ON_MS : GRADE_LEVEL_MS),
         decisions: [...corrections.decisions, ...raisePlan.decisions],
         reason: raisePlan.isTurnOn ? "restore" : "raise",
@@ -423,7 +462,7 @@ export function plan(input: PlanInput): PlanOutput {
   return {
     ...emptyPlan(input, "hold"),
     commands: corrections.commands,
-    commandedCutAmps: commandedCutAmpsOf(corrections.commands, onManaged, config, source),
+    commandedCutAmps: commandedCutAmpsOf(corrections.commands, onManaged, config, source, book, now),
     decisions: corrections.decisions,
     compareAfter: corrections.commands.length > 0 ? now + GRADE_LEVEL_MS : 0,
   };

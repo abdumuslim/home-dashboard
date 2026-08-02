@@ -63,6 +63,7 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     overLimitReadings: [],
     collapsed: false,
     frozen: false,
+    flickerAmps: 0,
     derateAmps: 0,
     commandedCutCreditAmps: 0,
     ...overrides,
@@ -113,6 +114,42 @@ describe("batch command dedupe (live journal row 2701, 2026-07-25 05:33)", () =>
   });
 });
 
+describe("escalation settle (2026-08-02 trim → double shed in 7 seconds)", () => {
+  const pinned = (): AcView[] => [
+    ac("a", { currentLevel: 1, fanSpeed: 1, needDelta: 2 }),
+    ac("b", { currentLevel: 1, fanSpeed: 1, needDelta: 0.3 }),
+  ];
+
+  it("holds the shed while a commanded cut is still landing", () => {
+    // Live 16:55:29 a fan trim shipped; 16:55:34 and :35 two rooms went off for
+    // the ~0.5A that trim had already covered.
+    const out = run(pinned(), overMeter([15.3], 15.2), {
+      mode: "SETTLING",
+      meter: { ...overMeter([15.3], 15.2), commandedCutCreditAmps: 0.6 },
+    });
+    expect(out.severity).toBe("mild");
+    expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(0);
+    expect(out.decisions.some((d) => d.blockedBy === "escalation settle")).toBe(true);
+  });
+
+  it("does NOT hold a severe breach", () => {
+    const out = run(pinned(), overMeter([16.5], 15.2), {
+      mode: "SETTLING",
+      meter: { ...overMeter([16.5], 15.2), commandedCutCreditAmps: 0.6 },
+    });
+    expect(out.severity).toBe("severe");
+    expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
+  });
+
+  it("a fan trim is credited what the planner claimed, not zero", () => {
+    // The credit is what shrinks the next evaluation's demand; at zero the
+    // reducer re-demanded amps that were already leaving.
+    const out = run([ac("a", { currentLevel: 1, fanSpeed: 5, needDelta: 2 })], overMeter([15.2], 15.1));
+    expect(out.commands.some((c) => c.kind === "set_fan" && c.reason === "trim")).toBe(true);
+    expect(out.commandedCutAmps).toBeGreaterThan(0);
+  });
+});
+
 describe("turn-on inrush blanking (2026-07-25 restore-bounce storm)", () => {
   // Both rooms pinned at their floor with no fan slack → a shed is the only
   // cover the reducer can find, exactly like the live 20:23 state.
@@ -133,9 +170,18 @@ describe("turn-on inrush blanking (2026-07-25 restore-bounce storm)", () => {
     expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
   });
 
-  it("the same overshoot DOES shed once the smoothed meter crosses the limit", () => {
-    const out = run(pinned(true), overMeter([15.9], 15.4));
+  it("the same overshoot DOES shed once the smoothed meter clears the blanking band", () => {
+    const out = run(pinned(true), overMeter([15.9], 15.6));
     expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
+  });
+
+  it("a smoothed crossing INSIDE the flicker band is still blanked (2026-08-02)", () => {
+    // Live: a room was shed for smoothed crossings of 0.02–0.31A over the
+    // limit, five times in fifteen minutes, while its compressor was still
+    // ramping. A fresh turn-on gets the same noise tolerance steady state does.
+    const out = run(pinned(true), overMeter([15.9], 15.3));
+    expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(0);
+    expect(out.decisions.some((d) => d.blockedBy === "turn-on inrush")).toBe(true);
   });
 
   it("a severe overshoot is never blanked — a real breach still sheds", () => {

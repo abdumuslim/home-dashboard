@@ -76,6 +76,70 @@ export const FROZEN_EPSILON_AMPS = 0.005;
 export const METER_FROZEN_AFTER_MS = 60_000;
 
 /**
+ * Deadband: an estimate below this rounds to ZERO rather than up. A quiet line
+ * has no flicker to tolerate, so it keeps exactly the classification it had
+ * before any of this existed — the tolerance only ever appears where the meter
+ * has actually demonstrated it.
+ */
+export const FLICKER_MIN_AMPS = 0.2;
+/**
+ * Cap. This bounds what noise tolerance can ever cost on a real breach: a
+ * reading must clear `OVER_LIMIT_SEVERE_AMPS + flicker` to be severe, so at
+ * most 2.5A over — and the SMOOTHED overshoot (below) is never discounted at
+ * all, which is what keeps a genuine overload's latency where it was.
+ */
+export const FLICKER_MAX_AMPS = 1.5;
+/** Ring readings required before flicker is estimable at all. */
+export const FLICKER_MIN_SAMPLES = 6;
+
+/**
+ * Live supply-flicker estimate: the SECOND-largest jump between consecutive
+ * readings in the ring.
+ *
+ * A generator is not a stable line — live 2026-08-02 the gen wobbled ~±1A
+ * reading-to-reading while the mean sat comfortably under the limit, and every
+ * one of those spikes drained the leaky bucket and broke the calm that refills
+ * it. The bucket could only ratchet down, so the reducer eventually shed a room
+ * at a SMOOTHED 14.215A against a 14.5A effective limit — the mean was 0.3A
+ * UNDER. Riding near the limit is the whole point of the controller, and on gen
+ * it was self-defeating.
+ *
+ * Second-largest, on consecutive JUMPS, is what makes this safe to trust:
+ * - supply flicker spikes up and comes back, so it contributes TWO large jumps
+ *   and survives the filter;
+ * - a genuine one-time step — a compressor stopping, a shed landing, a
+ *   changeover — is exactly ONE large jump and is filtered out, so a real
+ *   event can never inflate the noise tolerance that would then hide it;
+ * - a compressor ramp climbs in small even steps and reads low.
+ *
+ * Returns 0 below `FLICKER_MIN_SAMPLES`, so a fresh boot or a source change
+ * (the ring resets on both) behaves exactly as it did before this existed —
+ * never more permissive than the code it replaced.
+ */
+function flickerOfRing(recent: readonly number[]): number {
+  if (recent.length < FLICKER_MIN_SAMPLES) return 0;
+  const jumps: number[] = [];
+  for (let i = 1; i < recent.length; i++) jumps.push(Math.abs(recent[i] - recent[i - 1]));
+  jumps.sort((a, b) => b - a);
+  return jumps[1] < FLICKER_MIN_AMPS ? 0 : Math.min(FLICKER_MAX_AMPS, jumps[1]);
+}
+
+export function flickerAmps(state: MeterState): number {
+  return flickerOfRing(state.recent);
+}
+
+/**
+ * The ONE definition of a severely-over reading, shared by the bucket-empty
+ * event and by pressure's severity tier so they can never disagree. A raw
+ * reading must clear the severe rung by more than the live flicker to count —
+ * on a quiet line (flicker 0 or the 0.2 floor) this is within a rounding error
+ * of the old fixed rule.
+ */
+export function isSevereOverReading(reading: number, limit: number, flicker: number): boolean {
+  return reading - limit > OVER_LIMIT_SEVERE_AMPS + flicker;
+}
+
+/**
  * Post-collapse limit derate (2026-07-26 triple gen trip). A thermal-magnetic
  * breaker that just tripped is hot and re-trips well below its rating until it
  * cools: the same 15A gen went at 15.65A, then 14.48A 11 min later, then
@@ -371,22 +435,29 @@ export function ingestReading(
   let overLimitReadings = state.overLimitReadings;
   let calmSince = state.calmSince;
 
-  // Defensive: a freshly-latched collapse means this reading is lost AC load,
-  // never headroom — kill calm here regardless of which measured-branch runs
-  // below. Today a ≤ POWER_COLLAPSE_FLOOR_AMPS collapse reading always lands in
-  // the ≤ limit−margin branch (which already nulls it), so this only guards a
-  // future floor/limit retune; the suspected stale-calm-after-recovery window
-  // was NOT reproducible.
-  if (collapse != null && state.collapse == null) calmSince = null;
+  // The bucket and calm are now judged on DIFFERENT yardsticks, deliberately:
+  // the bucket still triggers on any raw reading over the limit (a real breach
+  // must not wait for the median), while calm — the thing that decides whether
+  // the episode is over — follows the smoothed mean. Live 2026-08-02 they were
+  // the same yardstick and the generator's ~±1A flicker made the bucket a
+  // one-way ratchet: every spike drained it and broke the calm that refills it,
+  // so a house whose MEAN sat 0.3A under the limit still got a room shed.
+  const flicker = flickerOfRing(recent);
+  const smoothed = median(recent.slice(-SMOOTH_WINDOW));
+  const smoothedOver = smoothed - limit;
 
   if (measured > limit) {
-    // Over the limit → drain, magnitude-weighted. Calm is broken.
-    calmSince = null;
-    const over = measured - limit;
+    // The raw overshoot is discounted by the live flicker before it is
+    // classified: on a generator a single reading a full amp high, against a
+    // mean that is UNDER the limit, is supply wobble, not load. What the
+    // discount can never hide is the mean itself — once the SMOOTHED meter is
+    // over, its overshoot classifies the drain directly and undiscounted, so a
+    // genuine overload drains exactly as fast as it did before.
+    const effOver = Math.max(measured - limit - flicker, smoothedOver);
     const drain =
-      over > OVER_LIMIT_SEVERE_AMPS
+      effOver > OVER_LIMIT_SEVERE_AMPS
         ? OVER_LIMIT_DRAIN_SEVERE
-        : over > OVER_LIMIT_MODERATE_AMPS
+        : effOver > OVER_LIMIT_MODERATE_AMPS
           ? OVER_LIMIT_DRAIN_MODERATE
           : OVER_LIMIT_DRAIN_MILD;
     overLimitBudget = Math.max(0, overLimitBudget - drain);
@@ -394,28 +465,43 @@ export function ingestReading(
     if (overLimitBudget <= 0) {
       // Re-fires on every over-limit reading while empty (a failed act retries);
       // the controller shell coalesces urgent evaluations.
-      const severe = overLimitReadings.some((r) => r - limit > OVER_LIMIT_SEVERE_AMPS);
+      const severe =
+        smoothedOver > OVER_LIMIT_SEVERE_AMPS ||
+        overLimitReadings.some((r) => isSevereOverReading(r, limit, flicker));
       events.push({ kind: "bucket_empty", severity: severe ? "severe" : "mild" });
     }
-  } else if (measured <= limit - config.marginAmps) {
-    if (collapse != null || frozen) {
-      // Probable trip in progress — this low reading is lost AC load, not
-      // headroom. A FROZEN value is equally not evidence of headroom: calm
-      // built on repeats of a stale number must never admit a raise.
-      calmSince = null;
-    } else {
-      calmSince = calmSince ?? now;
-      if (now - calmSince >= CALM_REFILL_MS) {
-        // Sustained calm = the over-limit episode is over. Episode-based refill,
-        // NOT per-reading: a balanced oscillation must not refill as fast as it
-        // drains (the 31A grid failure mode).
-        overLimitBudget = OVER_LIMIT_BUDGET;
-        overLimitReadings = [];
-      }
+  }
+
+  // A raw reading over the limit by MORE than the flicker is not supply noise,
+  // and calm must break on it immediately — waiting for the median would let
+  // calm keep accruing (and REFILL the bucket this very reading just drained)
+  // for the two readings a genuine step-up takes to reach the smoothed meter.
+  // The estimator is what separates the two cases: a load step is one jump and
+  // reads as low flicker, so it breaks calm; supply wobble spikes and returns,
+  // reads as high flicker, and does not.
+  const rawIsSupplyNoise = measured <= limit + flicker;
+
+  if (collapse != null || frozen) {
+    // Probable trip in progress — a low reading here is lost AC load, not
+    // headroom. A FROZEN value is equally not evidence of headroom: calm built
+    // on repeats of a stale number must never admit a raise. (This also covers
+    // the freshly-latched collapse the old code guarded separately.)
+    calmSince = null;
+  } else if (smoothed <= limit - config.marginAmps && rawIsSupplyNoise) {
+    calmSince = calmSince ?? now;
+    if (now - calmSince >= CALM_REFILL_MS) {
+      // Sustained calm = the over-limit episode is over. Episode-based refill,
+      // NOT per-reading: a balanced oscillation must not refill as fast as it
+      // drains (the 31A grid failure mode). That guard is intact — it keys off
+      // the smoothed mean, so an oscillation CENTRED on the limit still never
+      // refills. What refills now is the case that should always have: a mean
+      // with real headroom under it, crossed occasionally by supply noise.
+      overLimitBudget = OVER_LIMIT_BUDGET;
+      overLimitReadings = [];
     }
   } else {
-    // Margin band (limit − margin, limit]: the deliberate near-limit ride —
-    // neither genuine headroom nor over. Bucket holds; calm is broken.
+    // Smoothed mean is in the margin band or over the limit — the deliberate
+    // near-limit ride. Bucket holds; calm is broken.
     calmSince = null;
   }
 
@@ -483,6 +569,7 @@ export function meterView(state: MeterState, now: number): MeterView {
     overLimitReadings: state.overLimitReadings,
     collapsed: state.collapse != null,
     frozen: state.frozen,
+    flickerAmps: stale ? 0 : flickerAmps(state),
     commandedCutCreditAmps: pendingCutCredit(state, now),
   };
 }

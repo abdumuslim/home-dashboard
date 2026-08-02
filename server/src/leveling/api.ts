@@ -60,7 +60,14 @@ export interface LevelingStatusV2 {
   measuredAmps: number | null;
   limitAmps: number | null;
   budgetAmps: number | null;
+  /** Measured worst-case non-AC house load on this source (house-load.ts peak). */
   nonAcLoadAmps: number | null;
+  /**
+   * Live supply-flicker estimate in amps. ~0 on the grid, typically 0.5–1.2 on
+   * the generator. Raw readings within this much of the limit are classified as
+   * supply noise rather than load (sensing.ts).
+   */
+  flickerAmps: number;
   overLimitBudget: number;
   overLimitBudgetMax: number;
   headroomStreak: number;
