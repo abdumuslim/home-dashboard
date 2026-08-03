@@ -46,6 +46,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     rampAbsorbedAmps: null,
     reshedPenalized: false,
     satisfiedForMs: 0,
+    subFloorStalledMs: 0,
     unmeteredJumpAmps: 0,
     ...overrides,
     envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 1,
@@ -61,6 +62,8 @@ function raise(acs: AcView[], overrides: Partial<RaiseInput> = {}) {
     // The AC-only envelope these cases were written against; the house term
     // gets its own suite below.
     nonAcAmps: 0,
+    cutAnchorAmps: 0,
+    commandedCutAmps: 0,
     limitAmps: 15,
     calmMs: 60_000,
     config: cfg,
@@ -71,6 +74,52 @@ function raise(acs: AcView[], overrides: Partial<RaiseInput> = {}) {
     ...overrides,
   });
 }
+
+describe("a restore is judged on where the meter is HEADING (2026-08-03 shed/restore cycle)", () => {
+  // Najat was shed and restored FOUR times in 23 minutes. Each restore was
+  // admitted against the instantaneous meter, which right after her shed read
+  // 9.5–12.5A — her draw gone, the survivors mid-cycle — while the settled
+  // three-room draw was ~15A. Always affordable at admission, never affordable
+  // a minute later.
+  const shedRoom = (): AcView[] => [
+    ac("a", { needDelta: 2 }),
+    ac("b", { on: false, shed: true, needDelta: 4 }),
+  ];
+
+  it("refuses while the fall from our own cut is still arriving", () => {
+    // The meter reads 9.5, but we commanded 2.5A off from a house that was at
+    // 14.0 — so it is heading for 11.5, and her ~2.3A restore does not fit
+    // under the 14.9 ceiling once it lands there... plus her own draw.
+    const p = raise(shedRoom(), {
+      smoothedAmps: 9.5,
+      headroomAmps: 5.2,
+      cutAnchorAmps: 14.0,
+      commandedCutAmps: 2.5,
+      limitAmps: 13.0,
+    });
+    expect(p.commands).not.toContainEqual(
+      expect.objectContaining({ deviceId: "b", kind: "power_on" }),
+    );
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "b", blockedBy: "no headroom" }),
+    );
+  });
+
+  it("admits the same restore once no cut is in flight", () => {
+    // Identical meter, no pending cut: the 9.5 is the house, not a trough, and
+    // stranding a room off is the worse failure (invariant 16).
+    const p = raise(shedRoom(), {
+      smoothedAmps: 9.5,
+      headroomAmps: 5.2,
+      cutAnchorAmps: 0,
+      commandedCutAmps: 0,
+      limitAmps: 13.0,
+    });
+    expect(p.commands).toContainEqual(
+      expect.objectContaining({ deviceId: "b", kind: "power_on", reason: "restore" }),
+    );
+  });
+});
 
 describe("restore outranks raises", () => {
   it("a feasible shed restore ships alone at its floor (gentle — fan pinned on gen)", () => {

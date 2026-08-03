@@ -25,7 +25,7 @@ import type { AcView, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { fanTrimSavings, levelCutSavings, modelFor, steadyDraw } from "./costs.js";
-import { ceilCapOf, ceilOf, floorOf } from "./needs.js";
+import { ceilCapOf, ceilOf, floorOf, isNonCooling } from "./needs.js";
 
 export interface ReductionWeights {
   shed: number;
@@ -118,9 +118,9 @@ interface AcMove {
   disturbed: boolean;
   shedNeed: number;
   /**
-   * Cooling this move costs a HOT room by parking it below its active comfort
-   * floor. Kept apart from `shedNeed` because it only counts in plans that
-   * already switch a room off — see the leaf in `recurse`.
+   * Cooling this move costs a room by parking it below its active comfort floor
+   * at a level that will not cool it (`isNonCooling`). Tracked separately from
+   * `shedNeed` so the two remain legible in the leaf, where both are summed.
    */
   subFloorNeed: number;
   /** This move leaves the AC running ABOVE its floor — a level is still on offer. */
@@ -289,21 +289,20 @@ export function planReduction(input: ReduceInput): ReducePlan {
           shedNeed: 0,
           // A level that does not cool is an off (user, 2026-08-03; invariant
           // 36). The comfort floor's whole meaning is "below this, this room
-          // does not cool in this weather", so parking a HOT room under it buys
-          // amps by stopping its compressor — the same outcome as a shed, and
-          // the reducer used to score it at zero. Live 11:25:32 that made
+          // does not cool in this weather", so parking such a room under it
+          // buys amps by stopping its compressor — the same outcome as a shed,
+          // and the reducer used to score it at zero. Live 11:25:32 that made
           // {shed Najat (need 1.6) + Abdullah L2→L1} score 1.6 and beat
           // {shed Abdu} at 1.8: the hottest, top-priority room stopped cooling
           // to keep a milder one running, and — being a level and not a shed —
           // nothing tracked it as off. It sat at 28°C against a setpoint of 20
-          // until the user intervened.
+          // until the user intervened, and by that evening at 34°C against the
+          // same setpoint, when switching it off changed the meter barely at all.
           //
-          // A SATISFIED room is exempt: it is not cooling right now anyway, so
-          // its sub-floor rung stays free (and preferred).
-          subFloorNeed:
-            belowFloorSteps > 0 && ac.needDelta > config.nearTargetBandC
-              ? Math.max(0, ac.needDelta) * SUBFLOOR_NEED_FRACTION
-              : 0,
+          // `isNonCooling` owns the test: within 2°C of target the level still
+          // works (and the watch checks that against the thermometer), so those
+          // rooms keep their sub-floor rung free.
+          subFloorNeed: isNonCooling(ac, level) ? Math.max(0, ac.needDelta) * SUBFLOOR_NEED_FRACTION : 0,
           aboveFloor: level > floor,
         });
       }
@@ -363,15 +362,25 @@ export function planReduction(input: ReduceInput): ReducePlan {
         cost,
         commands,
         disturbed,
-        // The protection term ranks WHO PAYS among plans that take a room out
-        // of service. A hot room parked below its comfort floor is one of those
-        // rooms (see AcMove.subFloorNeed) — but only once something is being
-        // switched off at all. Counting it unconditionally inverts the ladder:
-        // the acceptance scenario answered a 1A near-limit deficit by shedding
-        // a room instead of taking the cheap level, which is the exact cost the
-        // user predicted when he sketched this fix ("gives up a reduction rung
-        // that exists to avoid a shed"). A plan that switches nobody off still
-        // wins first, every time.
+        // The protection term ranks who pays with their cooling. A room parked
+        // below its comfort floor while `isNonCooling` holds is paying in full
+        // — it is off in everything but the paperwork — so it counts here like
+        // a shed room, but ONLY once the plan is already taking a room out of
+        // service.
+        //
+        // The user's rule ("L1 above the boost temperature should not happen")
+        // argues for counting it unconditionally, and that was tried: on a line
+        // whose MEAN sits under the limit it turns the stable answer into a
+        // shed CYCLE — the acceptance scenario went shed → restore → shed →
+        // restore, 4 power commands in 10 minutes, and parked the room at L1 in
+        // the end anyway. The reducer refuses the silent answer, its only
+        // alternative is a shed, and the restore path undoes each one because
+        // the post-shed meter genuinely looks affordable.
+        //
+        // So the rule is honoured in the two places it changes an outcome
+        // without that cost — this term when something is going off anyway, and
+        // the recovery ranking in raise.ts — and the unconditional form waits on
+        // a restore-bounce backoff, without which it has nowhere stable to land.
         shedNeed: shedNeed + (sheds > 0 ? subFloorNeed : 0),
         feasible: savings >= requiredAmps - EPS && (!requireShed || sheds > 0),
         exportsShed:

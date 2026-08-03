@@ -46,6 +46,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     rampAbsorbedAmps: null,
     reshedPenalized: false,
     satisfiedForMs: 0,
+    subFloorStalledMs: 0,
     unmeteredJumpAmps: 0,
     ...overrides,
     envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 2,
@@ -67,6 +68,7 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     flickerAmps: 0,
     derateAmps: 0,
     commandedCutCreditAmps: 0,
+    commandedCutAnchorAmps: 0,
     commandedCutTotalAmps: 0,
     ...overrides,
   };

@@ -177,6 +177,12 @@ export interface MeterView {
    */
   commandedCutCreditAmps: number;
   /**
+   * The smoothed meter when the in-flight reducing batch was commanded (0 when
+   * none). Where the meter came FROM, so a consumer can work out where it is
+   * heading rather than trusting a value the cut has not finished moving.
+   */
+  commandedCutAnchorAmps: number;
+  /**
    * Everything the current cut episode has commanded off, absorption-INCLUDED
    * (the credit above is what the meter has not shown yet; this is the whole
    * of it). The settle hold needs the total: a cut lands over minutes, and
@@ -315,6 +321,14 @@ export interface AcView {
    * cannot demote a live room.
    */
   satisfiedForMs: number;
+  /**
+   * How long this room has sat BELOW its comfort floor without getting any
+   * cooler (0 when at/above the floor, or whenever the room last made progress).
+   * The watch behind `isNonCooling` — inside the 2°C band a sub-floor level is
+   * assumed to cool, and this is what tests that assumption against the
+   * thermometer rather than trusting it (user, 2026-08-03).
+   */
+  subFloorStalledMs: number;
   /** Boost floor (≥1; >1 when an outdoor-heat boost is active). */
   minLevel: number;
   manualCap: number | null;

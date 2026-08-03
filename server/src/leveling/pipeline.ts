@@ -414,6 +414,10 @@ export function plan(input: PlanInput): PlanOutput {
       // Gen only, the same split the envelope guard and ramp debit use: grid
       // starts every AC full by directive and leans on the reducer as its safety.
       nonAcAmps: source === "gen" ? (input.nonAcAmps ?? 0) : 0,
+      // Where a cut still in flight is taking the meter — a restore admitted on
+      // the trough of its own shed comes straight back out (2026-08-03).
+      cutAnchorAmps: meter.commandedCutAnchorAmps,
+      commandedCutAmps: meter.commandedCutTotalAmps,
       limitAmps: limit,
       calmMs: meter.calmMs,
       config,

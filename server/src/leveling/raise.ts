@@ -14,7 +14,7 @@ import type { AcView, Command, CostEstimate, Decision, PowerSource } from "./typ
 import type { CostBook } from "./costs.js";
 import { levelCutSavings, modelCutAmps, modelFor, raiseJumpAmps, restoreCostAmps, steadyDraw } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
-import { ceilCapOf, ceilOf, floorOf } from "./needs.js";
+import { ceilCapOf, ceilOf, floorOf, isNonCooling } from "./needs.js";
 import {
   attemptedWithin,
   canAttempt,
@@ -185,6 +185,15 @@ export interface RaiseInput {
    * whole 2.0A gap was the house the guard never counted.
    */
   nonAcAmps: number;
+  /**
+   * The smoothed meter as it stood when the reducing batch still in flight was
+   * commanded, or 0 when no cut is live. With `commandedCutAmps` this says
+   * where the meter is HEADING, which is what a restore must be judged against
+   * while a shed's own fall is still in progress (see `landingAmps`).
+   */
+  cutAnchorAmps?: number;
+  /** What that in-flight cut was priced to save (0/absent when none). */
+  commandedCutAmps?: number;
   limitAmps: number;
   calmMs: number;
   config: LevelingConfigV2;
@@ -364,9 +373,31 @@ export function planRaise(input: RaiseInput): RaisePlan {
   const restoreCeiling = input.limitAmps - config.marginAmps;
   const restoreCalmOk = input.calmMs >= config.restoreCalmSeconds * 1000;
   let reservedAmps = 0;
+  /**
+   * Where the meter is HEADING while a cut we commanded is still landing: the
+   * meter as it stood before that cut, less what the cut was priced to save.
+   *
+   * A shed's own fall is not evidence that the house has shrunk. The room's
+   * draw leaves at once while the survivors are mid-cycle, so for a minute or
+   * two the meter reads far below what this configuration actually costs. Live
+   * 2026-08-03: Najat was shed and restored FOUR times in 23 minutes, every
+   * restore admitted at a 9.5–12.5A meter while the settled three-room draw was
+   * ~15A. Always affordable at admission, never affordable a minute later.
+   *
+   * Deliberately the meter's OWN history, not `Σ modelled draw + house`. That
+   * sum looks like the same number and is not: a meter below it also describes
+   * rooms genuinely drawing under their models (satisfied compressors cycling),
+   * and treating that as lag invents load and strands a room off — the failure
+   * invariant 16 exists to prevent, and it broke that invariant's own test.
+   * The anchor is only a claim about amps WE removed, and it expires with the
+   * pending cut (`PENDING_CUT_MS`), by which time the meter is the truth again.
+   */
+  const cutAnchor = input.cutAnchorAmps ?? 0;
+  const landingAmps = cutAnchor > 0 ? cutAnchor - (input.commandedCutAmps ?? 0) : 0;
   // The meter plus the load already on its way to it — the honest picture of
-  // what this house is committed to right now.
-  const committedAmps = input.smoothedAmps + input.rampDebitAmps;
+  // what this house is committed to right now — and never below where a cut in
+  // flight is taking it.
+  const committedAmps = Math.max(input.smoothedAmps + input.rampDebitAmps, landingAmps);
   const rampNote = input.rampDebitAmps > 0 ? ` (+${input.rampDebitAmps.toFixed(1)}A ramping in)` : "";
 
   const shedCandidates = acs
@@ -388,7 +419,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
    * only right when it is the needier of the two.
    */
   const strandedBelowFloor = onManaged
-    .filter((a) => a.currentLevel >= 1 && a.currentLevel < floorOf(a) && a.needDelta > config.nearTargetBandC)
+    .filter((a) => a.currentLevel >= 1 && isNonCooling(a, a.currentLevel))
     .sort((a, b) => b.needDelta - a.needDelta);
 
   /**

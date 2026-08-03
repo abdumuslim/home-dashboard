@@ -8,6 +8,64 @@
 
 import type { AcView } from "./types.js";
 
+/**
+ * How far above its setpoint a room may sit before a level BELOW its active
+ * comfort floor stops counting as cooling at all (user, 2026-08-03 evening).
+ *
+ * The boost floor exists because above a configured outdoor temperature the
+ * compressor often will not engage at the level beneath it. Within a couple of
+ * degrees of target that still does useful work — the demand is small enough
+ * that the unit cycles and keeps up. Past it the room simply stops cooling: the
+ * user held Abdullah at L1 through 47.3°C outdoors, watched the room climb
+ * 30 → 34°C against a setpoint of 20, then switched the AC off and saw almost
+ * no change on the meter. A level nothing was drawing, in a room nothing was
+ * cooling.
+ *
+ * Above this, such a room is treated as OFF — see `isNonCooling`.
+ */
+export const NON_COOLING_NEED_C = 2;
+
+/**
+ * How long a room may sit below its comfort floor showing NO cooling progress
+ * before it is declared non-cooling regardless of how close to target it is.
+ *
+ * The 2°C band above is a prediction ("this close, L1 still works"); this is
+ * the check on it (user, 2026-08-03: "at the 2 degrees, the system should watch
+ * it if the compressor fall"). Long enough that a slow room on a hot afternoon
+ * is not misjudged, short enough to catch a compressor that never engaged well
+ * before the room drifts out of the band on its own.
+ */
+export const SUBFLOOR_WATCH_MS = 10 * 60 * 1000;
+
+/** Cooling progress that re-bases the watch — two sensor LSBs, not noise. */
+export const SUBFLOOR_PROGRESS_C = 0.2;
+
+/**
+ * Is this AC, at `level`, effectively switched off? True only below an ACTIVE
+ * comfort floor (`floorOf` > 1 means a boost or slot floor is in force), and
+ * then on either of two grounds:
+ *
+ *  - the room is more than `NON_COOLING_NEED_C` from target, so the compressor
+ *    will not engage at all (the user's rule, and his measurement: switching
+ *    the AC off barely moved the meter); or
+ *  - it IS within that band, but has sat there `SUBFLOOR_WATCH_MS` without the
+ *    room getting any cooler — the prediction tested against the thermometer.
+ *
+ * Room temperature is the signal on purpose. The tempting alternative — "it is
+ * not drawing its modelled amps" — is circular here: the house residual is
+ * `smoothed − modelled draw`, so a room under-drawing its model moves the very
+ * number you would be reading. That reasoning already produced one wrong
+ * diagnosis on 2026-08-03 and the user corrected it.
+ *
+ * Both directions of the ladder consult this: the reducer prices such a move as
+ * a room going out of service, and the recovery path ranks such a room
+ * alongside shed rooms rather than behind them.
+ */
+export function isNonCooling(ac: AcView, level: number): boolean {
+  if (level >= floorOf(ac)) return false;
+  return ac.needDelta > NON_COOLING_NEED_C || ac.subFloorStalledMs >= SUBFLOOR_WATCH_MS;
+}
+
 /** Hard floor (≥1). Manual/slot/reachable clamps win over the boost minimum. */
 export function floorOf(ac: AcView): number {
   let floor = Math.max(1, Math.min(ac.minLevel, ac.maxLevel));

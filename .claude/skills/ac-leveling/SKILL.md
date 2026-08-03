@@ -405,6 +405,48 @@ guards, because `scenarios.test.ts` cannot see them.
     the running build does not know). Corollary for forensics: **do not trust a
     config value because a session said it set it** — re-read it.
 
+**Added 2026-08-03 (evening), the user's own rule and his measurement:**
+39. **"L1 above the boost temperature should not happen unless the room is
+    within 2°C — otherwise consider it off."** `isNonCooling(ac, level)` in
+    needs.ts is the single definition, consulted by BOTH directions: below an
+    active comfort floor, a room more than `NON_COOLING_NEED_C` (2°C) from
+    target is OFF. His evidence: held at L1 through 47.3°C outdoors, the room
+    went 30 → 34°C against a setpoint of 20, and switching the AC off moved the
+    meter barely at all — a level nothing was drawing, in a room nothing was
+    cooling. Replaces the `nearTargetBandC` (0.5) gate invariant 36 shipped with.
+    ⚠️ **The reduction term is still conditional on the plan already shedding.**
+    Counting it unconditionally — which is what "should not happen" literally
+    asks for — was built and rejected on evidence: on a line whose MEAN sits
+    under the limit it turns the stable answer into a shed CYCLE (acceptance
+    scenario: shed → restore → shed → restore, 4 power commands in 10 min, room
+    at L1 in the end anyway). The reducer refuses the silent answer, its only
+    alternative is a shed, and the restore path undoes each one because the
+    post-shed meter looks affordable. **Prerequisite for the unconditional form:
+    a restore-bounce backoff** (a restore re-shed within N minutes must slow the
+    ladder), without which there is nowhere stable to land.
+40. **Inside the band, WATCH it** (user: "at the 2 degrees the system should
+    watch it if the compressor fall"). The band is a prediction; the thermometer
+    is the check. `AcView.subFloorStalledMs` counts how long a room has sat
+    below its floor **without getting cooler** — any progress of
+    `SUBFLOOR_PROGRESS_C` (0.2°C, two sensor LSBs) re-bases the clock — and
+    `SUBFLOOR_WATCH_MS` (10 min) of no progress makes it non-cooling whatever
+    its need. ⚠️ Room TEMPERATURE, never the amp residual: `smoothed − modelled`
+    moves when a room under-draws its model, so reading it to decide whether a
+    room is under-drawing is circular. That reasoning already produced one wrong
+    diagnosis, which the user corrected. Mirrored in `scenario.ts`
+    (`trackSubFloor`) — do not let that drift.
+41. **A restore is judged on where the meter is HEADING, not where it sits.**
+    Live: Najat shed and restored FOUR times in 23 min, every restore admitted
+    at a 9.5–12.5A meter while the settled three-room draw was ~15A — her draw
+    gone, the survivors mid-cycle. `committedAmps` is now floored at
+    `cutAnchorAmps − commandedCutAmps` (the meter before the in-flight cut, less
+    what that cut was priced to save), expiring with `PENDING_CUT_MS`.
+    ⚠️ **Not `Σ modelled draw + house`** — that looks like the same number and
+    is not: a meter below it also describes rooms genuinely drawing under their
+    models, and treating that as lag invents load and strands a room off. That
+    version was written first and broke invariant 16's own test, which is what
+    caught it.
+
 38. **A credit is "late amps", not a licence — it dies when the house OUTRUNS the
     cut.** `requiredAmps` is the credited figure, and the 120 s sustained-extreme
     rung (invariant 33) is gated on `required > 0`, so a large credit silences

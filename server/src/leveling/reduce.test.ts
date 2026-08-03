@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { planReduction, type ReduceInput } from "./reduce.js";
 import { updateCost, type CostBook } from "./costs.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
+import { NON_COOLING_NEED_C } from "./needs.js";
 import type { AcView } from "./types.js";
 
 const T = 1_000_000;
@@ -43,6 +44,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     rampAbsorbedAmps: null,
     reshedPenalized: false,
     satisfiedForMs: 0,
+    subFloorStalledMs: 0,
     unmeteredJumpAmps: 0,
     ...overrides,
     envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 2,
@@ -153,6 +155,26 @@ describe("the sub-floor rung — a comfort floor is not worth a power_off (2026-
     expect(p.toShed).toEqual(["big"]);
     expect(p.desiredLevels.hot).toBeUndefined();
     expect(p.satisfied).toBe(true);
+  });
+
+  it("the 2°C band decides whether the sub-floor rung is free (user rule, 2026-08-03)", () => {
+    // One house, one variable: how far the boosted room is from its setpoint.
+    // Within the band that level still cools, so the cheap rung is used and the
+    // mildest room covers the rest. Past it the level buys nothing but silence,
+    // so the room is left alone and the deficit comes out of the big room.
+    const house = (need: number): AcView[] => [
+      boosted({ needDelta: need }),
+      ac("cool", { currentLevel: 1, fanSpeed: 1, needDelta: 0.3 }),
+      ac("big", { currentLevel: 1, fanSpeed: 1, needDelta: 1.8 }),
+    ];
+
+    const inBand = plan(house(NON_COOLING_NEED_C - 0.5), 3.65);
+    expect(inBand.desiredLevels.hot).toBe(1);
+    expect(inBand.toShed).toEqual(["cool"]);
+
+    const beyond = plan(house(NON_COOLING_NEED_C + 1), 3.65);
+    expect(beyond.desiredLevels.hot).toBeUndefined();
+    expect(beyond.toShed).toEqual(["big"]);
   });
 
   it("sheds only once the sub-floor rung is exhausted too", () => {

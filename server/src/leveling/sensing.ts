@@ -771,6 +771,8 @@ export function meterView(state: MeterState, now: number): MeterView {
     frozen: state.frozen,
     flickerAmps: stale ? 0 : flickerAmps(state),
     commandedCutCreditAmps: pendingCutCredit(state, now),
+    commandedCutAnchorAmps:
+      state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut.anchorAmps : 0,
     commandedCutTotalAmps:
       state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut.amps : 0,
   };
