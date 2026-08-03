@@ -585,6 +585,41 @@ describe("commanded-cut credit (self-inflicted collapse suppression)", () => {
     expect(swapped.state.pendingCut).toBeNull();
     expect(pendingCutCredit(swapped.state, steady.now + 5_000)).toBe(0);
   });
+
+  it("credits NOTHING while the house outruns the cut (2026-08-03 gen break)", () => {
+    // 12:26–12:29 Baghdad: Abdu was switched on at 46°C outdoor. Two level cuts
+    // armed 2.0A then 3.1A of credit against a ~0.3–1.6A overshoot, so the
+    // demand read 0 and the reducer planned NOTHING for 2 min 24 s while the
+    // meter climbed 15.6 → 16.6A. The 120s sustained-extreme rung is gated on
+    // `required > 0`, so the one rung that would have undone the turn-on could
+    // never fire. The breaker went first.
+    const steady = feedGen([15.6, 15.7, 15.5, 15.6]);
+    const cut = noteCommandedCut(steady.state, 3.1, steady.now); // anchor ≈ 15.6
+    expect(pendingCutCredit(cut, steady.now)).toBeCloseTo(3.1, 5);
+
+    // …and the meter goes the WRONG way: a compressor ramping up outpaces it.
+    const climbing = feedGen([16.1, 16.4, 16.6, 16.6], { state: cut, startAt: steady.now + 5_000 });
+    expect(pendingCutCredit(climbing.state, climbing.now)).toBe(0);
+    expect(meterView(climbing.state, climbing.now).commandedCutCreditAmps).toBe(0);
+  });
+
+  it("still credits a cut that IS landing — the double-shed guard is intact", () => {
+    // The mirror case (2026-07-31): the meter falls toward the anchor, so the
+    // credit must survive, or a stale in-window reading sheds a second room.
+    const steady = feedGen([15.6, 15.7, 15.5, 15.6]);
+    const cut = noteCommandedCut(steady.state, 3.1, steady.now);
+    const falling = feedGen([15.2, 14.6, 14.1, 13.9], { state: cut, startAt: steady.now + 5_000 });
+    expect(pendingCutCredit(falling.state, falling.now)).toBeGreaterThan(0);
+  });
+
+  it("generator flicker alone does not revoke the credit", () => {
+    // Revoking it on supply wobble would re-open the 2026-07-31 double-shed, so
+    // the comparison clears the live flicker estimate first.
+    const steady = feedGen([15.6, 15.7, 15.5, 15.6]);
+    const cut = noteCommandedCut(steady.state, 3.1, steady.now);
+    const wobbling = feedGen([15.7, 15.6, 15.75, 15.65], { state: cut, startAt: steady.now + 5_000 });
+    expect(pendingCutCredit(wobbling.state, wobbling.now)).toBeGreaterThan(0);
+  });
 });
 
 describe("source changes & gaps", () => {

@@ -405,6 +405,27 @@ guards, because `scenarios.test.ts` cannot see them.
     the running build does not know). Corollary for forensics: **do not trust a
     config value because a session said it set it** — re-read it.
 
+38. **A credit is "late amps", not a licence — it dies when the house OUTRUNS the
+    cut.** `requiredAmps` is the credited figure, and the 120 s sustained-extreme
+    rung (invariant 33) is gated on `required > 0`, so a large credit silences
+    the last rung on the ladder. Live 2026-08-03 12:26–12:29, 46 °C outdoor: a
+    room was switched back on, two level cuts armed 2.0 A then 3.1 A of credit
+    against a ~0.3–1.6 A overshoot, and the reducer then planned **nothing for
+    2 min 24 s** while the meter climbed 15.6 → 16.6 A. The breaker went. The
+    credit's premise — these amps are not gone, they are late — holds only while
+    the net load is FALLING; a compressor ramping up outruns it. `pendingCutCredit`
+    now returns 0 when the smoothed meter sits above the cut's own anchor by more
+    than the live flicker. ⚠️ The flicker margin is load-bearing in the other
+    direction: revoking a credit on supply wobble re-opens the 2026-07-31
+    double-shed, which is why two of the three guard tests pin the credit
+    SURVIVING (falling meter, flickering meter).
+    ⚠️ **Not reproducible in `scenario.ts` today** — the live shape needs cut
+    savings SMALLER than their price (Abdullah's `level:2>3` learned 3.08 A
+    against a real ~1.5 A) plus a turn-on those cuts cannot cover, and the
+    harness prices cuts from the same models the controller uses, so the sim
+    always settles under the limit. Pinned at the `pendingCutCredit` unit level
+    instead. Closing this needs the harness debt below.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's

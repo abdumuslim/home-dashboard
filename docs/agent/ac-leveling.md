@@ -95,7 +95,42 @@ pays* once something is going off.
 
 **Live outcome.** With the user's call ("turn Abdu's AC off") the generator dropped to 9.5 A and the
 leveler lifted Abdullah L1→L2 on its own 80 seconds later; the meter rose 9.5 → 11.3 A as his
-compressor came up, confirming from the meter what the room temperature had been saying.
+compressor came up, confirming from the meter what the room temperature had been saying. The new
+`floor recovery` yield was then observed live at 12:37:24 — Abdullah's stranded floor bought back
+first, Najat's shed restore 34 s behind it — which is the 11:28 ordering, corrected.
+
+### 2026-08-03 (12:29Z) — the credit that silenced the ladder for 144 seconds
+
+At 46 °C outdoor the user asked for Abdu's room back (it had reached 35 °C while off). Turning him
+on put a third compressor start onto a line already at 12.4 A of 15 A, and the breaker went 3 min
+later. The controller's response is the record:
+
+```
+12:26:40  over_mild    pre 12.41   → Najat L2→L1     (credit armed 2.0A)
+12:26:46  SETTLING     "escalation settle — 2.0A already commanded off covers 1.8A owed"
+12:27:12  over_severe  pre 15.61   → Abdullah L3→L2  (credit armed 3.1A)
+          … 2 min 24 s of NOTHING while the meter climbed 15.6 → 16.6A …
+12:29:36  COLLAPSED
+```
+
+`requiredAmps` is the credited figure, so 3.1 A of credit against a ≤1.6 A overshoot read as zero
+demand: `planReduction` was handed `requiredAmps: 0` and correctly did nothing, and invariant 33's
+120 s sustained-extreme rung — added the day before for exactly this shape, and the only rung that
+forces a room off — is gated on `required > 0`. The reducer even recorded what it wanted at 12:27:12:
+*"Abdu shed preference (its own turn-on caused this — undo it, not a peer)"*. Severe cannot force a
+shed; only extreme can. Fix: invariant 38 — the credit is void while the smoothed meter sits above
+the cut's own anchor by more than the live flicker.
+
+Two things this exposed beyond the fix:
+- **The collapse latch worked.** 16.0 → 4.7 A latched COLLAPSED, derated the limit to 14 A and froze
+  spending — the relative floor from invariant 31, proving out against the failure that latched
+  nothing twice on 2026-08-02.
+- **Three ACs do not fit on this generator at 46 °C.** After recovery the house sat at 15.0 A on a
+  derated 14 A limit with all three rooms at L1 and every fan at 1 — the ladder fully exhausted. The
+  controller shed one room (Najat, the least needy) at 12:36:22 and has been cycling
+  shed → restore → over → shed since, because the restore path admits her at a 9.5 A meter while the
+  settled three-room draw is ~14.5 A. **Open:** the restore admission does not charge the settling
+  peers' remaining ramp, so it keeps re-restoring into a house that cannot hold her.
 
 **Fan-restore churn (shipped later the same day).** The climb charged the full 60 s anti-bounce
 window for EVERY 2-gear step, and because a fan restore spends (invariant 18) each step rewinds the

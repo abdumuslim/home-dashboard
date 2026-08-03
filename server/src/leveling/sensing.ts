@@ -326,10 +326,32 @@ export function noteCommandedCut(state: MeterState, amps: number, now: number): 
   };
 }
 
-/** Amps of commanded cut the meter has not shown yet (0 when none/expired). */
+/**
+ * Amps of commanded cut the meter has not shown yet (0 when none/expired).
+ *
+ * ZERO while the house is OUTRUNNING the cut. The credit's premise is "these
+ * amps are not gone, they are late" — true whenever the net load is falling
+ * toward the anchor. It is false when something else is ramping UP harder than
+ * our cut is winding down: the amps really are still coming off, and the meter
+ * is still climbing anyway, so excusing the ladder is excusing nothing.
+ *
+ * Live 2026-08-03 12:26–12:29: Abdu was switched back on at 46°C outdoor. Two
+ * level cuts armed 2.0A then 3.1A of credit against a ~0.3–1.6A overshoot, so
+ * `requiredAmps` read 0 and the reducer planned NOTHING for 2 min 24 s while
+ * the meter climbed 15.6 → 16.6A. The 120 s sustained-extreme rung — added the
+ * day before for exactly this shape — is gated on `required > 0` and could
+ * never fire. The breaker did.
+ *
+ * The anchor is the meter as the batch went out, so "above the anchor" means
+ * the house is drawing more now than when we started cutting. Compared past the
+ * live flicker so supply wobble on a generator cannot revoke a real credit —
+ * revoking it wrongly re-opens the 2026-07-31 double-shed.
+ */
 export function pendingCutCredit(state: MeterState, now: number): number {
   const cut = state.pendingCut;
   if (cut == null || now >= cut.until) return 0;
+  const outrun = smoothedAmps(state) - cut.anchorAmps;
+  if (outrun > Math.max(flickerAmps(state), FLICKER_MIN_AMPS)) return 0;
   return Math.max(0, cut.amps - cut.absorbedAmps);
 }
 
