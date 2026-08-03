@@ -51,23 +51,72 @@ function seedDraft(config: AcLevelingConfig, acDevices: AcDevice[]): AcLevelingC
   return { ...config, priority, ampModels, genAmpModels, levelBoosts, raiseBufferAmps, nearTargetBandC, maxRaiseStepGrid, maxRaiseStepGen };
 }
 
-function NumberField({ label, value, step, onChange }: {
+/**
+ * A number input you can actually type in.
+ *
+ * These were controlled inputs that re-derived their displayed value from the
+ * parsed number on every keystroke and silently dropped anything that failed to
+ * parse or fell outside the range. Ordinary editing is made of exactly those
+ * states: clearing the field parses as NaN, and typing the first digit of "42"
+ * into a min-25 field parses as 4 — both rejected, so the input snapped back to
+ * its old value and the field felt frozen. (User report 2026-08-03: "fields I
+ * cannot change, like comfort C and min outdoor temp for each ac level" — the
+ * outdoor field was the worst, since every intermediate value is below its min.)
+ *
+ * So: hold the raw text while the field is being edited, commit values that
+ * parse and pass the range, and re-sync to the canonical value on blur.
+ */
+function NumericInput({ value, step, min, max, integer, onChange, className, title }: {
+  value: number;
+  step?: number;
+  min?: number;
+  max?: number;
+  integer?: boolean;
+  onChange: (v: number) => void;
+  className: string;
+  title?: string;
+}) {
+  const [text, setText] = useState<string | null>(null);
+  return (
+    <input
+      type="number"
+      value={text ?? String(value)}
+      step={step ?? 1}
+      min={min}
+      max={max}
+      title={title}
+      onChange={(e) => {
+        setText(e.target.value);
+        const v = integer ? parseInt(e.target.value, 10) : parseFloat(e.target.value);
+        if (!isFinite(v)) return;
+        if (integer && !Number.isInteger(v)) return;
+        if (min != null && v < min) return;
+        if (max != null && v > max) return;
+        onChange(v);
+      }}
+      onBlur={() => setText(null)}
+      className={className}
+    />
+  );
+}
+
+function NumberField({ label, value, step, min, max, onChange }: {
   label: string;
   value: number;
   step?: number;
+  min?: number;
+  max?: number;
   onChange: (v: number) => void;
 }) {
   return (
     <label className="flex flex-col gap-0.5">
       <span className="text-[0.65rem] text-dim">{label}</span>
-      <input
-        type="number"
+      <NumericInput
         value={value}
-        step={step ?? 1}
-        onChange={(e) => {
-          const v = parseFloat(e.target.value);
-          if (isFinite(v)) onChange(v);
-        }}
+        step={step}
+        min={min}
+        max={max}
+        onChange={onChange}
         className="w-full px-2 py-1 rounded-lg bg-white/10 border border-white/10 text-xs text-text focus:outline-none focus:border-cyan/50"
       />
     </label>
@@ -300,8 +349,10 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
         <NumberField label="Gen limit A" value={draft.genLimitAmps} onChange={(v) => update({ genLimitAmps: v })} />
         <NumberField label="Margin A" step={0.5} value={draft.marginAmps} onChange={(v) => update({ marginAmps: v })} />
         <NumberField label="Raise buffer A" step={0.5} value={draft.raiseBufferAmps} onChange={(v) => update({ raiseBufferAmps: v })} />
-        <NumberField label="Comfort °C" step={0.5} value={draft.comfortTargetC} onChange={(v) => update({ comfortTargetC: v })} />
-        <NumberField label="Near target °C" step={0.1} value={draft.nearTargetBandC ?? 0.5} onChange={(v) => update({ nearTargetBandC: v })} />
+        {/* Ranges mirror validateLevelingConfig() in routes.ts — a value the
+            input accepts must be one the API will take. */}
+        <NumberField label="Comfort °C" step={0.5} min={16} max={32} value={draft.comfortTargetC} onChange={(v) => update({ comfortTargetC: v })} />
+        <NumberField label="Near target °C" step={0.1} min={0} max={5} value={draft.nearTargetBandC ?? 0.5} onChange={(v) => update({ nearTargetBandC: v })} />
         <NumberField label="Grid step" value={draft.maxRaiseStepGrid ?? 1} onChange={(v) => update({ maxRaiseStepGrid: v })} />
         <NumberField label="Gen step" value={draft.maxRaiseStepGen ?? 1} onChange={(v) => update({ maxRaiseStepGen: v })} />
       </div>
@@ -384,32 +435,26 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
               {/* Conditional minimum level: AC can't cool at L1 in extreme outdoor heat */}
               <div className="flex items-center gap-1.5 pl-7 text-[0.65rem] text-dim">
                 <span>Min L</span>
-                <input
-                  type="number"
+                <NumericInput
                   min={1}
                   max={3}
+                  integer
                   value={boost.minLevel}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value, 10);
-                    if (Number.isInteger(v) && v >= 1 && v <= 3) {
-                      update({ levelBoosts: { ...draft.levelBoosts, [id]: { ...boost, minLevel: v } } });
-                    }
-                  }}
+                  onChange={(v) =>
+                    update({ levelBoosts: { ...draft.levelBoosts, [id]: { ...boost, minLevel: v } } })
+                  }
                   className="w-9 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
                   title="Minimum generator level (1 = no rule)"
                 />
                 <span>when outdoor ≥</span>
-                <input
-                  type="number"
+                <NumericInput
                   min={25}
                   max={55}
+                  step={0.5}
                   value={boost.outdoorAtLeastC}
-                  onChange={(e) => {
-                    const v = parseFloat(e.target.value);
-                    if (isFinite(v) && v >= 25 && v <= 55) {
-                      update({ levelBoosts: { ...draft.levelBoosts, [id]: { ...boost, outdoorAtLeastC: v } } });
-                    }
-                  }}
+                  onChange={(v) =>
+                    update({ levelBoosts: { ...draft.levelBoosts, [id]: { ...boost, outdoorAtLeastC: v } } })
+                  }
                   className="w-11 px-1 py-0.5 rounded bg-white/10 border border-white/10 text-[0.7rem] text-text text-center focus:outline-none focus:border-cyan/50"
                   title="Outdoor temperature that activates the minimum"
                 />
