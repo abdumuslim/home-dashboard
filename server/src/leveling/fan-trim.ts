@@ -20,6 +20,23 @@ import { fanTrimSavings } from "./costs.js";
 export const FAN_RESTORE_CALM_MS = 60_000;
 
 /**
+ * Calm required for the SECOND and later gears of a climb that is already
+ * under way.
+ *
+ * The 60 s gate above is the anti-bounce guard: it decides whether a fan that
+ * was cut may start coming back at all. Charging it again for every gear made a
+ * six-gear recovery cost three separate batches a minute apart, and because a
+ * fan restore SPENDS (invariant 18) each one rewinds the shared calm clock —
+ * so the raise path, which needs `raiseCalmSeconds`, never got a window for the
+ * whole climb. Live 2026-08-03 05:16:29 and 05:17:33 are two steps of exactly
+ * that. Once the first gear has proved itself the question is no longer "should
+ * this fan come back" but "has the last gear landed", which is a much shorter
+ * clock. Each gear is still individually gated on headroom and still arms its
+ * own fan debit, and a fresh CUT clears the climb so the full 60 s applies again.
+ */
+export const FAN_RESTORE_CONTINUE_CALM_MS = 20_000;
+
+/**
  * Gears a single restore step may climb. The old "sweet spot" search took the
  * HIGHEST target whose learned cost fit — and a 6-gear swing is priced at only
  * ~0.15A×6 = 0.9A, which fits almost always. So the anti-bounce design did a
@@ -63,6 +80,14 @@ export interface FanHold {
    */
   lastCutAt?: number;
   /**
+   * When this hold's climb back began, or absent while it has not started. The
+   * first gear pays the full `FAN_RESTORE_CALM_MS`; the rest of the same climb
+   * pay `FAN_RESTORE_CONTINUE_CALM_MS`. Cleared by a fresh cut, so a new
+   * episode always re-earns the long gate. In-memory only, like `lastCutAt` —
+   * after a restart the climb simply starts over, which is the safe direction.
+   */
+  climbStartedAt?: number;
+  /**
    * This restore was ADMITTED at the gentle PROBE price (steady floor draw),
    * not the learned plain cost — the controller's freshly-on projection must
    * re-price it at the same price admission charged (see restoreCostAmps;
@@ -88,6 +113,9 @@ export function recordFanCut(holds: FanHolds, ac: AcView, target: number, now: n
       heldAt: existing?.heldAt ?? now,
       fromCut: true,
       lastCutAt: now,
+      // A new cut ends any climb in progress: the next one re-earns the full
+      // anti-bounce window rather than inheriting a half-finished one.
+      climbStartedAt: undefined,
     },
   };
 }
@@ -154,11 +182,13 @@ export function planFanRestore(
     now: number;
   },
 ): FanRestoreStep | null {
-  if (opts.calmMs < FAN_RESTORE_CALM_MS) return null;
-  // Highest-priority AC with a live hold and a known current fan (acs are priority-sorted).
+  // The calm gate is judged PER HOLD, not once for the batch: a climb already
+  // under way asks a shorter question than one deciding whether to start.
   for (const ac of acs) {
     const hold = holds[ac.deviceId];
     if (hold == null || !ac.on) continue;
+    const gate = hold.climbStartedAt == null ? FAN_RESTORE_CALM_MS : FAN_RESTORE_CONTINUE_CALM_MS;
+    if (opts.calmMs < gate) continue;
     // Cut→restore hysteresis. A fan-only batch does not rewind the shared calm
     // clock, so without this the 60s calm gate let a fan cut come all the way
     // back 80s later and the over-limit episode simply repeated. Gentle-restore
@@ -174,7 +204,7 @@ export function planFanRestore(
       // Built-in auto: single indivisible jump, costed as a full swing.
       const cost = fanTrimSavings(opts.book, ac.deviceId, opts.source, 6, opts.now);
       if (cost <= opts.headroomAmps) {
-        const holds2 = { ...holds, [ac.deviceId]: { ...hold, lastSetFan: 0 } };
+        const holds2 = { ...holds, [ac.deviceId]: { ...hold, lastSetFan: 0, climbStartedAt: hold.climbStartedAt ?? opts.now } };
         return {
           command: { deviceId: ac.deviceId, kind: "set_fan", fan: 0, reason: "trim_restore" },
           final: true,
@@ -198,7 +228,10 @@ export function planFanRestore(
     }
     if (target === current) continue; // not even one step fits
     const final = target === hold.originalFan;
-    const holds2 = { ...holds, [ac.deviceId]: { ...hold, lastSetFan: target } };
+    const holds2 = {
+      ...holds,
+      [ac.deviceId]: { ...hold, lastSetFan: target, climbStartedAt: hold.climbStartedAt ?? opts.now },
+    };
     return {
       command: { deviceId: ac.deviceId, kind: "set_fan", fan: target, reason: "trim_restore" },
       final,

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   FAN_RESTORE_AFTER_CUT_MS,
   FAN_RESTORE_CALM_MS,
+  FAN_RESTORE_CONTINUE_CALM_MS,
   FAN_RESTORE_MAX_STEP,
   planFanRestore,
   recordFanCut,
@@ -82,6 +83,37 @@ describe("planFanRestore", () => {
     expect(planFanRestore(justCut, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 5 }))).toBeNull();
     const cooled = recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - FAN_RESTORE_AFTER_CUT_MS);
     expect(planFanRestore(cooled, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 5 }))).not.toBeNull();
+  });
+
+  it("a climb already under way does not re-pay the full anti-bounce window per gear", () => {
+    // Live 2026-08-03 05:16:29 → 05:17:33: two gears of one recovery, a minute
+    // apart, because every gear was charged the 60s gate. A fan restore SPENDS,
+    // so each one also rewinds the shared calm clock — which is why the raise
+    // path got no window for the length of the climb. The long gate decides
+    // whether a cut fan may come back AT ALL; once the first gear has proved
+    // itself the remaining question is only whether the last one has landed.
+    const cut = cutLongAgo(7);
+    const first = planFanRestore(cut, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 5 }));
+    expect(first).not.toBeNull();
+    const climbing = first!.holds;
+    // The next gear goes at the short gate…
+    expect(
+      planFanRestore(climbing, [ac("a", { fanSpeed: 3 })], opts({ calmMs: FAN_RESTORE_CONTINUE_CALM_MS, headroomAmps: 5 })),
+    ).not.toBeNull();
+    // …but not instantly: it still has to see the meter agree.
+    expect(
+      planFanRestore(climbing, [ac("a", { fanSpeed: 3 })], opts({ calmMs: FAN_RESTORE_CONTINUE_CALM_MS - 1, headroomAmps: 5 })),
+    ).toBeNull();
+  });
+
+  it("a fresh cut ends the climb, so the next restore re-earns the long gate", () => {
+    const cut = cutLongAgo(7);
+    const first = planFanRestore(cut, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 5 }));
+    const recut = recordFanCut(first!.holds, ac("a", { fanSpeed: 3 }), 1, T - FAN_RESTORE_AFTER_CUT_MS);
+    expect(recut.a.climbStartedAt).toBeUndefined();
+    expect(
+      planFanRestore(recut, [ac("a", { fanSpeed: 1 })], opts({ calmMs: FAN_RESTORE_CONTINUE_CALM_MS, headroomAmps: 5 })),
+    ).toBeNull();
   });
 
   it("climbs at most FAN_RESTORE_MAX_STEP gears, however much headroom there is", () => {

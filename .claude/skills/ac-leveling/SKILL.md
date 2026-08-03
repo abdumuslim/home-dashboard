@@ -144,6 +144,12 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     The climb is bounded to `FAN_RESTORE_MAX_STEP` (2 gears) and owes `FAN_RESTORE_AFTER_CUT_MS`
     (180 s) since the last cut; gentle-restore holds are exempt via `FanHold.fromCut: false`.
     The old "sweet spot" search always reached the original — a 6-gear swing prices at ~0.9 A.
+    Since 2026-08-03 only the FIRST gear pays the 60 s anti-bounce window; the rest of the same climb
+    pays `FAN_RESTORE_CONTINUE_CALM_MS` (20 s), tracked by `FanHold.climbStartedAt` and cleared by any
+    fresh cut. Charging the long gate per gear made a six-gear recovery three batches minutes apart,
+    and since each step rewinds calm the RAISE path was starved for the whole climb (live 05:16:29 /
+    05:17:33). The long gate answers "may this fan come back at all"; a climb in progress only needs
+    to know the last gear has landed.
 19. **The drain rung was too coarse to catch a 0.9 A overload.** 15.93 A on a 15 A limit is under
     `OVER_LIMIT_SEVERE_AMPS` (1.0), so it drained 1 point per reading — **52 s** to the first act —
     and `noteActed` then refilled the bucket to FULL, costing another **38 s**. Now

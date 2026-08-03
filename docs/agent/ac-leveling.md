@@ -64,9 +64,14 @@ and the window is forgotten after any discontinuity.
 is declared in `scenario.ts` and never written; the send-side dedupe and the grading shell have no
 mirror at all. Every new test in this strand was verified to FAIL with its own mechanism disabled.
 
-**Deferred (P2, not shipped 2026-08-03):** the fan-restore climb still costs one calm window per
-2-gear step, and `pressure` returns `hold` during that climb, so a multi-minute recovery starves
-raises. Fix is one calm window per climb, not per gear.
+**Fan-restore churn (shipped later the same day).** The climb charged the full 60 s anti-bounce
+window for EVERY 2-gear step, and because a fan restore spends (invariant 18) each step rewinds the
+shared calm clock — so a six-gear recovery took three batches minutes apart and the raise path got no
+window for the length of it. Live 05:16:29 and 05:17:33 are two steps of exactly that. The long gate
+now decides only whether a cut fan may start coming back; the rest of the same climb runs on
+`FAN_RESTORE_CONTINUE_CALM_MS` (20 s), which asks the much smaller question "has the last gear
+landed". Each gear is still headroom-gated and still arms its own fan debit, and a fresh cut clears
+`FanHold.climbStartedAt` so the next episode re-earns the full window.
 
 ### 2026-08-02 (evening) — flicker-aware pressure, the sub-floor rung, one-room-at-a-time
 
