@@ -164,3 +164,44 @@ describe("the sub-floor watch (nextSubFloorWatch — one implementation, shell a
     expect(nextSubFloorWatch(t0.watch, { ...base, active: false, now: 60_000 }).watch).toBeNull();
   });
 });
+
+describe("manual wins over the boost floor (user, 2026-08-03 evening)", () => {
+  // Live 19:29:27 the user pinned Abdullah to L1 from the dashboard while his
+  // L2 heat boost was active. `ceilOf` returned max(floor 2, target 1) = 2 and
+  // the leveler raised him back at 19:32:13 and 19:38:33. The status showed
+  // manualTarget 1 the whole time — the pin was recorded and ignored.
+  const pinned = (target: number | null, o: Partial<AcView> = {}): AcView =>
+    ac({ minLevel: 2, currentLevel: 1, manualTarget: target, needDelta: 9, ...o });
+
+  it("a pin BELOW an active boost floor lowers the floor and holds", () => {
+    expect(floorOf(pinned(1))).toBe(1);
+    expect(ceilOf(pinned(1), 0.5)).toBe(1); // was 2 — the raise that undid the pin
+  });
+
+  it("an unpinned room keeps its boost floor", () => {
+    expect(floorOf(pinned(null))).toBe(2);
+    // …and its ceiling is still need-driven (9°C from target → the top level).
+    expect(ceilOf(pinned(null), 0.5)).toBe(3);
+  });
+
+  it("a pin ABOVE the floor changes nothing about the floor", () => {
+    expect(floorOf(pinned(3))).toBe(2);
+    expect(ceilOf(pinned(3), 0.5)).toBe(3);
+  });
+
+  it("a pinned room is NOT classified non-cooling — no peer is shed for it", () => {
+    // Manual wins means the controller stops arguing, in both directions: it
+    // may not raise the room back, and it may not switch off a neighbour to
+    // fund a level the user deliberately declined.
+    expect(isNonCooling(pinned(1, { needDelta: 11 }), 1)).toBe(false);
+    expect(isNonCooling(pinned(null, { needDelta: 11 }), 1)).toBe(true);
+  });
+
+  it("but the WATCH still observes it — reported, not enforced", () => {
+    // The watch keys off the boost minimum, so a pin cannot blind it: the
+    // stall clock keeps running and can still tell the user their pinned room
+    // has not cooled in ten minutes.
+    const belowBoostFloor = (ac_: AcView): boolean => ac_.currentLevel < ac_.minLevel;
+    expect(belowBoostFloor(pinned(1))).toBe(true);
+  });
+});

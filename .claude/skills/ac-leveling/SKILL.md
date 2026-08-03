@@ -469,6 +469,20 @@ guards, because `scenarios.test.ts` cannot see them.
     version was written first and broke invariant 16's own test, which is what
     caught it.
 
+42. **A manual level is a PIN, even under a boost floor** (user, 2026-08-03
+    evening: "manual wins"). `floorOf` clamps to `manualTarget` as it always did
+    to `manualCap`. Before this, `ceilOf`'s `max(floorOf, manualTarget)` meant a
+    user pinning L1 under an active L2 boost got `max(2,1) = 2` and the leveler
+    raised the room back — live 19:32:13 and 19:38:33, ~20 s after each pin,
+    with the status reporting `manualTarget 1` throughout. The dashboard said
+    pinned; the room said otherwise.
+    ⚠️ Deliberate consequence: a pin below the boost floor also makes
+    `isNonCooling` false for that room, so no peer is ever shed to fund a level
+    the user declined. The WATCH is unaffected — it keys off the boost minimum
+    (`minLevel`), not `floorOf` — so `subFloorStalledMs` keeps accruing and can
+    still report "pinned below the comfort floor and not cooling". Reported,
+    never enforced; that is what makes "manual wins" mean anything.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's

@@ -112,9 +112,28 @@ export function isNonCooling(ac: AcView, level: number): boolean {
   return ac.needDelta > NON_COOLING_NEED_C || ac.subFloorStalledMs >= SUBFLOOR_WATCH_MS;
 }
 
-/** Hard floor (≥1). Manual/slot/reachable clamps win over the boost minimum. */
+/**
+ * Hard floor (≥1). Manual/slot/reachable clamps win over the boost minimum.
+ *
+ * `manualTarget` clamps it too (user, 2026-08-03 evening: "manual wins"). It
+ * did not until then, and the asymmetry was invisible until someone used it:
+ * `ceilOf` returns `max(floorOf, manualTarget)`, so a user pinning L1 under an
+ * active L2 boost floor got `max(2, 1) = 2` and the leveler raised the room
+ * straight back — live at 19:32:13 and again at 19:38:33, twenty seconds after
+ * the pin each time. The dashboard reported the pin, the room ignored it. That
+ * contradicts the project's own rule that a manual change beats automation.
+ *
+ * Consequence, deliberate: a pin below the boost floor also stops the room
+ * being classified non-cooling (`isNonCooling` reads THIS floor), so no peer is
+ * ever shed to recover a level the user chose to leave. The watch keeps
+ * observing regardless — it keys off the boost minimum (`minLevel`), not this
+ * — so `subFloorStalledMs` still accrues and can still say "you pinned this
+ * room below its comfort floor and it has not cooled in ten minutes". Reported,
+ * never enforced: that is what "manual wins" has to mean to be worth anything.
+ */
 export function floorOf(ac: AcView): number {
   let floor = Math.max(1, Math.min(ac.minLevel, ac.maxLevel));
+  if (ac.manualTarget != null) floor = Math.min(floor, Math.max(1, ac.manualTarget));
   if (ac.manualCap != null) floor = Math.min(floor, Math.max(1, ac.manualCap));
   if (ac.slotCap != null) floor = Math.min(floor, Math.max(1, ac.slotCap));
   if (ac.reachableCap != null) floor = Math.min(floor, Math.max(1, ac.reachableCap));
