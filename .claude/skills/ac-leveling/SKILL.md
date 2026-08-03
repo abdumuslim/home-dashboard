@@ -396,6 +396,18 @@ Abdu = **2-ton** (≈ 4.1 / 6.5 / ~9 A at L1/2/3). Abdullah & Najat = **1-ton** 
 ⚠ The registry `model` field is protocol-inference only — **its capacity digits are WRONG** (see
 `docs/agent/tcl-ac.md`).
 
+**Abdullah at L1 in high outdoor heat may not cool at all** (user, 2026-08-03): above his configured
+boost threshold the compressor often will not engage at L1, so the room draws roughly its fan and
+becomes *effectively off* while the model still prices it at ~2.3 A. It is a "most of the time"
+behaviour, not a certainty — on 2026-08-03 at ~39 °C he was still running at L1. This is what
+`levelBoosts` (minLevel 2 above N °C) exists to prevent, but the **sub-floor rung (invariant 25) is
+allowed to cut below an active boost floor**, and `invariantCorrections` deliberately will not lift
+him back (that re-assertion was the 08-02 limit cycle), so only the raise path can. Open design
+question for a later session — see the memory open-state note.
+⚠ Do NOT diagnose this from the house-load figure: the residual is `smoothed − modeled draw`, so a
+room drawing less than its model inflates "house" by construction and the reasoning is circular. The
+honest signal is the room TEMPERATURE failing to fall while the level is held.
+
 ## Navigating the doc
 
 Grep the heading, read only that section. Ordered roughly by how often it is needed:
