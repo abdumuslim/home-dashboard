@@ -17,6 +17,57 @@ timestamp: 2026-07-28
 
 A ground-up rewrite lives in **`server/src/leveling/`** (19 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
+### 2026-08-03 — the two breaks the flicker rework did not stop (and the ones it caused)
+
+The 2026-08-02 rework shipped into the evening generator peak across five deploys, with hot-fixes
+committed minutes apart. It cured what it was aimed at — the Najat shed storm is gone, and the
+overnight journal contains **zero sheds** — but the household got **two generator breaks** that
+evening, at 17:39–17:40Z and 17:45Z, and the controller reported healthy through both. Invariants
+31–35 in the SKILL are the normative list; this is the incident record.
+
+**Break #1 (17:40Z).** A raise landed at 17:37:26, then the user turned Abdullah on at 17:38:18
+(audit) and the firmware brought him back at L3. The mean rode 15.0–15.5 A for two minutes. The
+reducer commanded ~8.8 A off in three batches inside 12 seconds — all of it level cuts and fan
+trims, whose compressors wind down over minutes. The one actuator with instant physics, undoing that
+very turn-on, was unreachable twice over: severity cannot leave `mild` on a 0.3–0.5 A overshoot, and
+the inrush blanking band had been widened that afternoon to `limit + 0.5`, which covered the whole
+ride. The breaker answered first.
+
+**Break #2 (17:45Z).** The 17:40 cliff left **5.88 A** of house load on the line — over the absolute
+5 A collapse floor, so nothing latched. With no latch there was no derate, no COLLAPSED freeze, no
+FLOORS on recovery and no notification; worse, the ~6 A trough satisfied the new smoothed-calm rule
+completely, so the controller **raised into a line that had just cut out**: Abdu L2 at 17:40:56, L3
+at 17:41:31, Najat L2 at 17:42:05, all at a `pre_amps` of ~6.3–6.5. Every compressor restarted
+together at 17:44:27 (15.28 → 16.76 A) and the line went down again at 17:45:35.
+
+| Live evidence (UTC) | Cause | Fix |
+|---|---|---|
+| 15.99 A → **5.88 A**, and 16.76 A → **5.76 A**, neither latched | `POWER_COLLAPSE_FLOOR_AMPS` (5) is absolute; the residual is the HOUSE and the house drew 5.76–6.2 A | Floor is `max(5, 0.5 × pre-fall mean)`; `cliffAnchor` holds the pre-fall mean 30 s so the 4-median flip cannot close the window |
+| The same floor cannot tell a trip from switching off the 2-ton room | That room IS most of the load — meter shape alone cannot separate them (hard rule 5b) | `creditRoomOff` prices EVERY off we can know about: dashboard tap, automation, remote (observed flip). Only the unexplained remainder latches |
+| Three raises into a dead line at `pre ≈ 6.4 A` | A post-trip trough is textbook "calm": mean far under the limit, raw readings quiet | `unexplained_fall` event + `UNEXPLAINED_FALL_CALM_HOLD_MS` (120 s); an empty bucket with no evidence returns `hold`, never `calm` |
+| Two minutes at 15.6–16.0 A classified `mild` throughout | Severity was magnitude-only; mild's repertoire winds down over minutes | `smoothedOverMs` clock: 45 s ⇒ severe, 120 s ⇒ extreme (ONE room, `required > 0` after credit) — **user-approved 2026-08-03** |
+| The newcomer's own shed blocked for the whole ride | Blanking widened to `limit + 0.5` on 2026-08-02 | Reverted to `smoothed ≤ limit`; noise-driven crossings are stopped upstream by the flicker-aware bucket instead |
+| Abdu at L3 on a 15 A gen for 27 min after the 00:13Z changeover, unpriced, with a peer raised on top | `clearOnSourceChange` wiped `sendCounts`/`sentAt`; the FLOORS clamp compared the stale shadow | Sends survive a changeover (the firmware restores its last commanded level); clamp judges `envelopeLevel`; a preserved send landing late is `landed`, not a manual target |
+| Abdullah cut L2→L1 at 00:41:10, raised back at 00:42:44 | No cooldown on the involuntary side (funding demotes had one) | `VICTIM_COOLDOWN_MS` (120 s); both cooldowns clear on a changeover |
+| Three cut batches in 13 s, 12.9 A commanded for a 0.4 A deficit | `escalationHold` gated only the SHED rung; SETTLING substitutes the pending level, so each pass re-planned from the level it had just sent | Settle hold covers level and fan rungs when `commandedCutTotalAmps ≥ rawRequiredAmps` (RAW, because the credit is spent as the meter absorbs it) |
+
+**Two-event flicker blindness.** The estimator's stated safety argument — a spike is two jumps and
+survives, a real step is one jump and is filtered — holds only while the ring contains at most one
+event. **Two compressors cycling inside eight readings is this house's ordinary steady state**, and
+it pinned the estimate at its 1.5 A cap, loosening severity, calm, the drain rung and the deficit
+sizing simultaneously. It also never reset after a trip, so tolerance was at maximum for the ~8
+readings after a breaker had just proved it could not hold. Now only *reverting* excursions count,
+and the window is forgotten after any discontinuity.
+
+**Why the tests did not catch any of it.** The harness `trip()` modelled a fixed ~4 A residual —
+*under* the old absolute floor — so the exact live failure was unreachable in simulation; `pendingOn`
+is declared in `scenario.ts` and never written; the send-side dedupe and the grading shell have no
+mirror at all. Every new test in this strand was verified to FAIL with its own mechanism disabled.
+
+**Deferred (P2, not shipped 2026-08-03):** the fan-restore climb still costs one calm window per
+2-gear step, and `pressure` returns `hold` during that climb, so a multi-minute recovery starves
+raises. Fix is one calm window per climb, not per gear.
+
 ### 2026-08-02 (evening) — flicker-aware pressure, the sub-floor rung, one-room-at-a-time
 
 Six changes, one theme: **the generator is not a stable line, and the controller was treating its

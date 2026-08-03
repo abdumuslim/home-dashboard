@@ -206,10 +206,21 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
 **Added 2026-08-02 (evening) after a room was shed five times in 15 min, then the TOP-priority room three times in 10:**
 24. **A generator is not a stable line, so the meter's MEAN is the truth about
     load and a raw spike is not.** `flickerAmps()` (sensing.ts) estimates supply
-    flicker as the **second-largest jump between consecutive ring readings** —
-    a spike goes up AND comes back (two jumps, survives); a genuine one-time
-    step (shed landing, compressor stopping) is ONE jump and is filtered out, so
-    a real event can never mint the tolerance that would hide it. Rounds to 0
+    flicker as the **second-largest REVERTING excursion** in the ring: a jump
+    counts only if the signal comes back within `FLICKER_REVERT_WINDOW` (2)
+    readings to within `FLICKER_REVERT_FRACTION` (0.5) of its origin, and a
+    qualifying excursion contributes both its legs. ⚠️ It shipped 2026-08-02 as
+    "second-largest jump", whose safety argument (a spike is two jumps and
+    survives; a real step is one jump and is filtered) holds only while the ring
+    contains at most ONE event — **two compressors cycling inside eight readings
+    is the ordinary steady state of this house**, and it pinned the estimate at
+    its cap, loosening severity, calm, the drain rung and the deficit sizing at
+    once. A monotonic ramp (or a shed's own wind-down) read as its per-reading
+    step for the same reason. The ring is also forgotten after a discontinuity
+    (`flickerSamples`: ESP gap, collapse latch, recovery) — tolerance was at its
+    maximum for the ~8 readings after a breaker proved it could not hold. Both
+    legs are counted because dropping the return leg made the estimate collapse
+    to the baseline wobble whenever the newest reading WAS the spike. Rounds to 0
     below `FLICKER_MIN_AMPS` (0.2) and caps at `FLICKER_MAX_AMPS` (1.5); needs
     `FLICKER_MIN_SAMPLES` (6) ring readings, so a fresh boot or source change is
     never more permissive than before it existed. Three consumers: the bucket
@@ -281,6 +292,75 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     receiver who still cannot afford it simply hands the level back.
     ⚠️ Stamp only donors whose demote was actually **sent** (the filtered
     command list), not the plan's wish list.
+
+**Added 2026-08-03 after TWO generator breaks the evening the flicker rework shipped, neither latched:**
+31. **The residual is the HOUSE, and the house is not a constant.** The collapse
+    latch required `measured ≤ POWER_COLLAPSE_FLOOR_AMPS` (5) — an absolute
+    floor that silently assumed everything but the ACs draws under 5 A. Live
+    17:39 and 17:45 the AC circuit died on a 15.6–16.0 A gen and the house kept
+    drawing **5.76–6.2 A**, so neither break latched: no derate, no COLLAPSED
+    freeze, no FLOORS on recovery, no push. The floor is now the higher of the
+    absolute value and `POWER_COLLAPSE_FLOOR_FRACTION` (0.5) of the pre-fall
+    mean — both breaks left ~0.36–0.40 of theirs. Third instance of hard rule 5c
+    (a guard sized against only part of what it guards).
+    ⚠️ **This cannot tell a trip from someone switching off the biggest room**,
+    because that room IS most of the load. What separates them is the
+    commanded-cut credit, so EVERY off we can know about must be priced:
+    `creditRoomOff` on the dashboard tap AND on the observed shadow flip
+    (automation, remote, schedule). Ours are already credited via
+    `Plan.commandedCutAmps` and must not be credited twice. Also: the latch
+    window used to be two readings wide and did not know it (the 4-median flips
+    on the third post-cliff reading) — `cliffAnchor` holds the pre-fall mean for
+    `CLIFF_ANCHOR_MS` (30 s).
+32. **A trough you cannot explain is not headroom.** A ≥ `POWER_COLLAPSE_DROP_AMPS`
+    fall that is neither credit-explained nor floor-deep emits `unexplained_fall`
+    and stands calm down for `UNEXPLAINED_FALL_CALM_HOLD_MS` (120 s). This is the
+    belt to 31's braces: after the first break the post-trip meter read as
+    PERFECT calm and the leveler raised Abdu L2→L3 and Najat to L2 at a "pre" of
+    ~6.4 A — every compressor restarted together and the line went down again
+    four minutes later. Related: a bucket that is empty with no banked evidence
+    now returns **hold**, never `calm` (one in-band spike could drain the last
+    point and clear the readings in the same ingest, and the urgent evaluation it
+    triggered ran the RAISE path).
+33. **Severity escalates on TIME, not only magnitude.** 15.6–16.0 A on a 15 A gen
+    is 0.6–1.0 A over: "mild" forever, and mild's only tools are level cuts whose
+    compressors wind down over minutes the breaker does not have. The SMOOTHED
+    mean over the limit for `SUSTAINED_OVER_SEVERE_MS` (45 s) is **severe**
+    regardless of overshoot; for `SUSTAINED_OVER_EXTREME_MS` (120 s) it is
+    **extreme** — exactly ONE room off (invariant 26's ceiling is unchanged),
+    the user's own trade on 2026-08-03 against losing the whole house. ⚠️ The
+    extreme rung additionally requires `required > 0` AFTER credit, or the clock
+    would shed a second room while the first cut was still landing (invariant
+    19's double-shed, re-created from a timer). The clock stops while frozen or
+    collapsed. And **inrush blanking is back to `smoothed ≤ limit`** — the
+    +0.5 A slack it carried for one day covered the entire 17:38–17:40 ride and
+    blocked the one actuator with instant physics, undoing that very turn-on.
+34. **A changeover must not erase what is already in flight.** `clearOnSourceChange`
+    wiped `sendCounts`/`sentAt`, so an L3 sent on grid two minutes before the
+    00:13Z changeover was invisible: the gen-entry clamp compared the stale
+    shadow and skipped it, the envelope priced the room ~4 A light and admitted a
+    peer raise on top, and the late confirm 27 min later cost five cut batches.
+    Sends now SURVIVE (the firmware restores its last commanded level after a
+    power cycle, so they are exactly the right worst case; the TTL still bounds
+    them), the FLOORS clamp judges `envelopeLevel`, and an observation matching a
+    preserved send is a **landed** confirm — not a manual target, which would win
+    over every automatic decision until a human cleared it.
+35. **A room the reducer just cut may not climb straight back** (`VICTIM_COOLDOWN_MS`
+    120 s — the involuntary twin of 30). Abdullah was cut L2→L1 at 00:41:10Z and
+    raised back at 00:42:44, before the cut reached the meter. Both cooldowns
+    clear on a changeover (per-line physics; `fundingDemotedAt` never did).
+    The escalation settle now also covers the LEVEL and FAN rungs, not just the
+    shed, whenever `commandedCutTotalAmps ≥ rawRequiredAmps` — compare against
+    the RAW requirement, because the credit is spent as the meter absorbs it and
+    reads zero exactly when the cut is arriving (3 batches / 13 s, 12.9 A
+    commanded for a 0.4 A deficit).
+
+**Known harness debt (2026-08-03) — the reason none of 31–35 was caught in test:**
+`scenario.ts` declares `pendingOn` but never WRITES it (invariant 28 is
+structurally unexercisable), mirrors none of the send-side dedupe, has no
+grading shell (`pendingGrades`/`bornContaminated`), and its `trip()` modelled a
+4 A residual — under the old absolute floor, so the live failure could not be
+simulated at all. `residualAmps` is now settable per scenario; the rest stands.
 
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
