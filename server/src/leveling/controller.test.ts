@@ -268,6 +268,44 @@ describe("LevelingControllerV2 — grade queue", () => {
     }
   });
 
+  it("a batch whose commands are ALL deduped still journals and still refills the bucket", async () => {
+    // The send-side dedupe returned early and silently when every command in a
+    // batch was a duplicate: no journal row (the reduce decision carries no
+    // `blockedBy`, which is all `journalBlocked` writes), and none of the
+    // bookkeeping the pass owed. So the leaky bucket stayed empty, the urgent
+    // trigger re-fired on every reading, and the only forensic surface there is
+    // showed a hole. FLOORS re-assertion is the natural way to reproduce it: it
+    // re-emits the same floor command every evaluation by design.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-03T06:15:00Z"));
+      const mock = createGradePool();
+      const controller = new LevelingControllerV2(mock.pool, {
+        ...createDeps(),
+        getTclCloud: () =>
+          // Firmware that ignores the level, so the clamp keeps being re-emitted.
+          ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never,
+      });
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: acDevice("a", true, 3), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
+      ];
+      let flip = 1;
+      for (let i = 0; i < 6; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: 8 + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx, 30);
+      }
+      const deduped = mock.journal.filter((r) =>
+        JSON.stringify(r.decisions ?? []).includes("duplicate send"),
+      );
+      expect(deduped.length, "a fully-deduped batch left no trace at all").toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a shed room already ON at boot is not un-shed on the first stale shadow", async () => {
     // 2026-08-02's fix cleared the record on FIRST sight, from the boot shadow —
     // which lags 5.8s to 13min. A room shed just before a redeploy still reads
