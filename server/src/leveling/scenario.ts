@@ -41,7 +41,7 @@ import {
 import type { FanHolds } from "./fan-trim.js";
 import type { CostBook } from "./costs.js";
 import { fanTrimSavings, raiseJumpAmps, restoreCostAmps, turnOnAmps } from "./costs.js";
-import { ceilOf, floorOf, SUBFLOOR_PROGRESS_C, worstCaseLevel } from "./needs.js";
+import { ceilOf, floorOf, nextSubFloorWatch, type SubFloorWatch, worstCaseLevel } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
 import {
   EXTERNAL_ON_VOID_MS,
@@ -164,7 +164,7 @@ export class Scenario {
   private acs: SimAc[];
   /** Shell parity: when each room's uninterrupted satisfied stretch began. */
   private satisfiedSince = new Map<string, number>();
-  private subFloorSince = new Map<string, { at: number; need: number }>();
+  private subFloorSince = new Map<string, SubFloorWatch>();
   /** Shell parity: the MEASURED non-AC split (never the sim's ground truth). */
   private houseLoad: HouseLoadState = initialHouseLoad();
   /** Mirror of the shell's boot quiet (`firstTickAt`). */
@@ -522,20 +522,19 @@ export class Scenario {
     return since == null ? 0 : this.now - since;
   }
 
-  /** Shell parity for the sub-floor watch (controller.subFloorStalledMs). */
-  private trackSubFloor(ac: SimAc, observedLevel: number): void {
+  /** Shell parity for the sub-floor watch — SAME implementation, not a mirror. */
+  private subFloorStalledMs(ac: SimAc, observedLevel: number): number {
     const floor = ac.setup.minLevel ?? 1;
-    const belowFloor = ac.on && !ac.shed && observedLevel >= 1 && observedLevel < floor;
-    const seen = this.subFloorSince.get(ac.setup.deviceId);
-    if (!belowFloor) this.subFloorSince.delete(ac.setup.deviceId);
-    else if (seen == null || ac.needDelta <= seen.need - SUBFLOOR_PROGRESS_C) {
-      this.subFloorSince.set(ac.setup.deviceId, { at: this.now, need: ac.needDelta });
-    }
-  }
-
-  private subFloorStalledMs(ac: SimAc): number {
-    const seen = this.subFloorSince.get(ac.setup.deviceId);
-    return seen == null ? 0 : this.now - seen.at;
+    const r = nextSubFloorWatch(this.subFloorSince.get(ac.setup.deviceId) ?? null, {
+      active: ac.on && !ac.shed,
+      belowFloor: observedLevel >= 1 && observedLevel < floor,
+      needDelta: ac.needDelta,
+      tempKnown: true, // the sim's thermometer is always live
+      now: this.now,
+    });
+    if (r.watch != null) this.subFloorSince.set(ac.setup.deviceId, r.watch);
+    else this.subFloorSince.delete(ac.setup.deviceId);
+    return r.stalledMs;
   }
 
   private buildViews(): AcView[] {
@@ -554,7 +553,6 @@ export class Scenario {
       // Any confirm clears every unconfirmed send (reconciler parity).
       if (ac.sentLevels.includes(observedLevel)) ac.sentLevels = [];
       this.trackSatisfied(ac);
-      this.trackSubFloor(ac, observedLevel);
       return {
         deviceId: ac.setup.deviceId,
         name: ac.setup.name ?? ac.setup.deviceId,
@@ -568,7 +566,7 @@ export class Scenario {
         fanExempt: false,
         needDelta: ac.needDelta,
         satisfiedForMs: this.satisfiedForMs(ac),
-        subFloorStalledMs: this.subFloorStalledMs(ac),
+        subFloorStalledMs: this.subFloorStalledMs(ac, observedLevel),
         minLevel: ac.setup.minLevel ?? 1,
         manualCap: null,
         manualTarget: ac.manualTarget,

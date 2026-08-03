@@ -40,6 +40,42 @@ export const SUBFLOOR_WATCH_MS = 10 * 60 * 1000;
 /** Cooling progress that re-bases the watch — two sensor LSBs, not noise. */
 export const SUBFLOOR_PROGRESS_C = 0.2;
 
+/** Open below-floor stretch: when it began, and the need it has yet to beat. */
+export interface SubFloorWatch {
+  at: number;
+  need: number;
+}
+
+/**
+ * One tick of the sub-floor watch — the SINGLE implementation behind
+ * `AcView.subFloorStalledMs`, used by both the controller shell and the
+ * scenario harness so the two can never drift (the mirror-drift trap that hid
+ * bug 14 for five days).
+ *
+ * ⚠ The `tempKnown` gate is load-bearing, and it is where `satisfiedForMs`'s
+ * no-stale-guard argument INVERTS. A dead room sensor maps to needDelta
+ * EXACTLY 1 (computeAcNeed's sentinel) — inside the 2°C band and constant, so
+ * it can never show the 0.2°C of progress that re-bases this clock; ten
+ * minutes of dead sensor would read as "compressor never engaged" and the
+ * recovery path would start SPENDING on a thermometer that is lying. For the
+ * demote that failure mode was a harmless L1 cap; here it is a raise, so a
+ * tick without a real reading reports 0 — acting always requires a live
+ * thermometer. The record is kept, not reset: when the sensor returns, the two
+ * REAL endpoint readings still answer "did this room get cooler" honestly.
+ */
+export function nextSubFloorWatch(
+  prev: SubFloorWatch | null,
+  input: { active: boolean; belowFloor: boolean; needDelta: number; tempKnown: boolean; now: number },
+): { watch: SubFloorWatch | null; stalledMs: number } {
+  if (!input.active || !input.belowFloor) return { watch: null, stalledMs: 0 };
+  if (!input.tempKnown) return { watch: prev, stalledMs: 0 };
+
+  if (prev == null || input.needDelta <= prev.need - SUBFLOOR_PROGRESS_C) {
+    return { watch: { at: input.now, need: input.needDelta }, stalledMs: 0 };
+  }
+  return { watch: prev, stalledMs: input.now - prev.at };
+}
+
 /**
  * Is this AC, at `level`, effectively switched off? True only below an ACTIVE
  * comfort floor (`floorOf` > 1 means a boost or slot floor is in force), and

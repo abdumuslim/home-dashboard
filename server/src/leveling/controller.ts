@@ -78,7 +78,8 @@ import {
   ceilOf,
   floorOf,
   nearTargetNeedCap,
-  SUBFLOOR_PROGRESS_C,
+  nextSubFloorWatch,
+  type SubFloorWatch,
   worstCaseLevel,
 } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
@@ -370,7 +371,7 @@ export class LevelingControllerV2 {
   /** When each room's current uninterrupted satisfied stretch began (demote dwell). */
   private satisfiedSince = new Map<string, number>();
   /** Start of the current below-floor stretch, and the need it has yet to beat. */
-  private subFloorSince = new Map<string, { at: number; need: number }>();
+  private subFloorSince = new Map<string, SubFloorWatch>();
   private prevPowerStates = new Map<string, boolean>();
   private deviceNames = new Map<string, string>();
   /** Devices the collector reports as leveler-managed (opt-outs excluded). */
@@ -1468,33 +1469,30 @@ export class LevelingControllerV2 {
 
   /**
    * How long this room has sat below its comfort floor WITHOUT getting cooler.
-   * Any real progress (`SUBFLOOR_PROGRESS_C`) re-bases the clock, so a room
-   * that is slowly winning never trips the watch; a compressor that never
-   * engaged makes no progress and trips it after `SUBFLOOR_WATCH_MS`.
-   *
-   * Deliberately keyed off the room temperature and nothing else: the amp-side
-   * alternative reads the house residual, which a room under-drawing its model
-   * moves by construction (see `isNonCooling`).
+   * Thin stateful wrapper over `nextSubFloorWatch` (needs.ts) — the logic
+   * lives there, shared with the scenario harness, including the load-bearing
+   * dead-sensor guard.
    */
   private subFloorStalledMs(
     deviceId: string,
     belowFloor: boolean,
     needDelta: number,
+    tempKnown: boolean,
     on: boolean,
     managed: boolean,
     shed: boolean,
     now: number,
   ): number {
-    if (!on || !managed || shed || !belowFloor) {
-      this.subFloorSince.delete(deviceId);
-      return 0;
-    }
-    const seen = this.subFloorSince.get(deviceId);
-    if (seen == null || needDelta <= seen.need - SUBFLOOR_PROGRESS_C) {
-      this.subFloorSince.set(deviceId, { at: now, need: needDelta });
-      return 0;
-    }
-    return now - seen.at;
+    const r = nextSubFloorWatch(this.subFloorSince.get(deviceId) ?? null, {
+      active: on && managed && !shed,
+      belowFloor,
+      needDelta,
+      tempKnown,
+      now,
+    });
+    if (r.watch != null) this.subFloorSince.set(deviceId, r.watch);
+    else this.subFloorSince.delete(deviceId);
+    return r.stalledMs;
   }
 
   /** Live turn-on start baseline for a device, or null once the window closed. */
@@ -1553,6 +1551,8 @@ export class LevelingControllerV2 {
           device.id,
           observed >= 1 && observed < boost.minLevel,
           needDelta,
+          // computeAcNeed's dead-sensor sentinel is delta 1 — see the guard.
+          device.currentTemp != null && device.currentTemp > 0,
           device.power,
           managed,
           this.shedIds.has(device.id),

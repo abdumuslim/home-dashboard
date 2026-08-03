@@ -423,11 +423,18 @@ export function planRaise(input: RaiseInput): RaisePlan {
     .sort((a, b) => b.needDelta - a.needDelta);
 
   /**
-   * Yield only to a floor recovery that can actually ship THIS tick — the same
-   * envelope and meter tests the raise phase is about to apply. Without that
-   * the yield is a livelock: a room whose floor nobody can afford would park
-   * every restore behind it forever. Both rooms' needs keep rising while they
-   * wait, so the ordering self-corrects as the physics changes.
+   * Yield only to a floor recovery that is PHYSICALLY affordable — the same
+   * envelope and meter tests the raise phase applies. Without that the yield
+   * is a livelock: a room whose floor nobody can afford would park every
+   * restore behind it forever.
+   *
+   * Deliberately NOT the raise phase's time-gates (victim cooldown, calm,
+   * pacing): when the floor step is affordable but merely time-gated, the
+   * yield still stands the restore down, because restoring the shed room now
+   * would spend the very amps the hotter room is waiting out its cooldown to
+   * take — the yield IS the reservation. Those gates all expire (≤120 s), the
+   * user ranked the non-cooling room "the higher priority", and both rooms'
+   * needs keep rising while they wait, so the ordering self-corrects.
    */
   const floorRecoveryFits = (ac: AcView): boolean => {
     const target = Math.min(ac.currentLevel + 1, floorOf(ac));

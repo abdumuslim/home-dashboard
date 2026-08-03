@@ -99,32 +99,6 @@ compressor came up, confirming from the meter what the room temperature had been
 `floor recovery` yield was then observed live at 12:37:24 — Abdullah's stranded floor bought back
 first, Najat's shed restore 34 s behind it — which is the 11:28 ordering, corrected.
 
-### 2026-08-03 (evening) — the user's rule, measured
-
-At 47.3 °C outdoors the user reported Abdullah down at L1 again and switched it off by hand: **the
-meter barely moved.** That is the measurement the morning's design question was missing — a level
-nothing was drawing, in a room that had climbed 30 → 34 °C against a setpoint of 20. His rule:
-
-> L1 with Abdullah AC and above the specified temp should not happen unless there is a real helpful
-> need and within only 2 temp degrees above the specified, otherwise it consider off, and that should
-> be considered as it is the higher priority. … at the 2 degrees, the system should watch it if the
-> compressor fall.
-
-Shipped as invariants 39–41. `isNonCooling()` in `needs.ts` is now the single definition of "this
-level is an off", consulted by the reducer and by the recovery ranking; the 0.5 °C gate invariant 36
-shipped with is replaced by his 2 °C; and `subFloorStalledMs` is the watch inside the band — 10 min
-below the floor with no cooling progress is an off however close to target the room looks, judged on
-the thermometer because the amp residual is circular here.
-
-**What was held back, and why.** "Should not happen" argues for counting a non-cooling sub-floor cut
-unconditionally in the protection term. That was built, and the acceptance scenario rejected it: on a
-line whose MEAN sits under the limit it produced shed → restore → shed → restore, four power commands
-in ten minutes, and parked the room at L1 anyway. The reducer refuses the silent answer, its only
-alternative is a shed, and the restore path undoes each one because the post-shed meter looks
-affordable. So the rule is applied where it changes an outcome without that cost, and the
-unconditional form waits on a **restore-bounce backoff** — the missing piece that would let the house
-settle at "one room off, the hot room cooling" instead of oscillating.
-
 ### 2026-08-03 (12:29Z) — the credit that silenced the ladder for 144 seconds
 
 At 46 °C outdoor the user asked for Abdu's room back (it had reached 35 °C while off). Turning him
@@ -157,6 +131,32 @@ Two things this exposed beyond the fix:
   shed → restore → over → shed since, because the restore path admits her at a 9.5 A meter while the
   settled three-room draw is ~14.5 A. **Open:** the restore admission does not charge the settling
   peers' remaining ramp, so it keeps re-restoring into a house that cannot hold her.
+
+### 2026-08-03 (evening) — the user's rule, measured
+
+At 47.3 °C outdoors the user reported Abdullah down at L1 again and switched it off by hand: **the
+meter barely moved.** That is the measurement the morning's design question was missing — a level
+nothing was drawing, in a room that had climbed 30 → 34 °C against a setpoint of 20. His rule:
+
+> L1 with Abdullah AC and above the specified temp should not happen unless there is a real helpful
+> need and within only 2 temp degrees above the specified, otherwise it consider off, and that should
+> be considered as it is the higher priority. … at the 2 degrees, the system should watch it if the
+> compressor fall.
+
+Shipped as invariants 39–41. `isNonCooling()` in `needs.ts` is now the single definition of "this
+level is an off", consulted by the reducer and by the recovery ranking; the 0.5 °C gate invariant 36
+shipped with is replaced by his 2 °C; and `subFloorStalledMs` is the watch inside the band — 10 min
+below the floor with no cooling progress is an off however close to target the room looks, judged on
+the thermometer because the amp residual is circular here.
+
+**What was held back, and why.** "Should not happen" argues for counting a non-cooling sub-floor cut
+unconditionally in the protection term. That was built, and the acceptance scenario rejected it: on a
+line whose MEAN sits under the limit it produced shed → restore → shed → restore, four power commands
+in ten minutes, and parked the room at L1 anyway. The reducer refuses the silent answer, its only
+alternative is a shed, and the restore path undoes each one because the post-shed meter looks
+affordable. So the rule is applied where it changes an outcome without that cost, and the
+unconditional form waits on a **restore-bounce backoff** — the missing piece that would let the house
+settle at "one room off, the hot room cooling" instead of oscillating.
 
 **Fan-restore churn (shipped later the same day).** The climb charged the full 60 s anti-bounce
 window for EVERY 2-gear step, and because a fan restore spends (invariant 18) each step rewinds the

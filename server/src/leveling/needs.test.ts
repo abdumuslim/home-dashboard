@@ -6,7 +6,9 @@ import {
   floorOf,
   isNonCooling,
   nearTargetNeedCap,
+  nextSubFloorWatch,
   NON_COOLING_NEED_C,
+  SUBFLOOR_PROGRESS_C,
   SUBFLOOR_WATCH_MS,
 } from "./needs.js";
 import type { AcView } from "./types.js";
@@ -125,5 +127,40 @@ describe("a level that does not cool is an off (user rule, 2026-08-03 evening)",
     expect(isNonCooling(stalled, 1)).toBe(true);
     const progressing = boosted({ needDelta: 1.0, subFloorStalledMs: SUBFLOOR_WATCH_MS - 1 });
     expect(isNonCooling(progressing, 1)).toBe(false);
+  });
+});
+
+describe("the sub-floor watch (nextSubFloorWatch — one implementation, shell and harness)", () => {
+  const base = { active: true, belowFloor: true, needDelta: 1.0, tempKnown: true, now: 0 };
+
+  it("accrues while the room makes no progress, re-bases on real cooling", () => {
+    const t0 = nextSubFloorWatch(null, base);
+    expect(t0.stalledMs).toBe(0);
+    const later = nextSubFloorWatch(t0.watch, { ...base, now: 300_000 });
+    expect(later.stalledMs).toBe(300_000);
+    // 0.2°C of progress is real cooling — the clock starts over.
+    const cooled = nextSubFloorWatch(later.watch, { ...base, needDelta: 1.0 - SUBFLOOR_PROGRESS_C, now: 310_000 });
+    expect(cooled.stalledMs).toBe(0);
+    expect(cooled.watch?.at).toBe(310_000);
+  });
+
+  it("a dead thermometer can NEVER accrue toward a spend (2026-08-03 review)", () => {
+    // computeAcNeed maps a missing sensor to needDelta exactly 1 — constant,
+    // inside the 2°C band, incapable of showing progress. Without this gate,
+    // ten minutes of dead sensor reads as a stalled compressor and the
+    // recovery path spends on a thermometer that is lying.
+    const t0 = nextSubFloorWatch(null, base);
+    const blind = nextSubFloorWatch(t0.watch, { ...base, tempKnown: false, now: SUBFLOOR_WATCH_MS + 60_000 });
+    expect(blind.stalledMs).toBe(0);
+    // The record survives the gap: two REAL endpoint readings still answer
+    // "did this room get cooler" — and here they say no.
+    const returned = nextSubFloorWatch(blind.watch, { ...base, now: SUBFLOOR_WATCH_MS + 120_000 });
+    expect(returned.stalledMs).toBeGreaterThanOrEqual(SUBFLOOR_WATCH_MS);
+  });
+
+  it("leaving the sub-floor state (or the room going off) resets the clock", () => {
+    const t0 = nextSubFloorWatch(null, base);
+    expect(nextSubFloorWatch(t0.watch, { ...base, belowFloor: false, now: 60_000 }).watch).toBeNull();
+    expect(nextSubFloorWatch(t0.watch, { ...base, active: false, now: 60_000 }).watch).toBeNull();
   });
 });
