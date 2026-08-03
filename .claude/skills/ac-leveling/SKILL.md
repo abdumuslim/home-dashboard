@@ -356,11 +356,16 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     commanded for a 0.4 A deficit).
 
 **Known harness debt (2026-08-03) — the reason none of 31–35 was caught in test:**
-`scenario.ts` declares `pendingOn` but never WRITES it (invariant 28 is
-structurally unexercisable), mirrors none of the send-side dedupe, has no
-grading shell (`pendingGrades`/`bornContaminated`), and its `trip()` modelled a
-4 A residual — under the old absolute floor, so the live failure could not be
-simulated at all. `residualAmps` is now settable per scenario; the rest stands.
+its `trip()` modelled a fixed ~4 A residual, *under* the old absolute collapse
+floor, so the live failure was unreachable in simulation (now settable via
+`residualAmps`); `pendingOn` was declared and never written (now wired: set on
+`power_on`, cleared on the next tick / any off — which is how the one-tick
+stand-down for our OWN restores became visible at all). **Still unmirrored:**
+the send-side dedupe (`shouldSendLevel`/`lastFanSent`/`lastOffSentAt` and the
+all-filtered early return), the collector's `LEVELING_RERUN_MIN_MS`
+re-entrancy, and the whole grading shell (`pendingGrades`, `bornContaminated`,
+`lastLoadAddAt`/`lastLoadDropAt`) — changes there need `controller.test.ts`
+guards, because `scenarios.test.ts` cannot see them.
 
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket

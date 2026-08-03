@@ -366,6 +366,7 @@ export class Scenario {
     ac.rampBaseline = null;
     ac.rampAbsorbed = 0;
     ac.turnedOnAt = 0;
+    this.pendingOn.delete(deviceId);
     this.meterState = resetCalm(this.meterState);
   }
 
@@ -646,8 +647,17 @@ export class Scenario {
           // The controller's model of the device flips now; the physical
           // compressor keeps drawing until the cloud actually delivers the off.
           ac.drawingUntil = this.now + (ac.setup.offLagMs ?? 0);
+          this.pendingOn.delete(cmd.deviceId);
           break;
         case "power_on":
+          // Shell parity (executeAndJournal): the compressor starts now and the
+          // shadow confirms later, so house sampling stands down until it does.
+          // The shell forges its power cache on the same line, which makes its
+          // own structural flip fire on the very next tick — so this entry is a
+          // ONE-TICK stand-down, exactly as it is in production. (That is a
+          // finding, not a design: invariant 28's protection is real for
+          // external ONs and near-vestigial for our own restores.)
+          this.pendingOn.set(cmd.deviceId, this.now);
           ac.on = true;
           ac.physicalOn = true;
           ac.pendingShadowOn = null;
@@ -748,6 +758,14 @@ export class Scenario {
     // external turn-on is discovered when its SHADOW flips, not when the
     // compressor started.
     this.applyPendingShadowFlips();
+    // …and our OWN restores clear on the next tick, when the shell's structural
+    // scan would see the (forged) off→on flip.
+    for (const [deviceId, sentAt] of this.pendingOn) {
+      const ac = this.acs.find((a) => a.setup.deviceId === deviceId);
+      if (ac != null && ac.on && ac.pendingShadowOn == null && sentAt < this.now) {
+        this.pendingOn.delete(deviceId);
+      }
+    }
 
     // FLOORS / GRID_FULL exit checks against confirmed shadows + ramps.
     const views = this.buildViews();
