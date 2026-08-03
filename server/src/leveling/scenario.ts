@@ -345,6 +345,13 @@ export class Scenario {
    */
   turnOff(deviceId: string): void {
     const ac = this.sim(deviceId);
+    // Mirrors the shell's `creditRoomOff`: an off by any hand but the reducer's
+    // is priced off the meter, because the fall it causes is collapse-SHAPED
+    // and the relative collapse floor would otherwise read it as a trip.
+    if (this.line !== "none" && ac.on && !ac.shed) {
+      const draw = this.drawOf(ac);
+      if (draw > 0) this.meterState = noteCommandedCut(this.meterState, draw, this.now);
+    }
     ac.on = false;
     ac.physicalOn = false;
     ac.pendingShadowOn = null;

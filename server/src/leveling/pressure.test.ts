@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { assessPressure, requiredSavingsAmps } from "./pressure.js";
+import { SUSTAINED_OVER_EXTREME_MS, SUSTAINED_OVER_SEVERE_MS } from "./sensing.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
 import type { MeterView } from "./types.js";
 
@@ -18,6 +19,7 @@ function view(overrides: Partial<MeterView> = {}): MeterView {
     latestAmps: 12,
     sampleCount: 4,
     calmMs: 0,
+    smoothedOverMs: 0,
     overLimitBudget: 5,
     overLimitReadings: [],
     collapsed: false,
@@ -114,6 +116,47 @@ describe("assessPressure", () => {
     expect(assessPressure(view({ calmMs: 0, smoothedAmps: 14.8 }), cfg).kind).toBe("hold");
     expect(assessPressure(view({ calmMs: 50_000, collapsed: true }), cfg).kind).toBe("hold");
     expect(assessPressure(view({ source: "none" }), cfg).kind).toBe("hold");
+  });
+
+  it("an empty bucket with no evidence HOLDS — it is never an invitation to spend", () => {
+    // Live 2026-08-02: one raw spike inside the flicker band drained the last
+    // point AND cleared the banked readings in the same ingest. The urgent
+    // evaluation that spike triggered found no readings, fell through to the
+    // calm branch, and ran the RAISE path — spending headroom on the strength
+    // of an over-limit episode that had not been closed.
+    const p = assessPressure(view({ overLimitBudget: 0, overLimitReadings: [], calmMs: 40_000 }), cfg);
+    expect(p.kind).toBe("hold");
+  });
+
+  it("a mean over the limit for 45s is SEVERE however small the overshoot", () => {
+    // 15.6A on a 15A gen is 0.6A over: mild forever under magnitude alone, and
+    // mild can only answer with level cuts whose compressors wind down over
+    // minutes. Live 2026-08-02 that ride tripped the breaker twice.
+    const riding = view({
+      overLimitBudget: 0,
+      overLimitReadings: [15.6, 15.7],
+      smoothedAmps: 15.6,
+      flickerAmps: 0.9,
+    });
+    expect(assessPressure(riding, cfg)).toMatchObject({ severity: "mild" });
+    expect(assessPressure({ ...riding, smoothedOverMs: SUSTAINED_OVER_SEVERE_MS }, cfg)).toMatchObject({
+      severity: "severe",
+    });
+  });
+
+  it("two minutes over the limit is EXTREME — but only once our own cuts have landed", () => {
+    const riding = view({
+      overLimitBudget: 0,
+      overLimitReadings: [15.6, 15.7],
+      smoothedAmps: 15.6,
+      smoothedOverMs: SUSTAINED_OVER_EXTREME_MS,
+    });
+    expect(assessPressure(riding, cfg)).toMatchObject({ severity: "extreme" });
+    // A cut still travelling to the meter covers the deficit: escalating here
+    // would shed a second room for amps already on their way out (2026-07-31).
+    expect(assessPressure({ ...riding, commandedCutCreditAmps: 5 }, cfg)).not.toMatchObject({
+      severity: "extreme",
+    });
   });
 
   it("a projected near-limit turn-on acts proactively (no over-limit readings yet)", () => {

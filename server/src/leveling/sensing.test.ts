@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   CALM_REFILL_MS,
   COLLAPSE_DERATE_AMPS,
+  SUSTAINED_OVER_SEVERE_MS,
+  UNEXPLAINED_FALL_CALM_HOLD_MS,
   COLLAPSE_DERATE_MAX_AMPS,
   COLLAPSE_DERATE_MS,
   FLICKER_MAX_AMPS,
@@ -90,13 +92,35 @@ describe("flicker estimator (2026-08-02: gen wobbles, grid does not)", () => {
   });
 
   it("is capped, so noise tolerance can never grow without bound", () => {
-    const { state } = feedGen([5, 20, 5, 20, 5, 20, 5, 20]);
+    // A 2.5A swing — comfortably over the 1.5A cap, and deliberately NOT
+    // collapse-shaped: the old fixture swung 5↔20, which under the relative
+    // collapse floor is a textbook trip (a 15A uncommanded fall to a third of
+    // the mean) and latches, resetting the estimator's window by design.
+    const { state } = feedGen([12, 14.5, 12, 14.5, 12, 14.5, 12, 14.5]);
     expect(flickerAmps(state)).toBe(FLICKER_MAX_AMPS);
   });
 
   it("a steady ramp reads LOW — small even steps are not flicker", () => {
     const { state } = feedGen([9, 9.3, 9.6, 9.9, 10.2, 10.5, 10.8, 11.1]);
     expect(flickerAmps(state)).toBeLessThan(0.5);
+  });
+
+  it("TWO genuine steps in one window still read as no flicker (2026-08-03)", () => {
+    // The shipped estimator's safety argument — "a spike is two jumps and
+    // survives, a real step is one jump and is filtered" — held only while the
+    // ring contained at most ONE event. Two compressors cycling inside eight
+    // readings is the ordinary steady state of this house, and it pinned the
+    // estimate at its 1.5A cap: severity, calm, the drain rung and the deficit
+    // sizing all loosened at once, the second compressor's own start minting
+    // the tolerance that then hid it.
+    const { state } = feedGen([12, 12, 14, 14, 16, 16, 16, 16]);
+    expect(flickerAmps(state)).toBe(0);
+  });
+
+  it("a post-shed wind-down does not read as flicker either", () => {
+    // Monotonic decay: every step is in the same direction, so nothing reverts.
+    const { state } = feedGen([16, 15.4, 14.8, 14.2, 13.6, 13, 12.4, 11.8]);
+    expect(flickerAmps(state)).toBe(0);
   });
 
   it("isSevereOverReading discounts by the live flicker", () => {
@@ -172,7 +196,12 @@ describe("flicker-aware bucket & calm (the 2026-08-02 ratchet)", () => {
     const spiked = feedGen([16.3, 16.5, 16.4, 16.6, 16.3]);
     expect(spiked.state.overLimitReadings.length).toBeGreaterThan(0);
     expect(spiked.state.overLimitBudget).toBe(0);
-    const fell = feedGen([6.4, 6.5, 6.45], { state: spiked.state, startAt: spiked.now + 5_000 });
+    // The premise is "its cuts landed", so the cuts must be on the books: an
+    // uncommanded 10A fall to 6.4A is a breaker trip under the relative
+    // collapse floor, and a latched collapse holds calm by design (that is the
+    // 17:40 fix). Credit is what tells the two apart — invariant 5.
+    const cutSent = noteCommandedCut(spiked.state, 10, spiked.now + 1_000);
+    const fell = feedGen([6.4, 6.5, 6.45], { state: cutSent, startAt: spiked.now + 5_000 });
     expect(fell.state.overLimitReadings).toHaveLength(0);
     // …and the bucket still waits out the calm refill: clearing the evidence is
     // not the same as declaring the episode closed, so a fresh breach still
@@ -306,6 +335,101 @@ describe("leaky bucket", () => {
     // A second one still escalates — the point is a partner, not a veto.
     const two = feedGen([16.5], { state: one.state, startAt: 1_000_000 + 20_000 });
     expect(two.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
+  });
+});
+
+describe("power-collapse latch — the residual is the HOUSE (2026-08-03)", () => {
+  it("latches when the AC load vanishes but the house keeps drawing over the 5A floor", () => {
+    // Live 2026-08-02 17:39-17:40Z: the gen carried 15.6-16.0A, the AC circuit
+    // died, and the meter settled at 5.88-6.2A of house load. The absolute 5A
+    // floor missed it — twice — so nothing latched: no derate, no freeze, no
+    // FLOORS on recovery, and the post-trip trough read as PERFECT calm. The
+    // controller then raised three levels into a dead line and the second break
+    // followed four minutes later.
+    const steady = feedGen([15.5, 15.7, 15.9, 15.7]);
+    const r = ingestReading(steady.state, { gridAmps: 0, genAmps: 6.2 }, cfg, steady.now + 5_000);
+    expect(r.events.some((e) => e.kind === "collapse")).toBe(true);
+    expect(r.state.collapse).not.toBeNull();
+    // …and the line is derated, which is the protection the miss cost us.
+    expect(r.state.derate?.amps).toBe(COLLAPSE_DERATE_AMPS);
+  });
+
+  it("a room switched off by hand is NOT a trip — the credit is what tells them apart", () => {
+    // Same fall, same residual, but this one we know about (dashboard tap,
+    // automation, or an observed off the shell priced). Without this the
+    // relative floor would latch COLLAPSED every time the biggest room goes off.
+    const steady = feedGen([15.5, 15.7, 15.9, 15.7]);
+    const known = noteCommandedCut(steady.state, 9.3, steady.now + 1_000);
+    const r = ingestReading(known, { gridAmps: 0, genAmps: 6.2 }, cfg, steady.now + 5_000);
+    expect(r.events.some((e) => e.kind === "collapse")).toBe(false);
+    expect(r.events.some((e) => e.kind === "collapse_suppressed")).toBe(true);
+    expect(r.state.derate).toBeNull();
+  });
+
+  it("a fall that arrives in two steps still latches — the pre-fall mean is held", () => {
+    // The window used to be two readings wide and did not know it: with a
+    // 4-wide median the baseline flips on the third post-cliff reading, so a
+    // 10.5A fall reads as 4A and fails the test it would have passed.
+    const steady = feedGen([16, 16, 16, 16]);
+    const step1 = feedGen([9.5, 9.4, 9.3], { state: steady.state, startAt: steady.now + 5_000 });
+    expect(step1.events.some((e) => e.kind === "unexplained_fall")).toBe(true);
+    expect(step1.state.cliffAnchor?.medianAmps).toBe(16);
+    const step2 = ingestReading(step1.state, { gridAmps: 0, genAmps: 5.5 }, cfg, step1.now + 5_000);
+    expect(step2.events.some((e) => e.kind === "collapse")).toBe(true);
+  });
+
+  it("an unexplained fall that does NOT latch still stands calm down", () => {
+    // Belt to the latch's braces: the line is still carrying load, so this is
+    // not provably a trip — but it is equally not headroom, and the controller
+    // may not spend into a trough it cannot explain.
+    const steady = feedGen([15.5, 15.7, 15.9, 15.7]);
+    const fell = ingestReading(steady.state, { gridAmps: 0, genAmps: 8.5 }, cfg, steady.now + 5_000);
+    expect(fell.events.some((e) => e.kind === "collapse")).toBe(false);
+    const ev = fell.events.find((e) => e.kind === "unexplained_fall");
+    expect(ev).toMatchObject({ fromAmps: 15.7, toAmps: 8.5 });
+    // Quiet, well-under-limit readings for a minute: still no calm. (Jittered —
+    // a bit-identical stream would read as a hung sensor and zero calm anyway,
+    // which would prove nothing about the hold.)
+    const quiet = feedGen(
+      Array.from({ length: 12 }, (_, i) => 8.5 + (i % 2) * 0.02),
+      { state: fell.state, startAt: fell.state.lastReadingAt + 5_000 },
+    );
+    expect(meterView(quiet.state, quiet.now).calmMs).toBe(0);
+    // …and it expires, so nothing is stranded.
+    const later = feedGen([8.5, 8.52, 8.5], {
+      state: quiet.state,
+      startAt: quiet.now + UNEXPLAINED_FALL_CALM_HOLD_MS,
+    });
+    expect(meterView(later.state, later.now).calmMs).toBeGreaterThan(0);
+  });
+
+  it("the estimator forgets the ring after a trip — tolerance is lowest when the breaker is hot", () => {
+    const steady = feedGen([15.5, 15.7, 15.9, 15.7]);
+    const tripped = ingestReading(steady.state, { gridAmps: 0, genAmps: 6.2 }, cfg, steady.now + 5_000);
+    expect(flickerAmps(tripped.state)).toBe(0);
+    // Even a wobbly post-trip line stays at zero until a full clean window.
+    const after = feedGen([6.2, 6.6, 6.2, 6.6], { state: tripped.state, startAt: steady.now + 10_000 });
+    expect(flickerAmps(after.state)).toBe(0);
+  });
+});
+
+describe("sustained-over clock (2026-08-03)", () => {
+  it("counts only unbroken time with the MEAN over the limit", () => {
+    const under = feedGen([14, 14, 14, 14]);
+    expect(meterView(under.state, under.now).smoothedOverMs).toBe(0);
+    // The clock starts when the MEDIAN crosses, which takes two readings — not
+    // on the first raw reading over the line. The jitter is not decoration: a
+    // live CT always micro-moves, and a bit-identical stream is a hung sensor,
+    // which stops this clock by design.
+    const over = feedGen(
+      Array.from({ length: 13 }, (_, i) => 15.6 + (i % 2) * 0.02),
+      { state: under.state, startAt: under.now + 5_000 },
+    );
+    expect(meterView(over.state, over.now).smoothedOverMs).toBeGreaterThanOrEqual(SUSTAINED_OVER_SEVERE_MS);
+    // One honest dip under the limit resets it — this clock is about a ride
+    // that will not end, not about an oscillation that keeps touching the line.
+    const dipped = feedGen([12, 12, 12, 12], { state: over.state, startAt: over.now + 5_000 });
+    expect(meterView(dipped.state, dipped.now).smoothedOverMs).toBe(0);
   });
 });
 

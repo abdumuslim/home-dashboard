@@ -41,6 +41,12 @@ export type MeterEvent =
   | { kind: "collapse_recovered"; source: PowerSource }
   /** A collapse-shaped drop the controller's own cut explains — latch withheld. */
   | { kind: "collapse_suppressed"; fromAmps: number; toAmps: number; creditAmps: number; source: PowerSource }
+  /**
+   * A collapse-shaped fall nobody commanded, but the line is still carrying
+   * enough load that it is not provably a trip. Not a latch — a stand-down: the
+   * controller must not spend into a trough it cannot explain.
+   */
+  | { kind: "unexplained_fall"; fromAmps: number; toAmps: number; unexplainedAmps: number; source: PowerSource }
   | { kind: "bucket_empty"; severity: "mild" | "severe" }
   | { kind: "meter_frozen"; frozenForMs: number; amps: number }
   | { kind: "meter_unfrozen"; frozenForMs: number };
@@ -65,6 +71,36 @@ export interface MeterState {
   overLimitReadings: readonly number[];
   /** Timestamp when the current uninterrupted genuine-headroom stretch began, or null. */
   calmSince: number | null;
+  /**
+   * Calm stand-down after an unexplained collapse-shaped fall (see the
+   * `unexplained_fall` event). A trough we cannot explain is not headroom: live
+   * 2026-08-02 17:40 a real break left a 5.9A residual that read as PERFECT
+   * calm, and the controller raised three levels into a line that had just cut
+   * out — the second break followed four minutes later.
+   */
+  calmHoldUntil: number;
+  /**
+   * The mean just before a still-developing fall, held briefly so the latch
+   * survives the smoothing window. The 4-wide median flips on the THIRD
+   * post-cliff reading, which collapsed the measured drop from 9.8A to 5.2A and
+   * closed the latch window before the fall had finished arriving.
+   */
+  cliffAnchor: { medianAmps: number; at: number } | null;
+  /**
+   * Readings ingested since the last discontinuity (source change, ESP gap,
+   * collapse latch or recovery). The flicker estimator sees only these: a trip's
+   * own cliff is a huge jump, and letting it into the ring pinned the estimate
+   * at its cap for the ~8 readings AFTER a breaker proved it could not hold —
+   * exactly when tolerance must be at its lowest.
+   */
+  flickerSamples: number;
+  /**
+   * When the SMOOTHED mean first went over the effective limit in the current
+   * unbroken stretch, or null. Magnitude alone cannot classify a slow kill: a
+   * mean 0.6–1.0A over is "mild" forever, and level cuts wind down over minutes
+   * while the breaker's thermal budget is ~2–4. Time is the missing dimension.
+   */
+  smoothedOverSince: number | null;
   collapse: CollapseLatch | null;
   /**
    * Frozen-meter tracking (device-level, survives source changes): the last
@@ -106,6 +142,13 @@ export interface MeterView {
   sampleCount: number;
   /** Milliseconds of uninterrupted genuine headroom (SMOOTHED ≤ limit − margin). */
   calmMs: number;
+  /**
+   * Milliseconds the SMOOTHED mean has sat continuously over the effective
+   * limit (0 when it is not). Severity escalates on this clock as well as on
+   * magnitude — a sustained ride the reducer cannot fix with level cuts is an
+   * emergency however small its overshoot.
+   */
+  smoothedOverMs: number;
   overLimitBudget: number;
   overLimitReadings: readonly number[];
   collapsed: boolean;

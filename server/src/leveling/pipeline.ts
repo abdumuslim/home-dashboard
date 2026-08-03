@@ -14,7 +14,6 @@ import { effectiveLimit } from "./config.js";
 import type { CostBook } from "./costs.js";
 import { commandedCutAmpsOf } from "./costs.js";
 import { assessPressure } from "./pressure.js";
-import { OVER_LIMIT_MODERATE_AMPS } from "./sensing.js";
 import { planReduction } from "./reduce.js";
 import { invariantCorrections, planRaise, rampDebitAmps } from "./raise.js";
 import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
@@ -145,16 +144,23 @@ export function plan(input: PlanInput): PlanOutput {
     // room for a transient that is about to decay on its own. Severe and extreme
     // are deliberately untouched: a real breach still sheds immediately.
     //
-    // The smoothed threshold carries one moderate rung of slack (2026-08-02):
-    // at exactly `limit` a room was shed for crossings of 0.02–0.31A — inside
-    // the generator's own flicker — five times in fifteen minutes. A fresh
-    // turn-on deserves the same tolerance steady state gets, and level cuts and
-    // fan trims still ship immediately at every severity; only losing the whole
-    // room waits.
+    // ⚠ The threshold is the LIMIT, not the limit plus slack. It carried one
+    // moderate rung (limit + 0.5) for a day, to stop a room being shed for
+    // smoothed crossings of 0.02–0.31A during a turn-on. What that actually
+    // bought was the 2026-08-02 17:40 break: a room came on at L3 onto a
+    // 12.5A gen, the mean rode 15.0–15.5A for two minutes — under the slack the
+    // whole time — and the one actuator with instant physics, undoing that very
+    // turn-on, sat blocked while three batches of level cuts wound down too
+    // slowly to matter. The breaker answered instead.
+    //
+    // The churn the slack was aimed at is now handled where it belongs and
+    // without giving up reaction time: the flicker-aware bucket and calm
+    // (invariant 24) stop noise-driven crossings reaching this branch at all,
+    // and the escalation settle below holds the shed rung while a cut we
+    // already sent is still landing.
     const rampingNow = onManaged.filter((a) => a.ramping);
-    const shedThreshold = limit + OVER_LIMIT_MODERATE_AMPS;
     const inrushBlanking =
-      pressure.severity === "mild" && meter.smoothedAmps <= shedThreshold && rampingNow.length > 0;
+      pressure.severity === "mild" && meter.smoothedAmps <= limit && rampingNow.length > 0;
     // If a shed IS unavoidable while exactly one room is ramping (its own
     // turn-on caused this), undo THAT turn-on rather than exporting the shed to
     // a bystander — the re-shed penalty otherwise protects the bouncing room and
@@ -227,7 +233,7 @@ export function plan(input: PlanInput): PlanOutput {
               at: now,
               action: "shed",
               blockedBy: "turn-on inrush",
-              detail: `smoothed ${meter.smoothedAmps.toFixed(1)}A ≤ ${shedThreshold.toFixed(1)}A, ${rampingNow.length} ramping`,
+              detail: `smoothed ${meter.smoothedAmps.toFixed(1)}A ≤ ${limit.toFixed(1)}A, ${rampingNow.length} ramping, over ${(meter.smoothedOverMs / 1000).toFixed(0)}s`,
             } satisfies Decision,
           ]
         : []),

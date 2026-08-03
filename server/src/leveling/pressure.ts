@@ -6,7 +6,13 @@
 import type { MeterView, Pressure } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { effectiveLimit } from "./config.js";
-import { OVER_LIMIT_SEVERE_AMPS, isSevereOverReading, median } from "./sensing.js";
+import {
+  OVER_LIMIT_SEVERE_AMPS,
+  SUSTAINED_OVER_EXTREME_MS,
+  SUSTAINED_OVER_SEVERE_MS,
+  isSevereOverReading,
+  median,
+} from "./sensing.js";
 
 /** Extreme-overshoot shed escalation (ported 2026-07-10 values). */
 export const EMERGENCY_SHED_OVERSHOOT_AMPS = 3;
@@ -52,6 +58,17 @@ export function assessPressure(
   // there and not here: only the reducer's own view knows whether a LOW smoothed
   // value means "the excursion is over" or "the median has not caught up with a
   // rise yet", and `rawIsSupplyNoise` is what separates them.
+  if (view.overLimitBudget <= 0 && view.overLimitReadings.length === 0) {
+    // The bucket is empty but the evidence has been dropped (sensing clears it
+    // the moment the mean shows genuine headroom). The episode is not closed —
+    // only the calm refill closes it — so there is nothing to size a cut from
+    // and nothing to spend either. Live 2026-08-02: one in-band spike drained
+    // the last point and cleared the readings in the SAME ingest, and the
+    // urgent evaluation it triggered fell through to `calm` and ran the RAISE
+    // path. An empty bucket must never be an invitation to spend.
+    return { kind: "hold" };
+  }
+
   if (view.overLimitBudget <= 0 && view.overLimitReadings.length > 0) {
     // Demand side of invariant 5: readings taken while a cut we already
     // commanded is still landing describe a house that no longer exists. Only
@@ -74,10 +91,33 @@ export function assessPressure(
     // the live flicker. On a stable line (flicker 0, or its 0.2 floor) this is
     // the old rule; on a flickering generator it stops one spike promoting a
     // mild episode to the tier that skips inrush blanking and sheds a room.
+    //
+    // TIME is the third tier alongside magnitude. A mean 0.6–1.0A over the gen
+    // limit classifies mild forever, and mild can only answer with level cuts
+    // whose compressors wind down over minutes — live 2026-08-02 the meter rode
+    // 15.6–16.0A on a 15A gen for two minutes while three cut batches went out,
+    // and the breaker got there first. Twice. Once the MEAN has been over for
+    // SUSTAINED_OVER_SEVERE_MS the tier stops depending on how far over it is.
+    const sustainedSevere = view.smoothedOverMs >= SUSTAINED_OVER_SEVERE_MS;
     const severe =
+      sustainedSevere ||
       view.smoothedAmps - limit > OVER_LIMIT_SEVERE_AMPS ||
       view.overLimitReadings.some((r) => isSevereOverReading(r, limit, view.flickerAmps));
-    const severity = required >= extremeAt ? "extreme" : severe ? "severe" : "mild";
+    // Two full minutes of mean-over-limit: whatever the reducer could cut, it
+    // has cut, and it is not arriving fast enough. This is the last rung — it
+    // forces exactly ONE room off (invariant 26's one-shed ceiling is
+    // unchanged), which is the trade the user chose over losing the whole house
+    // to the breaker (2026-08-03).
+    //
+    // ⚠ `required > 0` is load-bearing, not decoration: it is the credited
+    // figure, so while a cut we already sent still covers the deficit this can
+    // never fire. Without it the tier would re-arm every few seconds during the
+    // wind-down and shed a second room for amps that were already on their way
+    // out — the 2026-07-31 double-shed, re-created from a clock instead of a
+    // stale reading. "Not landing fast enough" is only knowable once the credit
+    // has been absorbed and the mean is STILL over.
+    const sustainedExtreme = view.smoothedOverMs >= SUSTAINED_OVER_EXTREME_MS && required > 0;
+    const severity = required >= extremeAt || sustainedExtreme ? "extreme" : severe ? "severe" : "mild";
     return { kind: "over", requiredAmps: required, severity };
   }
 

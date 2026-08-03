@@ -59,6 +59,7 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     latestAmps: 12,
     sampleCount: 4,
     calmMs: 0,
+    smoothedOverMs: 0,
     overLimitBudget: 5,
     overLimitReadings: [],
     collapsed: false,
@@ -175,11 +176,30 @@ describe("turn-on inrush blanking (2026-07-25 restore-bounce storm)", () => {
     expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
   });
 
-  it("a smoothed crossing INSIDE the flicker band is still blanked (2026-08-02)", () => {
-    // Live: a room was shed for smoothed crossings of 0.02–0.31A over the
-    // limit, five times in fifteen minutes, while its compressor was still
-    // ramping. A fresh turn-on gets the same noise tolerance steady state does.
+  it("blanking ends the moment the MEAN crosses the limit — it is not widened by a slack band", () => {
+    // This assertion is inverted from the day it shipped, deliberately and with
+    // the user's sign-off (2026-08-03). The blanking band carried one moderate
+    // rung of slack (limit + 0.5) so a turn-on would not be shed for smoothed
+    // crossings of 0.02–0.31A. What that bought instead was the 17:40 break: a
+    // room came on at L3 onto a 12.5A gen, the mean rode 15.0–15.5A for two
+    // minutes — inside the slack the whole time — and the only actuator with
+    // instant physics, undoing that very turn-on, stayed blocked while level
+    // cuts wound down too slowly to matter.
+    //
+    // Noise-driven crossings are now stopped upstream, where they cost no
+    // reaction time: the flicker-aware bucket and calm (invariant 24) keep them
+    // out of this branch entirely, and the escalation settle holds the shed rung
+    // while a cut we already sent is still landing.
     const out = run(pinned(true), overMeter([15.9], 15.3));
+    expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
+    expect(out.decisions.some((d) => d.blockedBy === "turn-on inrush")).toBe(false);
+  });
+
+  it("…but a mean still UNDER the limit keeps the ramping room safe", () => {
+    // The 2026-07-25 guard itself is untouched: while the mean has headroom, a
+    // transient that is about to decay on its own may cut levels and trim fans,
+    // never lose a whole room.
+    const out = run(pinned(true), overMeter([15.9], 14.9));
     expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(0);
     expect(out.decisions.some((d) => d.blockedBy === "turn-on inrush")).toBe(true);
   });

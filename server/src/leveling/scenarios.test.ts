@@ -73,6 +73,106 @@ describe("quiet at the resting point (anti-churn acceptance)", () => {
   });
 });
 
+describe("the two generator breaks of 2026-08-02 evening", () => {
+  // Both breaks in one evening, both on the 15A house generator, both with the
+  // flicker rework live. The controller reported healthy throughout.
+  const TRIO = [
+    { ...ABDULLAH, level: 2, demandAmps: 3.9, needDelta: 3 },
+    { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 2 },
+    { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1 },
+  ];
+
+  // BREAK #1's two mechanisms are pinned where they can be isolated, because a
+  // scenario replay of that evening cannot separate them from the gen start
+  // clamp that also fired: the blanking threshold in `pipeline.test.ts`
+  // ("blanking ends the moment the MEAN crosses the limit"), and the
+  // time-based severity tiers in `pressure.test.ts` ("a mean over the limit for
+  // 45s is SEVERE" / "two minutes over is EXTREME"). What belongs here is the
+  // end-to-end consequence: a ride the ladder cannot fix must END.
+  it("a ride level cuts CANNOT fix ends with one room off, not with the breaker", () => {
+    // 17:38-17:40Z, and again at 17:44. The mean sat 0.6-1.0A over a 15A gen for
+    // two minutes with every room already at its floor. That is "mild" forever
+    // under magnitude alone — and mild's whole repertoire is level cuts (there
+    // were no levels left to cut) and fan trims (0.5A against a 0.7A deficit).
+    // The controller kept issuing batches it had already issued while the
+    // compressors wound down over minutes the breaker did not have.
+    const floored = [
+      { ...ABDULLAH, level: 1, demandAmps: 2.2, needDelta: 3 },
+      { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 2 },
+      { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1 },
+    ];
+    // 4.1 + 2.2 + 2.2 = 8.5A of AC at the floor, plus 7.0A of house ≈ 15.5A on a
+    // 14.9A line. Nothing the level ladder can reach closes a 0.6A gap.
+    const s = new Scenario(cfg, floored, { nonAcAmps: 7.0, source: "gen", seed: 20260802 });
+    const t0 = s.now;
+    s.advance(200);
+    const off = s.commandsSince(t0, "power_off");
+    // Exactly ONE room — invariant 26's ceiling is not relaxed by the new tier.
+    expect(off, JSON.stringify(off.map((e) => e.cmd))).toHaveLength(1);
+    // …and it happened inside the breaker's thermal budget, not after it.
+    expect((off[0].at - t0) / 1000).toBeLessThan(180);
+  });
+
+  it("…but the same overshoot with levels still to cut spends those first", () => {
+    // The guard on the rung above: the last resort must stay last. Same house,
+    // same deficit, but the rooms have levels left — so nobody is switched off.
+    const withLevels = [
+      { ...ABDULLAH, level: 3, demandAmps: 5.3, needDelta: 3 },
+      { ...ABDU, level: 2, demandAmps: 6.5, needDelta: 2 },
+      { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1 },
+    ];
+    const s = new Scenario(cfg, withLevels, { nonAcAmps: 2.0, source: "gen", seed: 20260802 });
+    const t0 = s.now;
+    s.advance(200);
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(0);
+    expect(s.acsOn()).toEqual(["abdu", "abdullah", "najat"]);
+  });
+
+  it("BREAK #2: the trough after a break is not headroom — nothing may be raised into it", () => {
+    // 17:40-17:45Z. The AC circuit died and the meter settled on ~6A of house
+    // load — over the 5A absolute floor, so nothing latched. The trough then
+    // read as perfect calm and the controller raised Abdu to L2, to L3, and
+    // Najat to L2 in three minutes, all at a "pre" of ~6.4A. Every compressor
+    // restarted together and the line went down again.
+    // `residualAmps` is the whole point: the harness defaults to 4A, which is
+    // UNDER the old absolute floor, so every trip it modelled latched and the
+    // live failure was unreachable here. The AC circuit dying while the house
+    // keeps drawing 6A is what actually happened, twice.
+    const s = new Scenario(cfg, TRIO, {
+      nonAcAmps: 6.0,
+      residualAmps: 6.0,
+      source: "gen",
+      seed: 20260802,
+    });
+    // A live CT always micro-moves. Without this the flat post-trip meter reads
+    // as a HUNG SENSOR, which kills calm for its own reasons and would let this
+    // test pass no matter what the collapse detector did.
+    s.setNoise(0.05);
+    s.advance(240);
+    const t0 = s.now;
+    s.trip(); // AC circuits die; the 6A house residual stays on the line
+    s.advance(300);
+    // The latch fires on a residual the old absolute floor sailed over…
+    expect(meterView(s.meterState, s.now).collapsed || meterView(s.meterState, s.now).calmMs === 0).toBe(true);
+    // …and NOTHING is spent into the trough: no raises, no restores.
+    const raises = setLevels(s, t0).filter((e) => e.cmd.level >= 2);
+    expect(raises, JSON.stringify(raises)).toHaveLength(0);
+    expect(s.commandsSince(t0, "power_on")).toHaveLength(0);
+  });
+
+  it("a turn-off by hand is still not a trip — no phantom collapse on an ordinary evening", () => {
+    // The cost of the relative floor, and the guard that pays it: the biggest
+    // room IS most of the load, so switching it off looks exactly like the AC
+    // circuit dying. The commanded-cut credit is the only thing between the two.
+    const s = new Scenario(cfg, TRIO, { nonAcAmps: 4.0, source: "gen", seed: 20260802 });
+    s.advance(240);
+    s.turnOff("abdu"); // the 2-ton room, ~4.1A of a ~14A house
+    s.advance(180);
+    expect(meterView(s.meterState, s.now).collapsed).toBe(false);
+    expect(meterView(s.meterState, s.now).derateAmps).toBe(0);
+  });
+});
+
 describe("gen flicker shed storm (2026-08-02)", () => {
   // The live household on a flickering 14.9A generator: Abdullah held at his L2
   // heat-boost floor, Abdu and Najat at L1, ~2.5A of house. The user's own

@@ -39,6 +39,59 @@ export const OVER_LIMIT_MODERATE_AMPS = 0.5;
 export const POWER_COLLAPSE_DROP_AMPS = 6;
 /** …AND the reading must land at/below this floor (the AC load vanished). */
 export const POWER_COLLAPSE_FLOOR_AMPS = 5;
+/**
+ * …or at/below this FRACTION of the pre-fall mean, whichever is higher.
+ *
+ * The absolute floor encodes "the AC load vanished" and silently assumes the
+ * rest of the house draws under 5A. Live 2026-08-02 the AC circuit died twice
+ * on the generator and the house kept drawing **5.76–6.2A** — over the floor
+ * both times, so neither break latched. No derate, no freeze, no FLOORS on
+ * recovery, and (because a post-trip trough reads as perfect calm) the
+ * controller raised three levels into a dead line and caused the second break.
+ *
+ * A guard must be sized against the whole quantity it guards (hard rule 5c):
+ * the residual is the HOUSE, and the house is not a constant. Relative to the
+ * mean it was carrying, both breaks left ~0.36–0.40 — well inside 0.5.
+ *
+ * ⚠ This cannot distinguish a trip from someone turning off the biggest AC by
+ * remote, because that room IS most of the load. What separates them is the
+ * commanded-cut credit: every off we know about — ours, the dashboard's, the
+ * automation's, or one we merely OBSERVE — is priced and credited, and only the
+ * unexplained remainder latches. Keep those hooks wired (controller
+ * `onUserPowerOff` / the observed-off scan) or this floor will false-latch.
+ */
+export const POWER_COLLAPSE_FLOOR_FRACTION = 0.5;
+/**
+ * How long the pre-fall mean stays available as the collapse baseline.
+ *
+ * The latch had a two-reading window and did not know it: with `SMOOTH_WINDOW`
+ * 4, the median flips on the third post-cliff reading (two low + two high
+ * averages one of each), so a 9.8A measured drop reads as 5.2A and fails the
+ * test it passed twice. A fall that is still arriving must be judged against
+ * where it started.
+ */
+export const CLIFF_ANCHOR_MS = 30_000;
+/**
+ * Calm stand-down after an unexplained collapse-shaped fall that did NOT latch.
+ * Belt to the latch's braces: whatever the trough is, it is not evidence of
+ * headroom, and nothing may be spent into it until the line proves otherwise.
+ */
+export const UNEXPLAINED_FALL_CALM_HOLD_MS = 120_000;
+/**
+ * The SMOOTHED mean sitting continuously over the limit for this long is
+ * SEVERE, whatever its magnitude — it un-gates the shed rung (inrush blanking
+ * and the escalation settle are both mild-only, deliberately).
+ */
+export const SUSTAINED_OVER_SEVERE_MS = 45_000;
+/**
+ * …and for this long is EXTREME: two full minutes of mean-over-limit means the
+ * reducer has already cut what it could and the compressors are not winding
+ * down fast enough. A breaker's thermal budget is ~2–4 min, so this is the last
+ * moment a decision of ours can still beat it. Forces exactly ONE room off
+ * (invariant 26's one-shed ceiling is unchanged) — the user's own trade
+ * (2026-08-03): a break turns off every room.
+ */
+export const SUSTAINED_OVER_EXTREME_MS = 120_000;
 /** Collapse clears when measured recovers to within this of the pre-collapse median. */
 export const POWER_COLLAPSE_RECOVER_GAP = 3;
 /** Safety cap on a collapse latch (never strand the controller). */
@@ -93,8 +146,16 @@ export const FLICKER_MAX_AMPS = 1.5;
 export const FLICKER_MIN_SAMPLES = 6;
 
 /**
- * Live supply-flicker estimate: the SECOND-largest jump between consecutive
- * readings in the ring.
+ * How close to its origin the signal must return for an excursion to count as
+ * supply flicker rather than load: within half the excursion's own size.
+ */
+export const FLICKER_REVERT_FRACTION = 0.5;
+/** …and within this many readings. Flicker comes back; load does not. */
+export const FLICKER_REVERT_WINDOW = 2;
+
+/**
+ * Live supply-flicker estimate: the second-largest REVERTING excursion in the
+ * ring.
  *
  * A generator is not a stable line — live 2026-08-02 the gen wobbled ~±1A
  * reading-to-reading while the mean sat comfortably under the limit, and every
@@ -104,28 +165,64 @@ export const FLICKER_MIN_SAMPLES = 6;
  * UNDER. Riding near the limit is the whole point of the controller, and on gen
  * it was self-defeating.
  *
- * Second-largest, on consecutive JUMPS, is what makes this safe to trust:
- * - supply flicker spikes up and comes back, so it contributes TWO large jumps
- *   and survives the filter;
- * - a genuine one-time step — a compressor stopping, a shed landing, a
- *   changeover — is exactly ONE large jump and is filtered out, so a real
- *   event can never inflate the noise tolerance that would then hide it;
- * - a compressor ramp climbs in small even steps and reads low.
+ * What makes an estimate of noise safe to trust is that LOAD can never mint it.
+ * This shipped as "second-largest jump between consecutive readings", whose
+ * stated argument — a spike is two jumps and survives, a genuine step is one
+ * jump and is filtered — holds only while the ring contains at most ONE real
+ * event. Two compressors cycling inside one 8-reading window (the ordinary
+ * steady state of this house) are two large jumps, so the estimate pinned at
+ * its 1.5A cap and loosened severity, calm, the drain rung and the deficit
+ * sizing all at once — the second compressor's own start minting the tolerance
+ * that then hid it. A monotonic ramp (or a shed's own wind-down) read as its
+ * per-reading step for the same reason.
  *
- * Returns 0 below `FLICKER_MIN_SAMPLES`, so a fresh boot or a source change
- * (the ring resets on both) behaves exactly as it did before this existed —
- * never more permissive than the code it replaced.
+ * So an excursion counts only if the signal comes BACK: flicker spikes and
+ * returns within a reading or two, while a compressor step, a shed landing and
+ * a ramp all walk away from where they started and stay there. Two qualifying
+ * excursions are required, so a single spike-shaped coincidence — a turn-on
+ * that we shed two readings later, say — still mints nothing.
+ *
+ * Returns 0 below `FLICKER_MIN_SAMPLES` clean readings, so a fresh boot, a
+ * source change, an ESP gap or a post-collapse window behaves exactly as it did
+ * before this existed — never more permissive than the code it replaced.
  */
 function flickerOfRing(recent: readonly number[]): number {
   if (recent.length < FLICKER_MIN_SAMPLES) return 0;
-  const jumps: number[] = [];
-  for (let i = 1; i < recent.length; i++) jumps.push(Math.abs(recent[i] - recent[i - 1]));
-  jumps.sort((a, b) => b - a);
-  return jumps[1] < FLICKER_MIN_AMPS ? 0 : Math.min(FLICKER_MAX_AMPS, jumps[1]);
+  const excursions: number[] = [];
+  for (let i = 1; i < recent.length; i++) {
+    const origin = recent[i - 1];
+    const size = Math.abs(recent[i] - origin);
+    if (size < FLICKER_MIN_AMPS) continue;
+    const last = Math.min(i + FLICKER_REVERT_WINDOW, recent.length - 1);
+    for (let j = i + 1; j <= last; j++) {
+      if (Math.abs(recent[j] - origin) <= size * FLICKER_REVERT_FRACTION) {
+        // BOTH legs — the excursion out and the return. This is what the
+        // original "second-largest jump" was really counting whenever the
+        // signal was genuinely noisy, and dropping it here would make the
+        // estimate collapse to the baseline wobble whenever the newest reading
+        // happened to BE the spike (its return leg is not in the ring yet).
+        excursions.push(size, size);
+        break;
+      }
+    }
+  }
+  if (excursions.length < 2) return 0;
+  excursions.sort((a, b) => b - a);
+  return Math.min(FLICKER_MAX_AMPS, excursions[1]);
+}
+
+/**
+ * The readings the estimator may look at: only those since the last
+ * discontinuity. `slice(-0)` returns the WHOLE array, so the zero case is
+ * explicit.
+ */
+function flickerWindowOf(recent: readonly number[], samples: number): readonly number[] {
+  const n = Math.min(samples, recent.length);
+  return n <= 0 ? [] : recent.slice(-n);
 }
 
 export function flickerAmps(state: MeterState): number {
-  return flickerOfRing(state.recent);
+  return flickerOfRing(flickerWindowOf(state.recent, state.flickerSamples));
 }
 
 /**
@@ -195,6 +292,10 @@ export function initialMeterState(): MeterState {
     overLimitBudget: OVER_LIMIT_BUDGET,
     overLimitReadings: [],
     calmSince: null,
+    calmHoldUntil: 0,
+    cliffAnchor: null,
+    flickerSamples: 0,
+    smoothedOverSince: null,
     collapse: null,
     lastRaw: null,
     lastMicroChangeAt: 0,
@@ -322,6 +423,10 @@ export function ingestReading(
       overLimitBudget: OVER_LIMIT_BUDGET,
       overLimitReadings: [],
       calmSince: null,
+      calmHoldUntil: 0,
+      cliffAnchor: null,
+      flickerSamples: 0,
+      smoothedOverSince: null,
       collapse: null,
       lastRaw,
       lastMicroChangeAt,
@@ -341,6 +446,8 @@ export function ingestReading(
   // Collapse latch: resolve an active latch first (recovery or safety expiry),
   // then judge this reading against the trend BEFORE it joins the window.
   let collapse: CollapseLatch | null = state.collapse;
+  let cliffAnchor = state.cliffAnchor;
+  let calmHoldUntil = state.calmHoldUntil;
   if (collapse != null) {
     if (measured >= collapse.preMedianAmps - POWER_COLLAPSE_RECOVER_GAP) {
       collapse = null;
@@ -350,13 +457,26 @@ export function ingestReading(
     }
   }
   const priorMedian = state.recent.length >= SMOOTH_WINDOW ? smoothedAmps(state) : null;
+  // A fall still arriving is judged from where it STARTED, not from a median
+  // that has already swallowed half of it (see CLIFF_ANCHOR_MS).
+  const anchorMedian =
+    cliffAnchor != null && now < cliffAnchor.at + CLIFF_ANCHOR_MS ? cliffAnchor.medianAmps : null;
+  const baseline =
+    priorMedian != null && anchorMedian != null
+      ? Math.max(priorMedian, anchorMedian)
+      : (priorMedian ?? anchorMedian);
+  // "The AC load vanished" is a statement about the load that WAS there, not a
+  // constant: the residual house draw is whatever the house happens to be.
+  const collapseFloor =
+    baseline != null
+      ? Math.max(POWER_COLLAPSE_FLOOR_AMPS, baseline * POWER_COLLAPSE_FLOOR_FRACTION)
+      : POWER_COLLAPSE_FLOOR_AMPS;
   const liveCut = state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut : null;
   const cutCredit = pendingCutCredit(state, now);
   if (
     collapse == null &&
-    priorMedian != null &&
-    priorMedian - measured >= POWER_COLLAPSE_DROP_AMPS &&
-    measured <= POWER_COLLAPSE_FLOOR_AMPS &&
+    baseline != null &&
+    baseline - measured >= POWER_COLLAPSE_DROP_AMPS &&
     // Not right after a recovery event in this same ingest — a recovery reading
     // by definition sits near the pre-collapse median, so this cannot co-fire.
     !events.some((e) => e.kind === "collapse_recovered")
@@ -374,20 +494,38 @@ export function ingestReading(
     // 4.3A floor arrives instantly while the median is still draining 16 → 13
     // → 9). Anchor-relative, the whole cliff is one comparison.
     const unexplained =
-      liveCut != null ? liveCut.anchorAmps - measured - liveCut.amps : priorMedian - measured;
-    if (unexplained >= POWER_COLLAPSE_DROP_AMPS) {
-      collapse = { preMedianAmps: priorMedian, until: now + POWER_COLLAPSE_MAX_MS };
-      events.push({ kind: "collapse", fromAmps: priorMedian, toAmps: measured, source });
-    } else {
+      liveCut != null ? liveCut.anchorAmps - measured - liveCut.amps : baseline - measured;
+    if (unexplained < POWER_COLLAPSE_DROP_AMPS) {
       events.push({
         kind: "collapse_suppressed",
-        fromAmps: priorMedian,
+        fromAmps: baseline,
         toAmps: measured,
         creditAmps: cutCredit,
         source,
       });
+      // Ours — nothing left to watch for.
+      cliffAnchor = null;
+    } else if (measured <= collapseFloor) {
+      collapse = { preMedianAmps: baseline, until: now + POWER_COLLAPSE_MAX_MS };
+      events.push({ kind: "collapse", fromAmps: baseline, toAmps: measured, source });
+      cliffAnchor = null;
+    } else {
+      // A big fall nobody commanded, but the line is still carrying real load:
+      // not provably a trip, so no latch, no derate, no freeze. It is equally
+      // not headroom — so calm stands down, and the pre-fall mean is held as
+      // the baseline in case the fall is still arriving.
+      calmHoldUntil = Math.max(calmHoldUntil, now + UNEXPLAINED_FALL_CALM_HOLD_MS);
+      cliffAnchor = cliffAnchor ?? { medianAmps: baseline, at: now };
+      events.push({
+        kind: "unexplained_fall",
+        fromAmps: baseline,
+        toAmps: measured,
+        unexplainedAmps: unexplained,
+        source,
+      });
     }
   }
+  if (cliffAnchor != null && now >= cliffAnchor.at + CLIFF_ANCHOR_MS) cliffAnchor = null;
 
   // Walk the effective limit down on every collapse: the line just PROVED it
   // cannot hold what it was carrying, and a repeat trip inside the window
@@ -413,6 +551,15 @@ export function ingestReading(
   const limit = effectiveLimit(config, source, derateFor({ ...state, derate }, source, now));
 
   const recent = [...state.recent, measured].slice(-RECENT_RING);
+
+  // Readings the flicker estimator may look at. A discontinuity — an ESP gap, a
+  // trip, a recovery — contributes a jump that is not supply noise, and letting
+  // one into the estimate pinned it at its cap for the following ~8 readings.
+  // That window is the LAST place tolerance belongs: the breaker has just
+  // proved it cannot hold what it was carrying, and the limit is derated for it.
+  const discontinuity =
+    gapped || (collapse != null && state.collapse == null) || events.some((e) => e.kind === "collapse_recovered");
+  const flickerSamples = discontinuity ? 1 : Math.min(RECENT_RING, state.flickerSamples + 1);
 
   // Spend the cut credit as the meter actually falls. One-way ratchet on the
   // DEEPEST fall below the anchor: a peer turning on afterwards lifts the house
@@ -442,9 +589,15 @@ export function ingestReading(
   // the same yardstick and the generator's ~±1A flicker made the bucket a
   // one-way ratchet: every spike drained it and broke the calm that refills it,
   // so a house whose MEAN sat 0.3A under the limit still got a room shed.
-  const flicker = flickerOfRing(recent);
+  const flicker = flickerOfRing(flickerWindowOf(recent, flickerSamples));
   const smoothed = median(recent.slice(-SMOOTH_WINDOW));
   const smoothedOver = smoothed - limit;
+  // How long the MEAN has been over the limit without a break. Magnitude cannot
+  // classify a slow kill — 15.9A on a 15A gen is "mild" forever, and the level
+  // cuts mild allows wind down over minutes the breaker does not have. A frozen
+  // or collapsed meter is not evidence of anything, so the clock stops there.
+  const smoothedOverSince =
+    frozen || collapse != null ? null : smoothedOver > 0 ? (state.smoothedOverSince ?? now) : null;
 
   if (measured > limit) {
     // The raw overshoot is discounted by the live flicker before it is
@@ -465,6 +618,10 @@ export function ingestReading(
     if (overLimitBudget <= 0) {
       // Re-fires on every over-limit reading while empty (a failed act retries);
       // the controller shell coalesces urgent evaluations.
+      // The raw path keeps its own discount (`isSevereOverReading`) rather than
+      // a mean-is-over gate: a genuine step-up must still be able to classify
+      // severe before the 4-wide median has caught up with it, which is the
+      // whole reason the bucket reads raw readings at all.
       const severe =
         smoothedOver > OVER_LIMIT_SEVERE_AMPS ||
         overLimitReadings.some((r) => isSevereOverReading(r, limit, flicker));
@@ -481,11 +638,14 @@ export function ingestReading(
   // reads as high flicker, and does not.
   const rawIsSupplyNoise = measured <= limit + flicker;
 
-  if (collapse != null || frozen) {
+  if (collapse != null || frozen || now < calmHoldUntil) {
     // Probable trip in progress — a low reading here is lost AC load, not
     // headroom. A FROZEN value is equally not evidence of headroom: calm built
     // on repeats of a stale number must never admit a raise. (This also covers
-    // the freshly-latched collapse the old code guarded separately.)
+    // the freshly-latched collapse the old code guarded separately.) And an
+    // unexplained fall stands calm down for its hold: the trough after a break
+    // looks exactly like the trough after a room was switched off, and we do
+    // not get to spend either one until we know which it was.
     calmSince = null;
   } else if (smoothed <= limit - config.marginAmps && rawIsSupplyNoise) {
     // The mean now has real headroom under it, so whatever the banked readings
@@ -525,6 +685,10 @@ export function ingestReading(
       overLimitBudget,
       overLimitReadings,
       calmSince,
+      calmHoldUntil,
+      cliffAnchor,
+      flickerSamples,
+      smoothedOverSince,
       collapse,
       lastRaw,
       lastMicroChangeAt,
@@ -577,6 +741,8 @@ export function meterView(state: MeterState, now: number): MeterView {
     latestAmps: state.recent.length > 0 ? state.recent[state.recent.length - 1] : 0,
     sampleCount: Math.min(state.recent.length, SMOOTH_WINDOW),
     calmMs: state.calmSince != null && state.collapse == null ? Math.max(0, now - state.calmSince) : 0,
+    smoothedOverMs:
+      stale || state.smoothedOverSince == null ? 0 : Math.max(0, now - state.smoothedOverSince),
     overLimitBudget: state.overLimitBudget,
     overLimitReadings: state.overLimitReadings,
     collapsed: state.collapse != null,

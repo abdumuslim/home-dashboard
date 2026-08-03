@@ -74,7 +74,7 @@ import {
 } from "./reconciler.js";
 import { boostFloor, ceilOf, floorOf, nearTargetNeedCap, worstCaseLevel } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
-import { fanTrimSavings, raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, turnOnAmps, updateCost, type CostBook } from "./costs.js";
+import { fanTrimSavings, modelCutAmps, raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, turnOnAmps, updateCost, type CostBook } from "./costs.js";
 import { LevelingStore } from "./store.js";
 import type { AcView, Command, MeterState, Mode, PowerSource } from "./types.js";
 
@@ -681,9 +681,45 @@ export class LevelingControllerV2 {
     this.noteRampAbsorption(now);
   }
 
+  /**
+   * Credit a room's whole draw against the collapse detector when it goes off
+   * by a hand that is not the reducer's.
+   *
+   * The collapse floor is relative to the mean the line was carrying
+   * (POWER_COLLAPSE_FLOOR_FRACTION), because a breaker trip leaves the HOUSE
+   * drawing and the house is not under 5A. That makes "the biggest room was
+   * switched off" and "the AC circuit died" the same shape on the meter — the
+   * only thing that separates them is whether we know about the off. So every
+   * off we can know about is priced here, model-valued and one-way, exactly
+   * like a reducing batch (invariant 11).
+   *
+   * Our OWN sheds are excluded: `executeAndJournal` already credits them via
+   * `Plan.commandedCutAmps`, and crediting twice would inflate the allowance
+   * enough to launder a genuine trip.
+   */
+  private creditRoomOff(deviceId: string, observedLevel: number | null, now: number): void {
+    const source = this.meterState.source;
+    if (source === "none" || this.shedIds.has(deviceId)) return;
+    const from = this.recon[deviceId]?.confirmedLevel ?? observedLevel;
+    if (from == null || from <= 0) return;
+    const amps = modelCutAmps(
+      this.config,
+      deviceId,
+      source,
+      from,
+      null,
+      this.deviceMaxLevel.get(deviceId) ?? 3,
+    );
+    if (amps > 0) this.meterState = noteCommandedCut(this.meterState, amps, now);
+  }
+
   // ---------- user hooks (manual always wins) ----------
 
   async onUserPowerOff(deviceId: string): Promise<void> {
+    // Price this room off the meter BEFORE `clearOnPowerOff` forgets what level
+    // it was at. The tap is the earliest moment the draw can start falling, so
+    // the credit is armed ahead of the cliff it explains.
+    this.creditRoomOff(deviceId, null, Date.now());
     this.startBaseline.delete(deviceId);
     this.rememberedLevel.delete(deviceId);
     await this.pool.query("DELETE FROM ac_leveling_remembered_level WHERE device_id = $1", [deviceId]);
@@ -973,6 +1009,12 @@ export class LevelingControllerV2 {
           // measured its ramp as if the meter had been quiet.
           if (managed) this.lastLoadAddAt = now;
         } else {
+          // Someone else turned this room off — a remote, the automation, a
+          // schedule. Price it off the meter before the reconciler forgets its
+          // level: the fall that follows is collapse-SHAPED (a whole room's
+          // draw vanishing, leaving only the house), and the relative collapse
+          // floor cannot tell it from a breaker without this credit.
+          this.creditRoomOff(device.id, device.generatorMode ?? null, now);
           this.startBaseline.delete(device.id);
           // No compressor, no ramp to account for.
           this.rampUntil.delete(device.id);
