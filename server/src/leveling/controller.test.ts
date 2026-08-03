@@ -18,11 +18,16 @@ function createMockPool() {
         .map((id) => ({ id, config: configById.get(id) }));
       return { rows, rowCount: rows.length };
     }
-    if (sql.includes("SELECT config FROM ac_leveling_config WHERE id = 2")) {
-      return { rows: configById.has(2) ? [{ config: configById.get(2) }] : [], rowCount: configById.has(2) ? 1 : 0 };
+    const selectId = /SELECT config FROM ac_leveling_config WHERE id = (\d)/.exec(sql);
+    if (selectId) {
+      const id = Number(selectId[1]);
+      return { rows: configById.has(id) ? [{ config: configById.get(id) }] : [], rowCount: configById.has(id) ? 1 : 0 };
     }
     if (sql.includes("INSERT INTO ac_leveling_config")) {
-      configById.set(2, JSON.parse(String(params[0])));
+      // Honour the row the statement actually targets — v1-shaped fields go to
+      // row 1, the v2-owned flags to row 2 (2026-08-03).
+      const id = Number(/VALUES \((\d)/.exec(sql)?.[1] ?? 2);
+      configById.set(id, JSON.parse(String(params[0])));
       return { rows: [], rowCount: 1 };
     }
     if (sql.includes("FROM ac_leveling_shed")) {
@@ -100,6 +105,33 @@ describe("LevelingControllerV2 — acting-flavor re-sync", () => {
     await controller.updateConfig({ raiseCalmSeconds: 25 } as never);
     expect(controller.controllerFlavor()).toBe("v2");
     expect(controller.isShed("ac1")).toBe(true);
+  });
+
+  it("persists v1-shaped fields to row 1 — a config save is not a no-op (2026-08-03)", async () => {
+    // `collector.leveling()` routes every save to the ACTING controller, so
+    // since the cutover this method has been the only writer — and it only ever
+    // wrote its own five keys. Amp models, limits, boosts and priority went in
+    // and vanished; the dashboard returned 200 and row 1 kept the cutover-date
+    // values it had on 2026-07-24.
+    const mock = createMockPool();
+    mock.configById.set(1, { genLimitAmps: 15, genAmpModels: { ac1: { baseAmps: 2.3, stepAmps: 2.5 } }, priority: ["ac1"] });
+    mock.configById.set(2, { controller: "v2", enabled: true });
+    const controller = new LevelingControllerV2(mock.pool, createDeps());
+    await controller.ensureLoaded();
+
+    await controller.updateConfig({
+      genAmpModels: { ac1: { baseAmps: 2.3, stepAmps: 1.5 } },
+      restingBufferAmps: 0.3,
+    } as never);
+
+    expect(mock.configById.get(1)).toEqual({
+      genLimitAmps: 15, // untouched keys survive — merged, never replaced
+      genAmpModels: { ac1: { baseAmps: 2.3, stepAmps: 1.5 } },
+      priority: ["ac1"],
+    });
+    // The v2-owned key still goes to its own row, and row 1 does not get it.
+    expect(mock.configById.get(2)).toMatchObject({ controller: "v2", restingBufferAmps: 0.3 });
+    expect(mock.configById.get(1)).not.toHaveProperty("restingBufferAmps");
   });
 });
 

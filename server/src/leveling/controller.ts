@@ -500,6 +500,31 @@ export class LevelingControllerV2 {
        ON CONFLICT (id) DO UPDATE SET config = $1, updated_at = NOW()`,
       [JSON.stringify(row2)],
     );
+    // Everything else belongs to row 1 — amp models, limits, margins, priority,
+    // level boosts, raise pacing. It is written HERE because `collector.
+    // leveling()` routes every config save to whichever controller is acting,
+    // and since the 2026-07-24 cutover that is this one: v1's updateConfig (the
+    // only writer row 1 had) has not run since. Every save from the dashboard
+    // returned 200 and changed nothing — found 2026-08-03 trying to correct
+    // Abdullah's gen amp model, with row 1's updated_at still reading the
+    // cutover date.
+    //
+    // MERGED over the stored row, not replaced: v1 replaces row 1 wholesale
+    // from its own defaults, which would drop any field this build does not
+    // know about. A save that silently loses a field is the bug being fixed.
+    const row1Entries = Object.entries(cfg).filter(([key]) => !v2Keys.includes(key));
+    if (row1Entries.length > 0) {
+      const row1Res = await this.pool.query("SELECT config FROM ac_leveling_config WHERE id = 1");
+      const row1 = {
+        ...((row1Res?.rows?.[0]?.config as Record<string, unknown>) ?? {}),
+        ...Object.fromEntries(row1Entries),
+      };
+      await this.pool.query(
+        `INSERT INTO ac_leveling_config (id, config, updated_at) VALUES (1, $1, NOW())
+         ON CONFLICT (id) DO UPDATE SET config = $1, updated_at = NOW()`,
+        [JSON.stringify(row1)],
+      );
+    }
     // v2 deliberately does NOT clear learned costs on config save (they live in
     // the DB now; explicit reset via resetLearnedCosts()).
     await this.reloadConfig();

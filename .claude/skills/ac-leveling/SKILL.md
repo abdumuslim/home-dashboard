@@ -373,6 +373,38 @@ re-entrancy, and the whole grading shell (`pendingGrades`, `bornContaminated`,
 `lastLoadAddAt`/`lastLoadDropAt`) — changes there need `controller.test.ts`
 guards, because `scenarios.test.ts` cannot see them.
 
+**Added 2026-08-03 (midday) after the top-priority room sat 20 min at a level its compressor will not run at:**
+36. **A level that does not cool is an off — in BOTH directions.** A comfort
+    floor means "below this, this room does not cool in this weather", so a HOT
+    room parked under an active one is out of service while looking perfectly
+    healthy: a level carries no shed row, no restore queue, no push. Reduction
+    side: `AcMove.subFloorNeed` = `needDelta × SUBFLOOR_NEED_FRACTION` (0.9)
+    joins the protection term, but **only in plans that already shed** — live
+    11:25:32 `{shed Najat 1.6 + Abdullah L2→L1}` scored 1.6 and beat
+    `{shed Abdu}` at 1.8, so the hottest top-priority room stopped cooling to
+    keep a milder one running, for a deficit the bigger room covered alone.
+    ⚠️ Counting it unconditionally inverts the ladder — the acceptance scenario
+    answered a 1 A near-limit deficit with a SHED instead of the cheap level,
+    which is the cost the user named when he deferred this ("gives up a
+    reduction rung that exists to avoid a shed"). A plan that switches nobody
+    off still wins first; the term only decides who pays once something is
+    going off. The 0.9 is load-bearing too: at 1.0, `{shed cool + sub-floor
+    hot}` scores worse than `{shed hot}` and the reducer kills the room the term
+    protects. Recovery side: the restore phase **yields** (reserving nothing) to
+    a needier room stranded below its active floor — but only when that floor
+    step passes the same envelope + meter tests the raise phase is about to
+    apply, or the yield is a livelock. Live: Najat's restore (need 1.6) took the
+    2.3 A that appeared while Abdullah (3.0, 8 °C above setpoint) waited.
+37. **A config save goes to the ACTING controller — so v2 must write row 1 too.**
+    `collector.leveling()` routes `PUT /api/ac/leveling` to whichever controller
+    is acting; since the cutover that is v2, whose `updateConfig` persisted only
+    its own five keys. Amp models, limits, margins, priority and level boosts
+    went in and vanished behind a `200` — row 1's `updated_at` still read
+    2026-07-24. Row 1 is now written **merged** over its stored value, never
+    replaced (v1 replaces wholesale from its own defaults, which drops any field
+    the running build does not know). Corollary for forensics: **do not trust a
+    config value because a session said it set it** — re-read it.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's
@@ -389,7 +421,8 @@ requireShed ≥ max(3 A, 20%).
 gen (incl. cold start); GRID_FULL on any entry into grid.
 
 **Reduction ladder:** levels → floor → fans → **sub-floor levels** → ONE room off → (re-evaluate) →
-next room off (invariants 17, 18, 25, 26).
+next room off (invariants 17, 18, 25, 26). Once a rung reaches an off, a hot room's sub-floor cut is
+priced as an off too (invariant 36).
 
 **Fans are last-resort trim only** — a plan may cut a fan only if its end-state leaves EVERY AC at its
 floor (invariant 17); restores are bounded and cooldown-gated (invariant 18). (v1 cut fans while level
@@ -406,10 +439,19 @@ Abdu = **2-ton** (≈ 4.1 / 6.5 / ~9 A at L1/2/3). Abdullah & Najat = **1-ton** 
 boost threshold the compressor often will not engage at L1, so the room draws roughly its fan and
 becomes *effectively off* while the model still prices it at ~2.3 A. It is a "most of the time"
 behaviour, not a certainty — on 2026-08-03 at ~39 °C he was still running at L1. This is what
-`levelBoosts` (minLevel 2 above N °C) exists to prevent, but the **sub-floor rung (invariant 25) is
-allowed to cut below an active boost floor**, and `invariantCorrections` deliberately will not lift
-him back (that re-assertion was the 08-02 limit cycle), so only the raise path can. Open design
-question for a later session — see the memory open-state note.
+`levelBoosts` (minLevel 2 above N °C) exists to prevent; the **sub-floor rung (invariant 25) may
+still cut below an active boost floor**, and `invariantCorrections` deliberately will not lift him
+back (that re-assertion was the 08-02 limit cycle), so only the raise path can — which is why
+**invariant 36** prices that cut as an off on the reduction side and gives the stranded room
+precedence over a less-needy shed restore on the recovery side.
+
+**Measured gen draw** (`GET /api/ac/calibration`, 2026-06-11, 12–14 samples each): Abdullah
+2.08 / 3.81 / 4.32 · Abdu 4.08 / 5.66 / 6.21 · Najat's gen run failed (0 A). ⚠️ Each step was sampled
+~50 s after the command against a 240 s ramp, so **L2/L3 read low** — invariant 6's bug, in the
+calibrator. Treat them as lower bounds and cross-check against the user's hardware truth above.
+Abdullah's gen model was corrected to base 2.3 / step 1.5 on 2026-08-03 (was 2.3 / 2.5, pricing his
+L3 at 7.3 A — above the 2-ton's measured L3). **Abdu (4.3/2.5 ⇒ 9.3 A at L3) and Najat (2.3/2.0 ⇒
+6.3 A at L3) are still over-priced against the same evidence** — not yet corrected.
 ⚠ Do NOT diagnose this from the house-load figure: the residual is `smoothed − modeled draw`, so a
 room drawing less than its model inflates "house" by construction and the reasoning is circular. The
 honest signal is the room TEMPERATURE failing to fall while the level is held.

@@ -15,6 +15,7 @@ const cfg: LevelingConfigV2 = {
     hot: { baseAmps: 2, stepAmps: 2 },
     cool: { baseAmps: 2, stepAmps: 2 },
     third: { baseAmps: 2, stepAmps: 2 },
+    big: { baseAmps: 4.3, stepAmps: 2.5 },
   },
 };
 
@@ -97,7 +98,20 @@ describe("the sub-floor rung — a comfort floor is not worth a power_off (2026-
   const boosted = (o: Partial<AcView> = {}): AcView =>
     ac("hot", { minLevel: 2, currentLevel: 2, fanSpeed: 1, needDelta: 7, ...o });
 
-  it("drops below the boost floor instead of shedding the room", () => {
+  it("drops below the boost floor instead of shedding THAT room", () => {
+    // The directive's own case: the alternative on the table is shedding the
+    // same room. A level — even a non-cooling one — is recoverable with one
+    // set_level and never lands a manual-off lock, so it must still win.
+    const p = plan([boosted()], 1.5);
+    expect(p.toShed).toHaveLength(0);
+    expect(p.desiredLevels.hot).toBe(1);
+    expect(p.satisfied).toBe(true);
+  });
+
+  it("a shed-free plan still takes the cheap sub-floor rung over any peer's off", () => {
+    // The ladder order is untouched: nobody is switched off while a level can
+    // still answer the deficit, even though that level stops the hot room
+    // cooling. This is the rung the 2026-08-02 directive bought.
     const p = plan([boosted(), ac("cool", { currentLevel: 1, fanSpeed: 1, needDelta: 0.3 })], 1.5);
     expect(p.toShed).toHaveLength(0);
     expect(p.desiredLevels.hot).toBe(1);
@@ -119,6 +133,26 @@ describe("the sub-floor rung — a comfort floor is not worth a power_off (2026-
   it("never goes to level 0 — that is unrestricted draw, not a reduction", () => {
     const p = plan([boosted({ minLevel: 3, currentLevel: 3 })], 99);
     for (const level of Object.values(p.desiredLevels)) expect(level).toBeGreaterThanOrEqual(1);
+  });
+
+  it("a plan that already sheds does not ALSO stop the hottest room cooling (2026-08-03)", () => {
+    // Live 11:25:32: a 3.65A extreme deficit. {shed Najat (need 1.6) + Abdullah
+    // L2→L1} scored 1.6 on the protection term and beat {shed Abdu} at 1.8 —
+    // so the reducer switched off the milder room AND stopped the hottest,
+    // top-priority room cooling, for a deficit the bigger room covered alone.
+    // Abdullah then sat at a non-cooling L1 for 20 minutes with nothing
+    // tracking him as out of service.
+    const p = plan(
+      [
+        boosted({ needDelta: 3 }),
+        ac("cool", { currentLevel: 1, fanSpeed: 1, needDelta: 1.6 }),
+        ac("big", { currentLevel: 1, fanSpeed: 1, needDelta: 1.8 }),
+      ],
+      3.65,
+    );
+    expect(p.toShed).toEqual(["big"]);
+    expect(p.desiredLevels.hot).toBeUndefined();
+    expect(p.satisfied).toBe(true);
   });
 
   it("sheds only once the sub-floor rung is exhausted too", () => {

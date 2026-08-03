@@ -16,9 +16,10 @@
 //      levels, graduated.
 //
 // Lexicographic objective (unchanged from v1): feasible ≫ protect hot rooms
-// (min Σ shedNeed) ≫ need-weighted disruption (shed ≫ level ≫ fan; top-priority
-// level surcharge; re-shed-after-failed-restore penalty) ≫ less over-cut
-// (bucketed) ≫ fewer commands ≫ fewer ACs disturbed.
+// (min Σ shedNeed — which counts a hot room parked below its comfort floor,
+// see SUBFLOOR_NEED_FRACTION) ≫ need-weighted disruption (shed ≫ level ≫ fan;
+// top-priority level surcharge; re-shed-after-failed-restore penalty) ≫ less
+// over-cut (bucketed) ≫ fewer commands ≫ fewer ACs disturbed.
 
 import type { AcView, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
@@ -36,6 +37,21 @@ export interface ReductionWeights {
   /** Surcharge per level step taken BELOW an AC's comfort floor (see below). */
   subFloorStep: number;
 }
+
+/**
+ * How much of a room's cooling need a sub-floor cut costs it, relative to
+ * switching the room off outright (invariant 36).
+ *
+ * Below an ACTIVE comfort floor a hot room mostly stops cooling — that is the
+ * whole reason the floor exists — so the "protect hot rooms" term counts it.
+ * Not the FULL need, for one structural reason: at 1.0 a plan that sheds a cool
+ * peer AND sub-floors the hot room scores worse than shedding the hot room
+ * outright (0.3 + 7.0 > 7.0), and the reducer would answer by killing the room
+ * it is meant to protect. Anything below 1.0 keeps "sub-floor beats off" true
+ * for the SAME room at every need level; 0.9 also says something honest — the
+ * room keeps its fan, and the user's report is "most of the time", not always.
+ */
+export const SUBFLOOR_NEED_FRACTION = 0.9;
 
 export const DEFAULT_REDUCTION_WEIGHTS: ReductionWeights = {
   shed: 100,
@@ -101,6 +117,12 @@ interface AcMove {
   commands: number;
   disturbed: boolean;
   shedNeed: number;
+  /**
+   * Cooling this move costs a HOT room by parking it below its active comfort
+   * floor. Kept apart from `shedNeed` because it only counts in plans that
+   * already switch a room off — see the leaf in `recurse`.
+   */
+  subFloorNeed: number;
   /** This move leaves the AC running ABOVE its floor — a level is still on offer. */
   aboveFloor: boolean;
 }
@@ -223,6 +245,10 @@ export function planReduction(input: ReduceInput): ReducePlan {
     // so the only feasible plan left was 4.8A of power_off to answer 1.1A. L1
     // would have covered it with the room still running.
     //
+    // That rung stays — for the room itself it is still better than an off —
+    // but it is no longer FREE when the room is hot: see the `shedNeed` term
+    // below, where a sub-floor cut is priced as what it physically is.
+    //
     // Never level 0: that is UNRESTRICTED draw, not a reduction (hard rule).
     const HARD_FLOOR = 1;
     for (let level = HARD_FLOOR; level <= upper; level++) {
@@ -261,6 +287,23 @@ export function planReduction(input: ReduceInput): ReducePlan {
           commands: (levelChanged ? 1 : 0) + (fanDrop ? 1 : 0),
           disturbed: levelChanged || fanDrop,
           shedNeed: 0,
+          // A level that does not cool is an off (user, 2026-08-03; invariant
+          // 36). The comfort floor's whole meaning is "below this, this room
+          // does not cool in this weather", so parking a HOT room under it buys
+          // amps by stopping its compressor — the same outcome as a shed, and
+          // the reducer used to score it at zero. Live 11:25:32 that made
+          // {shed Najat (need 1.6) + Abdullah L2→L1} score 1.6 and beat
+          // {shed Abdu} at 1.8: the hottest, top-priority room stopped cooling
+          // to keep a milder one running, and — being a level and not a shed —
+          // nothing tracked it as off. It sat at 28°C against a setpoint of 20
+          // until the user intervened.
+          //
+          // A SATISFIED room is exempt: it is not cooling right now anyway, so
+          // its sub-floor rung stays free (and preferred).
+          subFloorNeed:
+            belowFloorSteps > 0 && ac.needDelta > config.nearTargetBandC
+              ? Math.max(0, ac.needDelta) * SUBFLOOR_NEED_FRACTION
+              : 0,
           aboveFloor: level > floor,
         });
       }
@@ -281,6 +324,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
         commands: 1,
         disturbed: true,
         shedNeed: Math.max(0, ac.needDelta),
+        subFloorNeed: 0,
         aboveFloor: false, // a room that is off is not withholding a level
       });
     }
@@ -302,6 +346,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
     sheds: number,
     fanCuts: number,
     aboveFloor: number,
+    subFloorNeed: number,
   ): void => {
     if (i === perAc.length) {
       // Levels before fans, judged on the PLAN: a candidate that trims a fan
@@ -318,7 +363,16 @@ export function planReduction(input: ReduceInput): ReducePlan {
         cost,
         commands,
         disturbed,
-        shedNeed,
+        // The protection term ranks WHO PAYS among plans that take a room out
+        // of service. A hot room parked below its comfort floor is one of those
+        // rooms (see AcMove.subFloorNeed) — but only once something is being
+        // switched off at all. Counting it unconditionally inverts the ladder:
+        // the acceptance scenario answered a 1A near-limit deficit by shedding
+        // a room instead of taking the cheap level, which is the exact cost the
+        // user predicted when he sketched this fix ("gives up a reduction rung
+        // that exists to avoid a shed"). A plan that switches nobody off still
+        // wins first, every time.
+        shedNeed: shedNeed + (sheds > 0 ? subFloorNeed : 0),
         feasible: savings >= requiredAmps - EPS && (!requireShed || sheds > 0),
         exportsShed:
           preferShed != null &&
@@ -341,6 +395,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
         sheds + (mv.level == null ? 1 : 0),
         fanCuts + (mv.fanTarget != null ? 1 : 0),
         aboveFloor + (mv.aboveFloor ? 1 : 0),
+        subFloorNeed + mv.subFloorNeed,
       );
     }
   };
@@ -357,7 +412,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
   // only prolong the overload.
   for (maxSheds = 1; maxSheds <= perAc.length; maxSheds++) {
     best = null;
-    recurse(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    recurse(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     if (best != null && (best as ComboScore).feasible) break;
   }
 

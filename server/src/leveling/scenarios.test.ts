@@ -330,6 +330,58 @@ describe("gen flicker shed storm (2026-08-02)", () => {
   });
 });
 
+describe("a level that does not cool is an off (2026-08-03)", () => {
+  // 11:25:32 Baghdad: an extreme deficit shed Najat AND cut Abdullah from his
+  // active L2 heat-boost floor to L1. Above the boost threshold his compressor
+  // mostly will not engage at L1 (user, hardware truth), so that cut took the
+  // top-priority room out of service — silently, since a level carries no shed
+  // record. Najat's restore then took the amps that appeared three minutes
+  // later, and Abdullah sat at 28°C against a setpoint of 20 for twenty minutes
+  // until the user switched a room off by hand.
+  const STRANDED = { ...ABDULLAH, minLevel: 2, level: 1, demandAmps: 3.9, needDelta: 3 };
+
+  it("buys a stranded comfort floor back BEFORE restoring a less-needy shed room", () => {
+    const s = new Scenario(
+      cfg,
+      [STRANDED, { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 1.8 }, { ...NAJAT, shed: true, on: false, needDelta: 1.6 }],
+      { nonAcAmps: 3.0, source: "gen", seed: 20260803 },
+    );
+    const t0 = s.now;
+    s.advance(6 * 60);
+    const cmds = s.commandsSince(t0);
+    const floorBack = cmds.findIndex((e) => e.cmd.deviceId === "abdullah" && e.cmd.kind === "set_level");
+    const restore = cmds.findIndex((e) => e.cmd.deviceId === "najat" && e.cmd.kind === "power_on");
+    const trace = cmds.map((e) => `${(e.at - t0) / 1000}s ${JSON.stringify(e.cmd)}`).join("\n");
+    expect(floorBack, trace).toBeGreaterThanOrEqual(0);
+    expect(restore, trace).toBeGreaterThanOrEqual(0);
+    // Both rooms get served — the fix is the ORDER, not a new strand.
+    expect(floorBack, trace).toBeLessThan(restore);
+  });
+
+  it("does not yield to a stranded room that is LESS needy than the shed one", () => {
+    // The shed room is fully off; a room merely below its floor outranks it
+    // only while it is genuinely the hotter of the two. Both needs keep rising
+    // while they wait, so the ordering self-corrects instead of latching.
+    const s = new Scenario(
+      cfg,
+      [
+        { ...STRANDED, needDelta: 1.0 },
+        { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 1.8 },
+        { ...NAJAT, shed: true, on: false, needDelta: 3 },
+      ],
+      { nonAcAmps: 3.0, source: "gen", seed: 20260803 },
+    );
+    const t0 = s.now;
+    s.advance(6 * 60);
+    const cmds = s.commandsSince(t0);
+    const floorBack = cmds.findIndex((e) => e.cmd.deviceId === "abdullah" && e.cmd.kind === "set_level");
+    const restore = cmds.findIndex((e) => e.cmd.deviceId === "najat" && e.cmd.kind === "power_on");
+    const trace = cmds.map((e) => `${(e.at - t0) / 1000}s ${JSON.stringify(e.cmd)}`).join("\n");
+    expect(restore, trace).toBeGreaterThanOrEqual(0);
+    expect(restore < floorBack || floorBack < 0, trace).toBe(true);
+  });
+});
+
 describe("mild overload → one graduated level cut (v1 could only floor-everyone or cascade fans)", () => {
   it("a ~0.6A overshoot cuts ONE level once fans can't cover — no cascade, no shed, no floor-everyone", () => {
     const s = new Scenario(cfg, [ABDU, ABDULLAH, NAJAT], { nonAcAmps: 2.6, source: "gen" });

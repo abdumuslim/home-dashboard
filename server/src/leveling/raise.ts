@@ -373,7 +373,53 @@ export function planRaise(input: RaiseInput): RaisePlan {
     .filter((a) => a.shed && a.managed && !a.on)
     .sort((a, b) => b.needDelta - a.needDelta || acs.indexOf(a) - acs.indexOf(b));
 
+  /**
+   * Rooms parked BELOW an active comfort floor while they still want cooling.
+   * A comfort floor means "under this level this room does not cool in this
+   * weather", so such a room is out of service in all but name (invariant 36) —
+   * it just has no shed record, no restore queue and no push to say so.
+   *
+   * The restore phase treats them as what they are: peers, ranked by need.
+   * Live 2026-08-03 11:25–11:45, Abdullah sat at L1 under an active L2 floor
+   * with his room 8°C above setpoint while Najat — shed in the same batch,
+   * 1.4°C less needy — took the 2.3A that appeared three minutes later, and the
+   * envelope then refused his floor by 0.1A for the next seventeen minutes.
+   * Restoring a room that is off ahead of a room that is off in all but name is
+   * only right when it is the needier of the two.
+   */
+  const strandedBelowFloor = onManaged
+    .filter((a) => a.currentLevel >= 1 && a.currentLevel < floorOf(a) && a.needDelta > config.nearTargetBandC)
+    .sort((a, b) => b.needDelta - a.needDelta);
+
+  /**
+   * Yield only to a floor recovery that can actually ship THIS tick — the same
+   * envelope and meter tests the raise phase is about to apply. Without that
+   * the yield is a livelock: a room whose floor nobody can afford would park
+   * every restore behind it forever. Both rooms' needs keep rising while they
+   * wait, so the ordering self-corrects as the physics changes.
+   */
+  const floorRecoveryFits = (ac: AcView): boolean => {
+    const target = Math.min(ac.currentLevel + 1, floorOf(ac));
+    if (envelopeGuard && raiseEnvelope({ [ac.deviceId]: target }) > envelopeCeiling) return false;
+    const step = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, target, ac.maxLevel, now);
+    return step.amps <= input.headroomAmps - input.rampDebitAmps;
+  };
+
   for (const candidate of shedCandidates) {
+    // Candidates are most-needy-first, so a stranded room that outranks this
+    // one outranks every candidate behind it: stand the whole phase down (no
+    // reservation) and let the raise phase buy the floor back.
+    const needier = strandedBelowFloor.find((a) => a.needDelta > candidate.needDelta && floorRecoveryFits(a));
+    if (needier != null) {
+      decisions.push({
+        at: now,
+        deviceId: candidate.deviceId,
+        action: "restore",
+        blockedBy: "floor recovery",
+        detail: `${needier.name} is below its comfort floor and needier (${needier.needDelta.toFixed(1)}°C vs ${candidate.needDelta.toFixed(1)}°C)`,
+      });
+      break;
+    }
     const floor = floorOf(candidate);
     // On gen every restore ships GENTLE (fan pinned to 1), but gentleness is
     // NOT a discount: 2026-07-27 proved the pin doesn't shrink the compressor

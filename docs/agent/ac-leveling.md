@@ -64,6 +64,39 @@ and the window is forgotten after any discontinuity.
 is declared in `scenario.ts` and never written; the send-side dedupe and the grading shell have no
 mirror at all. Every new test in this strand was verified to FAIL with its own mechanism disabled.
 
+### 2026-08-03 (midday) — "a level that does not cool is an off"
+
+The deferred design question from the morning (memory item 7) arrived as a live incident: *"Abdullah
+ac compressor just stopped"*. State at 11:33 Baghdad: all three rooms at L1 on a 15 A generator,
+meter 13.5 A, and **Abdullah at L1 under an ACTIVE L2 heat-boost floor** (outdoor ≥ 39 °C) with his
+room at 28 °C against a setpoint of 20 — the level his compressor mostly will not engage at. He had
+been there for 20 minutes and every attempt to lift him was refused.
+
+How he got there, and why he stayed:
+
+| Live evidence (Baghdad) | Cause | Fix |
+|---|---|---|
+| 11:25:32 `over_extreme`, req 3.65 A → shed Najat (need 1.6) **and** cut Abdullah L2→L1 (need 3.0, top priority), when shedding Abdu (4.3 A, need 1.8) covered it alone | The "protect hot rooms" term (`min Σ shedNeed`) counted only power-offs, so stopping the hottest room's compressor with a sub-floor level scored **zero** | `AcMove.subFloorNeed` — a hot room parked below an ACTIVE comfort floor counts `needDelta × SUBFLOOR_NEED_FRACTION` (0.9), added to the protection term **only in plans that already shed** |
+| Nothing recorded him as out of service — no shed row, no restore queue, no push | A level is not a shed; the state was invisible to every recovery path | Same invariant, recovery side (next row) |
+| 11:28:38 Najat (shed, need 1.6) restored into the 2.3 A that appeared, while Abdullah's floor buy-back sat blocked | A shed restore structurally outranks every raise, including buying back a comfort floor | Restore phase yields (no reservation) to a **needier** room stranded below its active floor, when that floor step passes the same envelope + meter tests the raise phase will apply |
+| 11:29:21 `raise L2 blocked: worst case 15.0 A > 14.9 A` — refused by 0.1 A | Abdullah's gen amp model priced L2 at 4.8 A / L3 at 7.3 A for a **1-ton** unit measured at 2.08 / 3.81 / 4.32 A | `genAmpModels` corrected to base 2.3 / step 1.5 (⇒ 2.3 / 3.8 / 5.3, matching the user-verified hardware truth) |
+| The config save that fixed it returned `200` and changed nothing | **`collector.leveling()` routes saves to the ACTING controller**, and v2's `updateConfig` persisted only its own five keys — row 1's `updated_at` still read the 2026-07-24 cutover date | v2 now writes v1-shaped fields to row 1, **merged** over the stored row (never replaced, so an unknown field cannot be dropped) |
+
+The last row is the widest of these: since the cutover, **every dashboard leveling save silently
+discarded amp models, limits, margins, priority and level boosts.** Anything a session "changed" in
+that config between 2026-07-24 and 2026-08-03 did not actually change.
+
+⚠️ **Why the reduction term is conditional on the plan already shedding.** The first version counted
+it unconditionally, and the acceptance scenario immediately answered a ~1 A near-limit deficit by
+shedding a room instead of taking the cheap level — exactly the cost the user named when he sketched
+this fix ("gives up a reduction rung that exists to avoid a shed"). The ladder order is untouched: a
+plan that switches nobody off still wins first, every time. What the term now decides is only *who
+pays* once something is going off.
+
+**Live outcome.** With the user's call ("turn Abdu's AC off") the generator dropped to 9.5 A and the
+leveler lifted Abdullah L1→L2 on its own 80 seconds later; the meter rose 9.5 → 11.3 A as his
+compressor came up, confirming from the meter what the room temperature had been saying.
+
 **Fan-restore churn (shipped later the same day).** The climb charged the full 60 s anti-bounce
 window for EVERY 2-gear step, and because a fan restore spends (invariant 18) each step rewinds the
 shared calm clock — so a six-gear recovery took three batches minutes apart and the raise path got no
