@@ -522,7 +522,12 @@ export function ingestReading(
         kind: "collapse_suppressed",
         fromAmps: baseline,
         toAmps: measured,
-        creditAmps: cutCredit,
+        // The RAW unabsorbed credit, not pendingCutCredit(): the outrun void
+        // (invariant 38) zeroes the spendable figure while the meter rides
+        // above the anchor, but suppression fired on the raw fields — a
+        // journal row saying "suppressed, credit 0A" would send the next
+        // forensic session down a hole.
+        creditAmps: liveCut != null ? Math.max(0, liveCut.amps - liveCut.absorbedAmps) : cutCredit,
         source,
       });
       // Ours — nothing left to watch for.

@@ -62,6 +62,16 @@ export interface SubFloorWatch {
  * tick without a real reading reports 0 — acting always requires a live
  * thermometer. The record is kept, not reset: when the sensor returns, the two
  * REAL endpoint readings still answer "did this room get cooler" honestly.
+ *
+ * Known accepted edge: when an automation rule drives needDelta from a WEATHER
+ * metric (e.g. the feels-like range rules), `tempKnown` reflects the AC's own
+ * thermometer, not that feed — a frozen weather station freezes the delta and
+ * the watch can accrue on it. Deliberately not plumbed (it needs a freshness
+ * flag through LevelerDeviceContext): the worst outcome is one envelope-guarded
+ * step up to the comfort floor, which is approximately what the floor asks for
+ * absent better information — the same accepted-risk class as satisfiedForMs's
+ * stale-but-plausible reading, with the same self-correction once the feed
+ * recovers.
  */
 export function nextSubFloorWatch(
   prev: SubFloorWatch | null,
