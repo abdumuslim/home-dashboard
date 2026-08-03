@@ -176,6 +176,15 @@ export interface MeterView {
    * from another room.
    */
   commandedCutCreditAmps: number;
+  /**
+   * Everything the current cut episode has commanded off, absorption-INCLUDED
+   * (the credit above is what the meter has not shown yet; this is the whole
+   * of it). The settle hold needs the total: a cut lands over minutes, and
+   * while it lands the credit shrinks to nothing even though the amps really
+   * are on their way out. Live 2026-08-03 00:41Z the reducer shipped three
+   * batches in 13 seconds — 12.9A commanded off for a 0.4A deficit.
+   */
+  commandedCutTotalAmps: number;
 }
 
 /** A single device command the pipeline wants executed. */
@@ -224,7 +233,19 @@ export interface Plan {
 
 /** Pressure assessment for one evaluation. */
 export type Pressure =
-  | { kind: "over"; requiredAmps: number; severity: Severity }
+  | {
+      kind: "over";
+      requiredAmps: number;
+      severity: Severity;
+      /**
+       * The deficit BEFORE the in-flight commanded-cut credit is subtracted —
+       * what the meter says is owed, ignoring what is already on its way. The
+       * settle hold compares this against the episode's total commanded cut;
+       * `requiredAmps` cannot answer that question, because the credit is spent
+       * as the meter absorbs it and reads 0 exactly when the cut is landing.
+       */
+      rawRequiredAmps: number;
+    }
   | { kind: "calm"; headroomAmps: number }
   | { kind: "hold" };
 

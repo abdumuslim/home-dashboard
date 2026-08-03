@@ -214,11 +214,32 @@ describe("unconfirmed levels (physics-envelope pricing)", () => {
     expect(unconfirmedLevels(s, "a", T + 4 * 60_000)).toEqual([]);
   });
 
-  it("power-off, source change and a manual probe all clear it", () => {
+  it("power-off and a manual probe clear it — a SOURCE CHANGE does not", () => {
     const sent = noteLevelSend(adopted(1), "a", 3, T).state;
     expect(unconfirmedLevels(clearOnPowerOff(sent, "a"), "a", T + 1_000)).toEqual([]);
-    expect(unconfirmedLevels(clearOnSourceChange(sent), "a", T + 1_000)).toEqual([]);
     expect(unconfirmedLevels(clearMarksOnManual(sent, "a"), "a", T + 1_000)).toEqual([]);
+    // A changeover used to wipe these, which erased the only memory of a level
+    // already travelling to the firmware — and the firmware RESTORES its last
+    // commanded level after a power cycle, so that send is exactly the worst
+    // case the envelope and the FLOORS clamp should still be charging for.
+    // Live 2026-08-03 00:13Z: an L3 sent two minutes before a grid→gen
+    // changeover went unclamped for 27 minutes and unpriced the whole time.
+    expect(unconfirmedLevels(clearOnSourceChange(sent), "a", T + 1_000)).toEqual([3]);
+    // …and it still expires on its own clock.
+    expect(unconfirmedLevels(clearOnSourceChange(sent), "a", T + UNCONFIRMED_SEND_TTL_MS)).toEqual([]);
+  });
+
+  it("a preserved send landing late is OUR command, not a manual change", () => {
+    // After a changeover the pending slot is gone, so the late confirm used to
+    // fall through to the manual-intent branch — and manual wins over every
+    // automatic decision until a human clears it.
+    const sent = clearOnSourceChange(noteLevelSend(adopted(1), "a", 3, T).state);
+    const adopt = observeLevel(sent, "a", 1, opts); // firmware reports the old level first
+    expect(adopt.result.kind).toBe("adopted");
+    const late = observeLevel(adopt.state, "a", 3, opts);
+    expect(late.result.kind).toBe("landed");
+    // …and the envelope stops charging for it once it has landed.
+    expect(unconfirmedLevels(late.state, "a", T + 1_000)).toEqual([]);
   });
 
   it("is empty for an unknown device", () => {

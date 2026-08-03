@@ -60,6 +60,8 @@ export interface PlanInput {
   inFlight?: (deviceId: string) => ReadonlyArray<{ level: number; sentAt: number }>;
   /** Devices that recently funded a peer's raise and may not re-take the level yet. */
   fundingCooldown?: (deviceId: string) => boolean;
+  /** Devices the reducer just cut, which may not climb back yet. */
+  victimCooldown?: (deviceId: string) => boolean;
 }
 
 export interface PlanOutput extends Plan {
@@ -74,6 +76,8 @@ export interface PlanOutput extends Plan {
   fanOnly: boolean;
   /** Devices demoted to fund a peer's raise — the shell stamps their cooldown. */
   fundingDonors?: string[];
+  /** Devices the reducer took a level from — the shell stamps their cooldown. */
+  reductionVictims?: string[];
 }
 
 /**
@@ -180,6 +184,43 @@ export function plan(input: PlanInput): PlanOutput {
     // never waits.
     const escalationHold =
       pressure.severity === "mild" && mode === "SETTLING" && meter.commandedCutCreditAmps > 0;
+    // …and when what we have ALREADY commanded off covers the whole raw
+    // deficit, the next batch is not an escalation, it is a duplicate. Live
+    // 2026-08-03 00:41Z: three batches in 13 seconds took 12.9A off the house
+    // for a 0.4A deficit, because each pass re-planned from the level it had
+    // just sent (SETTLING substitutes the pending level for the confirmed one)
+    // while none of it had reached the meter yet.
+    //
+    // Compared against `rawRequiredAmps`, not `requiredAmps`: the credit is
+    // spent as the meter absorbs it, so the credited figure reads 0 exactly
+    // when the cut is landing. Bounded three ways — SETTLE_MS ends the mode,
+    // PENDING_CUT_MS expires the total, and 45s of mean-over-limit promotes
+    // this to severe, which is never held.
+    const settleHold =
+      pressure.severity === "mild" &&
+      mode === "SETTLING" &&
+      meter.commandedCutCreditAmps > 0 &&
+      meter.commandedCutTotalAmps >= pressure.rawRequiredAmps;
+    if (settleHold) {
+      // Corrections still ship (they are hard invariants, and reductions), but
+      // nothing new is planned this pass: the amps are already commanded.
+      return {
+        ...emptyPlan(input, `over_${pressure.severity}`, [
+          {
+            at: now,
+            action: "reduce",
+            blockedBy: "escalation settle",
+            detail:
+              `${meter.commandedCutTotalAmps.toFixed(1)}A already commanded off ` +
+              `covers ${pressure.rawRequiredAmps.toFixed(1)}A owed — waiting for it to land`,
+          },
+          ...corrections.decisions,
+        ]),
+        commands: dedupeCommands(corrections.commands),
+        severity: pressure.severity,
+        requiredAmps: pressure.requiredAmps,
+      };
+    }
     const reduction = planReduction({
       acs: onManaged,
       requiredAmps: pressure.requiredAmps,
@@ -272,16 +313,29 @@ export function plan(input: PlanInput): PlanOutput {
       fanHolds,
       attempts: [],
       fanOnly: commands.length > 0 && commands.every((c) => c.kind === "set_fan") && corrections.commands.length === 0,
+      // Rooms this batch took a level from. Sheds are NOT victims (a restore is
+      // not a raise, and the restore path has its own pacing), and neither are
+      // fan trims — those already owe FAN_RESTORE_AFTER_CUT_MS.
+      reductionVictims: Object.keys(reduction.desiredLevels),
     };
   }
 
-  // ---- FLOORS (no over-pressure): hold everyone at floors, re-asserting
-  // against the OBSERVED shadow until it confirms (reconciler paces resends).
+  // ---- FLOORS (no over-pressure): hold everyone at floors, re-asserting until
+  // the shadow confirms (the reconciler paces the resends).
+  //
+  // Judged on `envelopeLevel` — the worst level the firmware might be at —
+  // rather than the observed shadow alone. A shadow confirms minutes late, so
+  // a level already sent but unconfirmed is invisible to `currentLevel`: live
+  // 2026-08-03 00:13Z a room raised to L3 on grid two minutes before the
+  // changeover was skipped by this clamp entirely, sat at L3 on a 15A
+  // generator for 27 minutes, and was priced ~4A light by the envelope while a
+  // peer was raised on top of it.
   if (mode === "FLOORS") {
     const commands: Command[] = [];
     for (const ac of onManaged) {
       const floor = floorOf(ac);
-      if (ac.currentLevel === 0 || ac.currentLevel > floor) {
+      const worst = Math.max(ac.currentLevel, ac.envelopeLevel);
+      if (worst === 0 || ac.currentLevel === 0 || worst > floor) {
         commands.push({ deviceId: ac.deviceId, kind: "set_level", level: floor });
       }
     }

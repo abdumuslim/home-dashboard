@@ -100,7 +100,19 @@ export function observeLevel(
   const d = dev(state, deviceId);
   if (d.confirmedLevel == null) {
     if (opts.inSettle) return { state, result: { kind: "none" } };
-    return { state: put(state, deviceId, { ...d, confirmedLevel: obs }), result: { kind: "adopted" } };
+    // Adopting proves where the firmware actually is, so a send we were still
+    // charging the envelope for at THAT level has landed. Sends for other
+    // levels are kept: this observation does not prove they were dropped, and
+    // over-charging is the safe direction (invariant 7).
+    return {
+      state: put(state, deviceId, {
+        ...d,
+        confirmedLevel: obs,
+        sendCounts: withoutLevel(d.sendCounts, obs),
+        sentAt: withoutLevel(d.sentAt, obs),
+      }),
+      result: { kind: "adopted" },
+    };
   }
   if (opts.inSettle || obs === d.confirmedLevel) return { state, result: { kind: "none" } };
 
@@ -146,6 +158,25 @@ export function observeLevel(
   if (opts.collapsed) {
     // Dead device's last word, not user intent; pending KEPT deliberately.
     return { state: put(state, deviceId, { ...d, confirmedLevel: obs }), result: { kind: "adopted" } };
+  }
+
+  if (d.sentAt[obs] != null) {
+    // We sent exactly this level and never saw it confirm, so its arrival is
+    // our own command landing late — not a hand on the remote. The pending slot
+    // cannot cover this across a changeover (it is cleared there while the
+    // sends now survive), and without this the late confirm fell through to the
+    // manual branch below and minted a manual TARGET — which wins over every
+    // automatic decision until a human clears it.
+    return {
+      state: put(state, deviceId, {
+        ...d,
+        confirmedLevel: obs,
+        pendingLevel: null,
+        sendCounts: withoutLevel(d.sendCounts, obs),
+        sentAt: withoutLevel(d.sentAt, obs),
+      }),
+      result: { kind: "landed", level: obs, unmarked: false },
+    };
   }
 
   const rank = (l: number): number => (l <= 0 ? opts.maxLevel + 1 : Math.min(l, opts.maxLevel));
@@ -246,7 +277,24 @@ export function clearOnPowerOff(state: ReconcilerState, deviceId: string): Recon
   });
 }
 
-/** Source change: compressors restart, firmware may come back anywhere — all baselines die; marks survive. */
+/**
+ * Source change: compressors restart, firmware may come back anywhere — all
+ * baselines die; marks survive.
+ *
+ * ⚠ Unconfirmed SENDS survive too, and that is the point. They used to be wiped
+ * here with everything else, which erased the only memory of a level already on
+ * its way to the firmware. Live 2026-08-03 00:11Z: Abdu was raised to L3 on
+ * grid, the grid ended two minutes later, and the changeover took the record
+ * with it — so the gen-entry FLOORS clamp saw a stale L1 shadow and left him
+ * alone, the physics envelope priced him ~4A light and admitted a peer raise on
+ * top, and when the L3 finally confirmed 27 minutes later the meter went to
+ * 15.4A and took five cut batches to unwind.
+ *
+ * Keeping them is also physically right: the TCL restores the level it was last
+ * commanded to after a power cycle, so a pre-changeover send is exactly the
+ * worst case the envelope should be charging for. `UNCONFIRMED_SEND_TTL_MS`
+ * still bounds how long it can haunt us, and any confirm clears it.
+ */
 export function clearOnSourceChange(state: ReconcilerState): ReconcilerState {
   const next: Record<string, ReconDevice> = {};
   for (const [id, d] of Object.entries(state)) {
@@ -254,12 +302,18 @@ export function clearOnSourceChange(state: ReconcilerState): ReconcilerState {
       ...d,
       confirmedLevel: null,
       pendingLevel: null,
-      sendCounts: {},
-      sentAt: {},
       pendingFan: null,
       fanResends: 0,
     };
   }
+  return next;
+}
+
+/** Drop one level's entry from a per-level map (send bookkeeping). */
+function withoutLevel<T>(map: Record<number, T>, level: number): Record<number, T> {
+  if (map[level] == null) return map;
+  const next = { ...map };
+  delete next[level];
   return next;
 }
 

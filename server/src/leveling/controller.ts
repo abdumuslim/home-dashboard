@@ -12,6 +12,7 @@ import { childLogger } from "../logger.js";
 import type { LevelerDeviceContext, LevelingDeps, LevelingStatusV2 } from "./api.js";
 import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, effectiveLimit, limitFor, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
 import {
+  derateFor,
   ingestReading,
   initialMeterState,
   meterView,
@@ -127,6 +128,24 @@ const SHED_RESEND_SPACING_MS = 30_000;
  * back rather than being stranded.
  */
 const FUNDING_COOLDOWN_MS = 120_000;
+/**
+ * How long a room the reducer just cut must wait before it may climb back.
+ *
+ * Same physics as the funding cooldown, involuntary side: the cut is priced
+ * instantly but arrives at the meter over seconds to minutes, so the next calm
+ * window sees headroom that does not exist yet and hands the level straight
+ * back — into the overload that caused the cut. Live 2026-08-03: Abdullah cut
+ * L2→L1 at 00:41:10, raised L1→L2 at 00:42:44. Matched to FUNDING_COOLDOWN_MS
+ * deliberately: it is the same wind-down being waited out.
+ */
+const VICTIM_COOLDOWN_MS = 120_000;
+/**
+ * How long a shed room must keep reporting ON after a boot before its shed
+ * record is cleared. The boot shadow can be up to 13 minutes stale, so one
+ * sighting proves nothing; two sightings this far apart mean the cloud has
+ * refreshed at least once with the room still on.
+ */
+const BOOT_SHED_CLEAR_GRACE_MS = 90_000;
 const PUSH_THROTTLE_MS = 5 * 60_000;
 /** Grade a batch only when this many fresh readings arrived after compareAfter. */
 const GRADE_MIN_SAMPLES = 4;
@@ -144,7 +163,14 @@ const GRADE_MIN_SAMPLES = 4;
  * mirror of the existing `contaminated` sweep, which only covers a LATER
  * batch moving into an open window.
  */
-const LEARN_SETTLE_UP_MS = AC_RAMP_MS;
+/**
+ * ⚠ Matched to `GRADE_TURN_ON_MS`, not to `AC_RAMP_MS`. When the turn-on grade
+ * window was lengthened to 315s (to outlive the attempt blame window) this
+ * stayed at the 240s ramp, leaving a 75-second hole: a window armed 250s after
+ * a turn-on evaluated as "born clean" while that turn-on's own compressor —
+ * by this code's own model — was still ramping.
+ */
+const LEARN_SETTLE_UP_MS = GRADE_TURN_ON_MS;
 const LEARN_SETTLE_DOWN_MS = 120_000;
 
 /** Hard cap on outstanding grade windows (runaway guard — normally 1–3). */
@@ -282,6 +308,10 @@ export class LevelingControllerV2 {
   private pendingOn = new Map<string, number>();
   /** Rooms that gave a level to fund a peer's raise → when (see FUNDING_COOLDOWN_MS). */
   private fundingDemotedAt = new Map<string, number>();
+  /** Rooms the REDUCER took a level from → when (see VICTIM_COOLDOWN_MS). */
+  private reducedAt = new Map<string, number>();
+  /** Shed rooms whose shadow said ON at boot → when first seen (see BOOT_SHED_CLEAR_GRACE_MS). */
+  private bootShedOnSince = new Map<string, number>();
   /** Last fan TRIM actually sent per device — the fan half of send dedupe. */
   private lastFanSent = new Map<string, { fan: number; at: number }>();
   /** Last shed actually sent per device — the power_off half of send dedupe. */
@@ -334,6 +364,8 @@ export class LevelingControllerV2 {
   private satisfiedSince = new Map<string, number>();
   private prevPowerStates = new Map<string, boolean>();
   private deviceNames = new Map<string, string>();
+  /** Devices the collector reports as leveler-managed (opt-outs excluded). */
+  private managedIds = new Set<string>();
   private deviceMaxLevel = new Map<string, number>();
   private armRampOnSourceChange = false;
   private freshlyOn: string[] = [];
@@ -524,6 +556,15 @@ export class LevelingControllerV2 {
    * we know it (our own restore, a dashboard tap) and the whole window when we
    * do not (a room discovered already on — nothing tells us when it started).
    */
+  /**
+   * Is this device one the leveler manages? Unknown devices answer `true` only
+   * until the first tick populates the set — the hooks that consult this are
+   * user-driven and cannot fire before the collector has seen the device.
+   */
+  private isManaged(deviceId: string): boolean {
+    return this.managedIds.size === 0 || this.managedIds.has(deviceId);
+  }
+
   private voidPhantomHouse(deviceId: string, now: number): void {
     const sentAt = this.pendingOn.get(deviceId);
     this.pendingOn.delete(deviceId);
@@ -556,8 +597,13 @@ export class LevelingControllerV2 {
   async reconcileObservedOn(deviceId: string): Promise<void> {
     // A live poll found this room ON. Whatever we thought, it has been drawing
     // for an unknown stretch — void the house samples that modeled it off.
-    // Unconditional: a room whose shadow lagged is exactly the case that
-    // poisons the residual, and it does not have to have been shed to do it.
+    // A room whose shadow lagged is exactly the case that poisons the residual,
+    // and it does not have to have been shed to do it. But it DOES have to be
+    // one of ours: an unmanaged AC appears in no sample's running set, so
+    // voiding for it drops every sample in the window — repeatedly, on a hot
+    // path — and `houseLoadAmps` collapses to 0, which is the over-permissive
+    // direction house-load.ts exists to prevent.
+    if (!this.isManaged(deviceId)) return;
     this.voidPhantomHouse(deviceId, Date.now());
     if (!this.shedIds.has(deviceId)) return;
     const shedAt = this.shedTimes.get(deviceId);
@@ -608,6 +654,13 @@ export class LevelingControllerV2 {
           this.startBaseline.clear();
           this.rampBaseline.clear();
           this.rampAbsorbed.clear();
+          // Both cooldowns are per-line physics — a wind-down on the source we
+          // just left says nothing about this one, and holding them across a
+          // changeover strands a room through the entry window that is supposed
+          // to re-establish levels. (`fundingDemotedAt` was never cleared at
+          // all; found reviewing the 2026-08-02 funding-cycle fix.)
+          this.fundingDemotedAt.clear();
+          this.reducedAt.clear();
           if (event.to === "grid") {
             this.manualCap.clear();
             this.manualTarget.clear();
@@ -615,6 +668,36 @@ export class LevelingControllerV2 {
           if (prevSource !== "none" && event.to !== "none") this.armRampOnSourceChange = true;
           log.info(`[leveler2] Power source changed → ${event.to}`);
           this.deps.onPowerEvent?.(`source ${event.from} → ${event.to}`);
+          // Journal it even though no command ships here. A changeover whose
+          // entry batch happens to be a no-op is otherwise INVISIBLE: the
+          // 2026-08-02 22:28Z gen→grid left a 3.8-hour hole in the only durable
+          // record there is, and reading that night meant guessing which side
+          // of the house the meter was on.
+          void this.store
+            .insertJournal({
+              at: now,
+              source: event.to,
+              mode: deriveMode(this.modeState, now),
+              severity: null,
+              reason: "source_change",
+              requiredAmps: null,
+              preAmps: meterView(this.meterState, now).smoothedAmps,
+              commands: [],
+              decisions: [
+                {
+                  at: now,
+                  action: "source change",
+                  detail: `${event.from} → ${event.to}, limit ${effectiveLimit(
+                    this.config,
+                    event.to === "none" ? "gen" : event.to,
+                    derateFor(this.meterState, event.to, now),
+                  ).toFixed(1)}A`,
+                },
+              ],
+              expectedDelta: null,
+              executed: this.acts(),
+            })
+            .catch(() => undefined);
           break;
         }
         case "collapse": {
@@ -720,6 +803,12 @@ export class LevelingControllerV2 {
     // it was at. The tap is the earliest moment the draw can start falling, so
     // the credit is armed ahead of the cliff it explains.
     this.creditRoomOff(deviceId, null, Date.now());
+    // An ON that never confirmed is now moot. Without this, tapping a room on
+    // and straight back off left the entry live until its 25-minute TTL — and
+    // the guard is GLOBAL, so one such tap stood the whole house's load
+    // sampling down for that long, ageing every sample out of the window and
+    // collapsing the envelope's house term to zero.
+    this.pendingOn.delete(deviceId);
     this.startBaseline.delete(deviceId);
     this.rememberedLevel.delete(deviceId);
     await this.pool.query("DELETE FROM ac_leveling_remembered_level WHERE device_id = $1", [deviceId]);
@@ -736,6 +825,7 @@ export class LevelingControllerV2 {
   }
 
   async onUserPowerOn(deviceId: string): Promise<void> {
+    if (!this.isManaged(deviceId)) return;
     await this.clearShed(deviceId, "user_power_on");
     this.rearmRamp([deviceId]);
     // Fires before the shadow flips — the meter here is still the pre-start
@@ -969,6 +1059,8 @@ export class LevelingControllerV2 {
     for (const { device, managed } of ctx) {
       this.deviceNames.set(device.id, device.name);
       this.deviceMaxLevel.set(device.id, device.maxGeneratorLevel || 3);
+      if (managed) this.managedIds.add(device.id);
+      else this.managedIds.delete(device.id);
       const prev = this.prevPowerStates.get(device.id);
       // FIRST sight of this device since boot. A shed record is persisted so it
       // survives a restart (a shed room must still be restored after a deploy)
@@ -979,8 +1071,25 @@ export class LevelingControllerV2 {
       // the house residual instead. Live 2026-08-02: Abdullah sat on=true
       // shed=true after the 17:40 shed and a redeploy, drawing 2.3A the
       // controller could not see, inflating "house" to 5.2A.
+      //
+      // ⚠ But the boot shadow is the WEAKEST evidence in the system — the TCL
+      // cloud confirms 5.8s to 13min late, so a room shed seconds before a
+      // redeploy can still read as ON. Clearing on that first sight destroys
+      // the shed record of a room that is physically off: the restore is lost
+      // and the model starts charging the meter for a compressor that is not
+      // running. So this needs the room to be seen ON TWICE, a grace apart —
+      // and it never runs in shadow flavour, where v1 owns the same table.
       if (prev === undefined && device.power && managed && this.shedIds.has(device.id)) {
-        await this.clearShed(device.id, "already on at boot");
+        this.bootShedOnSince.set(device.id, now);
+      }
+      const bootSeen = this.bootShedOnSince.get(device.id);
+      if (bootSeen != null) {
+        if (!device.power || !this.shedIds.has(device.id)) {
+          this.bootShedOnSince.delete(device.id);
+        } else if (this.acts() && now - bootSeen >= BOOT_SHED_CLEAR_GRACE_MS) {
+          this.bootShedOnSince.delete(device.id);
+          await this.clearShed(device.id, "still on at boot after grace");
+        }
       }
       if (prev !== undefined && prev !== device.power) {
         if (device.power) {
@@ -1007,7 +1116,17 @@ export class LevelingControllerV2 {
           // ever sees our OWN commands — so without this an external turn-on
           // left the add-side settle clock untouched and the next cost sample
           // measured its ramp as if the meter had been quiet.
-          if (managed) this.lastLoadAddAt = now;
+          if (managed) {
+            this.lastLoadAddAt = now;
+            // …and the clock only protects windows armed AFTER this moment. A
+            // window already open — a restore's 315s grade, say — is measuring
+            // a meter this compressor is now climbing into, and would ratchet
+            // that ramp into ITS own cost. Our own batches mark open windows
+            // this way; an external ON must too.
+            this.pendingGrades = this.pendingGrades.map((g) =>
+              g.contaminated || g.direction !== "up" ? g : { ...g, contaminated: true },
+            );
+          }
         } else {
           // Someone else turned this room off — a remote, the automation, a
           // schedule. Price it off the meter before the reconciler forgets its
@@ -1015,6 +1134,7 @@ export class LevelingControllerV2 {
           // draw vanishing, leaving only the house), and the relative collapse
           // floor cannot tell it from a breaker without this credit.
           this.creditRoomOff(device.id, device.generatorMode ?? null, now);
+          this.pendingOn.delete(device.id);
           this.startBaseline.delete(device.id);
           // No compressor, no ramp to account for.
           this.rampUntil.delete(device.id);
@@ -1255,6 +1375,10 @@ export class LevelingControllerV2 {
         const at = this.fundingDemotedAt.get(deviceId);
         return at != null && now - at < FUNDING_COOLDOWN_MS;
       },
+      victimCooldown: (deviceId) => {
+        const at = this.reducedAt.get(deviceId);
+        return at != null && now - at < VICTIM_COOLDOWN_MS;
+      },
     });
     this.fanHolds = out.fanHolds;
 
@@ -1452,7 +1576,35 @@ export class LevelingControllerV2 {
       return true;
     });
     if (commands.length === 0) {
-      await this.journalBlocked(out, view, mode, now);
+      // Everything was a duplicate of something already in flight. That is a
+      // real decision and it must leave a trace: `journalBlocked` only writes
+      // rows for decisions carrying `blockedBy`, and a reduce plan's own
+      // decision carries none — so this path could return in complete silence,
+      // leaving the leaky bucket empty, the urgent trigger re-firing on every
+      // reading, and a hole in the only forensic surface there is.
+      await this.journalBlocked(
+        {
+          ...out,
+          decisions: [
+            ...out.decisions,
+            {
+              at: now,
+              action: out.reason,
+              blockedBy: "duplicate send",
+              detail: out.commands
+                .map((c) => `${c.kind}${"level" in c ? `:${c.level}` : ""}@${c.deviceId}`)
+                .join(" "),
+            },
+          ],
+        },
+        view,
+        mode,
+        now,
+      );
+      // The bucket bookkeeping is owed either way: the amps this plan wanted are
+      // already commanded, so treat the pass as handled rather than letting it
+      // re-fire on the next reading for the rest of the episode.
+      if (out.severity != null) this.meterState = refillBucket(this.meterState, OVER_LIMIT_BUDGET_AFTER_ACT);
       return;
     }
 
@@ -1500,6 +1652,8 @@ export class LevelingControllerV2 {
           case "power_off": {
             await tcl.executeAcAction(cmd.deviceId, { power: 0 });
             this.lastOffSentAt.set(cmd.deviceId, now);
+            // Whatever ON we were still waiting to confirm is now overtaken.
+            this.pendingOn.delete(cmd.deviceId);
             await this.recordShed(
               cmd.deviceId,
               `over ${effectiveLimit(this.config, view.source === "none" ? "gen" : view.source, view.derateAmps)}A on ${view.source}`,
@@ -1551,7 +1705,12 @@ export class LevelingControllerV2 {
           case "set_fan": {
             const priorFan = acs.find((a) => a.deviceId === cmd.deviceId)?.fanSpeed ?? null;
             await tcl.sendControl(cmd.deviceId, "set_fan_speed", cmd.fan);
+            // The dedupe key is only meaningful while the fan has not moved
+            // since. A restore (or any other gear) makes the old key a lie —
+            // without clearing it, a trim to the same gear the restore just
+            // undid was suppressed for the rest of the 30s window.
             if (cmd.reason === "trim") this.lastFanSent.set(cmd.deviceId, { fan: cmd.fan, at: now });
+            else this.lastFanSent.delete(cmd.deviceId);
             this.recon = noteFanSend(this.recon, cmd.deviceId, cmd.fan, now);
             this.deps.onLevelerFanCommand(cmd.deviceId, cmd.fan);
             await this.persistFanHold(cmd.deviceId);
@@ -1653,6 +1812,14 @@ export class LevelingControllerV2 {
     for (const deviceId of out.fundingDonors ?? []) {
       if (commands.some((c) => c.deviceId === deviceId && c.kind === "set_level")) {
         this.fundingDemotedAt.set(deviceId, now);
+      }
+    }
+    // …and a room the reducer took a level from may not climb back into the
+    // overload before its own cut has reached the meter (VICTIM_COOLDOWN_MS).
+    // Same rule as the donors above: stamped only for cuts actually SENT.
+    for (const deviceId of out.reductionVictims ?? []) {
+      if (commands.some((c) => c.deviceId === deviceId && c.kind === "set_level")) {
+        this.reducedAt.set(deviceId, now);
       }
     }
 

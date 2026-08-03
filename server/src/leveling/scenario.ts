@@ -147,6 +147,8 @@ const GRID_START_MS = 240_000;
 const FAN_DEBIT_MS = 60_000;
 /** Mirrors the controller shell's FUNDING_COOLDOWN_MS. */
 const FUNDING_COOLDOWN_MS = 120_000;
+/** Mirrors the controller shell's VICTIM_COOLDOWN_MS. */
+const VICTIM_COOLDOWN_MS = 120_000;
 
 export class Scenario {
   now = 1_000_000_000;
@@ -188,6 +190,8 @@ export class Scenario {
   private pendingOn = new Map<string, number>();
   /** Shell parity: rooms that funded a peer's raise → when they were demoted. */
   private fundingDemotedAt = new Map<string, number>();
+  /** Shell parity: rooms the reducer cut → when (they may not climb straight back). */
+  private reducedAt = new Map<string, number>();
   private attempts: Array<{ deviceId: string; kind: AttemptKind; at: number }> = [];
 
   constructor(
@@ -288,7 +292,9 @@ export class Scenario {
     // Baselines are amps on the old source; the entry mode owns the transition.
     for (const ac of this.acs) {
       ac.startBaseline = null;
-      ac.sentLevels = []; // mirrors clearOnSourceChange
+      // `sentLevels` deliberately SURVIVES — mirrors clearOnSourceChange, which
+      // keeps unconfirmed sends so a level already on its way to the firmware
+      // is still clamped and still priced after a changeover.
     }
     if (line === "gen" || line === "grid") {
       // A real changeover restarts every running compressor.
@@ -805,6 +811,12 @@ export class Scenario {
         const at = this.fundingDemotedAt.get(deviceId);
         return at != null && this.now - at < FUNDING_COOLDOWN_MS;
       },
+      // …and a room the reducer cut may not climb back into the overload
+      // before its own cut has reached the meter.
+      victimCooldown: (deviceId) => {
+        const at = this.reducedAt.get(deviceId);
+        return at != null && this.now - at < VICTIM_COOLDOWN_MS;
+      },
     });
     this.freshlyOn = [];
     this.plans.push(out);
@@ -816,6 +828,11 @@ export class Scenario {
       for (const deviceId of out.fundingDonors ?? []) {
         if (out.commands.some((c) => c.deviceId === deviceId && c.kind === "set_level")) {
           this.fundingDemotedAt.set(deviceId, this.now);
+        }
+      }
+      for (const deviceId of out.reductionVictims ?? []) {
+        if (out.commands.some((c) => c.deviceId === deviceId && c.kind === "set_level")) {
+          this.reducedAt.set(deviceId, this.now);
         }
       }
       this.execute(out);

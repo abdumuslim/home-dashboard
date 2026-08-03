@@ -173,6 +173,77 @@ describe("the two generator breaks of 2026-08-02 evening", () => {
   });
 });
 
+describe("changeover and churn (2026-08-03 overnight)", () => {
+  const TRIO = [
+    { ...ABDULLAH, level: 2, demandAmps: 3.9, needDelta: 3 },
+    { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 2 },
+    { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1 },
+  ];
+
+  it("a level sent on grid is still clamped after the changeover to gen", () => {
+    // 00:11-00:41Z. Abdu was raised to L3 on grid; the grid ended two minutes
+    // later. The changeover wiped the unconfirmed-send record, so the gen-entry
+    // clamp compared a stale L1 shadow and skipped him entirely — he sat at L3
+    // on a 15A generator for 27 minutes, invisible to the physics envelope,
+    // while a peer was raised on top of him. When the shadow finally caught up
+    // the meter hit 15.4A and it took five cut batches to unwind.
+    // Abdu's shadow confirms 20 minutes late — the live lag runs 5.8s to 13min.
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDULLAH, level: 2, demandAmps: 3.9, needDelta: 3 },
+        { ...ABDU, level: 1, demandAmps: 9.0, needDelta: 3, confirmDelayMs: 20 * 60_000 },
+        { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1 },
+      ],
+      { nonAcAmps: 2.5, source: "grid", seed: 20260803 },
+    );
+    const t0 = s.now;
+    s.advance(180);
+    const raised = setLevels(s, t0).filter((e) => e.cmd.deviceId === "abdu" && e.cmd.level >= 2);
+    expect(raised.length, "harness did not raise abdu on grid").toBeGreaterThan(0);
+    const t1 = s.now;
+    s.setSource("gen");
+    s.advance(90);
+    // The clamp must reach him even though his SHADOW still says L1.
+    const clamped = setLevels(s, t1).filter((e) => e.cmd.deviceId === "abdu" && e.cmd.level <= 1);
+    expect(clamped.length, "the in-flight L3 was never clamped on gen entry").toBeGreaterThan(0);
+  });
+
+  it("a room the reducer just cut does not climb straight back into the overload", () => {
+    // 00:41:10Z cut Abdullah L2→L1; 00:42:44Z raised him L1→L2, 94 seconds
+    // later, before the first cut had even reached the meter.
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDULLAH, level: 2, demandAmps: 3.9, needDelta: 3 },
+        { ...ABDU, level: 2, demandAmps: 6.5, needDelta: 3 },
+        { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1 },
+      ],
+      { nonAcAmps: 2.0, source: "gen", seed: 20260803 },
+    );
+    s.advance(180);
+    const t0 = s.now;
+    // Push the house over the limit so the reducer takes a level, then give it
+    // back so the meter looks roomy again — the shape that invites the bounce.
+    s.setNonAc(4.5);
+    s.advance(120);
+    const cuts = setLevels(s, t0);
+    expect(cuts.length, "the reducer never cut a level").toBeGreaterThan(0);
+    const { at: cutAt, cmd: cut } = cuts[0];
+    s.setNonAc(2.0); // the meter looks roomy again long before the cut lands
+    s.advance(90);
+    const backUp = setLevels(s, cutAt).filter(
+      (e) => e.cmd.deviceId === cut.deviceId && e.cmd.level > cut.level,
+    );
+    for (const e of backUp) {
+      expect(
+        (e.at - cutAt) / 1000,
+        `${cut.deviceId} climbed back to L${e.cmd.level} after ${(e.at - cutAt) / 1000}s`,
+      ).toBeGreaterThanOrEqual(120);
+    }
+  });
+});
+
 describe("gen flicker shed storm (2026-08-02)", () => {
   // The live household on a flickering 14.9A generator: Abdullah held at his L2
   // heat-boost floor, Abdu and Najat at L1, ~2.5A of house. The user's own

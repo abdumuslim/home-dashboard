@@ -67,6 +67,7 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     flickerAmps: 0,
     derateAmps: 0,
     commandedCutCreditAmps: 0,
+    commandedCutTotalAmps: 0,
     ...overrides,
   };
 }
@@ -193,6 +194,33 @@ describe("turn-on inrush blanking (2026-07-25 restore-bounce storm)", () => {
     const out = run(pinned(true), overMeter([15.9], 15.3));
     expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
     expect(out.decisions.some((d) => d.blockedBy === "turn-on inrush")).toBe(false);
+  });
+
+  it("plans NOTHING new while what we already commanded covers the whole deficit", () => {
+    // 2026-08-03 00:41Z: three reducing batches in 13 seconds, 12.9A commanded
+    // off for a 0.4A deficit. Each pass re-planned from the level it had just
+    // sent (SETTLING substitutes the pending level) while none of it had
+    // reached the meter. The shed rung was already held here; the level and
+    // fan rungs were not, and they are what escalated.
+    // A room with a level still to give, so the difference between the two
+    // halves is the settle hold alone — not the shed rung, which the older
+    // escalation hold already covers.
+    const cuttable = [ac("a", { currentLevel: 3, fanSpeed: 5, needDelta: 2 })];
+    const base = overMeter([15.9], 15.2);
+    const held = run(
+      cuttable,
+      { ...base, commandedCutCreditAmps: 2.0, commandedCutTotalAmps: 4.0 },
+      { mode: "SETTLING" },
+    );
+    expect(held.commands.filter((c) => c.kind === "set_level" || c.kind === "set_fan")).toHaveLength(0);
+    expect(held.decisions.some((d) => d.blockedBy === "escalation settle")).toBe(true);
+    // …and it is not a gag: a deficit BIGGER than what is in flight still acts.
+    const acted = run(
+      cuttable,
+      { ...base, commandedCutCreditAmps: 0.1, commandedCutTotalAmps: 0.1 },
+      { mode: "SETTLING" },
+    );
+    expect(acted.commands.filter((c) => c.kind === "set_level")).toHaveLength(1);
   });
 
   it("…but a mean still UNDER the limit keeps the ramping room safe", () => {

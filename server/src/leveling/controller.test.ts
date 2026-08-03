@@ -267,6 +267,40 @@ describe("LevelingControllerV2 — grade queue", () => {
       vi.useRealTimers();
     }
   });
+
+  it("a shed room already ON at boot is not un-shed on the first stale shadow", async () => {
+    // 2026-08-02's fix cleared the record on FIRST sight, from the boot shadow —
+    // which lags 5.8s to 13min. A room shed just before a redeploy still reads
+    // ON, and clearing then destroys the record of a room that is physically
+    // off: the restore is lost and the model starts charging the meter for a
+    // compressor that is not running.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-03T06:00:00Z"));
+      const mock = createGradePool({}, ["a"]);
+      const controller = new LevelingControllerV2(mock.pool, {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never,
+      });
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
+      ];
+      controller.onPowerReading({ current_1: 0, current_2: 8 } as never);
+      await controller.tick(ctx, 30);
+      expect(controller.isShed("a"), "cleared on the very first boot sighting").toBe(true);
+      // …but a room that is STILL on a minute and a half later really is on.
+      for (let i = 0; i < 24; i++) {
+        vi.advanceTimersByTime(5_000);
+        controller.onPowerReading({ current_1: 0, current_2: 8 + 0.01 * (i % 2) } as never);
+        await controller.tick(ctx, 30);
+      }
+      expect(controller.isShed("a")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

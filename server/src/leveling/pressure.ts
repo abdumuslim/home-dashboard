@@ -118,7 +118,7 @@ export function assessPressure(
     // has been absorbed and the mean is STILL over.
     const sustainedExtreme = view.smoothedOverMs >= SUSTAINED_OVER_EXTREME_MS && required > 0;
     const severity = required >= extremeAt || sustainedExtreme ? "extreme" : severe ? "severe" : "mild";
-    return { kind: "over", requiredAmps: required, severity };
+    return { kind: "over", requiredAmps: required, severity, rawRequiredAmps: rawRequired };
   }
 
   // Proactive projection (an AC just turned ON near the limit): the compressor
@@ -126,10 +126,12 @@ export function assessPressure(
   // instead of letting the bucket drain reading-by-reading during the ramp.
   const projected = view.smoothedAmps + (opts.projectedExtraAmps ?? 0);
   if (opts.projectedExtraAmps != null && view.sampleCount >= 2 && projected > limit) {
+    const projectedRequired = Math.max(0.1, projected - limit) + config.marginAmps;
     return {
       kind: "over",
-      requiredAmps: Math.max(0.1, projected - limit) + config.marginAmps,
+      requiredAmps: projectedRequired,
       severity: "mild",
+      rawRequiredAmps: projectedRequired,
     };
   }
 

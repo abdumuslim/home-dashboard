@@ -203,6 +203,16 @@ export interface RaiseInput {
    * level. Defaults to "nothing cooling" when the caller does not supply it.
    */
   fundingCooldown?: (deviceId: string) => boolean;
+  /**
+   * Devices the REDUCER just took a level from, which may not climb back yet.
+   * The mirror of `fundingCooldown` for the involuntary case: an over-limit
+   * batch cuts a room, the compressor takes seconds to minutes to throttle
+   * down, and in the meantime the meter still shows the old draw — so the very
+   * next calm window admits the raise that undoes the cut. Live 2026-08-03
+   * 00:41:10Z Abdullah was cut L2→L1 and raised back at 00:42:44, 94s later,
+   * into the same overload. Defaults to "nothing cooling".
+   */
+  victimCooldown?: (deviceId: string) => boolean;
 }
 
 export interface RaisePlan {
@@ -541,6 +551,12 @@ export function planRaise(input: RaiseInput): RaisePlan {
       if (a.currentLevel > f) {
         commands.push({ deviceId: a.deviceId, kind: "set_level", level: f });
         cutAmps += modelCutAmps(config, a.deviceId, source, a.currentLevel, f, a.maxLevel);
+        // These peers are funding a restore, which is the slowest-landing
+        // receiver there is: it waits out a calm window AND a whole compressor
+        // start. Without the cooldown they take their levels straight back on
+        // the next tick — the 2026-08-02 donor↔receiver cycle, with a shed room
+        // stranded off instead of a peer stuck a level low.
+        fundingDonors.push(a.deviceId);
       }
     }
     commands.push(restoreCmd());
@@ -667,6 +683,14 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // L1↔L2 every ~45s while Abdu, the room the demote was for, never climbed.
     if (input.fundingCooldown?.(ac.deviceId) === true) {
       decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "funding cooldown" });
+      continue;
+    }
+    // …and the same for a level the reducer TOOK. Climbing back before the cut
+    // has even reached the meter re-creates the overload that caused it, and
+    // the pair repeats: cut, raise, cut. A shed room is deliberately exempt —
+    // a restore is not a raise, and stranding a room off is the worse failure.
+    if (input.victimCooldown?.(ac.deviceId) === true) {
+      decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "victim cooldown" });
       continue;
     }
     // Grid turn-on full start (user directive "on grid start all to full"):
