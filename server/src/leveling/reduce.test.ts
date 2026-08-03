@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { planReduction, type ReduceInput } from "./reduce.js";
 import { updateCost, type CostBook } from "./costs.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
+import { SHED_NEED_GAP_C } from "./reduce.js";
 import { NON_COOLING_NEED_C } from "./needs.js";
 import type { AcView } from "./types.js";
 
@@ -378,15 +379,27 @@ describe("turn-on inrush blanking (2026-07-25 restore-bounce storm)", () => {
 });
 
 describe("preferShed — undo the turn-on that caused this, never a bystander", () => {
-  it("sheds the preferred room even when a bystander is less needy", () => {
+  it("sheds the preferred room when the bystander is comparably warm", () => {
+    // Within SHED_NEED_GAP_C the no-surprise rule holds: you should not switch
+    // your AC on and find a similarly-warm room switched off instead.
     const acs = [
       ac("hot", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 3 }),
-      ac("cool", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 0.2 }),
+      ac("cool", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 3 - (SHED_NEED_GAP_C - 0.1) }),
     ];
-    // Without the hint the least-needy room (cool) sheds…
-    expect(plan(acs, 1.5).toShed).toEqual(["cool"]);
-    // …with it, the room whose own turn-on caused the overload does.
+    expect(plan(acs, 1.5).toShed).toEqual(["cool"]); // least-needy, no hint
     expect(plan(acs, 1.5, { preferShed: "hot" }).toShed).toEqual(["hot"]);
+  });
+
+  it("sheds a CLEARLY milder bystander instead of the causer (user, 2026-08-03)", () => {
+    // Amended that evening: "why it turned off mine not najat?". Live 20:24:50
+    // a 0.3A overshoot shed the user's own 33°C room (need 4.2) while a 28.2°C
+    // room (need 2.5) kept running — and shedding the milder one covered the
+    // deficit many times over. Past the gap, protecting the hotter room wins.
+    const acs = [
+      ac("hot", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 4.2 }),
+      ac("cool", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 2.5 }),
+    ];
+    expect(plan(acs, 1.5, { preferShed: "hot" }).toShed).toEqual(["cool"]);
   });
 
   it("the preferred room is exempt from its own re-shed penalty", () => {

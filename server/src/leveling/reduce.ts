@@ -53,6 +53,22 @@ export interface ReductionWeights {
  */
 export const SUBFLOOR_NEED_FRACTION = 0.9;
 
+/**
+ * How much milder a running room must be than the room whose turn-on caused an
+ * overload before it is shed INSTEAD of that room (user, 2026-08-03 evening:
+ * "why it turned off mine not najat?").
+ *
+ * "Undo the turn-on, don't make a bystander pay" outranked "protect the hotter
+ * room" absolutely, which is right when the two rooms are comparably warm — you
+ * should not flip your AC on and find a different room switched off. It is
+ * wrong when the bystander is barely warm: live 20:24:50, a 0.3A overshoot shed
+ * the user's own 33°C room (need 4.2) while a 28.2°C room (need 2.5) kept
+ * running, and shedding the milder one would have covered the deficit five
+ * times over. The gap keeps the no-surprise rule for close calls and lets a
+ * genuinely hotter room keep cooling.
+ */
+export const SHED_NEED_GAP_C = 1.5;
+
 export const DEFAULT_REDUCTION_WEIGHTS: ReductionWeights = {
   shed: 100,
   levelStep: 10,
@@ -177,6 +193,11 @@ export function planReduction(input: ReduceInput): ReducePlan {
   const w = input.weights ?? DEFAULT_REDUCTION_WEIGHTS;
   const needWeight = (ac: AcView): number => 1 + w.needK * Math.max(0, ac.needDelta);
   const topId = acs[0]?.deviceId ?? null;
+  const needById = new Map(acs.map((a) => [a.deviceId, Math.max(0, a.needDelta)]));
+  const preferShedNeed = preferShed != null ? (needById.get(preferShed) ?? 0) : 0;
+  /** Every room this plan sheds is clearly milder than the room that caused it. */
+  const shedsOnlyMilder = (shedIds: string[]): boolean =>
+    shedIds.every((id) => (needById.get(id) ?? 0) + SHED_NEED_GAP_C <= preferShedNeed);
 
   // "Reduce the levels, then the fan speed as the last try before turning off"
   // (user, 2026-07-31). The floor gate used to be PER-AC: a room already at its
@@ -383,10 +404,16 @@ export function planReduction(input: ReduceInput): ReducePlan {
         // a restore-bounce backoff, without which it has nowhere stable to land.
         shedNeed: shedNeed + (sheds > 0 ? subFloorNeed : 0),
         feasible: savings >= requiredAmps - EPS && (!requireShed || sheds > 0),
+        // "A bystander pays" — but only when the bystander is not obviously the
+        // right room to lose. A plan that sheds ONLY rooms clearly milder than
+        // the causer (see SHED_NEED_GAP_C) is not exporting anything; it is the
+        // hot-room protection doing its job, and it competes normally on the
+        // shedNeed term below.
         exportsShed:
           preferShed != null &&
           shedIds.length > 0 &&
-          !shedIds.includes(preferShed),
+          !shedIds.includes(preferShed) &&
+          !shedsOnlyMilder(shedIds),
       };
       if (best == null || reductionBetter(candidate, best, requiredAmps)) best = candidate;
       return;

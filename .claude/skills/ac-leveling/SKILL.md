@@ -483,6 +483,18 @@ guards, because `scenarios.test.ts` cannot see them.
     still report "pinned below the comfort floor and not cooling". Reported,
     never enforced; that is what makes "manual wins" mean anything.
 
+43. **"Undo the turn-on" outranks "protect the hotter room" — but only for a
+    close call** (user, 2026-08-03 evening: "why it turned off mine not
+    najat?"). `exportsShed` ranks immediately after feasibility, so the room
+    whose turn-on caused an overload was shed absolutely, whatever the
+    alternative. Live 20:24:50: a **0.3 A** overshoot shed the user's own 33 °C
+    room (need 4.2) while a 28.2 °C room (need 2.5) kept running — and shedding
+    the milder one covered that deficit many times over. A plan that sheds ONLY
+    rooms at least `SHED_NEED_GAP_C` (1.5 °C) milder than the causer no longer
+    counts as exporting; it competes normally on `shedNeed`. Inside the gap the
+    original rule stands, and it should: flipping your AC on must not switch off
+    a comparably warm room instead.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's
