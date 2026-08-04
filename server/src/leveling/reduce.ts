@@ -66,8 +66,17 @@ export const SUBFLOOR_NEED_FRACTION = 0.9;
  * running, and shedding the milder one would have covered the deficit five
  * times over. The gap keeps the no-surprise rule for close calls and lets a
  * genuinely hotter room keep cooling.
+ *
+ * 1.5 → 1.0 on the user's own instruction, 2026-08-04: **"1 c is enough to
+ * switch between acs"**. He lives with the consequence either way, and the
+ * shape he objected to (a 1.7°C gap) still clears the smaller bar; what the
+ * change buys is that a genuinely hotter room is protected sooner.
+ *
+ * Also read by the FLOORS recovery admission (pipeline.ts), which uses it for
+ * the same question in the other direction: once a room has been refused, may a
+ * COOLER one take the amps it could not use?
  */
-export const SHED_NEED_GAP_C = 1.5;
+export const SHED_NEED_GAP_C = 1.0;
 
 export const DEFAULT_REDUCTION_WEIGHTS: ReductionWeights = {
   shed: 100,
