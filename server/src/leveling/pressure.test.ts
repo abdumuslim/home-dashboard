@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { assessPressure, requiredSavingsAmps } from "./pressure.js";
-import { SUSTAINED_OVER_EXTREME_MS, SUSTAINED_OVER_SEVERE_MS } from "./sensing.js";
+import {
+  CREDIT_LANDING_GRACE_MS,
+  SUSTAINED_OVER_EXTREME_MS,
+  SUSTAINED_OVER_SEVERE_MS,
+} from "./sensing.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
 import type { MeterView } from "./types.js";
 
@@ -29,6 +33,7 @@ function view(overrides: Partial<MeterView> = {}): MeterView {
     commandedCutCreditAmps: 0,
     commandedCutAnchorAmps: 0,
     commandedCutTotalAmps: 0,
+    commandedCutAgeMs: 0,
     ...overrides,
   };
 }
@@ -211,5 +216,69 @@ describe("demand-side commanded-cut credit", () => {
     const a = assessPressure(over, cfg);
     const b = assessPressure({ ...over, commandedCutCreditAmps: 0 }, cfg);
     expect(a).toEqual(b);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The SECOND generator break of 2026-08-04 (12:39:57), and the defect it found
+// on the ladder rather than in the sensing:
+//
+//   12:38:23  over_severe  pre 15.615 → fan trims {Abdu→1, Najat→1}, ~1.5A
+//   12:38:26  over_mild    pre 16.145 → Abdullah L2→L1, ~1.9A  (≈3.0A commanded)
+//   12:38:29  "escalation settle: 3.0A already commanded covers 1.2A owed"
+//   …the meter falls 0.49A in 91 seconds…
+//   12:39:57  COLLAPSED — the breaker got there first.
+//
+// A credit is the claim that amps are LATE. Lateness that never shrinks is not
+// a claim, it is a bet — and the credited deficit reading 0 silenced the one
+// rung that forces a room off, for two and a half minutes at 0.6–1.1A over.
+// ---------------------------------------------------------------------------
+
+describe("a credit that is not arriving is not protection (2026-08-04 12:39)", () => {
+  /** The live 12:39:30 view: mean 0.65A over, ~3A commanded, 0.49A delivered. */
+  const notArriving = () =>
+    view({
+      overLimitBudget: 0,
+      overLimitReadings: [15.6, 15.7],
+      smoothedAmps: 15.655,
+      smoothedOverMs: 150_000,
+      commandedCutAnchorAmps: 16.145,
+      commandedCutTotalAmps: 3.0,
+      commandedCutCreditAmps: 2.51, // 0.49A of the 3.0 absorbed
+      commandedCutAgeMs: 91_000,
+    });
+
+  it("sheds instead of tripping when 91 seconds have delivered 16% of the cut", () => {
+    const p = assessPressure(notArriving(), cfg);
+    expect(p).toMatchObject({ kind: "over", severity: "extreme" });
+    // …and the credited deficit really is zero, which is exactly why the old
+    // `required > 0` gate could never fire here.
+    if (p.kind === "over") expect(p.requiredAmps).toBe(0);
+  });
+
+  it("…but a credit that IS landing still holds the rung, exactly as before", () => {
+    // Same ride, same commanded amps — the meter has come down 1.4A of the 3.0,
+    // past the bar. The cut is working; escalating would shed a second room for
+    // amps already on their way out (2026-07-31).
+    const arriving = { ...notArriving(), commandedCutAnchorAmps: 17.055 };
+    expect(assessPressure(arriving, cfg)).toMatchObject({ severity: "severe" });
+  });
+
+  it("trusts a fresh cut inside its landing grace — fan trims land in seconds", () => {
+    const fresh = { ...notArriving(), commandedCutAgeMs: CREDIT_LANDING_GRACE_MS - 1 };
+    expect(assessPressure(fresh, cfg)).toMatchObject({ severity: "severe" });
+  });
+
+  it("a shed it fires re-arms the anchor, so the next window is trusted again", () => {
+    // `noteCommandedCut` re-anchors on every batch, so the tick after the
+    // escalation shed looks like a fresh cut — which is what stops this rung
+    // cascading through the house.
+    const afterShed = { ...notArriving(), commandedCutAgeMs: 0, commandedCutTotalAmps: 5.5 };
+    expect(assessPressure(afterShed, cfg)).toMatchObject({ severity: "severe" });
+  });
+
+  it("does not fire before the mean has been over for the full two minutes", () => {
+    const early = { ...notArriving(), smoothedOverMs: SUSTAINED_OVER_EXTREME_MS - 1 };
+    expect(assessPressure(early, cfg)).not.toMatchObject({ severity: "extreme" });
   });
 });

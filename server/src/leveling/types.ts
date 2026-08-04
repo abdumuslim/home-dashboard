@@ -215,6 +215,13 @@ export interface MeterView {
    * batches in 13 seconds — 12.9A commanded off for a 0.4A deficit.
    */
   commandedCutTotalAmps: number;
+  /**
+   * How long the in-flight cut episode has been travelling (0 when none). A
+   * credit is a claim that amps are LATE, and lateness that never shrinks is
+   * not a claim, it is a bet — this is the clock that tests it (see
+   * CREDIT_LANDING_GRACE_MS).
+   */
+  commandedCutAgeMs: number;
 }
 
 /** A single device command the pipeline wants executed. */

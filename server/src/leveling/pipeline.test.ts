@@ -70,6 +70,7 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     commandedCutCreditAmps: 0,
     commandedCutAnchorAmps: 0,
     commandedCutTotalAmps: 0,
+    commandedCutAgeMs: 0,
     ...overrides,
   };
 }

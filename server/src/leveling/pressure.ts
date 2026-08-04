@@ -7,6 +7,8 @@ import type { MeterView, Pressure } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { effectiveLimit } from "./config.js";
 import {
+  CREDIT_LANDING_FRACTION,
+  CREDIT_LANDING_GRACE_MS,
   OVER_LIMIT_SEVERE_AMPS,
   SUSTAINED_OVER_EXTREME_MS,
   SUSTAINED_OVER_SEVERE_MS,
@@ -116,7 +118,29 @@ export function assessPressure(
     // out — the 2026-07-31 double-shed, re-created from a clock instead of a
     // stale reading. "Not landing fast enough" is only knowable once the credit
     // has been absorbed and the mean is STILL over.
-    const sustainedExtreme = view.smoothedOverMs >= SUSTAINED_OVER_EXTREME_MS && required > 0;
+    //
+    // …and that carve-out is what killed the generator at 12:39:57 on
+    // 2026-08-04. A credit is the claim that amps are LATE. Lateness that never
+    // shrinks is not a claim, it is a bet: at 12:38 the reducer commanded ~3.0A
+    // (two fan trims plus Abdullah L2→L1), the meter fell **0.49A in 91
+    // seconds**, and because the credited deficit read 0 the last rung on the
+    // ladder stayed silent while the mean sat 0.6–1.1A over for two and a half
+    // minutes. Invariant 38's revocation could not help either: it fires when
+    // the meter RISES above the cut's anchor, and this one sat pinned AT it.
+    //
+    // So the credit keeps the rung only while it is demonstrably arriving —
+    // past `CREDIT_LANDING_GRACE_MS`, at least `CREDIT_LANDING_FRACTION` of what
+    // was commanded has actually left the meter. Inside the grace it is trusted
+    // (fan trims land in seconds, compressors do not), and a fired shed re-arms
+    // both the credit and the anchor, so the double-shed shapes this carve-out
+    // was written for stay covered.
+    const fallenAmps = Math.max(0, view.commandedCutAnchorAmps - view.smoothedAmps);
+    const creditIsArriving =
+      view.commandedCutTotalAmps <= 0 ||
+      view.commandedCutAgeMs < CREDIT_LANDING_GRACE_MS ||
+      fallenAmps >= CREDIT_LANDING_FRACTION * view.commandedCutTotalAmps;
+    const sustainedExtreme =
+      view.smoothedOverMs >= SUSTAINED_OVER_EXTREME_MS && (required > 0 || !creditIsArriving);
     const severity = required >= extremeAt || sustainedExtreme ? "extreme" : severe ? "severe" : "mild";
     return { kind: "over", requiredAmps: required, severity, rawRequiredAmps: rawRequired };
   }

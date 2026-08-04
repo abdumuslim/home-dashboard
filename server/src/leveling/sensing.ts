@@ -92,6 +92,35 @@ export const SUSTAINED_OVER_SEVERE_MS = 45_000;
  * (2026-08-03): a break turns off every room.
  */
 export const SUSTAINED_OVER_EXTREME_MS = 120_000;
+/**
+ * How long a commanded cut gets before its progress is judged at all.
+ *
+ * A fan trim reaches the meter in seconds; a level cut's compressor throttles
+ * down over a minute or more, and a shed's off lands anywhere from 6 s to
+ * minutes after the send. Sixty seconds is past the fast actuators and into the
+ * slow ones, so a cut that has shown nothing by now is not merely late.
+ *
+ * ⚠ The residual risk is named on purpose: a genuinely slow shed can look
+ * un-landed at 60 s and cost ONE extra room. That is the trade the user made
+ * when he chose the extreme rung (2026-08-03) — a break turns off every room —
+ * and the fired shed re-arms the credit and the anchor, so nothing can cascade
+ * inside the next window.
+ */
+export const CREDIT_LANDING_GRACE_MS = 60_000;
+/**
+ * How much of a commanded cut must have reached the meter by then for the
+ * credit to still count as "late amps" rather than amps that are not coming.
+ *
+ * Compared against `commandedCutTotalAmps` (0.4–13 A across observed episodes)
+ * measured as the fall from that cut's own anchor. What consumes it is the
+ * compressor wind-down curve against the breaker's thermal one: live 2026-08-04
+ * 12:38–12:39, ~3.0 A of fan trims and a level cut delivered **0.49 A in 91 s**
+ * — 16% — while the mean sat 0.6–1.1 A over a 15 A generator, and the breaker
+ * went at 12:39:57. A fan trim alone lands ~100% inside the grace, and a real
+ * level cut shows well over a third of itself, so the bar separates "arriving"
+ * from "not arriving" without punishing the fast actuators.
+ */
+export const CREDIT_LANDING_FRACTION = 0.35;
 /** Collapse clears when measured recovers to within this of the pre-collapse median. */
 export const POWER_COLLAPSE_RECOVER_GAP = 3;
 /** Safety cap on a collapse latch (never strand the controller). */
@@ -952,5 +981,9 @@ export function meterView(state: MeterState, now: number): MeterView {
       state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut.anchorAmps : 0,
     commandedCutTotalAmps:
       state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut.amps : 0,
+    commandedCutAgeMs:
+      state.pendingCut != null && now < state.pendingCut.until
+        ? Math.max(0, PENDING_CUT_MS - (state.pendingCut.until - now))
+        : 0,
   };
 }
