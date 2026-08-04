@@ -34,8 +34,17 @@ export const NON_COOLING_NEED_C = 2;
  * it if the compressor fall"). Long enough that a slow room on a hot afternoon
  * is not misjudged, short enough to catch a compressor that never engaged well
  * before the room drifts out of the band on its own.
+ *
+ * Shipped at 10 min; the user cut it to 3 after watching an afternoon of it
+ * (2026-08-04: "no need for 10 min, 3 min is enough"). What consumes the window
+ * is a working compressor's own duty cycle — it must be able to show
+ * SUBFLOOR_PROGRESS_C (0.2°C, two sensor LSBs) inside it or a healthy room
+ * reads as dead. A TCL cycles in ones of minutes and a room that IS cooling
+ * moves 0.2°C well inside three; ten minutes was simply longer than the
+ * evidence needed, and every minute of it is a minute the hottest room spends
+ * at a level its compressor is not running at.
  */
-export const SUBFLOOR_WATCH_MS = 10 * 60 * 1000;
+export const SUBFLOOR_WATCH_MS = 3 * 60 * 1000;
 
 /** Cooling progress that re-bases the watch — two sensor LSBs, not noise. */
 export const SUBFLOOR_PROGRESS_C = 0.2;
