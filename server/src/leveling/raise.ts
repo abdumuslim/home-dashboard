@@ -15,6 +15,7 @@ import type { CostBook } from "./costs.js";
 import { levelCutSavings, modelCutAmps, modelFor, raiseJumpAmps, restoreCostAmps, steadyDraw } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { ceilCapOf, ceilOf, floorOf, isNonCooling } from "./needs.js";
+import { SHED_NEED_GAP_C } from "./reduce.js";
 import {
   attemptedWithin,
   canAttempt,
@@ -856,7 +857,45 @@ export function planRaise(input: RaiseInput): RaisePlan {
     return cut;
   };
 
+  /**
+   * R8b — raises admit in NEED order, and the order has to MEAN something
+   * (orchestrator ruling, 2026-08-04, from the stage-2 reading of the 08-03
+   * journal: at 17:13:36 the mildest room, need 1.9, took 2.0A while the
+   * hottest, need 8.0, was refused its step by 0.2A — and the funding swap then
+   * spent three commands undoing it).
+   *
+   * The list was already sorted hottest-first; what it lacked was any
+   * consequence for a refusal. Once a room has been refused for AMPS, a milder
+   * one may take those amps only if it is at least `SHED_NEED_GAP_C` milder —
+   * the SAME constant and the same question the recovery admission asks in the
+   * other direction ("once a room has been refused, may a cooler one take the
+   * amps it could not use?"), and the user calibrated it this afternoon. One
+   * gap rule everywhere, not a second constant.
+   *
+   * Inside the gap the milder room waits: near-equals resolve toward the hotter
+   * room, and the amps stay free for it to fit as a derate recovers or a peer's
+   * cut lands. Only AMPS refusals arm this — a room waiting out its own calm,
+   * backoff, victim or funding cooldown is not competing for anything, and
+   * those gates all expire on their own.
+   */
+  let refusedNeed: number | null = null;
+  const refuseForAmps = (ac: AcView): void => {
+    refusedNeed = Math.max(refusedNeed ?? ac.rankNeedDelta, ac.rankNeedDelta);
+  };
+
   for (const { ac, ceil } of candidates) {
+    if (refusedNeed != null && ac.rankNeedDelta + SHED_NEED_GAP_C > refusedNeed) {
+      decisions.push({
+        at: now,
+        deviceId: ac.deviceId,
+        action: "raise",
+        blockedBy: "needier room waiting",
+        detail:
+          `${ac.rankNeedDelta.toFixed(1)}°C real vs ${(refusedNeed as number).toFixed(1)}°C refused — ` +
+          `not ${SHED_NEED_GAP_C.toFixed(1)}°C milder, so the amps stay with the hotter room`,
+      });
+      continue;
+    }
     // A gen start window is an ENTRY POLICY, and entry policy outranks the
     // raise phase for that device — the same rule FLOORS gets. Without this the
     // clamp and the raise phase fight inside one batch: `invariantCorrections`
@@ -913,6 +952,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
           blockedBy: "no headroom",
           detail: `${startBaseline.toFixed(1)}A before start + L${ac.currentLevel + 1} draw > ${restingCeiling.toFixed(1)}A`,
         });
+        refuseForAmps(ac);
         continue;
       }
     } else if (warmTarget == null) {
@@ -1012,6 +1052,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
             `worst case ${raiseEnvelope({ [ac.deviceId]: desired }).toFixed(1)}A ` +
             `(incl. ${input.nonAcAmps.toFixed(1)}A house) > ${envelopeCeiling.toFixed(1)}A on ${source}`,
         });
+        refuseForAmps(ac);
         continue;
       }
     }
@@ -1067,6 +1108,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
         blockedBy: "no headroom",
         detail: `needs ${jump.amps.toFixed(1)}A (${jump.confidence}), ${Math.max(0, available).toFixed(1)}A available${rampNote}`,
       });
+      refuseForAmps(ac);
       continue;
     }
     commands.push({ deviceId: ac.deviceId, kind: "set_level", level: target });

@@ -126,6 +126,62 @@ describe("a restore is judged on where the meter is HEADING (2026-08-03 shed/res
 });
 
 // ---------------------------------------------------------------------------
+// R8b — raises admit in NEED order, and the order has to MEAN something.
+//
+// Orchestrator ruling, 2026-08-04, from the stage-2 reading of the 08-03
+// journal: at 17:13:36 the MILDEST room (need 1.9) took 2.0A while the HOTTEST
+// (need 8.0) was refused its step by 0.2A, and the funding swap then spent
+// three commands undoing it. The list was already sorted hottest-first; what it
+// lacked was any consequence for a refusal.
+//
+// The gap is `SHED_NEED_GAP_C`, the same constant the recovery admission uses
+// for the same question in the other direction — one gap rule, not a second.
+// ---------------------------------------------------------------------------
+describe("a refused hot room keeps its amps unless the next room is clearly milder (R8b)", () => {
+  // `a` is the 2-ton (3.0A a step), `b` a 1-ton (1.5A). Only ~2A of headroom
+  // exists: enough for b's step, short of a's.
+  const models = {
+    ...cfg,
+    ampModels: { a: { baseAmps: 4, stepAmps: 3 }, b: { baseAmps: 2, stepAmps: 1.5 } },
+  };
+  const pair = (coolNeed: number): AcView[] => [
+    ac("a", { currentLevel: 2, needDelta: 8, rankNeedDelta: 8 }),
+    ac("b", { currentLevel: 1, needDelta: coolNeed, rankNeedDelta: coolNeed }),
+  ];
+
+  it("a near-equal room waits — the amps stay with the hotter one", () => {
+    const p = raise(pair(7.5), { headroomAmps: 2.0, smoothedAmps: 12.1, config: models });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", blockedBy: "no headroom" }),
+    );
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "b", blockedBy: "needier room waiting" }),
+    );
+  });
+
+  it("a clearly milder room still takes amps the hot room cannot use", () => {
+    // Same arithmetic, but b is 6.5°C milder — well past the gap. Refusing it
+    // would be pure waste: the amps help nobody while a waits for more.
+    const p = raise(pair(1.5), { headroomAmps: 2.0, smoothedAmps: 12.1, config: models });
+    expect(p.commands).toContainEqual({ deviceId: "b", kind: "set_level", level: 2 });
+  });
+
+  it("a room merely waiting out its own cooldown does not fence its peers", () => {
+    // `a` is inside the victim cooldown — not competing for amps, serving a
+    // sentence, and the gate expires on its own. A peer taking the headroom
+    // meanwhile costs it nothing.
+    const p = raise(pair(7.5), {
+      headroomAmps: 2.0,
+      smoothedAmps: 12.1,
+      config: models,
+      victimCooldown: (id) => id === "a",
+    });
+    expect(p.commands).toContainEqual({ deviceId: "b", kind: "set_level", level: 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // R9 — the trough a shed digs outlives the credit that explains it.
 //
 // Invariant 41 floors the committed meter at `cutAnchorAmps − commandedCutAmps`
