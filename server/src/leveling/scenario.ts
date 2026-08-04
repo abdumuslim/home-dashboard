@@ -854,6 +854,12 @@ export class Scenario {
           ac.setup.roomTempC != null ? ac.setup.roomTempC - this.cfg.comfortTargetC : ac.needDelta,
         satisfiedForMs: this.satisfiedForMs(ac),
         subFloorStalledMs: this.subFloorStalledMs(ac, observedLevel),
+        // Shell parity (R6): the METER's own answer to "is this compressor
+        // running". The harness has a physical compressor, so it reports the
+        // dead-window half directly — a power-event ramp held open past its
+        // timer — and a scenario can state the graded-off-drop half.
+        compressorOffLikely:
+          ac.on && !ac.shed && ac.powerEventRamp && ac.rampHeldUntil > this.now,
         minLevel: ac.setup.minLevel ?? 1,
         // Shell parity (R14-hard): above the room's boost band the reducer may
         // not enumerate a level below its floor at all. The harness has no

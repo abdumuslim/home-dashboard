@@ -52,6 +52,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     reshedPenalized: false,
     satisfiedForMs: 0,
     subFloorStalledMs: 0,
+    compressorOffLikely: false,
     roomTempC: null,
     boostFloorHard: false,
     unmeteredJumpAmps: 0,

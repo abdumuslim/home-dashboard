@@ -147,8 +147,30 @@ function AcStatusBadges({ ac }: { ac: AcLevelingAcStatus }) {
         </span>
       )}
       {ac.minLevel > 1 && (
-        <span className="px-1.5 py-0.5 rounded text-[0.6rem] font-medium bg-violet-400/15 text-violet-400" title="Outdoor-heat minimum level active">
+        <span
+          className="px-1.5 py-0.5 rounded text-[0.6rem] font-medium bg-violet-400/15 text-violet-400"
+          title={ac.levelHold?.detail ?? "Outdoor-heat minimum level active"}
+        >
           min L{ac.minLevel}
+          {ac.levelHold != null && " learned"}
+        </span>
+      )}
+      {/*
+        R7 — what the room is DOING, not what its level says. One inline
+        indicator, no header, title-case, and only when there is something to
+        report: a room can sit at a perfectly healthy-looking L1 and be out of
+        service, which is the failure this whole family of bugs shares.
+      */}
+      {(ac.coolingState === "compressor_off" || ac.coolingState === "stalled") && (
+        <span
+          className={`text-[0.6rem] font-medium ${ac.coolingState === "compressor_off" ? "text-orange-400" : "text-amber-400"}`}
+          title={
+            ac.coolingState === "compressor_off"
+              ? "The meter says this room's compressor is not running at this level"
+              : `Below its comfort floor with no cooling progress for ${Math.round((ac.subFloorStalledMs ?? 0) / 60_000)} min`
+          }
+        >
+          {ac.coolingState === "compressor_off" ? "Compressor Off" : "Not Cooling"}
         </span>
       )}
       {ac.slotCap != null && (

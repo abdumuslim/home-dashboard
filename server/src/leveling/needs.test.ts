@@ -40,6 +40,7 @@ function ac(overrides: Partial<AcView> = {}): AcView {
     reshedPenalized: false,
     satisfiedForMs: 0,
     subFloorStalledMs: 0,
+    compressorOffLikely: false,
     roomTempC: null,
     boostFloorHard: false,
     unmeteredJumpAmps: 0,
@@ -165,6 +166,17 @@ describe("a level that does not cool is an off (user rule, 2026-08-03 evening)",
   it("never applies at or above the floor, however hot the room", () => {
     expect(isNonCooling(boosted({ needDelta: 9 }), 2)).toBe(false);
     expect(isNonCooling(ac({ minLevel: 1, needDelta: 9 }), 1)).toBe(false);
+  });
+
+  it("takes the METER's word too — a fan-sized off-drop beats the three-minute clock (R6)", () => {
+    // Same physical state the watch detects, arriving minutes sooner: a graded
+    // lone off that moved about a fan, or a dead window nothing has absorbed.
+    // It must reach the SAME consumers, not a parallel set.
+    const measured = boosted({ needDelta: 0.4, subFloorStalledMs: 0, compressorOffLikely: true });
+    expect(isNonCooling(measured, 1)).toBe(true);
+    // …and it still says nothing at or above the floor: the evidence is about
+    // a level the room is not at any more.
+    expect(isNonCooling(measured, 2)).toBe(false);
   });
 
   it("WATCHES inside the band: no cooling for the watch window is an off too", () => {

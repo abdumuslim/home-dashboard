@@ -197,6 +197,70 @@ export function meterIsSteady(view: { latestAmps: number; smoothedAmps: number }
 }
 
 // ---------------------------------------------------------------------------
+// Per-AC compressor evidence from a GRADED off-drop (R6, and the user's own
+// experiment: "an off with 1 amp or less of drop means the compressor was not
+// running").
+//
+// The sub-floor watch (needs.ts) answers the same question from the
+// thermometer, and it is the honest signal — but it needs three minutes of a
+// room failing to get cooler. A lone shed's off-drop answers it in one grading
+// window, and the shed is going to happen anyway.
+//
+// ⚠ ATTRIBUTABLE evidence only. The standing residual (`smoothed − modelled`)
+// moves when a room under-draws its model, so reading it to decide whether a
+// room is under-drawing is circular — that reasoning produced one wrong
+// diagnosis on 2026-08-03 and the user corrected it. A graded LONE off is not
+// circular: it is a controlled experiment with one actuator, and the grading
+// pipeline already refuses windows born beside another batch (invariant 23).
+// ---------------------------------------------------------------------------
+
+/**
+ * The largest measured off-drop that still says "nothing but the fan was
+ * running" (user, 2026-08-04, from switching a room off and watching the meter:
+ * "1 amp or less").
+ *
+ * Largest single increment that can consume it (hard rule 5c): the room's FAN,
+ * which does leave the meter with the compressor. A TCL at fan 7 draws ~0.3 A
+ * of fan over its blower's floor, and the smoothing window adds its own wobble
+ * — an amp of headroom over the user's bar covers both. Compared against the
+ * graded drop of a single power_off, nothing else; it is never compared to a
+ * residual, which is the circular quantity above.
+ */
+export const COMPRESSOR_OFF_DROP_AMPS = 1.2;
+
+/**
+ * …and the drop only MEANS anything when the model claimed real load. A room
+ * modelled under this draws so little that "it dropped less than 1.2 A" is
+ * consistent with a perfectly healthy compressor.
+ *
+ * Sized at the smallest whole compressor on this house (a 1-ton at L1, ~2.2–2.3
+ * A modelled) minus a margin: above it, a ≤1.2 A drop means at least half the
+ * modelled draw never existed. Compared against `steadyDraw` at the confirmed
+ * level — the same figure the envelope and the dead window price with.
+ */
+export const COMPRESSOR_OFF_MODEL_AMPS = 2.0;
+
+/**
+ * A graded drop this large is POSITIVE proof the compressor was running, and
+ * retires any standing off-evidence for that room.
+ *
+ * Same quantity and same reasoning as `DEAD_WINDOW_GAP_AMPS` — it is the
+ * smallest whole compressor this house has — so the two cannot disagree about
+ * what "a compressor's worth of amps" means.
+ */
+export const COMPRESSOR_ON_DROP_AMPS = DEAD_WINDOW_GAP_AMPS;
+
+/** Did this lone off measure a room that was drawing about its fan? */
+export function offDropSaysCompressorOff(dropAmps: number, modeledSteadyAmps: number): boolean {
+  return modeledSteadyAmps >= COMPRESSOR_OFF_MODEL_AMPS && dropAmps <= COMPRESSOR_OFF_DROP_AMPS;
+}
+
+/** …or one that was demonstrably running? */
+export function offDropSaysCompressorOn(dropAmps: number): boolean {
+  return dropAmps >= COMPRESSOR_ON_DROP_AMPS;
+}
+
+// ---------------------------------------------------------------------------
 // Trip on ENTRY (2026-08-04, user-confirmed: the breaker physically tripped
 // this morning and he reset it by hand).
 //

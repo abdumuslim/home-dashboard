@@ -66,7 +66,10 @@ import {
   houseIsDead,
   meterIsSteady,
   modeledGapAmps,
+  offDropSaysCompressorOff,
+  offDropSaysCompressorOn,
   rampAbsorptionLanded,
+  RAMP_RELEASE_MAX_AMPS,
   type ModeledAc,
 } from "./dead-window.js";
 import {
@@ -421,6 +424,14 @@ export class LevelingControllerV2 {
    * nothing power-cycled there, so the amps really are on their way.
    */
   private powerEventRamp = new Map<string, { armedAt: number; heldSince: number | null }>();
+  /**
+   * Rooms a graded LONE off measured as drawing about their fan (R6): the level
+   * it was observed at, and the line it was observed on. Retained until
+   * confirmed compressor evidence — an absorbed ramp, a graded drop of a whole
+   * compressor's worth — or a source change. The evidence is about a device AT
+   * A LEVEL, so it says nothing once the room climbs above it.
+   */
+  private compressorOff = new Map<string, { level: number; source: PowerSource }>();
   /**
    * Entry-collapse state (2026-08-04). `entryCollapseSince` is when the
    * evidence first held without a break — a dwell, so a shadow that is merely
@@ -832,6 +843,9 @@ export class LevelingControllerV2 {
           // 30A of grid are not the same number, and carrying it across would
           // strand a room off on the roomy source.
           this.shedBar.clear();
+          // …and so is compressor-off evidence (R6): the amp models, the
+          // voltage and the compressor's willingness to start are all per-line.
+          this.compressorOff.clear();
           // Dead-window holds are about ramps on the line we just left; the
           // entry re-arms them a tick later against the new line's readings.
           this.powerEventRamp.clear();
@@ -1331,6 +1345,11 @@ export class LevelingControllerV2 {
       if ((this.rampUntil.get(id) ?? 0) <= now && !this.powerEventRamp.has(id)) continue;
       const risen = view.smoothedAmps - baseline;
       if (risen > (this.rampAbsorbed.get(id) ?? 0)) this.rampAbsorbed.set(id, risen);
+      // A whole amp of measured rise attributable to THIS room's ramp is a
+      // compressor starting — positive evidence, so any standing "it was only
+      // drawing its fan" record for it is retired (R6). Same bar the dead
+      // window releases a held ramp on, so the two cannot disagree.
+      if ((this.rampAbsorbed.get(id) ?? 0) >= RAMP_RELEASE_MAX_AMPS) this.compressorOff.delete(id);
     }
     for (const debits of [this.jumpDebit, this.fanDebit]) {
       for (const [id, debit] of debits) {
@@ -2308,6 +2327,20 @@ export class LevelingControllerV2 {
           this.shedIds.has(device.id),
           now,
         ),
+        // R6 — the METER's answer to "is this compressor running", from the two
+        // attributable sources: a graded lone off that measured about a fan (at
+        // or below the level it was measured at — the evidence says nothing
+        // about a level the room has since climbed to), and a power-event ramp
+        // held open past its timer because nothing has been absorbed.
+        compressorOffLikely:
+          device.power &&
+          managed &&
+          !this.shedIds.has(device.id) &&
+          (this.powerEventRamp.get(device.id)?.heldSince != null ||
+            (() => {
+              const seen = this.compressorOff.get(device.id);
+              return seen != null && seen.source === this.meterState.source && observed >= 1 && observed <= seen.level;
+            })()),
         minLevel: Math.max(boost.minLevel, holdFloor),
         // Hard in EITHER form: the configured band past its flex (R14-hard), or
         // a live learned hold (R14-learned). Both say the same thing about the
@@ -2837,6 +2870,11 @@ export class LevelingControllerV2 {
   private async learnGrade(grade: PendingGrade, now: number): Promise<void> {
     if (grade.single == null || grade.source === "none") return;
     const learnSample = grade.single.negate ? -grade.peakDeltaAmps : grade.peakDeltaAmps;
+    // R6 — a graded LONE off is a controlled experiment with one actuator, and
+    // this is the moment its answer arrives. Read BEFORE the 0.2A learn
+    // threshold below: a room that dropped almost nothing is exactly the case
+    // this is about, and that is the case the threshold discards.
+    if (grade.single.negate === true) this.noteOffDrop(grade, learnSample, now);
     if (!(learnSample > 0.2)) return;
     this.book = updateCost(
       this.book,
@@ -2855,6 +2893,45 @@ export class LevelingControllerV2 {
         `${this.deviceNames.get(grade.single.deviceId) ?? grade.single.deviceId} on ${grade.source}` +
         (grade.single.negate ? " (from shed off-drop)" : " (peak over the compressor ramp)"),
     );
+  }
+
+  /**
+   * What one graded lone off says about that room's compressor (R6).
+   *
+   * `transition` is `on@L{level}` and `dropAmps` is the negated peak — the
+   * measured fall this single power_off produced, over a window the grading
+   * pipeline has already certified as uncontaminated (invariant 23) and as
+   * belonging to a SETTLED compressor (invariant 29). Those two guards are what
+   * make this attributable rather than circular.
+   */
+  private noteOffDrop(grade: PendingGrade, dropAmps: number, now: number): void {
+    if (grade.single == null || grade.source === "none") return;
+    const level = Number(/^on@L(\d+)$/.exec(grade.single.transition)?.[1] ?? NaN);
+    if (!Number.isFinite(level) || level < 1) return;
+    const deviceId = grade.single.deviceId;
+    const name = this.deviceNames.get(deviceId) ?? deviceId;
+    const modeled = steadyDraw(
+      level,
+      this.deviceMaxLevel.get(deviceId) ?? 3,
+      modelFor(this.config, deviceId, grade.source),
+    );
+    if (offDropSaysCompressorOn(dropAmps)) {
+      if (this.compressorOff.delete(deviceId)) {
+        log.info(`[leveler2] ${name}: off-drop ${dropAmps.toFixed(1)}A — compressor WAS running, evidence cleared`);
+      }
+      return;
+    }
+    if (!offDropSaysCompressorOff(dropAmps, modeled)) return;
+    this.compressorOff.set(deviceId, { level, source: grade.source });
+    log.warn(
+      `[leveler2] ${name}: switching off at L${level} moved the meter ${dropAmps.toFixed(1)}A against a ` +
+        `${modeled.toFixed(1)}A model — its compressor was not running at that level`,
+    );
+    // …and that is one of R14's two triggers, arriving minutes before the
+    // thermometer watch could have said the same thing.
+    if (level === 1) {
+      void this.noteLevelHold(deviceId, 1, this.freshOutdoorC(now), now, `off-drop of only ${dropAmps.toFixed(1)}A at L1`);
+    }
   }
 
   private async persistFanHold(deviceId: string): Promise<void> {
@@ -2951,6 +3028,17 @@ export class LevelingControllerV2 {
         raiseCooldownMs: cooldownRemainingMs(this.pacing, a.deviceId, "raise", now),
         restoreCooldownMs: cooldownRemainingMs(this.pacing, a.deviceId, "restore", now),
         levelHold: this.levelHoldStatus(a.deviceId, now),
+        subFloorStalledMs: a.subFloorStalledMs,
+        // Precedence is deliberate: the METER's evidence outranks the
+        // thermometer's, because it is the faster of the two and it is what the
+        // reduction ladder is already acting on.
+        coolingState: !a.on || a.shed
+          ? "off"
+          : a.compressorOffLikely
+            ? "compressor_off"
+            : a.subFloorStalledMs >= SUBFLOOR_WATCH_MS
+              ? "stalled"
+              : "cooling",
       })),
       mode,
       calmMs: view.calmMs,

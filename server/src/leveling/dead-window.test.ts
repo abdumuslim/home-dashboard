@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
+  COMPRESSOR_OFF_DROP_AMPS,
+  COMPRESSOR_ON_DROP_AMPS,
+  offDropSaysCompressorOff,
+  offDropSaysCompressorOn,
   DEAD_WINDOW_GAP_AMPS,
   ENTRY_COLLAPSE_DWELL_MS,
   ENTRY_COLLAPSE_STALE_MS,
@@ -218,5 +222,34 @@ describe("entry-collapse evidence", () => {
     // This morning's was ~6 minutes from changeover to manual reset; the send
     // anchor must age, then the evidence must dwell.
     expect(ENTRY_COLLAPSE_UNCONFIRMED_MS + ENTRY_COLLAPSE_DWELL_MS).toBeLessThan(6 * 60_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R6 — per-AC compressor evidence from a graded off-drop (user, 2026-08-04,
+// from his own experiment: "an off with 1 amp or less of drop means the
+// compressor was not running").
+// ---------------------------------------------------------------------------
+
+describe("what a lone off's measured drop says about the compressor", () => {
+  it("calls a fan-sized drop against a real model what it is", () => {
+    // Abdullah at L1: 2.3A modelled, 0.4A measured. The room drew its blower.
+    expect(offDropSaysCompressorOff(0.4, 2.3)).toBe(true);
+    expect(offDropSaysCompressorOff(COMPRESSOR_OFF_DROP_AMPS, 2.3)).toBe(true);
+    expect(offDropSaysCompressorOff(COMPRESSOR_OFF_DROP_AMPS + 0.01, 2.3)).toBe(false);
+  });
+
+  it("says nothing when the model never claimed much either", () => {
+    // A room modelled under COMPRESSOR_OFF_MODEL_AMPS can drop 1.0A and be
+    // perfectly healthy — the comparison has no signal in it.
+    expect(offDropSaysCompressorOff(0.4, 1.5)).toBe(false);
+  });
+
+  it("treats a whole compressor's worth of fall as proof it WAS running", () => {
+    expect(offDropSaysCompressorOn(COMPRESSOR_ON_DROP_AMPS)).toBe(true);
+    expect(offDropSaysCompressorOn(2.9)).toBe(true);
+    expect(offDropSaysCompressorOn(1.9)).toBe(false);
+    // The two verdicts can never both hold — the bars do not overlap.
+    expect(offDropSaysCompressorOff(2.5, 4.1) && offDropSaysCompressorOn(2.5)).toBe(false);
   });
 });

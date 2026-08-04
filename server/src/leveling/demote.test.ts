@@ -40,6 +40,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     reshedPenalized: false,
     satisfiedForMs: DEMOTE_DWELL_MS,
     subFloorStalledMs: 0,
+    compressorOffLikely: false,
     roomTempC: null,
     boostFloorHard: false,
     unmeteredJumpAmps: 0,

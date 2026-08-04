@@ -1766,3 +1766,88 @@ describe("LevelingControllerV2 — a room's own shed bars its restore (R9)", () 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// R6/R7 — per-AC compressor evidence from a graded off-drop, and the surface it
+// gets. User, 2026-08-04, from his own experiment: "an off with 1 amp or less
+// of drop means the compressor was not running".
+//
+// SHELL tests: the grading window, the amp model behind the comparison, and the
+// per-device+level retention all live here; the arithmetic has its own guards
+// in dead-window.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — a fan-sized off-drop says the compressor was off (R6)", () => {
+  function setup(dropTo: number) {
+    // 2.3A modelled at L1 — a real 1-ton, so a small drop MEANS something.
+    const mock = createGradePool({ genAmpModels: { a: { baseAmps: 2.3, stepAmps: 1.5 } } });
+    const a = { id: "a", name: "a", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1, currentTemp: 30 };
+    const deps: LevelingDeps = {
+      ...createDeps(),
+      getTclCloud: () =>
+        ({
+          sendControl: async () => undefined,
+          executeAcAction: async (_id: string, action: { power?: number }) => {
+            if (action.power === 0) a.power = false;
+          },
+        }) as never,
+    };
+    const controller = new LevelingControllerV2(mock.pool, deps);
+    const ctx = [{ device: a as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null }];
+    let flip = 1;
+    const run = async (genAmps: number, steps: number, outdoorC: number | null = 44) => {
+      for (let i = 0; i < steps; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx, outdoorC);
+      }
+    };
+    return { mock, controller, a, run, dropTo };
+  }
+
+  it("records the evidence, surfaces it, and turns it into a learned L1 hold", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T14:00:00Z"));
+      // Settle high enough that the 4-wide median is really there before the
+      // shed — the drop is measured from the SMOOTHED meter, so a lagging
+      // median would measure the settle rather than the compressor.
+      const { mock, controller, a, run } = setup(15.1);
+      await controller.ensureLoaded();
+
+      await run(14.5, 12);
+      await run(16.5, 4);
+      expect(a.power).toBe(false);
+      // …and the meter barely moves. That is the user's own experiment,
+      // reproduced: a level nothing was drawing.
+      await run(15.1, 16);
+
+      const status = controller.getStatus().acs.find((s) => s.deviceId === "a");
+      expect(status?.coolingState).toBe("off"); // the room is off, so that wins
+      // …and the evidence became a learned hold at the outdoor temperature it
+      // was observed at (R14's first trigger, arriving from the METER).
+      expect(mock.levelHolds.get("a")).toMatchObject({ level: 1, outdoorC: 44 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a whole compressor's worth of fall records nothing — that room was running", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T14:00:00Z"));
+      const { mock, controller, a, run } = setup(13.0);
+      await controller.ensureLoaded();
+
+      await run(14.5, 12);
+      await run(16.5, 4);
+      expect(a.power).toBe(false);
+      await run(13.0, 16); // ~2.5A gone: the compressor was there
+
+      expect(mock.levelHolds.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

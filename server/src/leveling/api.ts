@@ -53,6 +53,29 @@ export interface LevelingAcStatusV2 {
   raiseCooldownMs?: number;
   restoreCooldownMs?: number;
   /**
+   * How long this room has sat below its comfort floor WITHOUT getting cooler
+   * (0 when at/above it, or whenever it last made progress). The raw clock
+   * behind `coolingState: "stalled"` — surfaced so the diagnosis can be checked
+   * rather than taken on faith.
+   */
+  subFloorStalledMs?: number;
+  /**
+   * What this room is actually DOING, as opposed to what its level says (R7):
+   *
+   *  - `off`             not on, or shed by the leveler.
+   *  - `compressor_off`  the METER says its compressor is not running — a graded
+   *                      lone off that moved about a fan, or a dead window
+   *                      nothing has absorbed (R6).
+   *  - `stalled`         the THERMOMETER says so: below its comfort floor with
+   *                      no cooling progress for `SUBFLOOR_WATCH_MS`.
+   *  - `cooling`         nothing to report.
+   *
+   * A diagnostic, not an alarm: a room can sit at a perfectly healthy-looking
+   * L1 and be out of service, which is the failure this whole family of bugs
+   * has in common — the system reports healthy while acting on fiction.
+   */
+  coolingState?: "cooling" | "stalled" | "compressor_off" | "off";
+  /**
    * The LEARNED non-cooling hold, when one is live (level-hold.ts): why this
    * room's floor sits above L1 even though nothing in the config says so. The
    * user asked for this in as many words — the status must say "L1 non-cooling

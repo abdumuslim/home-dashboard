@@ -104,7 +104,11 @@ export function nextSubFloorWatch(
  *    will not engage at all (the user's rule, and his measurement: switching
  *    the AC off barely moved the meter); or
  *  - it IS within that band, but has sat there `SUBFLOOR_WATCH_MS` without the
- *    room getting any cooler — the prediction tested against the thermometer.
+ *    room getting any cooler — the prediction tested against the thermometer; or
+ *  - the METER has already said so (`compressorOffLikely`, R6): a graded lone
+ *    off that measured about a fan, or a dead window nothing has absorbed. The
+ *    same physical state the watch detects, arriving minutes sooner — so it
+ *    reaches the same consumers rather than a parallel set.
  *
  * Room temperature is the signal on purpose. The tempting alternative — "it is
  * not drawing its modelled amps" — is circular here: the house residual is
@@ -118,7 +122,11 @@ export function nextSubFloorWatch(
  */
 export function isNonCooling(ac: AcView, level: number): boolean {
   if (level >= floorOf(ac)) return false;
-  return ac.needDelta > NON_COOLING_NEED_C || ac.subFloorStalledMs >= SUBFLOOR_WATCH_MS;
+  return (
+    ac.needDelta > NON_COOLING_NEED_C ||
+    ac.subFloorStalledMs >= SUBFLOOR_WATCH_MS ||
+    ac.compressorOffLikely
+  );
 }
 
 /**

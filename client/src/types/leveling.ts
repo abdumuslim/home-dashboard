@@ -64,6 +64,21 @@ export interface AcLevelingAcStatus {
   slotCap: number | null;
   /** Levels the firmware never confirmed after repeated sends (empty = all reachable). */
   unreachableLevels: number[];
+  /**
+   * What the room is actually DOING, as opposed to what its level says:
+   * `compressor_off` = the meter says its compressor is not running (a graded
+   * lone off that moved about a fan, or a changeover dead window);
+   * `stalled` = the thermometer says so (below its comfort floor with no cooling
+   * progress for three minutes). A diagnostic, not an alarm.
+   */
+  coolingState?: "cooling" | "stalled" | "compressor_off" | "off";
+  /** How long it has sat below its comfort floor without getting cooler (ms). */
+  subFloorStalledMs?: number;
+  /**
+   * The LEARNED non-cooling hold, when one is live: why this room's floor sits
+   * above L1 even though nothing in the config says so.
+   */
+  levelHold?: { level: number; outdoorC: number; until: number; detail: string } | null;
 }
 
 export interface AcLevelingStatus {

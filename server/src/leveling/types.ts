@@ -411,6 +411,30 @@ export interface AcView {
    * thermometer rather than trusting it (user, 2026-08-03).
    */
   subFloorStalledMs: number;
+  /**
+   * This room's compressor is probably not running RIGHT NOW, on evidence from
+   * the METER rather than from the thermometer (R6, user 2026-08-04 — his own
+   * experiment: "an off with 1 amp or less of drop means the compressor was not
+   * running"). Two attributable sources, both one-off measurements rather than
+   * standing residuals:
+   *
+   *  - a graded LONE off/shed whose measured drop was ≤ `COMPRESSOR_OFF_DROP_AMPS`
+   *    while the model claimed ≥ `COMPRESSOR_OFF_MODEL_AMPS` at that level;
+   *    retained per device+level until confirmed compressor evidence or a
+   *    source change (dead-window.ts);
+   *  - the changeover DEAD WINDOW — a power-event ramp held open past its timer
+   *    because nothing has been absorbed and the whole house agrees.
+   *
+   * The third way a room can be non-cooling — the sub-floor thermometer watch —
+   * is carried by `subFloorStalledMs` and consumed by the same `isNonCooling`,
+   * so it is deliberately NOT folded in here: keeping them separate is what lets
+   * the status card say "compressor off" and "stalled" as different words.
+   *
+   * ⚠ Never from the standing residual (`smoothed − modelled`): a room drawing
+   * under its model moves that number by construction, so reading it to decide
+   * whether the room is under-drawing is circular (invariant 40).
+   */
+  compressorOffLikely: boolean;
   /** Boost floor (≥1; >1 when an outdoor-heat boost is active). */
   minLevel: number;
   /**
