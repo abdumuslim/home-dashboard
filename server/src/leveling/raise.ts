@@ -367,6 +367,20 @@ export function planRaise(input: RaiseInput): RaisePlan {
     extra?: { deviceId: string; level: number; maxLevel: number },
   ): number => envelopeWith(overrides, extra) + input.nonAcAmps;
 
+  /**
+   * The level a peer is being CHARGED for right now: its confirmed shadow, or
+   * any higher level we sent and have not seen confirm (invariant 7's worst
+   * case). Level 0 is UNRESTRICTED draw, which `steadyDraw` prices as the top
+   * level, so a numeric max would read it as "below the floor" and silently
+   * drop the biggest recoverable level of all.
+   *
+   * One definition, used by BOTH the at-floors credit and the floor-down
+   * commands it promises — a plan that counts a level as recoverable and then
+   * does not send the command to recover it is a plan that over-admits.
+   */
+  const chargedLevelOf = (a: AcView): number =>
+    a.envelopeLevel === 0 ? a.maxLevel : Math.max(a.currentLevel, a.envelopeLevel);
+
   // ---- Restore phase: most-needy shed AC first, no queue jumping ----
   // Restores are exempt from the resting buffer (a whole room off is worse
   // than riding near the limit): fits under limit − margin.
@@ -502,10 +516,31 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // needs to know whether this room could return at all (plain, or by pulling
     // every raised peer down to its floor in the same batch).
     const envelopePlainOk = !envelopeGuard || envelopeWith({}, candidateEntry) <= envelopeCeiling;
+    // What pulling every raised peer down to its floor would free — priced at
+    // the level the METER IS BEING CHARGED FOR, not the confirmed shadow.
+    //
+    // The two sides of this comparison have to describe the same house.
+    // `committedAmps` includes `rampDebitAmps`, which charges a raise's
+    // committed-but-unmetered jump the instant it is sent (invariant 12); this
+    // sum read `currentLevel`, which does not move until the firmware confirms
+    // — anywhere from seconds to fifteen minutes later (invariant 7). For that
+    // whole window a peer's raise counted AGAINST the shed room's return while
+    // the level it could hand back counted for nothing, so a room that fitted
+    // at floors was refused for amps that were recoverable by definition.
+    //
+    // Live 2026-08-03 17:13:36 / 17:19:03 / 17:25:31 — the same shape three
+    // times inside twelve minutes: Abdu shed, his restore refused at "floors
+    // 16.5A vs 14.9A" with `savingsAtFloors` reading ZERO, and in the very same
+    // batch Najat raised L1→L2. A minute later the funding swap pulled that
+    // level straight back for Abdullah, the meter went over, and Abdu stayed
+    // off. `envelopeLevel` is the worst case the firmware might be at — the
+    // same figure the physics envelope already prices peers at — so the credit
+    // and the charge now move together.
     const savingsAtFloors = onManaged.reduce((sum, a) => {
       const f = floorOf(a);
-      return a.currentLevel > f
-        ? sum + levelCutSavings(book, config, a.deviceId, source, a.currentLevel, f, a.maxLevel, now)
+      const charged = chargedLevelOf(a);
+      return charged > f
+        ? sum + levelCutSavings(book, config, a.deviceId, source, charged, f, a.maxLevel, now)
         : sum;
     }, 0);
     const floorOverrides = Object.fromEntries(onManaged.map((a) => [a.deviceId, floorOf(a)]));
@@ -638,9 +673,14 @@ export function planRaise(input: RaiseInput): RaisePlan {
     }
     for (const a of onManaged) {
       const f = floorOf(a);
-      if (a.currentLevel > f) {
+      const charged = chargedLevelOf(a);
+      if (charged > f) {
+        // `charged`, not `currentLevel`: a room whose L2 is still in flight is
+        // brought down by SENDING L1, which cancels that raise. Send-dedupe
+        // compares against the last level SENT (the L2), so this is a genuine
+        // correction and ships.
         commands.push({ deviceId: a.deviceId, kind: "set_level", level: f });
-        cutAmps += modelCutAmps(config, a.deviceId, source, a.currentLevel, f, a.maxLevel);
+        cutAmps += modelCutAmps(config, a.deviceId, source, charged, f, a.maxLevel);
         // These peers are funding a restore, which is the slowest-landing
         // receiver there is: it waits out a calm window AND a whole compressor
         // start. Without the cooldown they take their levels straight back on

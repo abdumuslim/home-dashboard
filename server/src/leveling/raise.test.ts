@@ -124,6 +124,39 @@ describe("a restore is judged on where the meter is HEADING (2026-08-03 shed/res
   });
 });
 
+// ---------------------------------------------------------------------------
+// R8 — the raise and the restore have to describe the same house.
+// Live 2026-08-03 17:13:36 / 17:19:03 / 17:25:31, the same shape three times in
+// twelve minutes: Abdu shed, his restore refused at "floors 16.5A vs 14.9A"
+// with `savingsAtFloors` reading ZERO, and in the SAME batch Najat raised
+// L1→L2. A minute later the funding swap pulled that level back for Abdullah,
+// the meter went over, and Abdu stayed off.
+// ---------------------------------------------------------------------------
+describe("a peer's in-flight raise is recoverable, so it cannot refuse a restore", () => {
+  const peerRaising = (envelopeLevel: number): AcView[] => [
+    // Sent L1→L2; the shadow has not confirmed, so `currentLevel` is still 1
+    // while `rampDebitAmps` is already charging the jump.
+    ac("a", { currentLevel: 1, envelopeLevel, needDelta: 1 }),
+    ac("b", { on: false, shed: true, needDelta: 4 }),
+  ];
+
+  it("admits the restore by pulling the peer's UNCONFIRMED level back down", () => {
+    // committed = 12.6 smoothed + 2.0 in flight = 14.6; the restore costs 2.0,
+    // so it only fits if the peer's un-landed level counts as recoverable.
+    const p = raise(peerRaising(2), { smoothedAmps: 12.6, rampDebitAmps: 2.0, headroomAmps: 0 });
+    expect(p.commands).toContainEqual({ deviceId: "a", kind: "set_level", level: 1 });
+    expect(p.commands).toContainEqual({ deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 });
+  });
+
+  it("still refuses when the peer really is at its floor and nothing is recoverable", () => {
+    // Same meter, same cost — but no level in flight, so "floors" is where the
+    // house already is and the room genuinely does not fit.
+    const p = raise(peerRaising(1), { smoothedAmps: 14.6, rampDebitAmps: 0, headroomAmps: 0 });
+    expect(p.commands).toHaveLength(0);
+    expect(p.decisions.some((d) => d.blockedBy === "no headroom")).toBe(true);
+  });
+});
+
 describe("restore outranks raises", () => {
   it("a feasible shed restore ships alone at its floor (gentle — fan pinned on gen)", () => {
     const p = raise([ac("a", { needDelta: 3 }), ac("b", { on: false, shed: true, needDelta: 4 })]);
