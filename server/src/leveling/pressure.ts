@@ -7,11 +7,10 @@ import type { MeterView, Pressure } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { effectiveLimit } from "./config.js";
 import {
-  CREDIT_LANDING_FRACTION,
-  CREDIT_LANDING_GRACE_MS,
   OVER_LIMIT_SEVERE_AMPS,
   SUSTAINED_OVER_EXTREME_MS,
   SUSTAINED_OVER_SEVERE_MS,
+  cutTrendOf,
   isSevereOverReading,
   median,
 } from "./sensing.js";
@@ -133,14 +132,11 @@ export function assessPressure(
     // was commanded has actually left the meter. Inside the grace it is trusted
     // (fan trims land in seconds, compressors do not), and a fired shed re-arms
     // both the credit and the anchor, so the double-shed shapes this carve-out
-    // was written for stay covered.
-    const fallenAmps = Math.max(0, view.commandedCutAnchorAmps - view.smoothedAmps);
-    const creditIsArriving =
-      view.commandedCutTotalAmps <= 0 ||
-      view.commandedCutAgeMs < CREDIT_LANDING_GRACE_MS ||
-      fallenAmps >= CREDIT_LANDING_FRACTION * view.commandedCutTotalAmps;
+    // was written for stay covered. `cutTrendOf` is that judgment, shared with
+    // the sustained clock and the escalation hold — one predicate, so the three
+    // rungs cannot disagree about whether the same cut is working.
     const sustainedExtreme =
-      view.smoothedOverMs >= SUSTAINED_OVER_EXTREME_MS && (required > 0 || !creditIsArriving);
+      view.smoothedOverMs >= SUSTAINED_OVER_EXTREME_MS && (required > 0 || cutTrendOf(view) === "stalled");
     const severity = required >= extremeAt || sustainedExtreme ? "extreme" : severe ? "severe" : "mild";
     return { kind: "over", requiredAmps: required, severity, rawRequiredAmps: rawRequired };
   }

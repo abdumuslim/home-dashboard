@@ -146,6 +146,55 @@ describe("escalation settle (2026-08-02 trim → double shed in 7 seconds)", () 
     expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
   });
 
+  // -------------------------------------------------------------------------
+  // R12b — the other face of "a credit that is not arriving is not protection".
+  // Live 2026-08-04, journal rows 7569/7570, thirteen seconds apart:
+  //
+  //   12:56:26  over_severe  pre 16.565 → fan trim + shed Najat, 2.9A commanded
+  //   12:56:39  over_severe  pre 14.240 → shed Abdu as well
+  //
+  // At the second row the meter was 2.3A BELOW that cut's own anchor and still
+  // falling — the cut was working, visibly. What shed the second room was a
+  // severity of `severe` carried by a banked 16.6A reading (sensing drops
+  // banked readings only once the mean clears limit − margin, and 14.24 against
+  // 13.9 just misses), and the escalation hold covered MILD only.
+  // -------------------------------------------------------------------------
+  describe("…and holds a SEVERE one too while the cut is visibly landing (2026-08-04 12:56)", () => {
+    const live = (over: Partial<MeterView> = {}): MeterView => ({
+      ...overMeter([16.0, 15.9], 14.24),
+      derateAmps: 1.0, // the live effective limit was 14.0 on a 15A gen
+      flickerAmps: 0.4,
+      commandedCutCreditAmps: 0.575,
+      commandedCutAnchorAmps: 16.565,
+      commandedCutTotalAmps: 2.9,
+      commandedCutAgeMs: 13_000,
+      ...over,
+    });
+
+    it("does not shed a second room 13 seconds after the first", () => {
+      const out = run(pinned(), live(), { mode: "SETTLING" });
+      expect(out.severity).toBe("severe");
+      expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(0);
+      expect(out.decisions.some((d) => d.blockedBy === "escalation settle")).toBe(true);
+    });
+
+    it("and sheds the moment that same cut stops arriving", () => {
+      // Identical severity and credit; the meter has come down 0.4A of the 2.9
+      // in 91 seconds. That is not lateness, it is a bet — and this is the
+      // 12:39:57 shape, which must never be held.
+      const stalled = live({ smoothedAmps: 16.165, commandedCutAgeMs: 91_000 });
+      const out = run(pinned(), stalled, { mode: "SETTLING" });
+      expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
+    });
+
+    it("an arriving cut never holds the EXTREME rung — it is the last one", () => {
+      const extreme = live({ smoothedOverMs: 200_000 });
+      const out = run(pinned(), extreme, { mode: "SETTLING" });
+      expect(out.severity).toBe("extreme");
+      expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
+    });
+  });
+
   it("a fan trim is credited what the planner claimed, not zero", () => {
     // The credit is what shrinks the next evaluation's demand; at zero the
     // reducer re-demanded amps that were already leaving.

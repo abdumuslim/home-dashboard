@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   CALM_REFILL_MS,
   COLLAPSE_DERATE_AMPS,
+  CREDIT_LANDING_GRACE_MS,
   SUSTAINED_OVER_SEVERE_MS,
   UNEXPLAINED_FALL_CALM_HOLD_MS,
   COLLAPSE_DERATE_MAX_AMPS,
@@ -21,6 +22,7 @@ import {
   STRAIN_DERATE_MS,
   STRAIN_DERATE_RECOVERY_STEP,
   clearCollapse,
+  cutTrendOf,
   determineSource,
   flickerAmps,
   ingestReading,
@@ -31,6 +33,7 @@ import {
   noteCommandedCut,
   pendingCutCredit,
   refillBucket,
+  type CutTrendInput,
 } from "./sensing.js";
 import { DEFAULT_LEVELING_CONFIG_V2, effectiveLimit, type LevelingConfigV2 } from "./config.js";
 import type { MeterEvent, MeterState } from "./types.js";
@@ -420,6 +423,44 @@ describe("power-collapse latch — the residual is the HOUSE (2026-08-03)", () =
   });
 });
 
+describe("cutTrendOf — one trend judgment about a cut in flight (2026-08-04)", () => {
+  const cut = (over: Partial<CutTrendInput> = {}): CutTrendInput => ({
+    commandedCutTotalAmps: 3.0,
+    commandedCutAnchorAmps: 16.0,
+    commandedCutAgeMs: 0,
+    smoothedAmps: 16.0,
+    ...over,
+  });
+
+  it("nothing in flight is `none`", () => {
+    expect(cutTrendOf(cut({ commandedCutTotalAmps: 0 }))).toBe("none");
+  });
+
+  it("young and unproven is `settling` — a compressor is allowed to be slow", () => {
+    expect(cutTrendOf(cut({ commandedCutAgeMs: CREDIT_LANDING_GRACE_MS - 1, smoothedAmps: 15.8 }))).toBe("settling");
+  });
+
+  it("past its grace with the fall still short is `stalled` (the 12:39:57 trip)", () => {
+    // 3.0A commanded, 0.49A delivered in 91 seconds.
+    expect(cutTrendOf(cut({ commandedCutAgeMs: 91_000, smoothedAmps: 15.51 }))).toBe("stalled");
+  });
+
+  it("a fall past the bar is `arriving` BEFORE the grace, not merely young (the 12:56:39 shed)", () => {
+    // 2.9A commanded at a 16.565A anchor; thirteen seconds later, 14.24A.
+    const landing = cut({
+      commandedCutTotalAmps: 2.9,
+      commandedCutAnchorAmps: 16.565,
+      commandedCutAgeMs: 13_000,
+      smoothedAmps: 14.24,
+    });
+    expect(cutTrendOf(landing)).toBe("arriving");
+  });
+
+  it("a meter that has climbed back above the anchor is never arriving", () => {
+    expect(cutTrendOf(cut({ commandedCutAgeMs: 91_000, smoothedAmps: 17.0 }))).toBe("stalled");
+  });
+});
+
 describe("sustained-over clock (2026-08-03)", () => {
   it("counts only unbroken time with the MEAN over the limit", () => {
     const under = feedGen([14, 14, 14, 14]);
@@ -437,6 +478,35 @@ describe("sustained-over clock (2026-08-03)", () => {
     // that will not end, not about an oscillation that keeps touching the line.
     const dipped = feedGen([12, 12, 12, 12], { state: over.state, startAt: over.now + 5_000 });
     expect(meterView(dipped.state, dipped.now).smoothedOverMs).toBe(0);
+  });
+
+  it("rebases while a commanded cut is landing, and runs again the moment it stops", () => {
+    // Live 2026-08-04 12:56:26 → :39. The clock had been running since ~12:53,
+    // so the pass 13 seconds after a 2.9A cut inherited a "severe" and shed a
+    // SECOND room while the meter was 2.3A below that cut's own anchor and
+    // still falling. A ride we are visibly ending is not a ride that will not
+    // end, which is the only thing this clock was ever meant to measure.
+    // The 0.02A wobble is the live CT's micro-jitter: a bit-identical stream is
+    // a hung sensor, and that stops this clock by design.
+    const held = (amps: number, n: number): number[] => Array.from({ length: n }, (_, i) => amps + (i % 2) * 0.02);
+    const riding = feedGen(held(21, 14));
+    expect(meterView(riding.state, riding.now).smoothedOverMs).toBeGreaterThanOrEqual(SUSTAINED_OVER_SEVERE_MS);
+
+    // 6.0A commanded off at a 21A anchor; the meter comes down to 18.5 — a 2.5A
+    // fall, past the 35% bar — and the line is still 3.5A over the 15A limit,
+    // so nothing else could have reset the clock.
+    const cutAt = riding.now + 5_000;
+    const armed = noteCommandedCut(riding.state, 6.0, cutAt);
+    const landing = feedGen(held(18.5, 4), { state: armed, startAt: cutAt });
+    expect(meterView(landing.state, landing.now).smoothedAmps).toBeGreaterThan(15);
+    expect(meterView(landing.state, landing.now).smoothedOverMs).toBe(0);
+
+    // …and the fall is what buys that, not the cut's existence: hold the meter
+    // flat at 18.5 with the same credit outstanding and the clock is back over
+    // the severe rung. Otherwise a cut that delivered a third and stopped would
+    // buy three minutes of silence on a line that is still over.
+    const flat = feedGen(held(18.5, 14), { state: landing.state, startAt: landing.now + 5_000 });
+    expect(meterView(flat.state, flat.now).smoothedOverMs).toBeGreaterThanOrEqual(SUSTAINED_OVER_SEVERE_MS);
   });
 });
 

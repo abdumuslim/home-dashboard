@@ -23,6 +23,20 @@ export type Mode = "NORMAL" | "SETTLING" | "FLOORS" | "GRID_FULL" | "COLLAPSED";
 
 export type Severity = "mild" | "severe" | "extreme";
 
+/**
+ * What the meter says about a reducing batch we have already commanded — the
+ * single trend judgment every ladder rung consults (`cutTrendOf` in sensing.ts).
+ *
+ * - `none`     nothing in flight.
+ * - `settling` in flight, inside its landing grace: trusted, but unproven.
+ * - `arriving` the fall from the cut's own anchor has reached the promised
+ *              fraction of what was commanded — the amps are demonstrably
+ *              leaving, so the sustained clock rebases and the rungs hold.
+ * - `stalled`  past the grace with the fall still short: lateness that never
+ *              shrinks is not a claim, it is a bet. The last rung runs.
+ */
+export type CutTrend = "none" | "settling" | "arriving" | "stalled";
+
 /** One whole-house meter reading (the only feedback signal in the system). */
 export interface MeterReading {
   /** Grid line amps (current_1 on the ESP payload). */

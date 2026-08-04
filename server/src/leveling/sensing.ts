@@ -8,7 +8,7 @@
 // No I/O, no Date.now() — the caller passes `now`. Every ingest returns a new
 // MeterState (immutable) plus the events it produced.
 
-import type { CollapseLatch, MeterEvent, MeterState, MeterView, PowerSource } from "./types.js";
+import type { CollapseLatch, CutTrend, MeterEvent, MeterState, MeterView, PowerSource } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { effectiveLimit } from "./config.js";
 
@@ -516,6 +516,61 @@ export function pendingCutCredit(state: MeterState, now: number): number {
   return Math.max(0, cut.amps - cut.absorbedAmps);
 }
 
+/** The four numbers a cut's trend is judged from — `MeterView` satisfies it. */
+export interface CutTrendInput {
+  commandedCutTotalAmps: number;
+  commandedCutAnchorAmps: number;
+  commandedCutAgeMs: number;
+  smoothedAmps: number;
+}
+
+/**
+ * ONE trend judgment about a reducing batch already in flight, shared by every
+ * consumer that used to ask the question its own way (2026-08-04, R12b).
+ *
+ * Both faces of the same defect were live on 2026-08-04 within thirteen
+ * minutes, and they are opposites:
+ *
+ *  - 12:38→12:39:57 — ~3.0A commanded, **0.49A delivered in 91s**, mean 0.6–1.1A
+ *    over. The credited deficit read 0, so the last rung stayed silent and the
+ *    breaker went. That cut was `stalled`.
+ *  - 12:56:26→12:56:39 — 2.9A commanded at a 16.565A anchor, and thirteen
+ *    seconds later the smoothed meter was 14.24A: **2.3A of the 2.9 already
+ *    gone**, falling fast. A second room was shed anyway. That cut was
+ *    `arriving`, and arriving is exactly when nothing more should be spent from
+ *    a room's comfort.
+ *
+ * `arriving` is deliberately checked BEFORE the grace: a cut that proves itself
+ * in ten seconds (fan trims do) is arriving, not merely young. `stalled` is
+ * only ever claimed after `CREDIT_LANDING_GRACE_MS`, so the fast actuators are
+ * never called liars for physics they have not had time to deliver.
+ */
+export function cutTrendOf(v: CutTrendInput): CutTrend {
+  if (!(v.commandedCutTotalAmps > 0)) return "none";
+  const fallenAmps = Math.max(0, v.commandedCutAnchorAmps - v.smoothedAmps);
+  if (fallenAmps >= CREDIT_LANDING_FRACTION * v.commandedCutTotalAmps) return "arriving";
+  return v.commandedCutAgeMs < CREDIT_LANDING_GRACE_MS ? "settling" : "stalled";
+}
+
+/**
+ * The in-flight cut's figures exactly as `MeterView` publishes them (zeros when
+ * nothing is in flight). One definition, so the clock inside `ingestReading`
+ * and the view the pipeline reads can never disagree about the same cut.
+ */
+function liveCutFigures(
+  pendingCut: MeterState["pendingCut"],
+  now: number,
+): Omit<CutTrendInput, "smoothedAmps"> {
+  if (pendingCut == null || now >= pendingCut.until) {
+    return { commandedCutTotalAmps: 0, commandedCutAnchorAmps: 0, commandedCutAgeMs: 0 };
+  }
+  return {
+    commandedCutTotalAmps: pendingCut.amps,
+    commandedCutAnchorAmps: pendingCut.anchorAmps,
+    commandedCutAgeMs: Math.max(0, PENDING_CUT_MS - (pendingCut.until - now)),
+  };
+}
+
 /** Mirrors the power card's active-source logic. */
 export function determineSource(
   reading: { gridAmps: number; genAmps: number } | null,
@@ -795,11 +850,17 @@ export function ingestReading(
   // the first raw reading of it. Dropped once fully absorbed or expired, so a
   // stale credit never blinds the next episode.
   let pendingCut = state.pendingCut;
+  // …and whether it absorbed MORE on this reading than on any before it: the
+  // difference between a cut that is landing and one that landed a little and
+  // then stopped. `absorbedAmps` is a level, so it cannot answer that on its
+  // own, and the sustained clock below needs the rate, not the level.
+  let cutFellThisReading = false;
   if (pendingCut != null) {
     if (now >= pendingCut.until) {
       pendingCut = null;
     } else {
       const absorbedAmps = Math.max(pendingCut.absorbedAmps, pendingCut.anchorAmps - smoothedAmps(state));
+      cutFellThisReading = absorbedAmps > pendingCut.absorbedAmps;
       pendingCut = absorbedAmps >= pendingCut.amps ? null : { ...pendingCut, absorbedAmps };
     }
   }
@@ -822,8 +883,32 @@ export function ingestReading(
   // classify a slow kill — 15.9A on a 15A gen is "mild" forever, and the level
   // cuts mild allows wind down over minutes the breaker does not have. A frozen
   // or collapsed meter is not evidence of anything, so the clock stops there.
+  //
+  // …and neither is a ride we are already visibly ending. The clock promotes on
+  // TIME alone (45s ⇒ severe, 120s ⇒ extreme), and it kept accruing straight
+  // through a cut that was landing: live 2026-08-04 12:56:26 a fan trim plus a
+  // shed went out at a 16.565A anchor, thirteen seconds later the meter read
+  // 14.24A — 2.3A of the 2.9 commanded already gone — and a clock that had been
+  // running since ~12:53 handed the next pass a "severe" that shed a SECOND
+  // room. So while a cut is landing the clock rebases (it restarts from this
+  // reading; it does not freeze).
+  //
+  // ⚠ BOTH conditions are load-bearing, and the second is what keeps this from
+  // becoming a licence. `arriving` is a LEVEL test (35% of the commanded amps
+  // are gone), so a cut that delivered its third and then went flat would
+  // satisfy it for the whole of PENDING_CUT_MS — three minutes of a mild ride
+  // that could never promote, on a breaker whose thermal budget is two to four.
+  // Requiring the meter to have fallen FURTHER on this very reading makes the
+  // rebase a statement about the present: the clock resumes the moment the fall
+  // stops, which is exactly invariant 33's case.
+  const cutTrend = cutTrendOf({ ...liveCutFigures(pendingCut, now), smoothedAmps: smoothed });
+  const cutIsLanding = cutTrend === "arriving" && cutFellThisReading;
   const smoothedOverSince =
-    frozen || collapse != null ? null : smoothedOver > 0 ? (state.smoothedOverSince ?? now) : null;
+    frozen || collapse != null || cutIsLanding
+      ? null
+      : smoothedOver > 0
+        ? (state.smoothedOverSince ?? now)
+        : null;
 
   if (measured > limit) {
     // The raw overshoot is discounted by the live flicker before it is
@@ -977,13 +1062,6 @@ export function meterView(state: MeterState, now: number): MeterView {
     frozen: state.frozen,
     flickerAmps: stale ? 0 : flickerAmps(state),
     commandedCutCreditAmps: pendingCutCredit(state, now),
-    commandedCutAnchorAmps:
-      state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut.anchorAmps : 0,
-    commandedCutTotalAmps:
-      state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut.amps : 0,
-    commandedCutAgeMs:
-      state.pendingCut != null && now < state.pendingCut.until
-        ? Math.max(0, PENDING_CUT_MS - (state.pendingCut.until - now))
-        : 0,
+    ...liveCutFigures(state.pendingCut, now),
   };
 }

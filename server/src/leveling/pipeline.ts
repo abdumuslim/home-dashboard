@@ -14,6 +14,7 @@ import { effectiveLimit } from "./config.js";
 import type { CostBook } from "./costs.js";
 import { commandedCutAmpsOf, modelFor, steadyDraw } from "./costs.js";
 import { assessPressure } from "./pressure.js";
+import { cutTrendOf } from "./sensing.js";
 import { planReduction, SHED_NEED_GAP_C } from "./reduce.js";
 import { invariantCorrections, planRaise, rampDebitAmps } from "./raise.js";
 import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
@@ -189,10 +190,24 @@ export function plan(input: PlanInput): PlanOutput {
     // trim had already covered. `commandedCutCreditAmps` shrinks the demand,
     // but only until an unrelated fall absorbs the credit early; this holds the
     // SHED rung for one settle window while any credit is live. Levels and fans
-    // still ship immediately, and severe/extreme are untouched — a real breach
-    // never waits.
+    // still ship immediately.
+    //
+    // MILD alone was not enough. Live 2026-08-04 12:56:26 a fan trim plus a shed
+    // went out at a 16.565A anchor; thirteen seconds later the meter read
+    // 14.24A — 2.3A of the 2.9 commanded already gone, still falling — and a
+    // SECOND room went off. Severity was `severe` from a banked 16.6A reading
+    // (sensing only drops banked readings once the mean clears limit − margin,
+    // and 14.24 against 13.9 just missed), so the mild-only hold never applied.
+    // A cut the meter is visibly digesting is the one moment nothing further
+    // should be spent from a room's comfort, whatever a stale reading says — so
+    // a `arriving` trend extends the hold to SEVERE. It cannot extend to
+    // extreme: that rung is itself gated on the same trend (`stalled`), and it
+    // is the last one before the breaker.
+    const cutTrend = cutTrendOf(meter);
     const escalationHold =
-      pressure.severity === "mild" && mode === "SETTLING" && meter.commandedCutCreditAmps > 0;
+      mode === "SETTLING" &&
+      meter.commandedCutCreditAmps > 0 &&
+      (pressure.severity === "mild" || (pressure.severity === "severe" && cutTrend === "arriving"));
     // …and when what we have ALREADY commanded off covers the whole raw
     // deficit, the next batch is not an escalation, it is a duplicate. Live
     // 2026-08-03 00:41Z: three batches in 13 seconds took 12.9A off the house
@@ -293,7 +308,10 @@ export function plan(input: PlanInput): PlanOutput {
               at: now,
               action: "shed",
               blockedBy: "escalation settle",
-              detail: `${meter.commandedCutCreditAmps.toFixed(1)}A already commanded off, still landing`,
+              detail:
+                `${meter.commandedCutCreditAmps.toFixed(1)}A already commanded off, still landing ` +
+                `(${cutTrend}, ${Math.max(0, meter.commandedCutAnchorAmps - meter.smoothedAmps).toFixed(1)}A ` +
+                `of ${meter.commandedCutTotalAmps.toFixed(1)}A gone in ${(meter.commandedCutAgeMs / 1000).toFixed(0)}s)`,
             } satisfies Decision,
           ]
         : []),
