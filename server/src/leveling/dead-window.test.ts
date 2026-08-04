@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
   DEAD_WINDOW_GAP_AMPS,
+  deviceIsDark,
+  ENTRY_COLLAPSE_DWELL_MS,
+  ENTRY_COLLAPSE_STALE_MS,
+  entryCollapseEvidence,
   houseIsDead,
   meterIsSteady,
   modeledGapAmps,
@@ -11,6 +15,8 @@ import {
   type ModeledAc,
 } from "./dead-window.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
+
+const T = 1_800_000_000;
 
 // The live gen models the morning of 2026-08-04.
 const cfg: LevelingConfigV2 = {
@@ -122,5 +128,61 @@ describe("whole-house dead-window evidence", () => {
     expect(DEAD_WINDOW_GAP_AMPS).toBeGreaterThan(1.5);
     expect(DEAD_WINDOW_GAP_AMPS).toBeLessThanOrEqual(2.3);
     expect(RESIDUAL_TRUST_GAP_AMPS).toBeLessThan(DEAD_WINDOW_GAP_AMPS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Trip on ENTRY (2026-08-04, user-confirmed breaker trip and manual reset). The
+// gen session STARTED with the AC circuit dead: the quiet ~6A window from 11:16
+// to ~11:21 was an open breaker, and the four FLOORS resends went to devices
+// that could not hear them. `ingestReading` judges FALLS inside a session, and
+// a session that begins dead has no cliff — so the third real trip in ten days
+// never latched, no derate armed, and the controller rode 14.3–14.8A on it.
+// ---------------------------------------------------------------------------
+
+describe("entry-collapse evidence", () => {
+  const dark = { lastSeenAt: T - ENTRY_COLLAPSE_STALE_MS - 1_000 };
+  const fresh = { lastSeenAt: T - 30_000 };
+  /** 6.1A metered against the 11.4A floor set — the live 11:18 reading. */
+  const deadGap = modeledGapAmps({ smoothedAmps: 6.1, acs: floored(), config: cfg, source: "gen" });
+
+  it("latches when the model says we draw, the meter says nothing does, and every room is dark", () => {
+    expect(entryCollapseEvidence({ gapAmps: deadGap, devices: [dark, dark, dark], now: T })).toBe(true);
+  });
+
+  it("ONE room still reporting is a cloud problem, not a breaker", () => {
+    expect(entryCollapseEvidence({ gapAmps: deadGap, devices: [dark, dark, fresh], now: T })).toBe(false);
+  });
+
+  it("restart protection does not latch — the modules stay powered and keep reporting", () => {
+    // The whole point of signal (b): a compressor that has not started looks
+    // exactly like a dead circuit on the meter. The shadows are what differ.
+    expect(entryCollapseEvidence({ gapAmps: deadGap, devices: [fresh, fresh, fresh], now: T })).toBe(false);
+  });
+
+  it("a house Wi-Fi outage cannot fake it — the ACs keep drawing, so the gap never holds", () => {
+    const drawing = modeledGapAmps({ smoothedAmps: 13.9, acs: floored(), config: cfg, source: "gen" });
+    expect(entryCollapseEvidence({ gapAmps: drawing, devices: [dark, dark, dark], now: T })).toBe(false);
+  });
+
+  it("with nothing running there is no claim to contradict", () => {
+    expect(entryCollapseEvidence({ gapAmps: deadGap, devices: [], now: T })).toBe(false);
+  });
+
+  it("darkness is POSITIVE evidence only — unknown liveness never latches", () => {
+    // Every test fixture and every pre-liveness code path leaves these unset.
+    expect(deviceIsDark({}, T)).toBe(false);
+    expect(deviceIsDark({ lastSeenAt: null }, T)).toBe(false);
+    // …and either signal alone is enough once it IS known.
+    expect(deviceIsDark({ isOnline: false }, T)).toBe(true);
+    expect(deviceIsDark({ isOnline: true, lastSeenAt: T - ENTRY_COLLAPSE_STALE_MS - 1 }, T)).toBe(true);
+    expect(deviceIsDark({ isOnline: true, lastSeenAt: T - 60_000 }, T)).toBe(false);
+  });
+
+  it("staleness plus dwell has to fit inside a real dead window", () => {
+    // This morning's was ~6 minutes from changeover to manual reset, and the
+    // two clocks are cumulative: darkness accrues from the last report, and
+    // only then can the evidence start its dwell.
+    expect(ENTRY_COLLAPSE_STALE_MS + ENTRY_COLLAPSE_DWELL_MS).toBeLessThan(6 * 60_000);
   });
 });

@@ -15,9 +15,11 @@ import {
   OVER_LIMIT_DRAIN_SEVERE,
   PENDING_CUT_MS,
   POWER_COLLAPSE_MAX_MS,
+  clearCollapse,
   determineSource,
   flickerAmps,
   ingestReading,
+  latchCollapse,
   initialMeterState,
   isSevereOverReading,
   meterView,
@@ -814,5 +816,67 @@ describe("post-collapse limit derate", () => {
     expect(meterView(onGrid.state, now + 5_000).derateAmps).toBe(0);
     const backOnGen = ingestReading(onGrid.state, { gridAmps: 0, genAmps: 12 }, cfg, now + 10_000);
     expect(meterView(backOnGen.state, now + 10_000).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A collapse the READINGS cannot see (2026-08-04). `ingestReading` judges FALLS
+// inside a source session, so a session that BEGINS with the AC circuit dead
+// has no cliff to latch on. The evidence for that shape is device liveness, not
+// a meter fact, so the caller owns it (dead-window.ts) — but the machinery it
+// arms has to be the SAME one, or a real trip gets a weaker answer than a
+// detected one.
+// ---------------------------------------------------------------------------
+
+describe("collapse latched on entry", () => {
+  const settled = () => feedGen([6, 6, 6, 6]);
+
+  it("arms the same derate the fall path arms", () => {
+    const { state, now } = settled();
+    const latched = latchCollapse(state, { source: "gen", now, preMedianAmps: 11.4 });
+    expect(meterView(latched, now).collapsed).toBe(true);
+    expect(meterView(latched, now).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
+    expect(effectiveLimit(cfg, "gen", meterView(latched, now).derateAmps)).toBe(14);
+  });
+
+  it("stacks on a rung still standing, exactly like a repeat trip", () => {
+    // Invariant 15: a trip part-way up the recovery ladder escalates from where
+    // the line actually was, and an entry latch is not a lesser event.
+    const { state, now } = feedGen([14, 14, 14, 14, 3, 13, 13, 13, 13]);
+    expect(meterView(state, now).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
+    const latched = latchCollapse(state, { source: "gen", now: now + 5_000, preMedianAmps: 14 });
+    expect(meterView(latched, now + 5_000).derateAmps).toBe(2 * COLLAPSE_DERATE_AMPS);
+  });
+
+  it("breaks calm and never double-latches", () => {
+    const { state, now } = settled();
+    const latched = latchCollapse(state, { source: "gen", now, preMedianAmps: 11.4 });
+    expect(meterView(latched, now).calmMs).toBe(0);
+    // A second call must not stack a second derate on top of its own latch.
+    const again = latchCollapse(latched, { source: "gen", now: now + 1_000, preMedianAmps: 11.4 });
+    expect(again).toBe(latched);
+  });
+
+  it("clears on the caller's evidence, leaving the derate standing", () => {
+    // The breaker is closed again — but it just opened, so the ceiling stays
+    // down while it cools (invariants 2/15).
+    const { state, now } = settled();
+    const latched = latchCollapse(state, { source: "gen", now, preMedianAmps: 11.4 });
+    const cleared = clearCollapse(latched);
+    expect(meterView(cleared, now).collapsed).toBe(false);
+    expect(meterView(cleared, now).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
+  });
+
+  it("prices its reference at what the line SHOULD carry, so the meter can recover it", () => {
+    // `preMedianAmps` is the house plus everything we believe is on. Against the
+    // dead reading itself (6A) the metered recovery test — measured within
+    // POWER_COLLAPSE_RECOVER_GAP of the reference — is satisfied by the very
+    // reading that latched it, and the latch would clear on the next tick.
+    const { state, now } = settled();
+    const latched = latchCollapse(state, { source: "gen", now, preMedianAmps: 11.4 });
+    const stillDead = feedGen([6, 6], { state: latched, startAt: now + 5_000 });
+    expect(meterView(stillDead.state, stillDead.now).collapsed).toBe(true);
+    const backAlive = feedGen([16, 16], { state: latched, startAt: now + 5_000 });
+    expect(backAlive.events.some((e) => e.kind === "collapse_recovered")).toBe(true);
   });
 });

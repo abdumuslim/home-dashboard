@@ -284,6 +284,58 @@ export function derateFor(state: MeterState, source: PowerSource, now: number): 
   return Math.max(0, d.amps - rungsElapsed * COLLAPSE_DERATE_RECOVERY_STEP);
 }
 
+/**
+ * The derate a fresh collapse on `source` arms, stacking on whatever rung is
+ * still standing. ONE definition, shared by the fall-latched collapse inside
+ * `ingestReading` and the entry-latched one below — a second copy would drift,
+ * and the whole point of invariant 15 is that a repeat trip escalates from
+ * where the line actually was rather than from full rating.
+ */
+export function collapseDerate(
+  state: MeterState,
+  source: PowerSource,
+  now: number,
+): NonNullable<MeterState["derate"]> {
+  const standing = derateFor(state, source, now);
+  return {
+    source,
+    amps: Math.min(COLLAPSE_DERATE_MAX_AMPS, standing + COLLAPSE_DERATE_AMPS),
+    until: now + COLLAPSE_DERATE_MS,
+  };
+}
+
+/**
+ * Latch a collapse the READINGS cannot see: a source session that BEGINS with
+ * the AC circuit already dead has no cliff for `ingestReading` to judge (see
+ * dead-window.ts for the 2026-08-04 trip this missed). The caller owns the
+ * evidence — it needs device liveness, which is not a meter fact — and this
+ * arms exactly what the fall path arms: the latch, the stacked derate, and a
+ * broken calm.
+ *
+ * `preMedianAmps` is what the line SHOULD be carrying (the meter plus the
+ * modeled draw of the rooms we believe are on), not the dead reading itself.
+ * Recovery in `ingestReading` is "the meter came back to within
+ * POWER_COLLAPSE_RECOVER_GAP of the pre-collapse mean", and against a
+ * house-only reading that is satisfied by the very reading that latched it.
+ */
+export function latchCollapse(
+  state: MeterState,
+  opts: { source: Exclude<PowerSource, "none">; now: number; preMedianAmps: number },
+): MeterState {
+  if (state.collapse != null) return state;
+  return {
+    ...state,
+    collapse: { preMedianAmps: opts.preMedianAmps, until: opts.now + POWER_COLLAPSE_MAX_MS },
+    derate: collapseDerate(state, opts.source, opts.now),
+    calmSince: null,
+  };
+}
+
+/** Release a latch the caller armed, once its own evidence has cleared. */
+export function clearCollapse(state: MeterState): MeterState {
+  return state.collapse == null ? state : { ...state, collapse: null, calmSince: null };
+}
+
 export function initialMeterState(): MeterState {
   return {
     source: "none",
@@ -562,12 +614,7 @@ export function ingestReading(
   // escalates from where the line actually was rather than from full rating.
   let derate = state.derate;
   if (collapse != null && state.collapse == null) {
-    const standing = derateFor(state, source, now);
-    derate = {
-      source,
-      amps: Math.min(COLLAPSE_DERATE_MAX_AMPS, standing + COLLAPSE_DERATE_AMPS),
-      until: now + COLLAPSE_DERATE_MS,
-    };
+    derate = collapseDerate(state, source, now);
   } else if (derate != null && derateFor(state, derate.source, now) <= 0) {
     // Fully recovered — drop the record (judged on ITS line, so a gen derate
     // still retires while the house is on grid).

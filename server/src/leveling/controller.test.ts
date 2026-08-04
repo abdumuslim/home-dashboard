@@ -1182,3 +1182,181 @@ describe("LevelingControllerV2 — a ramp closes on evidence, not on its timer",
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Trip on ENTRY (2026-08-04, user-confirmed breaker trip and manual reset).
+// `ingestReading` judges FALLS inside a source session, so a gen session that
+// BEGINS with the AC circuit dead has no cliff to latch on: the third real trip
+// in ten days went unlatched, no derate armed, and the controller then rode
+// 14.3–14.8A on a breaker that had just opened.
+//
+// SHELL tests on purpose. The evidence is device LIVENESS — `isOnline` and
+// `lastSeenAt` off the TCL shadow, which the leveler had never read before and
+// which scenario.ts can only mirror, not reproduce. Both sides need their own
+// guard (the SKILL's mirror warning).
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — a session that begins with a dead circuit", () => {
+  type LiveDevice = { id: string; isOnline: boolean; lastSeenAt: number | null };
+
+  function setup() {
+    const mock = createGradePool({
+      genAmpModels: {
+        abdullah: { baseAmps: 2.3, stepAmps: 2.5 },
+        najat: { baseAmps: 2.3, stepAmps: 2.0 },
+        abdu: { baseAmps: 4.3, stepAmps: 2.5 },
+      },
+    });
+    const pushes: string[] = [];
+    const sent: Array<{ deviceId: string; value: number }> = [];
+    const devices = ["abdullah", "najat", "abdu"].map(
+      (id) => ({ ...(acDevice(id, true, 1) as object), isOnline: true, lastSeenAt: Date.now() }) as unknown as LiveDevice,
+    );
+    const deps: LevelingDeps = {
+      ...createDeps(),
+      broadcast: async (payload: Record<string, unknown>) => {
+        pushes.push(String(payload.body));
+      },
+      getTclCloud: () =>
+        ({
+          sendControl: async (id: string, cmd: string, value: number) => {
+            if (cmd === "set_generator_mode") sent.push({ deviceId: id, value });
+          },
+          executeAcAction: async () => undefined,
+        }) as never,
+    };
+    const controller = new LevelingControllerV2(mock.pool, deps);
+    const ctx = devices.map((device, i) => ({
+      device: device as never,
+      managed: true,
+      needTier: "full" as const,
+      needDelta: [3, 1, 2.5][i],
+      slotGenCap: null,
+    }));
+    let flip = 1;
+    /** `dark` stops the shadows reporting — the AC circuit feeds the Wi-Fi modules. */
+    const run = async (amps: number, steps: number, line: "gen" | "grid", dark = false) => {
+      for (let i = 0; i < steps; i++) {
+        flip = -flip;
+        const jitter = amps + 0.01 * flip;
+        if (!dark) for (const d of devices) d.lastSeenAt = Date.now();
+        controller.onPowerReading(
+          (line === "gen" ? { current_1: 0, current_2: jitter } : { current_1: jitter, current_2: 0 }) as never,
+        );
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx as never, 30);
+      }
+    };
+    return { mock, controller, devices, pushes, sent, run };
+  }
+
+  /** Past ENTRY_COLLAPSE_STALE_MS (4 min) + ENTRY_COLLAPSE_DWELL_MS (60s). */
+  const DEAD_STEPS = 72; // 360s
+
+  it("latches the collapse, derates the line, and says so out loud", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T08:10:00Z"));
+      const { mock, controller, pushes, sent, run } = setup();
+      await controller.ensureLoaded();
+
+      await run(13.0, 40, "grid");
+      const before = mock.journal.length;
+      sent.length = 0;
+      // The changeover, and the AC breaker is already open: 5A of house on the
+      // line against three rooms the model says are drawing 8.9A, and every
+      // shadow dark because the modules lost power with the circuit.
+      await run(5.0, DEAD_STEPS, "gen", true);
+
+      expect(controller.getStatus().mode).toBe("COLLAPSED");
+      // The REAL machinery, not a softer version of it: the ceiling comes down
+      // while the breaker cools (invariants 2/15).
+      expect(controller.getStatus().limitAmps).toBeLessThan(15);
+      expect(pushes.some((p) => p.includes("AC circuit appears dead"))).toBe(true);
+      expect(
+        mock.journal.slice(before).some((r) => r.reason === "collapse_on_entry"),
+      ).toBe(true);
+      // Nothing is commanded into a dead line.
+      expect(sent).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does NOT latch while the rooms are merely slow to start", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T08:10:00Z"));
+      const { controller, pushes, run } = setup();
+      await controller.ensureLoaded();
+
+      await run(13.0, 40, "grid");
+      // Identical meter, identical gap — but restart protection keeps the Wi-Fi
+      // modules powered, so the shadows keep reporting. That is the whole
+      // discriminator between "no compressor has started" and "no circuit".
+      await run(5.0, DEAD_STEPS, "gen");
+
+      expect(controller.getStatus().mode).not.toBe("COLLAPSED");
+      expect(controller.getStatus().limitAmps).toBe(15);
+      expect(pushes.some((p) => p.includes("AC circuit appears dead"))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("one room still reporting is a cloud problem, not a breaker", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T08:10:00Z"));
+      const { controller, devices, run } = setup();
+      await controller.ensureLoaded();
+
+      await run(13.0, 40, "grid");
+      // Two modules go quiet; the third keeps reporting throughout.
+      const alive = devices[2];
+      let flip = 1;
+      for (let i = 0; i < DEAD_STEPS; i++) {
+        flip = -flip;
+        alive.lastSeenAt = Date.now();
+        controller.onPowerReading({ current_1: 0, current_2: 5.0 + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(
+          devices.map((device, i2) => ({
+            device: device as never,
+            managed: true,
+            needTier: "full" as const,
+            needDelta: [3, 1, 2.5][i2],
+            slotGenCap: null,
+          })) as never,
+          30,
+        );
+      }
+      expect(controller.getStatus().mode).not.toBe("COLLAPSED");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases on the rooms coming back, and re-enters at floors", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T08:10:00Z"));
+      const { controller, sent, run } = setup();
+      await controller.ensureLoaded();
+
+      await run(13.0, 40, "grid");
+      await run(5.0, DEAD_STEPS, "gen", true);
+      expect(controller.getStatus().mode).toBe("COLLAPSED");
+      sent.length = 0;
+      // The user resets the breaker: the shadows report again and the rooms
+      // draw. The latch is evidence-held, so it goes the moment the evidence
+      // does — and the re-entry is FLOORS, like any other gen entry.
+      await run(13.0, 12, "gen");
+
+      expect(controller.getStatus().mode).not.toBe("COLLAPSED");
+      expect(controller.getStatus().limitAmps).toBeLessThan(15); // still cooling
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

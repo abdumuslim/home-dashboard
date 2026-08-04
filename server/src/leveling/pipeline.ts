@@ -12,9 +12,9 @@ import type { AcView, Command, Decision, MeterView, Mode, Plan, Severity } from 
 import type { LevelingConfigV2 } from "./config.js";
 import { effectiveLimit } from "./config.js";
 import type { CostBook } from "./costs.js";
-import { commandedCutAmpsOf } from "./costs.js";
+import { commandedCutAmpsOf, modelFor, steadyDraw } from "./costs.js";
 import { assessPressure } from "./pressure.js";
-import { planReduction } from "./reduce.js";
+import { planReduction, SHED_NEED_GAP_C } from "./reduce.js";
 import { invariantCorrections, planRaise, rampDebitAmps } from "./raise.js";
 import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
 import { ceilOf, floorOf } from "./needs.js";
@@ -62,6 +62,15 @@ export interface PlanInput {
   fundingCooldown?: (deviceId: string) => boolean;
   /** Devices the reducer just cut, which may not climb back yet. */
   victimCooldown?: (deviceId: string) => boolean;
+  /**
+   * This FLOORS window follows a dead circuit coming back — a breaker reset, or
+   * a collapse we latched on entry. Every room returns AT ONCE with restart
+   * protection already served, so the floor set arrives as one surge and the
+   * meter cannot warn anybody in time (2026-08-04: 6.4 → 16.6A in 90 seconds).
+   * Admission is decided on the ENVELOPE instead of the meter — see the FLOORS
+   * branch. Defaults to the ordinary "clamp everyone to their floor".
+   */
+  recoveryAdmission?: boolean;
 }
 
 export interface PlanOutput extends Plan {
@@ -331,20 +340,109 @@ export function plan(input: PlanInput): PlanOutput {
   // generator for 27 minutes, and was priced ~4A light by the envelope while a
   // peer was raised on top of it.
   if (mode === "FLOORS") {
+    // RECOVERY ADMISSION (2026-08-04). A dead circuit coming back is the one
+    // entry where "hold everyone at their floor" is not a safe answer: nothing
+    // is drawing yet, so the meter says the house is empty, and every room
+    // returns together the instant the breaker closes. Live arithmetic that
+    // morning: floors modeled 10.4A + a measured ~6A house = 16.4A onto a 15A
+    // generator — the surge was decided before the first reading arrived, and
+    // the reducer could only answer it after the fact.
+    //
+    // So the floor set is admitted against the ENVELOPE, hottest room first:
+    // rooms are taken while `Σ floor models + house` still fits under
+    // `limit − margin`, and the rest are shed properly — ordinary shed rows,
+    // ordinary one-by-one restore admission as real headroom appears. No
+    // parallel queue, and the reducer stays the meter-truth backstop exactly as
+    // before. Correct end-state for that morning: {Abdullah L2, Abdu L1,
+    // Najat shed} ≈ 14.1A.
+    const admitted = new Set(onManaged.map((a) => a.deviceId));
+    const shedForFit: string[] = [];
+    if (input.recoveryAdmission === true && source === "gen") {
+      const ceiling = limit - config.marginAmps;
+      const floorDraw = (a: AcView): number =>
+        steadyDraw(floorOf(a), a.maxLevel, modelFor(config, a.deviceId, source));
+      // A user-pinned room is admitted before the budget is spent at all: being
+      // switched off is worse than any level (invariant 25), and a pin is the
+      // clearest statement there is that this room is wanted. If the pinned set
+      // alone does not fit, the reducer answers it on the meter like any other
+      // overload — this phase never sheds a room the user asked for.
+      const pinned = onManaged.filter((a) => a.manualTarget != null || a.manualCap != null);
+      const rest = onManaged
+        .filter((a) => !pinned.includes(a))
+        // Hottest first; `acs` is pre-sorted by priority, so the index is the
+        // existing tiebreak.
+        .sort((a, b) => b.needDelta - a.needDelta || acs.indexOf(a) - acs.indexOf(b));
+      let total = (input.nonAcAmps ?? 0) + pinned.reduce((sum, a) => sum + floorDraw(a), 0);
+      // Once a room has been refused, a COOLER one may still fit in the amps it
+      // could not use — but only if it is at least `SHED_NEED_GAP_C` milder.
+      // Inside that gap the user has already ruled: a comparably warm room
+      // running while a hotter one sits off is the complaint invariant 43 came
+      // from ("why it turned off mine not najat?"). Reusing his calibrated gap
+      // rather than inventing a second one.
+      let refusedNeed: number | null = null;
+      for (const ac of rest) {
+        const draw = floorDraw(ac);
+        const fits = total + draw <= ceiling;
+        const notColdEnough = refusedNeed != null && ac.needDelta + SHED_NEED_GAP_C > refusedNeed;
+        if (fits && !notColdEnough) {
+          total += draw;
+          continue;
+        }
+        if (fits) refusedNeed = Math.max(refusedNeed ?? 0, ac.needDelta);
+        else refusedNeed = refusedNeed ?? ac.needDelta;
+        admitted.delete(ac.deviceId);
+        shedForFit.push(ac.deviceId);
+      }
+    }
     const commands: Command[] = [];
     for (const ac of onManaged) {
+      if (!admitted.has(ac.deviceId)) continue;
       const floor = floorOf(ac);
       const worst = Math.max(ac.currentLevel, ac.envelopeLevel);
       if (worst === 0 || ac.currentLevel === 0 || worst > floor) {
         commands.push({ deviceId: ac.deviceId, kind: "set_level", level: floor });
       }
     }
+    // Sheds last in emission order, like the reducer's — the executor sends in
+    // array order, so the rooms that stay are floored before one goes off.
+    for (const deviceId of shedForFit) {
+      commands.push({ deviceId, kind: "power_off", reason: "shed" });
+    }
+    const decisions: Decision[] = [
+      { at: now, action: "raises/restores", blockedBy: "gen-entry floors" },
+      ...shedForFit.map(
+        (deviceId): Decision => ({
+          at: now,
+          deviceId,
+          action: "shed",
+          detail:
+            `recovery admission: floors + ${(input.nonAcAmps ?? 0).toFixed(1)}A house ` +
+            `exceed ${(limit - config.marginAmps).toFixed(1)}A on ${source}`,
+        }),
+      ),
+    ];
     return {
-      ...emptyPlan(input, "floors", [
-        { at: now, action: "raises/restores", blockedBy: "gen-entry floors" },
-      ]),
+      ...emptyPlan(input, shedForFit.length > 0 ? "recovery_admission" : "floors", decisions),
       commands,
-      compareAfter: commands.length > 0 ? now + GRADE_LEVEL_MS : 0,
+      // The SHEDS credit the collapse detector (invariant 11) — a whole room
+      // leaving is exactly the fall shape a phantom collapse latches on.
+      //
+      // ⚠ The floor clamps deliberately do NOT, which is how this branch has
+      // always behaved. Crediting them was tried and reverted the same hour:
+      // gen entry clamps every room down, so the credit is live exactly when a
+      // breaker is most likely to go, and it explained away a REAL second trip
+      // in the 2026-07-26 cascade regression (derate stopped compounding at
+      // 1A instead of 2A). Widening the credit here is its own investigation,
+      // not a side effect of admission.
+      commandedCutAmps: commandedCutAmpsOf(
+        commands.filter((c) => c.kind === "power_off"),
+        onManaged,
+        config,
+        source,
+        book,
+        now,
+      ),
+      compareAfter: commands.length > 0 ? now + (shedForFit.length > 0 ? GRADE_TURN_ON_MS : GRADE_LEVEL_MS) : 0,
     };
   }
 

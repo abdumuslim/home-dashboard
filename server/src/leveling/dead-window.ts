@@ -195,3 +195,110 @@ export const DIRECT_SAMPLE_DRIFT_AMPS = 1.6;
 export function meterIsSteady(view: { latestAmps: number; smoothedAmps: number }): boolean {
   return view.latestAmps - view.smoothedAmps <= DIRECT_SAMPLE_DRIFT_AMPS;
 }
+
+// ---------------------------------------------------------------------------
+// Trip on ENTRY (2026-08-04, user-confirmed: the breaker physically tripped
+// this morning and he reset it by hand).
+//
+// The refined timeline is worse than the one above. The gen session did not
+// merely start with the compressors in restart protection — it started with the
+// AC CIRCUIT ALREADY DEAD. The quiet ~6A window from 11:16 to ~11:21 was a
+// tripped breaker, the four FLOORS resends went to devices that could not hear
+// them, and the reset at ~11:21–11:22 brought all three ACs back at once with
+// restart protection already served: 6.4 → 16.6A in ninety seconds.
+//
+// The collapse latch missed a real trip for the THIRD time, and this is a new
+// hole class. Invariant 31 fixed the floor (a trip leaves the house drawing);
+// invariant 5 fixed the credit (our own cut is not a trip). Both still describe
+// a FALL inside one source session — and a session that BEGINS dead has no
+// cliff to see. No latch, so no derate: the controller then rode 14.3–14.8A on
+// a generator whose breaker had just opened.
+//
+// Two signals, and the pair is what makes it safe:
+//   (a) the dead-window gap above — our model says we are drawing and the meter
+//       says nothing is;
+//   (b) every managed running room's cloud shadow has gone dark.
+// Restart protection keeps the Wi-Fi modules powered, so (b) is what separates
+// "the compressors have not started" from "the circuit is dead". And a house
+// Wi-Fi outage cannot fake it in the other direction: the ACs keep drawing, so
+// (a) never holds.
+// ---------------------------------------------------------------------------
+
+/** The device fields the entry-collapse evidence reads (`AcDevice` satisfies it). */
+export interface DeviceLiveness {
+  /** The folded online decision (`deviceOnline()` — TCL's flag, else shadow freshness). */
+  isOnline?: boolean;
+  /** Epoch ms of the last shadow report, null/undefined when unknown. */
+  lastSeenAt?: number | null;
+}
+
+/**
+ * How stale a shadow must be, LEVELER-side, to count as a dark room.
+ *
+ * Deliberately shorter than `SHADOW_STALE_MS` (10 min, tcl-cloud.ts): that one
+ * drives a UI dot and is generous on purpose ("better a late offline than a
+ * flapping one"), and at 10 minutes it cannot see a six-minute dead circuit at
+ * all — this morning's breaker was reset before a 10-minute window would have
+ * expired.
+ *
+ * ⚠ The cadence a healthy TCL module reports at is not recorded anywhere in
+ * this repo, so this is the one threshold here NOT derived from a measurement.
+ * What makes 5 minutes safe to act on is the conjunction, not the number: every
+ * managed running room must be dark AT ONCE, the whole-house gap must say
+ * nothing of ours is drawing, and both must hold continuously for
+ * `ENTRY_COLLAPSE_DWELL_MS`. Any single room reporting, or any real draw,
+ * retires the evidence.
+ */
+export const ENTRY_COLLAPSE_STALE_MS = 4 * 60_000;
+
+/**
+ * How long both signals must hold CONTINUOUSLY before the latch arms.
+ *
+ * Deliberately SHORT, because darkness already carries four minutes of dwell of
+ * its own: the two are cumulative, and the sum is what has to fit inside a real
+ * dead window. This morning's was about six minutes from the changeover to the
+ * manual reset, and `ENTRY_COLLAPSE_STALE_MS + this` is five — the only budget
+ * there was. Its own job is narrower: reject a single tick where a reading
+ * arrives mid-batch, so a lone unlucky sample cannot latch a breaker trip.
+ *
+ * ⚠ Note what CANNOT do this job. `AcDevice.isOnline` is itself computed
+ * against `SHADOW_STALE_MS` (10 min), so it cannot flip inside a six-minute
+ * dead window at all — it is kept in `deviceIsDark` only to catch the opposite
+ * failure (TCL reporting a device offline that this freshness test would still
+ * call fresh).
+ */
+export const ENTRY_COLLAPSE_DWELL_MS = 60_000;
+
+/**
+ * Is this room's shadow dark? Positive evidence only — an unknown `isOnline`
+ * or an unknown `lastSeenAt` is not evidence of anything, and must never latch
+ * a collapse.
+ *
+ * Two ways to be dark, because they cover each other's blind spot:
+ * `isOnline === false` is already the conservative conjunction (`deviceOnline()`
+ * only believes TCL's offline flag when the shadow is also stale), and the
+ * freshness test catches the opposite failure — TCL still claiming a dead
+ * device is online.
+ */
+export function deviceIsDark(device: DeviceLiveness, now: number): boolean {
+  if (device.isOnline === false) return true;
+  return device.lastSeenAt != null && now - device.lastSeenAt > ENTRY_COLLAPSE_STALE_MS;
+}
+
+/**
+ * Entry-collapse evidence for one tick: the model says we are drawing, the
+ * meter says nothing is, and every managed running room has gone dark.
+ *
+ * ALL rooms, never one — a single module flapping is a cloud problem, not a
+ * breaker. Returns false for an empty set: with nothing running there is no
+ * claim to contradict.
+ */
+export function entryCollapseEvidence(opts: {
+  gapAmps: number;
+  devices: readonly DeviceLiveness[];
+  now: number;
+}): boolean {
+  if (opts.devices.length === 0) return false;
+  if (!houseIsDead(opts.gapAmps)) return false;
+  return opts.devices.every((d) => deviceIsDark(d, opts.now));
+}

@@ -8,8 +8,10 @@
 import type { AcView, Command, MeterEvent, MeterState } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
 import {
+  clearCollapse,
   ingestReading,
   initialMeterState,
+  latchCollapse,
   meterView,
   noteCommandedCut,
   OVER_LIMIT_BUDGET_AFTER_ACT,
@@ -21,6 +23,7 @@ import {
   clearFloorsIfDone,
   clearGridFullIfDone,
   deriveMode,
+  FLOORS_MAX_MS,
   initialModeState,
   noteBatch,
   type ModeState,
@@ -52,7 +55,14 @@ import {
   voidSamples,
   type HouseLoadState,
 } from "./house-load.js";
-import { houseIsDead, meterIsSteady, modeledGapAmps, rampAbsorptionLanded } from "./dead-window.js";
+import {
+  ENTRY_COLLAPSE_DWELL_MS,
+  entryCollapseEvidence,
+  houseIsDead,
+  meterIsSteady,
+  modeledGapAmps,
+  rampAbsorptionLanded,
+} from "./dead-window.js";
 
 export interface SimAcSetup {
   deviceId: string;
@@ -151,6 +161,13 @@ interface SimAc {
   rampHeldUntil: number;
   /** Compressor restart protection: no draw at all until this moment. */
   compressorIdleUntil: number;
+  /**
+   * When this module's shadow last reported. The Wi-Fi module is fed by the AC
+   * circuit, so it goes dark exactly when the breaker opens and keeps reporting
+   * through restart protection — which is the whole signal that separates the
+   * two (dead-window.ts, entry collapse).
+   */
+  lastSeenAt: number;
   /** Compressor still spinning down after an off was sent (0 = already stopped). */
   drawingUntil: number;
   /** Shell parity: a level RAISE's committed-but-unmetered amps (gen only). */
@@ -210,6 +227,10 @@ export class Scenario {
   private freshlyOn: string[] = [];
   /** Shell parity: re-arm every running compressor's ramp a tick after a changeover. */
   private armRampOnSourceChange = false;
+  /** Shell parity: entry-collapse dwell / ownership / the recovery window. */
+  private entryCollapseSince: number | null = null;
+  private entryCollapseLatched = false;
+  private recoveryAdmissionUntil = 0;
   /** Shell parity: rooms on whose shadow has not confirmed (house sampling off). */
   private pendingOn = new Map<string, number>();
   /** Shell parity: rooms that funded a peer's raise → when they were demoted. */
@@ -267,6 +288,7 @@ export class Scenario {
       powerEventRamp: false,
       rampHeldUntil: 0,
       compressorIdleUntil: 0,
+      lastSeenAt: 0,
       drawingUntil: 0,
       jumpDebit: null,
       fanDebit: null,
@@ -671,6 +693,80 @@ export class Scenario {
     return this.now - ac.shadowLevelAt >= ac.setup.confirmDelayMs ? ac.level : ac.shadowLevel;
   }
 
+  /**
+   * Shell parity for `assessEntryCollapse` — latch the collapse the readings
+   * cannot see (a session that BEGINS with the AC circuit dead has no cliff),
+   * and release it on evidence, arming the envelope-judged recovery admission.
+   */
+  /** Shell parity for `armRecoveryAdmission`. */
+  private armRecoveryAdmission(): void {
+    this.recoveryAdmissionUntil = this.now + FLOORS_MAX_MS;
+    for (const ac of this.acs) if (ac.physicalOn) this.startRamp(ac, { powerEvent: true });
+  }
+
+  private assessEntryCollapse(): void {
+    if (this.line === "none") return;
+    const view = meterView(this.meterState, this.now);
+    // Shell parity: our latch going away for ANY reason — the meter coming back
+    // past its reference, or the sensing safety cap — is the circuit returning.
+    if (this.entryCollapseLatched && this.meterState.collapse == null) {
+      this.entryCollapseLatched = false;
+      this.armRecoveryAdmission();
+    }
+    if (view.source === "none" || view.frozen || view.sampleCount < 2) {
+      this.entryCollapseSince = null;
+      return;
+    }
+    const running = this.acs.filter((a) => a.on && !a.shed);
+    const gapAmps = modeledGapAmps({
+      smoothedAmps: view.smoothedAmps,
+      acs: running.map((a) => ({
+        deviceId: a.setup.deviceId,
+        on: true,
+        managed: true,
+        shed: false,
+        currentLevel: this.observedLevelOf(a),
+        maxLevel: 3,
+      })),
+      config: this.cfg,
+      source: this.line,
+      commandedCutCreditAmps: view.commandedCutCreditAmps,
+    });
+    const evidence = entryCollapseEvidence({
+      gapAmps,
+      devices: running.map((a) => ({ lastSeenAt: a.lastSeenAt })),
+      now: this.now,
+    });
+    if (!evidence) {
+      this.entryCollapseSince = null;
+      if (this.entryCollapseLatched) {
+        this.entryCollapseLatched = false;
+        this.meterState = clearCollapse(this.meterState);
+        this.modeState = applyMeterEvent(
+          this.modeState,
+          { kind: "collapse_recovered", source: this.line },
+          this.now,
+        );
+        this.armRecoveryAdmission();
+      }
+      return;
+    }
+    this.entryCollapseSince ??= this.now;
+    if (this.entryCollapseLatched || this.now - this.entryCollapseSince < ENTRY_COLLAPSE_DWELL_MS) return;
+    const preMedianAmps = view.smoothedAmps + gapAmps;
+    this.meterState = latchCollapse(this.meterState, {
+      source: this.line,
+      now: this.now,
+      preMedianAmps,
+    });
+    this.modeState = applyMeterEvent(
+      this.modeState,
+      { kind: "collapse", fromAmps: preMedianAmps, toAmps: view.smoothedAmps, source: this.line },
+      this.now,
+    );
+    this.entryCollapseLatched = true;
+  }
+
   private buildViews(): AcView[] {
     // Priority-sorted, like the controller shell will pass them (priority list
     // first, unknowns after in setup order).
@@ -929,10 +1025,17 @@ export class Scenario {
       }
     }
 
+    // The Wi-Fi modules ride the AC circuit: while the breaker holds they keep
+    // reporting, and the moment it opens they go dark. That is the signal the
+    // entry-collapse latch reads (dead-window.ts) — restart protection leaves
+    // them powered, a dead circuit does not.
+    if (!this.lineDead) for (const ac of this.acs) ac.lastSeenAt = this.now;
+
     // Shell parity: a ramp opened by a power event closes on evidence, not on
     // its timer — decided BEFORE the views, because the views are where the
     // window becomes `AcView.ramping`.
     const houseIsDirect = this.holdPowerEventRamps();
+    this.assessEntryCollapse();
 
     // FLOORS / GRID_FULL exit checks against confirmed shadows + ramps.
     const views = this.buildViews();
@@ -1005,6 +1108,10 @@ export class Scenario {
         const at = this.reducedAt.get(deviceId);
         return at != null && this.now - at < VICTIM_COOLDOWN_MS;
       },
+      // Shell parity: rooms coming back from a dead circuit arrive together, so
+      // the floor set is admitted on the envelope rather than on a meter that
+      // has seen none of it yet.
+      recoveryAdmission: this.now < this.recoveryAdmissionUntil,
     });
     this.freshlyOn = [];
     this.plans.push(out);

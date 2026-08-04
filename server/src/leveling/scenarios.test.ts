@@ -1723,3 +1723,151 @@ describe("the changeover dead window (2026-08-04)", () => {
     expect(s.commandsSince(t0, "power_off")).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Trip on ENTRY, and the recovery that follows (2026-08-04, user-confirmed:
+// the breaker physically tripped and he reset it by hand).
+//
+// The refined timeline. The gen session did not merely start with compressors
+// in restart protection — it started with the AC CIRCUIT DEAD. 11:16 to ~11:21
+// was an open breaker, the four FLOORS resends went to devices that could not
+// hear them, and the reset brought all three rooms back AT ONCE with restart
+// protection already served: 6.4 → 16.6A in ninety seconds.
+//
+// Two failures, one event. The collapse latch judges FALLS inside a session and
+// a session that begins dead has no cliff, so a real trip went unlatched for
+// the third time in ten days — no derate, and the controller then rode
+// 14.3–14.8A on a breaker that had just opened. And the return itself was
+// unmanageable by the meter: floors modeled 11.3A + a measured ~6A house is
+// 17.3A on a 14.9A ceiling, decided before the first reading arrived.
+//
+// The same shape ran again in production at 12:39:57 the same day. That one
+// latched correctly on the fall, derated to 14A, re-entered at FLOORS and shed
+// a room at 12:43:49 — the right end-state, reached only after riding over the
+// derated limit for minutes. Recovery admission is that end-state chosen up
+// front.
+// ---------------------------------------------------------------------------
+
+describe("trip on entry, and the surge that follows (2026-08-04)", () => {
+  // Floors: Abdullah L2 (boost) 4.1 + Abdu L1 4.5 + Najat L1 2.7 = 11.3A
+  // modeled, against a 6A house and a 14.9A ceiling. Physically they draw
+  // 3.9 + 4.1 + 2.2 = 10.2, so all three back at once is 16.2A on a 14.9A gen.
+  const trio = (): SimAcSetup[] => [
+    { ...ABDULLAH, level: 2, minLevel: 2, demandAmps: 3.9, needDelta: 3, rampSeconds: 60 },
+    { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 2.5, rampSeconds: 60 },
+    { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1, rampSeconds: 60 },
+  ];
+  /** Grid session, then the changeover, then the AC breaker opens. */
+  const deadEntry = () => {
+    const s = new Scenario(cfg, trio(), {
+      // 5A of house, not the live ~6: the entry latch derates the gen by 1A
+      // (invariants 2/15 — the breaker really did open), and the brief's
+      // arithmetic was written against the nameplate 15A. Same shape, same
+      // conclusion, judged against the ceiling the line has actually been
+      // holding — which is the point of `effectiveLimit`.
+      nonAcAmps: 5.0,
+      residualAmps: 5.0, // the house keeps drawing — invariant 31's shape
+      source: "grid",
+      seed: 20260804,
+    });
+    // A live CT always micro-moves; a flat post-trip meter would otherwise read
+    // as a HUNG SENSOR and kill calm for its own reasons.
+    s.setNoise(0.05);
+    s.advance(300);
+    s.setSource("gen");
+    s.trip(); // 11:16 — the AC circuit is dead as the generator takes over
+    return s;
+  };
+
+  it("latches the collapse a session that BEGINS dead gives no cliff for", () => {
+    const s = deadEntry();
+    s.advance(6 * 60);
+    const view = meterView(s.meterState, s.now);
+    expect(view.collapsed).toBe(true);
+    // …with the real machinery: the ceiling comes down while the breaker cools.
+    expect(view.derateAmps).toBeGreaterThan(0);
+  });
+
+  it("does not latch while the rooms are merely slow to start", () => {
+    // The discriminator. Same dead-looking meter, same gap — but the Wi-Fi
+    // modules are powered, so the shadows keep reporting. Restart protection
+    // must never read as a breaker trip.
+    const s = new Scenario(
+      cfg,
+      trio().map((a) => ({ ...a, restartDelayMs: 6 * 60_000 })),
+      { nonAcAmps: 5.0, source: "grid", seed: 20260804 },
+    );
+    s.setNoise(0.05);
+    s.advance(300);
+    s.setSource("gen");
+    s.advance(6 * 60);
+    expect(meterView(s.meterState, s.now).collapsed).toBe(false);
+    expect(meterView(s.meterState, s.now).derateAmps).toBe(0);
+  });
+
+  it("admits the returning rooms hottest-first and sheds the one that does not fit", () => {
+    const s = deadEntry();
+    s.advance(6 * 60);
+    const t0 = s.now;
+    s.recoverLine(); // ~11:21 — the user resets the breaker
+    s.advance(4 * 60);
+
+    // 5A house + Abdullah's 4.1 + Abdu's 4.5 = 13.6 fits under the 13.8A
+    // derated ceiling; Najat's 2.7 does not, and she is the coolest room
+    // (need 1 against 3 and 2.5).
+    const off = s.commandsSince(t0, "power_off");
+    expect(off.map((e) => e.cmd.deviceId)).toEqual(["najat"]);
+    expect(s.acsOn().sort()).toEqual(["abdu", "abdullah"]);
+    // The hot rooms come back AT THEIR FLOORS, not at whatever the firmware
+    // restored — and never at level 0.
+    expect(s.sim("abdullah").level).toBe(2);
+    expect(s.sim("abdu").level).toBe(1);
+  });
+
+  it("reaches that end-state BEFORE the meter has to prove it", () => {
+    // The 12:39:57 production trip got here too, but only after riding over its
+    // own derated limit for minutes while the reducer worked it out. The whole
+    // point of admitting on the envelope is that the surge never happens.
+    const s = deadEntry();
+    s.advance(6 * 60);
+    const t0 = s.now;
+    s.recoverLine();
+    let peak = 0;
+    for (let i = 0; i < 60; i++) {
+      s.step();
+      peak = Math.max(peak, meterView(s.meterState, s.now).smoothedAmps);
+    }
+    expect(peak).toBeLessThanOrEqual(cfg.genLimitAmps);
+    // One room off, once — not a shed, a restore and a re-shed.
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(1);
+  });
+
+  it("leaves the shed room on the ORDINARY restore queue, not a parallel one", () => {
+    // Recovery admission sheds through the normal rows, so the normal
+    // one-by-one restore brings the room back when real headroom appears.
+    const s = deadEntry();
+    s.advance(6 * 60);
+    s.recoverLine();
+    s.advance(4 * 60);
+    expect(s.acsOn().sort()).toEqual(["abdu", "abdullah"]);
+    const t1 = s.now;
+    s.setNonAc(1.5); // the house load leaves; now she genuinely fits
+    s.advance(10 * 60);
+    expect(s.commandsSince(t1, "power_on").map((e) => e.cmd.deviceId)).toContain("najat");
+  });
+
+  it("respects a manual pin — recovery never sheds a room the user asked for", () => {
+    // Being switched off is worse than any level (invariant 25), and a pin is
+    // the clearest statement there is that this room is wanted. If the pinned
+    // set alone cannot fit, the reducer answers it on the meter like any other
+    // overload; this phase does not make that choice for the user.
+    const s = deadEntry();
+    s.pinLevel("najat", 1);
+    s.advance(6 * 60);
+    const t0 = s.now;
+    s.recoverLine();
+    s.advance(3 * 60);
+    const off = s.commandsSince(t0, "power_off").map((e) => e.cmd.deviceId);
+    expect(off).not.toContain("najat");
+  });
+});

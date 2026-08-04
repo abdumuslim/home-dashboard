@@ -12,9 +12,11 @@ import { childLogger } from "../logger.js";
 import type { LevelerDeviceContext, LevelingDeps, LevelingStatusV2 } from "./api.js";
 import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, effectiveLimit, limitFor, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
 import {
+  clearCollapse,
   derateFor,
   ingestReading,
   initialMeterState,
+  latchCollapse,
   meterView,
   noteCommandedCut,
   OVER_LIMIT_BUDGET_AFTER_ACT,
@@ -27,6 +29,7 @@ import {
   clearFloorsOnManual,
   clearGridFullIfDone,
   deriveMode,
+  FLOORS_MAX_MS,
   initialModeState,
   noteBatch,
   type ModeState,
@@ -56,6 +59,8 @@ import {
   type HouseLoadState,
 } from "./house-load.js";
 import {
+  ENTRY_COLLAPSE_DWELL_MS,
+  entryCollapseEvidence,
   houseIsDead,
   meterIsSteady,
   modeledGapAmps,
@@ -381,6 +386,18 @@ export class LevelingControllerV2 {
    * nothing power-cycled there, so the amps really are on their way.
    */
   private powerEventRamp = new Map<string, { armedAt: number; heldSince: number | null }>();
+  /**
+   * Entry-collapse state (2026-08-04). `entryCollapseSince` is when the
+   * evidence first held without a break — a dwell, so a shadow that is merely
+   * late cannot latch. `entryCollapseLatched` records that the latch on
+   * `MeterState` is OURS: a fall-latched collapse, or the sensing safety cap
+   * retiring one, must not be released by this machine. `recoveryAdmissionUntil`
+   * marks the FLOORS window in which the returning rooms are admitted on the
+   * envelope rather than on a meter that has seen no compressor yet.
+   */
+  private entryCollapseSince: number | null = null;
+  private entryCollapseLatched = false;
+  private recoveryAdmissionUntil = 0;
   /**
    * Level-RAISE commitments the meter has not shown yet, per device: the priced
    * jump, the house load when it was sent, and the peak rise since. Same shape
@@ -726,6 +743,12 @@ export class LevelingControllerV2 {
           // Dead-window holds are about ramps on the line we just left; the
           // entry re-arms them a tick later against the new line's readings.
           this.powerEventRamp.clear();
+          // …and so is the entry-collapse evidence: it is a claim about one
+          // line's breaker. (The DERATE deliberately survives — it carries its
+          // own source tag, so a gen→grid→gen bounce cannot launder it.)
+          this.entryCollapseSince = null;
+          this.entryCollapseLatched = false;
+          this.recoveryAdmissionUntil = 0;
           // Both cooldowns are per-line physics — a wind-down on the source we
           // just left says nothing about this one, and holding them across a
           // changeover strands a room through the entry window that is supposed
@@ -1017,16 +1040,14 @@ export class LevelingControllerV2 {
    * debit, house sampling), so a false hold costs a delayed raise and a false
    * release is merely the behaviour that shipped before this existed.
    */
-  private holdPowerEventRamps(
-    ctx: LevelerDeviceContext[],
-    view: ReturnType<typeof meterView>,
-    now: number,
-  ): boolean {
-    if (this.powerEventRamp.size === 0) return false;
-    // No trustworthy meter, no evidence either way — leave the timer in charge.
-    if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return false;
-    const source = view.source;
-    const running: ModeledAc[] = ctx
+  /**
+   * The rooms we believe are drawing, projected straight off the device context
+   * rather than from `AcView`s — both consumers run BEFORE `buildViews`, which
+   * is where `rampUntil` becomes `AcView.ramping`. The context's own shadow
+   * level is the conservative choice for a gap that must not under-read.
+   */
+  private modeledRunningOf(ctx: LevelerDeviceContext[]): ModeledAc[] {
+    return ctx
       .filter((c) => c.managed && c.device.power && !this.shedIds.has(c.device.id))
       .map((c) => ({
         deviceId: c.device.id,
@@ -1036,6 +1057,18 @@ export class LevelingControllerV2 {
         currentLevel: c.device.generatorMode,
         maxLevel: c.device.maxGeneratorLevel || 3,
       }));
+  }
+
+  private holdPowerEventRamps(
+    ctx: LevelerDeviceContext[],
+    view: ReturnType<typeof meterView>,
+    now: number,
+  ): boolean {
+    if (this.powerEventRamp.size === 0) return false;
+    // No trustworthy meter, no evidence either way — leave the timer in charge.
+    if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return false;
+    const source = view.source;
+    const running = this.modeledRunningOf(ctx);
     const gapAmps = modeledGapAmps({
       smoothedAmps: view.smoothedAmps,
       acs: running,
@@ -1142,6 +1175,137 @@ export class LevelingControllerV2 {
         if (risen > debit.absorbed) debits.set(id, { ...debit, absorbed: risen });
       }
     }
+  }
+
+  /**
+   * Latch — and release — a collapse the READINGS cannot see: a gen session
+   * that BEGINS with the AC circuit already dead (2026-08-04, user-confirmed
+   * breaker trip and manual reset). `ingestReading` judges FALLS inside a
+   * session, and a session that starts dead has no cliff, so the third real
+   * trip in ten days went unlatched: no derate, and the controller then rode
+   * 14.3–14.8A on a generator whose breaker had just opened.
+   *
+   * Evidence and dwell live in dead-window.ts; this owns the state machine and
+   * the fan-out, which is deliberately the SAME one a fall-latched collapse
+   * gets — stacked derate (invariants 2/15), COLLAPSED mode, a critical push,
+   * a journal row, and FLOORS on the way back in.
+   *
+   * Release is on evidence, never on a clock: the moment ANY room reports in or
+   * the meter shows our load again, the circuit is alive. (`ingestReading`'s
+   * own `POWER_COLLAPSE_MAX_MS` safety cap still applies underneath — a latch
+   * must never be able to strand the house, and that property is not this
+   * change's to relax.)
+   */
+  /**
+   * A dead circuit is coming back: every room returns at once, with restart
+   * protection already served, and the meter has seen none of it. Open the
+   * window in which the FLOORS entry admits the floor set on the ENVELOPE —
+   * bounded by the FLOORS window itself, so it cannot outlive the entry it
+   * belongs to — and re-arm the ramps, which also keeps FLOORS from clearing
+   * before anything has confirmed.
+   */
+  private armRecoveryAdmission(ctx: LevelerDeviceContext[], now: number): void {
+    this.recoveryAdmissionUntil = now + FLOORS_MAX_MS;
+    this.rearmRamp(
+      ctx.filter((c) => c.device.power).map((c) => c.device.id),
+      { powerEvent: true },
+    );
+  }
+
+  private async assessEntryCollapse(
+    ctx: LevelerDeviceContext[],
+    view: ReturnType<typeof meterView>,
+    now: number,
+  ): Promise<void> {
+    // OUR latch has gone — because the meter came back past its reference, or
+    // because the sensing safety cap retired it. Both mean the same thing as
+    // clearing it ourselves below: the circuit is alive and every room is about
+    // to arrive at once, so the recovery window opens here too. (`ingestReading`
+    // emits its own `collapse_recovered`, so FLOORS is already armed.)
+    if (this.entryCollapseLatched && this.meterState.collapse == null) {
+      this.entryCollapseLatched = false;
+      this.armRecoveryAdmission(ctx, now);
+    }
+    if (view.source === "none" || view.frozen || view.sampleCount < 2) {
+      this.entryCollapseSince = null;
+      return;
+    }
+    const source = view.source;
+    const running = this.modeledRunningOf(ctx);
+    const gapAmps = modeledGapAmps({
+      smoothedAmps: view.smoothedAmps,
+      acs: running,
+      config: this.config,
+      source,
+      commandedCutCreditAmps: view.commandedCutCreditAmps,
+    });
+    const devices = ctx
+      .filter((c) => c.managed && c.device.power && !this.shedIds.has(c.device.id))
+      .map((c) => c.device);
+    const evidence = entryCollapseEvidence({ gapAmps, devices, now });
+    if (!evidence) {
+      this.entryCollapseSince = null;
+      if (this.entryCollapseLatched) {
+        // The circuit is alive again. Hand the recovery to the same machinery a
+        // metered recovery uses — which re-arms FLOORS on gen — and mark the
+        // window so admission is judged on the envelope, not on a meter that
+        // has not seen a single compressor yet.
+        this.entryCollapseLatched = false;
+        this.meterState = clearCollapse(this.meterState);
+        this.modeState = applyMeterEvent(this.modeState, { kind: "collapse_recovered", source }, now);
+        this.armRecoveryAdmission(ctx, now);
+        log.warn(`[leveler2] AC circuit is back on ${source} — re-entering at floors, admission re-judged`);
+      }
+      return;
+    }
+    this.entryCollapseSince ??= now;
+    if (this.entryCollapseLatched || now - this.entryCollapseSince < ENTRY_COLLAPSE_DWELL_MS) return;
+    // The line SHOULD be carrying the house plus everything we believe is on;
+    // that is the reference the metered recovery check compares against.
+    const preMedianAmps = view.smoothedAmps + gapAmps;
+    this.meterState = latchCollapse(this.meterState, { source, now, preMedianAmps });
+    this.modeState = applyMeterEvent(
+      this.modeState,
+      { kind: "collapse", fromAmps: preMedianAmps, toAmps: view.smoothedAmps, source },
+      now,
+    );
+    this.entryCollapseLatched = true;
+    const derated = effectiveLimit(this.config, source, this.meterState.derate?.amps ?? 0);
+    log.warn(
+      `[leveler2] AC circuit appears DEAD on ${source}: ${running.length} room(s) modeled at ` +
+        `${(view.smoothedAmps + gapAmps).toFixed(1)}A, meter ${view.smoothedAmps.toFixed(1)}A, every shadow dark for ` +
+        `${Math.round((now - this.entryCollapseSince) / 1000)}s — probable breaker trip; commands frozen, ` +
+        `${source} limit derated to ${derated.toFixed(1)}A`,
+    );
+    this.deps.onPowerEvent?.(`AC circuit dead on ${source}`);
+    void this.pushNotice(
+      `AC circuit appears dead on the ${source === "gen" ? "generator" : "grid"} — check the breaker. ` +
+        `Levelling is frozen until the rooms come back.`,
+      true,
+    );
+    void this.store
+      .insertJournal({
+        at: now,
+        source,
+        mode: deriveMode(this.modeState, now),
+        severity: null,
+        reason: "collapse_on_entry",
+        requiredAmps: null,
+        preAmps: view.smoothedAmps,
+        commands: [],
+        decisions: [
+          {
+            at: now,
+            action: "collapse latched on entry",
+            detail:
+              `modeled ${(view.smoothedAmps + gapAmps).toFixed(1)}A vs meter ${view.smoothedAmps.toFixed(1)}A ` +
+              `with every shadow dark — no fall to see, the session began dead`,
+          },
+        ],
+        expectedDelta: null,
+        executed: this.acts(),
+      })
+      .catch(() => undefined);
   }
 
   /**
@@ -1456,6 +1620,9 @@ export class LevelingControllerV2 {
     // (2026-08-04). Must precede buildViews: that is where `rampUntil` becomes
     // `AcView.ramping`.
     const houseIsDirect = this.holdPowerEventRamps(ctx, view, now);
+    // …and a circuit that is dead rather than merely slow to start is a real
+    // collapse, latched here because the readings alone cannot see it.
+    await this.assessEntryCollapse(ctx, view, now);
 
     // Build views.
     const acs = this.buildViews(ctx, outdoorTempC, now);
@@ -1602,6 +1769,9 @@ export class LevelingControllerV2 {
         const at = this.reducedAt.get(deviceId);
         return at != null && now - at < VICTIM_COOLDOWN_MS;
       },
+      // The rooms are coming back from a dead circuit all at once — admit the
+      // floor set on the envelope, because the meter has seen none of it yet.
+      recoveryAdmission: now < this.recoveryAdmissionUntil,
     });
     this.fanHolds = out.fanHolds;
 
