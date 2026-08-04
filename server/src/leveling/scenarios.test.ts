@@ -1693,7 +1693,7 @@ describe("the changeover dead window (2026-08-04)", () => {
     expect(s.measuredHouseAmps()).toBeLessThan(4.5);
   });
 
-  it("rides the simultaneous restart without an overload or a shed", () => {
+  it("rides the simultaneous restart without an overload, and the coolest room waits", () => {
     const s = changeover();
     const t0 = s.now;
     s.advance(150);
@@ -1702,11 +1702,35 @@ describe("the changeover dead window (2026-08-04)", () => {
       s.step();
       peak = Math.max(peak, meterView(s.meterState, s.now).smoothedAmps);
     }
-    // Every compressor engaged at once — with nothing extra admitted while they
-    // were dead, the floor state is what arrives, and it fits.
+    // Every compressor engaged at once, and nothing extra was admitted while
+    // they were dead — so what arrives is the floor state, and it stays under.
     expect(peak).toBeLessThanOrEqual(cfg.genLimitAmps);
+    // R11b (user, 2026-08-04 17:22): this trio's floors are 11.3A modeled and
+    // the carried house is ~4, which is over the 14.8A ceiling BEFORE the first
+    // compressor starts. A changeover power-cycles every room exactly as a
+    // collapse recovery does, so the entry admission decides it on the envelope
+    // rather than letting the restart prove it — the coolest room waits while
+    // the two hotter ones hold their floors through the restart.
+    expect(s.commandsSince(t0, "power_off").map((e) => e.cmd.deviceId)).toEqual(["najat"]);
+    expect(s.sim("abdullah").level).toBe(2);
+    expect(s.sim("abdu").level).toBe(1);
+    // …and she is on the ORDINARY restore queue, so once the restart has landed
+    // and the meter shows the real draw she comes back on her own terms.
+    expect(s.acsOn()).toContain("najat");
+  });
+
+  it("a changeover whose floors DO fit sheds nobody — the admission is free when it can be", () => {
+    // The other half of R11b, and the reason it is safe to run on every entry:
+    // the phase only removes rooms that Σ floor models + house cannot carry.
+    // Same trio, same entry, a house small enough that 11.3A of floors fits
+    // under the 14.8A ceiling → the batch is an ordinary FLOORS clamp.
+    const s = new Scenario(cfg, trio(), { nonAcAmps: 1.0, source: "grid", seed: 20260804 });
+    s.advance(300);
+    const t0 = s.now;
+    s.setSource("gen");
+    s.advance(150);
     expect(s.commandsSince(t0, "power_off")).toHaveLength(0);
-    expect(s.acsOn()).toEqual(["abdu", "abdullah", "najat"]);
+    expect(s.acsOn().sort()).toEqual(["abdu", "abdullah", "najat"]);
   });
 
   it("hands the raise path back once the compressors prove they are drawing", () => {
@@ -1807,10 +1831,15 @@ describe("trip on entry, and the surge that follows (2026-08-04)", () => {
 
   it("admits the returning rooms hottest-first and sheds the one that does not fit", () => {
     const s = deadEntry();
+    const t0 = s.now; // BEFORE the changeover — see R11b below
     s.advance(6 * 60);
-    const t0 = s.now;
     s.recoverLine(); // ~11:21 — the user resets the breaker
     s.advance(4 * 60);
+    // ⚠ The window starts at the changeover, not at the reset. Since R11b the
+    // admission runs on EVERY gen entry, so on a session that begins dead the
+    // room that cannot fit is decided as the line comes up — before the breaker
+    // is even known to be open. The end-state is what this pins; WHICH tick
+    // reached it is not the guarantee.
 
     // 5A house + Abdullah's 4.1 + Abdu's 4.5 = 13.6 fits under the 13.8A
     // derated ceiling; Najat's 2.7 does not, and she is the coolest room
@@ -1829,8 +1858,8 @@ describe("trip on entry, and the surge that follows (2026-08-04)", () => {
     // own derated limit for minutes while the reducer worked it out. The whole
     // point of admitting on the envelope is that the surge never happens.
     const s = deadEntry();
+    const t0 = s.now; // before the changeover — the admission decides at entry (R11b)
     s.advance(6 * 60);
-    const t0 = s.now;
     s.recoverLine();
     let peak = 0;
     for (let i = 0; i < 60; i++) {

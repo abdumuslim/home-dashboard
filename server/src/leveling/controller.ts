@@ -769,7 +769,22 @@ export class LevelingControllerV2 {
           // own source tag, so a gen→grid→gen bounce cannot launder it.)
           this.entryCollapseSince = null;
           this.entryCollapseLatched = false;
-          this.recoveryAdmissionUntil = 0;
+          // R11b (2026-08-04 17:22, the first changeover that ran with the rest
+          // of today's protections). A NORMAL changeover power-cycles every
+          // compressor exactly as a collapse recovery does — same physics, same
+          // surge — so the floor set has to be admitted against the ENVELOPE on
+          // every gen entry, not only after a latched collapse. Live: entry at
+          // 17:22:57 with floors {L2,L1,L1} = 10.4A modeled plus ~4.5–5A of
+          // carried house is over a 15A generator before the first reading
+          // exists, and at 17:27:18 the simultaneous restart peaked the line at
+          // 16.5A severe with the hottest room's level the only rung left.
+          //
+          // Free when the arithmetic fits: the admission phase only sheds rooms
+          // that Σ floor models + house cannot carry, so a changeover with room
+          // to spare journals "floors" and commands exactly what it did before.
+          // Grid is untouched — `recoveryAdmission` is gen-only by construction,
+          // and grid enters FULL by directive.
+          this.recoveryAdmissionUntil = event.to === "gen" ? now + FLOORS_MAX_MS : 0;
           // The anchor every "since entry" test is measured against.
           this.sourceSince = now;
           this.lastConfirmAt.clear();

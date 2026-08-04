@@ -460,7 +460,11 @@ export class Scenario {
     for (const ac of this.acs) ac.unansweredSince = 0;
     this.entryCollapseSince = null;
     this.entryCollapseLatched = false;
-    this.recoveryAdmissionUntil = 0;
+    // Shell parity (R11b): a changeover power-cycles every compressor exactly
+    // as a collapse recovery does, so the gen-entry floor set is admitted
+    // against the envelope on EVERY gen entry — not only after a latched
+    // collapse. Free when the arithmetic fits.
+    this.recoveryAdmissionUntil = line === "gen" ? this.now + FLOORS_MAX_MS : 0;
   }
 
   /** Breaker trips: the AC circuits go dead, a small residual stays on the line. */
