@@ -433,8 +433,29 @@ export function planReduction(input: ReduceInput): ReducePlan {
         //
         // So the rule is honoured in the two places it changes an outcome
         // without that cost — this term when something is going off anyway, and
-        // the recovery ranking in raise.ts — and the unconditional form waits on
-        // a restore-bounce backoff, without which it has nowhere stable to land.
+        // the recovery ranking in raise.ts.
+        //
+        // ⚠ RE-TESTED 2026-08-04 (R9b) once the restore-bounce backoff and the
+        // per-room shed bar (R9) existed, which was the named prerequisite. It
+        // still cycles, and the backoff is not what is missing. On the gen
+        // flicker trio riding a MEAN of ~14.6A under a 14.9A ceiling, forty
+        // minutes produced 41 commands against the conditional form's 4:
+        //
+        //   t+125  shed najat            (unconditional: 1.0 beats 2.7)
+        //   t+160  abdullah → L3         (the shed freed real amps; the raise
+        //                                 path spent them, correctly)
+        //   t+400  restore najat, abdullah floor-down funding it
+        //   t+1605 shed najat again … and round.
+        //
+        // The bar did NOT fail: the second restore was funded by a peer's
+        // genuine floor-down, so it fits at floors honestly. The loop is
+        // structural — the shed frees headroom, the raise path is entitled to
+        // it, and the line goes over again — and closing it means a shed that
+        // does not hand its amps straight back, which is the user's parked
+        // "gated proactive shed", deliberately not built this session.
+        //
+        // Left conditional, on evidence, for the second time. Do not flip it
+        // without re-running that scenario and reading the command list.
         shedNeed: shedNeed + (sheds > 0 ? subFloorNeed : 0),
         feasible: savings >= requiredAmps - EPS && (!requireShed || sheds > 0),
         // "A bystander pays" — but only when the bystander is not obviously the
