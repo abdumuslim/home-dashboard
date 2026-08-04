@@ -453,3 +453,41 @@ describe("gen start clamp reaches the batch (2026-07-30)", () => {
     expect(levels[0].level).toBeLessThanOrEqual(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cooldown wiring (2026-08-04). `PlanInput` declares both cooldown predicates,
+// the controller shell and scenario.ts have supplied both since invariant 35
+// shipped, and `planRaise` reads both — but `plan()` only ever forwarded the
+// FUNDING one, so `RaiseInput.victimCooldown` was permanently undefined and a
+// room the reducer had just cut could climb straight back into the overload
+// that caused the cut (live 2026-08-03 00:41:10Z cut → 00:42:44 raise).
+//
+// The acceptance scenario for that bounce passes on the other gates (calm,
+// settle window, envelope), which is exactly how a missing wire hides: nothing
+// asserted that the predicate reached the planner at all. These do.
+// ---------------------------------------------------------------------------
+
+describe("raise cooldowns reach the planner", () => {
+  const raiser = () => [ac("a", { currentLevel: 1, needDelta: 3 })];
+  const calm = () => meter({ smoothedAmps: 4, calmMs: 300_000 });
+
+  it("raises freely when neither cooldown is live (the control)", () => {
+    expect(run(raiser(), calm()).commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+  });
+
+  it("a room the REDUCER just cut may not climb back", () => {
+    const out = run(raiser(), calm(), { victimCooldown: () => true });
+    expect(out.commands).toHaveLength(0);
+    expect(out.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", blockedBy: "victim cooldown" }),
+    );
+  });
+
+  it("…and neither may a room that just funded a peer's raise", () => {
+    const out = run(raiser(), calm(), { fundingCooldown: () => true });
+    expect(out.commands).toHaveLength(0);
+    expect(out.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", blockedBy: "funding cooldown" }),
+    );
+  });
+});

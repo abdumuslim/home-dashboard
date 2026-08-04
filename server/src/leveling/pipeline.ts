@@ -426,6 +426,15 @@ export function plan(input: PlanInput): PlanOutput {
       now,
       pacing,
       fundingCooldown: input.fundingCooldown,
+      // …and its involuntary twin. Declared on PlanInput and supplied by BOTH
+      // the shell and the harness since invariant 35 shipped, but never handed
+      // to the planner — so `RaiseInput.victimCooldown` was permanently
+      // undefined and a room the reducer had just cut could climb straight back
+      // into the overload that caused the cut. Found reviewing the 2026-08-04
+      // dead-window work; the acceptance scenario that covers the live 00:41Z
+      // bounce passes on the other gates (calm, settle, envelope), which is why
+      // a missing wire could sit here unnoticed.
+      victimCooldown: input.victimCooldown,
     });
     if (raisePlan.commands.length > 0 || corrections.commands.length > 0) {
       // A gentle restore (power_on carrying a pinned fan) records a fan hold so
