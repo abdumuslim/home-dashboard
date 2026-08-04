@@ -91,6 +91,29 @@ describe("one room at a time (user, 2026-08-02)", () => {
     expect(p.toShed).toHaveLength(2);
     expect(p.satisfied).toBe(true);
   });
+
+  it("the EXTREME rung never escalates — one room, whatever the arithmetic says", () => {
+    // Live 2026-08-04 12:53:45Z (journal 7635): the sustained clock promoted to
+    // extreme with the mean sitting 0.025A over a 15A generator, carrying a
+    // 4.57A deficit invented from one inrush spike. No single room covered it,
+    // the one-shed ceiling lifted, and BOTH remaining rooms went off at once.
+    // The user: "it could only turn off only the coolest room and that would be
+    // enough." Invariant 33 says the same thing — this rung relieves a sustained
+    // strain, it does not clear an arithmetic bill.
+    const p = plan([atFloor("hot", 3), atFloor("cool", 0.3)], 4.57, { requireShed: true });
+    expect(p.toShed).toHaveLength(1);
+    // …and the room it takes is still the coolest one, not the biggest saving.
+    expect(p.toShed).toEqual(["cool"]);
+  });
+
+  it("a deficit that truly needs two still gets two — from the NEXT pass", () => {
+    // Same 4.57A, re-evaluated after the first shed landed: one room is gone, the
+    // deficit is re-priced against a meter that has seen it, and the rung takes
+    // the next one. One at a time, never one batch (invariant 26).
+    const first = plan([atFloor("hot", 3), atFloor("cool", 0.3)], 4.57, { requireShed: true });
+    const second = plan([atFloor("hot", 3)], 2.57, { requireShed: true });
+    expect([...first.toShed, ...second.toShed]).toEqual(["cool", "hot"]);
+  });
 });
 
 describe("the sub-floor rung — a comfort floor is not worth a power_off (2026-08-02)", () => {

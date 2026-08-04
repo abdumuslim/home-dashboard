@@ -455,7 +455,19 @@ export function planReduction(input: ReduceInput): ReducePlan {
   // ceiling first and only raises it when nothing at that ceiling covers the
   // deficit — which is exactly the "big pump" case, where waiting a pass would
   // only prolong the overload.
-  for (maxSheds = 1; maxSheds <= perAc.length; maxSheds++) {
+  //
+  // …except at EXTREME, where the ceiling never lifts. Invariant 33 defines that
+  // rung as "exactly ONE room off" — the user's own trade against losing the
+  // whole house — and it exists to relieve a sustained strain, not to clear an
+  // arithmetic bill. Live 2026-08-04 12:53:45Z the tier arrived with a 4.57A
+  // deficit invented from a lone inrush spike (see SEVERE_STREAK_READINGS), no
+  // single room covered it, the ceiling lifted, and BOTH remaining rooms went
+  // off at once for a mean sitting 0.025A over the limit. A deficit that
+  // genuinely needs a second room still gets one — from the NEXT evaluation,
+  // re-priced against a meter that has seen the first shed, one room at a time
+  // exactly as invariant 26 asks.
+  const shedCeiling = requireShed ? 1 : perAc.length;
+  for (maxSheds = 1; maxSheds <= shedCeiling; maxSheds++) {
     best = null;
     recurse(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     if (best != null && (best as ComboScore).feasible) break;

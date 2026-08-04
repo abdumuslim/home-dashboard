@@ -55,6 +55,29 @@ describe("requiredSavingsAmps", () => {
     expect(requiredSavingsAmps(v, 15, 0.1)).toBeCloseTo(0.2); // max(0.1, −0.4, 0.0) + 0.1
   });
 
+  it("ONE severe reading is a spike, not a streak — it may not size the deficit", () => {
+    // Live 2026-08-04 12:53:45Z (journal 7635). Gen re-entry, all three rooms at
+    // L1 with their fans already trimmed, mean sitting AT the 15A limit, flicker
+    // pinned at its 1.5A cap — and one ~19.5A compressor-inrush sample in the
+    // banked ring. `min(severe)` over a set of one IS that sample: it sized
+    // 4.57A, which no single room could cover, so the extreme rung shed two.
+    const spike = view({
+      overLimitReadings: [15.4, 15.8, 19.47, 15.6, 15.2],
+      flickerAmps: 1.5,
+      smoothedAmps: 15.025,
+    });
+    expect(requiredSavingsAmps(spike, 15, 0.1)).toBeLessThan(0.6);
+    // The old rule, for the record: 19.47 − 15 + 0.1.
+    expect(requiredSavingsAmps(spike, 15, 0.1)).not.toBeCloseTo(4.57);
+  });
+
+  it("…but a genuine severe streak still sizes from its min, undiscounted", () => {
+    // Same flicker, same limit: the newest readings are severe, so the line
+    // really is that far over and the median has simply not caught up.
+    const streak = view({ overLimitReadings: [15.4, 19.0, 19.47], flickerAmps: 1.5, smoothedAmps: 15.5 });
+    expect(requiredSavingsAmps(streak, 15, 0.1)).toBeCloseTo(4.1);
+  });
+
   it("never sizes below the SMOOTHED overshoot, whatever the flicker", () => {
     // The mean is the floor on the answer: if the house really is 0.6A over,
     // that is owed no matter how noisy the line is.

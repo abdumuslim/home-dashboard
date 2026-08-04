@@ -20,26 +20,70 @@ export const EMERGENCY_SHED_OVERSHOOT_AMPS = 3;
 export const EMERGENCY_SHED_OVERSHOOT_FRACTION = 0.2;
 
 /**
+ * How many of the NEWEST banked over-limit readings must be severe before the
+ * severe-streak rule may size the deficit from them.
+ *
+ * Largest single increment that can consume this (hard rule 5c): ONE compressor
+ * inrush reading. A TCL's locked-rotor draw is several times its running amps
+ * and the ESP samples every ~2.7–5s, so exactly one sample can land on it —
+ * live 2026-08-04 12:53:45Z, a reading of ~19.5A against a **15.025A smoothed
+ * mean** on a 15A generator. Compared against: the whole banked ring
+ * (`overLimitReadings`, up to 8 readings) as classified by `isSevereOverReading`
+ * at the LIVE flicker, which on a generator is routinely pinned at its 1.5A cap
+ * — and a high flicker raises the severe bar, so it is precisely the lone
+ * inrush spike that survives the filter while the ordinary 15.5–16.5A readings
+ * do not. `Math.min(...severe)` over a set of ONE is that spike, and it sized a
+ * 4.57A deficit at 0.025A of real overshoot, which the reducer paid by shedding
+ * TWO rooms.
+ *
+ * Two is the smallest number that can distinguish load from a spike, and it
+ * costs no reaction time on a genuine step-up: the leaky bucket needs
+ * OVER_LIMIT_DRAIN_SEVERE (3) per severe reading out of a 5-point budget, so a
+ * real step has always banked its second severe reading by the time the bucket
+ * empties and this function is consulted at all. What a lone spike falls back
+ * to is not nothing — it is the median/smoothed sizing, whose floor IS the
+ * smoothed overshoot: the honest figure for a house whose mean sits at the line.
+ */
+export const SEVERE_STREAK_READINGS = 2;
+
+/**
  * Meter-sized savings target for an over-limit episode: the overshoot the
  * readings actually support, plus the margin so the landing point is just
  * under the limit (never deep below — the anti-over-reduction rule).
- * Severe streaks size from min(severe readings) — every reading supports it,
- * one spike can't inflate it; an all-mild/oscillating episode sizes from the
- * median of the over-limit readings, discounted by the live flicker.
+ * Severe STREAKS size from min(severe readings) — every reading in the streak
+ * supports it, so one spike cannot inflate it; an all-mild/oscillating episode
+ * sizes from the median of the over-limit readings, discounted by the live
+ * flicker.
  *
- * The SMOOTHED overshoot is always a floor on the answer and is never
- * discounted: whatever the raw readings look like, if the mean is over the
- * limit that much really is owed. What the flicker discount removes is the
+ * ⚠ "Streak" is load-bearing and was not enforced until 2026-08-04. The rule
+ * shipped as `severe.length > 0`, and the safety argument — a min over several
+ * readings cannot be inflated by one of them — is only true when there ARE
+ * several. Over a set of one, min IS the spike: live 12:53:45Z one ~19.5A
+ * inrush sample sized a 4.57A deficit while the smoothed mean sat 0.025A over
+ * a 15A generator, and the extreme rung paid it with two rooms. So the newest
+ * `SEVERE_STREAK_READINGS` banked readings must ALL be severe before their min
+ * may speak; anything less falls back to the median/smoothed sizing.
+ *
+ * In the median branch the SMOOTHED overshoot is a floor on the answer and is
+ * never discounted: whatever the raw readings look like, if the mean is over the
+ * limit that much really is owed. (The streak branch does not take that max —
+ * it is already bounded below by limit + OVER_LIMIT_SEVERE_AMPS + flicker, and
+ * raising it to the mean would change sizing in a case no live incident has
+ * asked for.) What the flicker discount removes is the
  * 2026-08-02 failure — a lone 16.04A spike against a 14.92A mean sized a 1.14A
  * demand, and the reducer paid it by shedding a 4.8A room.
  */
 export function requiredSavingsAmps(view: MeterView, limit: number, marginAmps: number): number {
   const over = view.overLimitReadings;
-  const severe = over.filter((r) => isSevereOverReading(r, limit, view.flickerAmps));
-  const overshoot =
-    severe.length > 0
-      ? Math.min(...severe) - limit
-      : Math.max(view.smoothedAmps - limit, median([...over]) - limit - view.flickerAmps);
+  const isSevere = (r: number): boolean => isSevereOverReading(r, limit, view.flickerAmps);
+  const severe = over.filter(isSevere);
+  // The newest readings, not merely the count: two spikes minutes apart in an
+  // 8-deep ring are still two spikes, and the question this answers is whether
+  // the line is severe NOW, before the 4-wide median has caught up with it.
+  const streak = over.length >= SEVERE_STREAK_READINGS && over.slice(-SEVERE_STREAK_READINGS).every(isSevere);
+  const overshoot = streak
+    ? Math.min(...severe) - limit
+    : Math.max(view.smoothedAmps - limit, median([...over]) - limit - view.flickerAmps);
   return Math.max(0.1, overshoot) + marginAmps;
 }
 
