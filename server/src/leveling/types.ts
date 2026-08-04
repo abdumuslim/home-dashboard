@@ -413,6 +413,18 @@ export interface AcView {
   subFloorStalledMs: number;
   /** Boost floor (≥1; >1 when an outdoor-heat boost is active). */
   minLevel: number;
+  /**
+   * The outdoor temperature is more than `BOOST_FLOOR_FLEX_C` past this room's
+   * configured boost threshold, so levels below its comfort floor are not legal
+   * AUTOMATIC targets at all — see `hardFloorOf`. Below the floor the
+   * compressor does not engage up here, which makes "cut a level" and "switch
+   * the room off" the same physical act with only one of them visible (user,
+   * 2026-08-04 at 47°C: "that should never put it at l1").
+   *
+   * Narrows invariant 25's sub-floor rung; never deletes it. A room whose boost
+   * condition does not currently hold, and any non-boost floor, keeps the rung.
+   */
+  boostFloorHard: boolean;
   manualCap: number | null;
   manualTarget: number | null;
   slotCap: number | null;

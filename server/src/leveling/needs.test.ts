@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   boostFloor,
+  boostZoneOf,
+  hardFloorOf,
   ceilCapOf,
   ceilOf,
   floorOf,
@@ -39,6 +41,7 @@ function ac(overrides: Partial<AcView> = {}): AcView {
     satisfiedForMs: 0,
     subFloorStalledMs: 0,
     roomTempC: null,
+    boostFloorHard: false,
     unmeteredJumpAmps: 0,
     ...overrides,
     envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 1,
@@ -82,20 +85,63 @@ describe("ceilOf / ceilCapOf", () => {
   });
 });
 
-describe("boostFloor hysteresis", () => {
+describe("the boost gradient (user, 2026-08-04 — one zone function, four zones)", () => {
   const boost = { minLevel: 2, outdoorAtLeastC: 39 };
+  // Abdullah's ladder as the user described it: <36 normal · 36–39 watched at
+  // L1 · 39–41 floor binds and L1 is still a reducer rung · >41 never L1.
 
-  it("activates at ≥ threshold, releases at ≤ threshold − 1", () => {
-    expect(boostFloor(boost, 39, false)).toEqual({ minLevel: 2, active: true });
-    expect(boostFloor(boost, 38.5, false)).toEqual({ minLevel: 1, active: false });
-    expect(boostFloor(boost, 38.5, true)).toEqual({ minLevel: 2, active: true });
-    expect(boostFloor(boost, 38, true)).toEqual({ minLevel: 1, active: false });
+  it("places each zone at its own boundary", () => {
+    expect(boostZoneOf(boost, 35, "none")).toBe("none");
+    expect(boostZoneOf(boost, 36, "none")).toBe("watch");
+    expect(boostZoneOf(boost, 38.9, "watch")).toBe("watch");
+    expect(boostZoneOf(boost, 39, "watch")).toBe("flex");
+    expect(boostZoneOf(boost, 40.9, "flex")).toBe("flex");
+    expect(boostZoneOf(boost, 41, "flex")).toBe("hard");
+    expect(boostZoneOf(boost, 47, "none")).toBe("hard"); // live, 2026-08-04 17:27
   });
 
-  it("holds its last state when outdoor is unknown", () => {
-    expect(boostFloor(boost, null, true).active).toBe(true);
-    expect(boostFloor(boost, null, false).active).toBe(false);
-    expect(boostFloor(undefined, 45, true).active).toBe(false);
+  it("gives every boundary the same 1°C release hysteresis", () => {
+    // Entering takes the bar; leaving takes a full degree below it, so a
+    // wobbling reading cannot flap a room's whole reduction ladder.
+    expect(boostZoneOf(boost, 40.5, "hard")).toBe("hard");
+    expect(boostZoneOf(boost, 39.9, "hard")).toBe("flex");
+    expect(boostZoneOf(boost, 38.5, "flex")).toBe("flex");
+    expect(boostZoneOf(boost, 37.9, "flex")).toBe("watch");
+    expect(boostZoneOf(boost, 35.5, "watch")).toBe("watch");
+    expect(boostZoneOf(boost, 34.9, "watch")).toBe("none");
+  });
+
+  it("holds the last zone when the outdoor reading is unknown", () => {
+    // The weather does not become mild because the station went quiet, and the
+    // failure direction of holding is a room that keeps cooling.
+    expect(boostZoneOf(boost, null, "hard")).toBe("hard");
+    expect(boostZoneOf(boost, null, "none")).toBe("none");
+    expect(boostZoneOf(undefined, 45, "hard")).toBe("none");
+  });
+
+  it("arms the floor in flex and the WATCH three degrees earlier", () => {
+    // 37°C: L1 is still Abdullah's legitimate floor, and he is already watched
+    // there — which is the only moment the evidence can be gathered before the
+    // heat that makes it matter.
+    const watched = boostFloor(boost, 37, "none");
+    expect(watched).toMatchObject({ minLevel: 1, active: false, hard: false, watchMinLevel: 2 });
+    const flex = boostFloor(boost, 39, "watch");
+    expect(flex).toMatchObject({ minLevel: 2, active: true, hard: false, watchMinLevel: 2 });
+    const hard = boostFloor(boost, 47, "flex");
+    expect(hard).toMatchObject({ minLevel: 2, active: true, hard: true, watchMinLevel: 2 });
+  });
+});
+
+describe("hardFloorOf — R14-hard (user, 2026-08-04 at 47°C)", () => {
+  it("is 1 until the room is past its boost band, then the comfort floor", () => {
+    expect(hardFloorOf(ac({ minLevel: 2 }))).toBe(1);
+    expect(hardFloorOf(ac({ minLevel: 2, boostFloorHard: true }))).toBe(2);
+  });
+
+  it("a manual pin below the floor wins — declining the floor is the user's to do", () => {
+    // Invariant 42: manual wins in both directions. `floorOf` already clamps to
+    // the pin, so the hard floor follows it down and the rung comes back.
+    expect(hardFloorOf(ac({ minLevel: 2, boostFloorHard: true, manualTarget: 1 }))).toBe(1);
   });
 });
 

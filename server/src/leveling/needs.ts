@@ -192,17 +192,148 @@ export function ceilCapOf(ac: AcView): number {
 }
 
 /**
- * Outdoor-heat boost floor with 1°C hysteresis, ported from v1 minLevelFor:
- * activates at outdoor ≥ threshold, releases at ≤ threshold − 1, holds its
- * last state when the outdoor reading is unknown/stale.
+ * How far above its configured threshold the outdoor temperature must be before
+ * a room's boost floor stops being a preference and becomes a HARD bound on
+ * every automatic path (user, 2026-08-04: "it is already 47 outside (8 c above
+ * what specifyed for abdullah lowest level temp) that should never put it at
+ * l1", then ~17:45 asking for the band).
+ *
+ * Largest single increment that can consume it (hard rule 5c): the gap between
+ * "the temperature at which L1 STARTS to fail" and "the temperature at which it
+ * certainly fails". The threshold is the user's estimate of the first; two
+ * degrees is his allowance for being early. Compared against: the same
+ * ≤10-min-fresh outdoor value `levelBoosts` already uses, and nothing else —
+ * this is a temperature band, not an amps budget, so no load can eat it.
+ *
+ * Inside [threshold, threshold+2) the sub-floor rung keeps working: L1 might
+ * genuinely cool there (live 2026-08-03 at ~39°C Abdullah was still running at
+ * L1), and the R14 learned hold is what revokes it on evidence. Above the band
+ * no evidence is needed — live 2026-08-04 17:27:18 at 47°C the reducer cut the
+ * hottest room to L1 because it was the only level rung left, which is exactly
+ * the move that produces a room that draws its fan and cools nothing.
+ */
+export const BOOST_FLOOR_FLEX_C = 2;
+
+/**
+ * How far BELOW its configured threshold a boosted room starts being watched at
+ * L1 (user, 2026-08-04 ~17:50: "starting from 3 degrees below that temp and
+ * above, the system should keep watching abdullah ac if the compressor could
+ * not work, so it raise").
+ *
+ * Largest single increment that can consume it (hard rule 5c): the error in the
+ * threshold itself. The user picked 39°C for a compressor whose real failure
+ * point moves with humidity, condenser fouling and the generator's voltage —
+ * three degrees is his allowance for the estimate being late, and inside it the
+ * watch costs nothing, because a room that IS cooling shows 0.2°C of progress
+ * and never trips it. Compared against: the same ≤10-min-fresh outdoor value
+ * `levelBoosts` uses.
+ */
+export const BOOST_WATCH_BELOW_C = 3;
+
+/**
+ * Where a boosted room's outdoor temperature sits on its own gradient. One
+ * function, four zones, because the alternative is four conditionals in four
+ * files that drift apart (the mirror-drift trap, in its per-room form).
+ *
+ * Abdullah's configured 39°C, as the user described the whole ladder:
+ *
+ *   < 36    `none`   nothing special; L1 is an ordinary level.
+ *   36–39   `watch`  L1 is still his legitimate floor, but he is WATCHED there
+ *                    — the 3-min no-progress watch runs against the boost
+ *                    minimum even though the floor has not armed. Evidence that
+ *                    the compressor is not running makes the RAISE path lift
+ *                    him, need-based and envelope-gated like any raise. Never a
+ *                    floor assertion: re-asserting a comfort floor outside the
+ *                    raise path is the 2026-08-02 limit cycle (invariant 25).
+ *   39–41   `flex`   the floor binds raises and entry clamps as it always has,
+ *                    and the sub-floor rung may STILL use L1 — at ~39°C on
+ *                    2026-08-03 he was genuinely cooling there. Evidence can
+ *                    revoke it (the R14 learned hold).
+ *   > 41    `hard`   L1 is not a legal automatic target at all. No evidence
+ *                    needed: live 2026-08-04 17:27:18 at 47°C the reducer cut
+ *                    the hottest room to L1 because it was the only level rung
+ *                    left, which is how a room ends up drawing its fan and
+ *                    cooling nothing while the dashboard calls it healthy.
+ *
+ * Every boundary carries the same 1°C release hysteresis the boost floor has
+ * always had — a reading wobbling across a line would otherwise flap a room's
+ * whole reduction ladder. A stale/unknown reading holds the LAST zone rather
+ * than falling back to permissive: the weather does not become mild because the
+ * station went quiet, and the failure direction of holding is a room that keeps
+ * cooling.
+ */
+export type BoostZone = "none" | "watch" | "flex" | "hard";
+
+const ZONE_ORDER: readonly BoostZone[] = ["none", "watch", "flex", "hard"];
+
+export function boostZoneOf(
+  boost: { minLevel: number; outdoorAtLeastC: number } | undefined,
+  outdoorC: number | null,
+  wasZone: BoostZone,
+): BoostZone {
+  if (boost == null) return "none";
+  if (outdoorC == null) return wasZone;
+  const bars = [
+    boost.outdoorAtLeastC - BOOST_WATCH_BELOW_C,
+    boost.outdoorAtLeastC,
+    boost.outdoorAtLeastC + BOOST_FLOOR_FLEX_C,
+  ];
+  const wasRank = ZONE_ORDER.indexOf(wasZone);
+  let rank = 0;
+  bars.forEach((bar, i) => {
+    // Already at or past this zone → it takes a full degree BELOW the bar to
+    // fall out of it; not yet in it → the bar itself is the entry.
+    const held = wasRank >= i + 1 ? outdoorC > bar - 1 : outdoorC >= bar;
+    if (held) rank = i + 1;
+  });
+  return ZONE_ORDER[rank];
+}
+
+/**
+ * Outdoor-heat boost floor, ported from v1 minLevelFor and now expressed on top
+ * of `boostZoneOf`: the floor arms in the `flex` zone and stays armed through
+ * `hard`, which is exactly the old "activates at ≥ threshold, releases at
+ * ≤ threshold − 1" behaviour.
+ *
+ * `watchMinLevel` is the level the sub-floor WATCH measures against, and it
+ * arms three degrees earlier than the floor does — a room can be failing to
+ * cool at L1 before L1 stops being its legitimate floor, and that is precisely
+ * the evidence the learned hold is built from.
  */
 export function boostFloor(
   boost: { minLevel: number; outdoorAtLeastC: number } | undefined,
   outdoorC: number | null,
-  wasActive: boolean,
-): { minLevel: number; active: boolean } {
-  if (boost == null) return { minLevel: 1, active: false };
-  if (outdoorC == null) return { minLevel: wasActive ? boost.minLevel : 1, active: wasActive };
-  const active = wasActive ? outdoorC > boost.outdoorAtLeastC - 1 : outdoorC >= boost.outdoorAtLeastC;
-  return { minLevel: active ? boost.minLevel : 1, active };
+  wasZone: BoostZone,
+): { minLevel: number; active: boolean; hard: boolean; watchMinLevel: number; zone: BoostZone } {
+  const zone = boostZoneOf(boost, outdoorC, wasZone);
+  const active = zone === "flex" || zone === "hard";
+  return {
+    minLevel: active && boost != null ? boost.minLevel : 1,
+    active,
+    hard: zone === "hard",
+    watchMinLevel: zone !== "none" && boost != null ? boost.minLevel : 1,
+    zone,
+  };
+}
+
+/**
+ * The lowest level any AUTOMATIC path may target for this room right now.
+ *
+ * Normally 1 — the sub-floor rung (invariant 25) exists because being switched
+ * off is worse for the occupant than any level, and that is still true for
+ * every room whose low levels actually cool.
+ *
+ * But a comfort floor whose outdoor condition holds by more than
+ * `BOOST_FLOOR_FLEX_C` is no longer a preference: below it the compressor does
+ * not engage, so "cut a level" and "switch the room off" are the same physical
+ * act with only one of them visible. Above the band the room's automatic ladder
+ * is therefore L3 → L2 → off, and the off is priced as an off (invariants
+ * 36/39), which is what sends it to the coolest room instead.
+ *
+ * ⚠ Manual wins in both directions (invariant 42): `floorOf` already clamps to
+ * `manualTarget`/`manualCap`, so a user who pins L1 under an active boost gets
+ * a hard floor of 1 and the rung back. Declining the floor is the user's to do.
+ */
+export function hardFloorOf(ac: AcView): number {
+  return ac.boostFloorHard ? floorOf(ac) : 1;
 }

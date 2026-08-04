@@ -47,6 +47,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     satisfiedForMs: 0,
     subFloorStalledMs: 0,
     roomTempC: null,
+    boostFloorHard: false,
     unmeteredJumpAmps: 0,
     ...overrides,
     envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 2,
@@ -205,6 +206,42 @@ describe("the sub-floor rung — a comfort floor is not worth a power_off (2026-
   it("never goes to level 0 — that is unrestricted draw, not a reduction", () => {
     const p = plan([boosted({ minLevel: 3, currentLevel: 3 })], 99);
     for (const level of Object.values(p.desiredLevels)) expect(level).toBeGreaterThanOrEqual(1);
+  });
+
+  // R14-hard (user, 2026-08-04 ~17:35, at 47°C outdoor — 8°C past Abdullah's
+  // configured 39): "that should never put it at l1". Live 17:27:18 the reducer
+  // did exactly that to the hottest room, because with the peer already at its
+  // floor it was the only level rung left on the board.
+  describe("…but not past the boost band (R14-hard)", () => {
+    it("does not enumerate L1 at all for a room past its band", () => {
+      const p = plan([boosted({ boostFloorHard: true })], 1.5);
+      expect(p.desiredLevels.hot).toBeUndefined();
+    });
+
+    it("the 17:27:18 input sheds the coolest room instead of parking the hottest at L1", () => {
+      // The live board: hottest room at its L2 floor, the peer already at L1,
+      // fans already trimmed. Pre-R14-hard the only move was hot→L1.
+      const board = [
+        boosted({ boostFloorHard: true }),
+        ac("cool", { currentLevel: 1, fanSpeed: 1, needDelta: 0.3, rankNeedDelta: 0.3 }),
+      ];
+      const p = plan(board, 1.5);
+      expect(p.desiredLevels.hot).toBeUndefined();
+      expect(p.toShed).toEqual(["cool"]);
+    });
+
+    it("keeps the rung for the SAME room inside the band — it might still cool there", () => {
+      // 39–41°C is the flexible zone: the 2026-08-02 rung is alive, and only
+      // the learned hold can revoke it. Narrowed, not deleted.
+      const p = plan([boosted({ boostFloorHard: false })], 1.5);
+      expect(p.desiredLevels.hot).toBe(1);
+      expect(p.toShed).toHaveLength(0);
+    });
+
+    it("a manual pin to L1 keeps the rung even past the band (invariant 42)", () => {
+      const p = plan([boosted({ boostFloorHard: true, manualTarget: 1 })], 1.5);
+      expect(p.desiredLevels.hot).toBe(1);
+    });
   });
 
   it("a plan that already sheds does not ALSO stop the hottest room cooling (2026-08-03)", () => {

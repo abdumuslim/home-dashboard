@@ -41,6 +41,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     satisfiedForMs: DEMOTE_DWELL_MS,
     subFloorStalledMs: 0,
     roomTempC: null,
+    boostFloorHard: false,
     unmeteredJumpAmps: 0,
     ...overrides,
     envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 3,

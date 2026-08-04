@@ -25,7 +25,7 @@ import type { AcView, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { fanTrimSavings, levelCutSavings, modelFor, steadyDraw } from "./costs.js";
-import { ceilCapOf, ceilOf, floorOf, isNonCooling } from "./needs.js";
+import { ceilCapOf, ceilOf, floorOf, hardFloorOf, isNonCooling } from "./needs.js";
 
 export interface ReductionWeights {
   shed: number;
@@ -280,7 +280,22 @@ export function planReduction(input: ReduceInput): ReducePlan {
     // below, where a sub-floor cut is priced as what it physically is.
     //
     // Never level 0: that is UNRESTRICTED draw, not a reduction (hard rule).
-    const HARD_FLOOR = 1;
+    //
+    // …and never below `hardFloorOf` either (R14-hard, user 2026-08-04 at 47°C
+    // outdoor: "that should never put it at l1"). More than BOOST_FLOOR_FLEX_C
+    // above a room's configured boost threshold the compressor does not engage
+    // beneath its floor at all, so a sub-floor cut is not a cheaper rung than a
+    // shed — it IS the shed, minus the shed row, the restore queue and the push.
+    // Live 17:27:18 the reducer took exactly that move on the hottest room
+    // because it was the only level rung left. Above the band the room's
+    // automatic ladder is L3 → L2 → off, and the off is priced as an off
+    // (invariants 36/39), which is what routes it to the coolest room instead.
+    //
+    // Pricing alone was not enough: R9b prices such a cut as an off, and the
+    // live batch still executed it, because the reducer will pay any price when
+    // the alternative is infeasible. A target the search cannot enumerate is
+    // the only form of "never" that holds.
+    const HARD_FLOOR = hardFloorOf(ac);
     for (let level = HARD_FLOOR; level <= upper; level++) {
       const belowFloorSteps = Math.max(0, floor - level);
       const steps = Math.max(0, effFrom - level);

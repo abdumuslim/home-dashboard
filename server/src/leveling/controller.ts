@@ -88,6 +88,7 @@ import {
 } from "./reconciler.js";
 import {
   boostFloor,
+  type BoostZone,
   ceilOf,
   floorOf,
   nearTargetNeedCap,
@@ -439,7 +440,12 @@ export class LevelingControllerV2 {
   private fanDebit = new Map<string, { amps: number; baseline: number | null; absorbed: number; until: number }>();
   /** Turn-on start windows: house amps measured just before this AC came on. */
   private startBaseline = new Map<string, { amps: number; until: number }>();
-  private boostActive = new Map<string, boolean>();
+  /**
+   * Where each boosted room sits on its outdoor gradient (needs.ts
+   * `boostZoneOf`). Kept per room because every boundary is hysteretic and a
+   * stale outdoor reading holds the last zone — both need the previous value.
+   */
+  private boostZone = new Map<string, BoostZone>();
   /** When each room's current uninterrupted satisfied stretch began (demote dwell). */
   private satisfiedSince = new Map<string, number>();
   /** Start of the current below-floor stretch, and the need it has yet to beat. */
@@ -1980,8 +1986,12 @@ export class LevelingControllerV2 {
     const sorted = [...ctx].sort((a, b) => rank(a.device.id) - rank(b.device.id));
     const comfortTargetC = this.config.comfortTargetC;
     return sorted.map(({ device, managed, needDelta, slotGenCap }) => {
-      const boost = boostFloor(this.config.levelBoosts[device.id], outdoorTempC, this.boostActive.get(device.id) ?? false);
-      this.boostActive.set(device.id, boost.active);
+      const boost = boostFloor(
+        this.config.levelBoosts[device.id],
+        outdoorTempC,
+        this.boostZone.get(device.id) ?? "none",
+      );
+      this.boostZone.set(device.id, boost.zone);
       const recon = this.recon[device.id];
       const ramping = (this.rampUntil.get(device.id) ?? 0) > now && device.power;
       // During settle the shadow reflects the pre-command state — use pending.
@@ -2032,9 +2042,16 @@ export class LevelingControllerV2 {
         // Judged on the OBSERVED level against the boost floor — a level we
         // sent but the firmware has not confirmed is not yet a room that is
         // failing to cool.
+        //
+        // Against `watchMinLevel`, not the ACTIVE floor: the watch arms
+        // `BOOST_WATCH_BELOW_C` before the floor does, so a room can be caught
+        // failing at L1 while L1 is still its legitimate floor (user,
+        // 2026-08-04: "starting from 3 degrees below that temp and above").
+        // That is the earliest the evidence exists, and evidence is what the
+        // raise path needs to lift the room before the heat arrives.
         subFloorStalledMs: this.subFloorStalledMs(
           device.id,
-          observed >= 1 && observed < boost.minLevel,
+          observed >= 1 && observed < boost.watchMinLevel,
           needDelta,
           // computeAcNeed's dead-sensor sentinel is delta 1 — see the guard.
           device.currentTemp != null && device.currentTemp > 0,
@@ -2044,6 +2061,7 @@ export class LevelingControllerV2 {
           now,
         ),
         minLevel: boost.minLevel,
+        boostFloorHard: boost.hard,
         manualCap: this.manualCap.get(device.id) ?? null,
         manualTarget: this.manualTarget.get(device.id) ?? null,
         slotCap: slotGenCap,

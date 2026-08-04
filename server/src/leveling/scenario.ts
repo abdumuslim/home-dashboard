@@ -88,6 +88,11 @@ export interface SimAcSetup {
   level?: number;
   fan?: number;
   minLevel?: number;
+  /**
+   * The outdoor temperature is past this room's boost band, so levels below
+   * `minLevel` are not legal automatic targets (needs.ts `hardFloorOf`).
+   */
+  boostFloorHard?: boolean;
   rampSeconds?: number;
   /**
    * Startup transient: during the ramp the draw may exceed the cap by this
@@ -843,6 +848,10 @@ export class Scenario {
         satisfiedForMs: this.satisfiedForMs(ac),
         subFloorStalledMs: this.subFloorStalledMs(ac, observedLevel),
         minLevel: ac.setup.minLevel ?? 1,
+        // Shell parity (R14-hard): above the room's boost band the reducer may
+        // not enumerate a level below its floor at all. The harness has no
+        // weather, so a scenario states the zone directly.
+        boostFloorHard: ac.setup.boostFloorHard ?? false,
         manualCap: null,
         manualTarget: ac.manualTarget,
         slotCap: null,
