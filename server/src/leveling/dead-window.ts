@@ -224,81 +224,109 @@ export function meterIsSteady(view: { latestAmps: number; smoothedAmps: number }
 // (a) never holds.
 // ---------------------------------------------------------------------------
 
-/** The device fields the entry-collapse evidence reads (`AcDevice` satisfies it). */
-export interface DeviceLiveness {
+/** What the entry-collapse evidence needs to know about one room. */
+export interface RoomLiveness {
   /** The folded online decision (`deviceOnline()` — TCL's flag, else shadow freshness). */
   isOnline?: boolean;
-  /** Epoch ms of the last shadow report, null/undefined when unknown. */
+  /** Epoch ms of this room's last shadow report, null/undefined when unknown. */
   lastSeenAt?: number | null;
+  /** Epoch ms we last saw one of our sends CONFIRM on this room's shadow. */
+  lastConfirmAt?: number | null;
+  /** Age of this room's oldest still-unconfirmed send (0 = nothing in flight). */
+  unconfirmedSendAgeMs?: number;
 }
 
 /**
- * How stale a shadow must be, LEVELER-side, to count as a dark room.
+ * A shadow this stale is dark on its own, whatever else is going on.
  *
- * Deliberately shorter than `SHADOW_STALE_MS` (10 min, tcl-cloud.ts): that one
- * drives a UI dot and is generous on purpose ("better a late offline than a
- * flapping one"), and at 10 minutes it cannot see a six-minute dead circuit at
- * all — this morning's breaker was reset before a 10-minute window would have
- * expired.
+ * ⚠ MEASURED, 2026-08-04, twice about a minute apart: last-seen ages of
+ * 248/157/269 s and then 305/214/326 s — none of the three advanced, and two of
+ * the rooms were actively cooling with their compressors running. TCL shadows
+ * report on STATE CHANGE, not on a keepalive, so healthy silence routinely
+ * passes 5.5 minutes. Any passive bar under that calls a working house dead.
  *
- * ⚠ The cadence a healthy TCL module reports at is not recorded anywhere in
- * this repo, so this is the one threshold here NOT derived from a measurement.
- * What makes 5 minutes safe to act on is the conjunction, not the number: every
- * managed running room must be dark AT ONCE, the whole-house gap must say
- * nothing of ours is drawing, and both must hold continuously for
- * `ENTRY_COLLAPSE_DWELL_MS`. Any single room reporting, or any real draw,
- * retires the evidence.
+ * Eight minutes therefore sits above the measured healthy silence with margin,
+ * and it is NOT what the latch normally runs on — the entry-anchored evidence
+ * below is. This exists only so a house that went dark long after a changeover
+ * (where the entry anchor has nothing to say) can still be recognised.
  */
-export const ENTRY_COLLAPSE_STALE_MS = 4 * 60_000;
+export const ENTRY_COLLAPSE_STALE_MS = 8 * 60_000;
 
 /**
- * How long both signals must hold CONTINUOUSLY before the latch arms.
+ * How long a send may sit unconfirmed before it counts as ACTIVE evidence that
+ * nothing is listening.
  *
- * Deliberately SHORT, because darkness already carries four minutes of dwell of
- * its own: the two are cumulative, and the sum is what has to fit inside a real
- * dead window. This morning's was about six minutes from the changeover to the
- * manual reset, and `ENTRY_COLLAPSE_STALE_MS + this` is five — the only budget
- * there was. Its own job is narrower: reject a single tick where a reading
- * arrives mid-batch, so a lone unlucky sample cannot latch a breaker trip.
+ * This is the fingerprint of this morning's trip: gen entry FLOORS-sends every
+ * room above its floor at entry+2 s, and not one of those four sends was ever
+ * confirmed — because the devices could not hear them. A live module confirms
+ * in about a minute or two even while its compressor is held off by restart
+ * protection (the Wi-Fi side never lost power), so two minutes of silence on a
+ * send we actually made is a claim about the DEVICES, not about a cadence.
  *
- * ⚠ Note what CANNOT do this job. `AcDevice.isOnline` is itself computed
- * against `SHADOW_STALE_MS` (10 min), so it cannot flip inside a six-minute
- * dead window at all — it is kept in `deviceIsDark` only to catch the opposite
- * failure (TCL reporting a device offline that this freshness test would still
- * call fresh).
+ * ⚠ Najat's firmware confirms anywhere from 5.8 s to 13 min, which is exactly
+ * why this is "at least ONE room has an old unconfirmed send" and not "every
+ * room confirms promptly". One slow room is normal; nothing at all is not.
+ */
+export const ENTRY_COLLAPSE_UNCONFIRMED_MS = 120_000;
+
+/**
+ * How long the whole evidence set must hold CONTINUOUSLY before the latch arms.
+ *
+ * On top of the two minutes an unconfirmed send already has to age, so the
+ * earliest possible latch is about entry + 3 min — inside the six-minute window
+ * this morning's breaker actually gave us, and far too late to be tripped by a
+ * single unlucky tick.
  */
 export const ENTRY_COLLAPSE_DWELL_MS = 60_000;
 
 /**
- * Is this room's shadow dark? Positive evidence only — an unknown `isOnline`
- * or an unknown `lastSeenAt` is not evidence of anything, and must never latch
- * a collapse.
+ * Has this room shown any sign of life since the current source session began?
  *
- * Two ways to be dark, because they cover each other's blind spot:
- * `isOnline === false` is already the conservative conjunction (`deviceOnline()`
- * only believes TCL's offline flag when the shadow is also stale), and the
- * freshness test catches the opposite failure — TCL still claiming a dead
- * device is online.
+ * Deliberately anchored to the CHANGEOVER rather than to a cadence: "nothing
+ * since entry" is a statement about a known event, where "nothing for N
+ * minutes" is a bet on how often a healthy module talks — and the measurement
+ * above says that bet loses. Either signal counts, because they cover different
+ * rooms: a room the entry policy clamped proves itself by confirming, and a
+ * room already at its floor (nothing was sent to it) can only prove itself by
+ * reporting.
+ *
+ * Positive evidence only. Unknown liveness is not evidence of death.
  */
-export function deviceIsDark(device: DeviceLiveness, now: number): boolean {
-  if (device.isOnline === false) return true;
-  return device.lastSeenAt != null && now - device.lastSeenAt > ENTRY_COLLAPSE_STALE_MS;
+export function roomIsDark(room: RoomLiveness, opts: { sinceEntry: number; now: number }): boolean {
+  if (room.isOnline === false) return true;
+  if (room.lastSeenAt != null && room.lastSeenAt > opts.sinceEntry) return false;
+  if (room.lastConfirmAt != null && room.lastConfirmAt > opts.sinceEntry) return false;
+  // Nothing since entry — or nothing ever. The passive bar is the long stop for
+  // a session whose entry is far behind us.
+  if (room.lastSeenAt != null && opts.now - room.lastSeenAt <= ENTRY_COLLAPSE_STALE_MS) {
+    return opts.sinceEntry > 0 && room.lastSeenAt <= opts.sinceEntry;
+  }
+  return true;
 }
 
 /**
- * Entry-collapse evidence for one tick: the model says we are drawing, the
- * meter says nothing is, and every managed running room has gone dark.
+ * Entry-collapse evidence for one tick. Four things must agree:
+ *   - the model says we are drawing and the meter says nothing is;
+ *   - EVERY managed running room is dark (one flapping module is a cloud
+ *     problem, not a breaker);
+ *   - at least one room has a send we made sitting unconfirmed — the ACTIVE
+ *     anchor, without which "dark" is only an absence of chatter;
+ *   - and there is an entry to anchor "since" to at all.
  *
- * ALL rooms, never one — a single module flapping is a cloud problem, not a
- * breaker. Returns false for an empty set: with nothing running there is no
- * claim to contradict.
+ * A house Wi-Fi or cloud outage cannot fake this: the ACs keep drawing, so the
+ * gap never holds. Restart protection cannot either: the modules keep their
+ * power, confirm the entry clamp, and light up the first condition.
  */
 export function entryCollapseEvidence(opts: {
   gapAmps: number;
-  devices: readonly DeviceLiveness[];
+  rooms: readonly RoomLiveness[];
+  sinceEntry: number;
   now: number;
 }): boolean {
-  if (opts.devices.length === 0) return false;
+  if (opts.rooms.length === 0 || opts.sinceEntry <= 0) return false;
   if (!houseIsDead(opts.gapAmps)) return false;
-  return opts.devices.every((d) => deviceIsDark(d, opts.now));
+  if (!opts.rooms.every((r) => roomIsDark(r, { sinceEntry: opts.sinceEntry, now: opts.now }))) {
+    return false;
+  }
+  return opts.rooms.some((r) => (r.unconfirmedSendAgeMs ?? 0) >= ENTRY_COLLAPSE_UNCONFIRMED_MS);
 }

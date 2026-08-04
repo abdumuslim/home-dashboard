@@ -161,6 +161,8 @@ interface SimAc {
   rampHeldUntil: number;
   /** Compressor restart protection: no draw at all until this moment. */
   compressorIdleUntil: number;
+  /** Shell parity: when this room's run of unanswered sends began (0 = none). */
+  unansweredSince: number;
   /**
    * When this module's shadow last reported. The Wi-Fi module is fed by the AC
    * circuit, so it goes dark exactly when the breaker opens and keeps reporting
@@ -227,6 +229,10 @@ export class Scenario {
   private freshlyOn: string[] = [];
   /** Shell parity: re-arm every running compressor's ramp a tick after a changeover. */
   private armRampOnSourceChange = false;
+  /** Shell parity: when the current source session began (the entry anchor). */
+  private sourceSince = 0;
+  /** Shell parity: when we last saw a send confirm on each room's shadow. */
+  private lastConfirmAt = new Map<string, number>();
   /** Shell parity: entry-collapse dwell / ownership / the recovery window. */
   private entryCollapseSince: number | null = null;
   private entryCollapseLatched = false;
@@ -288,6 +294,7 @@ export class Scenario {
       powerEventRamp: false,
       rampHeldUntil: 0,
       compressorIdleUntil: 0,
+      unansweredSince: 0,
       lastSeenAt: 0,
       drawingUntil: 0,
       jumpDebit: null,
@@ -436,6 +443,14 @@ export class Scenario {
     // snapshot the OLD line's meter as the baseline, and absorption measured
     // from that can never ratchet.
     if (line === "gen" || line === "grid") this.armRampOnSourceChange = true;
+    // Shell parity: the anchor every "since entry" liveness test measures from.
+    // Stamped for the tick that will ingest the first reading on the new line.
+    this.sourceSince = this.now + STEP_MS;
+    this.lastConfirmAt.clear();
+    for (const ac of this.acs) ac.unansweredSince = 0;
+    this.entryCollapseSince = null;
+    this.entryCollapseLatched = false;
+    this.recoveryAdmissionUntil = 0;
   }
 
   /** Breaker trips: the AC circuits go dead, a small residual stays on the line. */
@@ -734,7 +749,12 @@ export class Scenario {
     });
     const evidence = entryCollapseEvidence({
       gapAmps,
-      devices: running.map((a) => ({ lastSeenAt: a.lastSeenAt })),
+      rooms: running.map((a) => ({
+        lastSeenAt: a.lastSeenAt,
+        lastConfirmAt: this.lastConfirmAt.get(a.setup.deviceId) ?? null,
+        unconfirmedSendAgeMs: a.unansweredSince > 0 ? this.now - a.unansweredSince : 0,
+      })),
+      sinceEntry: this.sourceSince,
       now: this.now,
     });
     if (!evidence) {
@@ -780,8 +800,14 @@ export class Scenario {
     return sorted.map((ac) => {
       // Shadow lags firmware by confirmDelayMs.
       const observedLevel = this.observedLevelOf(ac);
-      // Any confirm clears every unconfirmed send (reconciler parity).
-      if (ac.sentLevels.includes(observedLevel)) ac.sentLevels = [];
+      // Any confirm clears every unconfirmed send (reconciler parity) — and a
+      // shadow that MOVED is a device that is listening (shell parity: the
+      // active half of the entry-collapse liveness test).
+      if (ac.sentLevels.includes(observedLevel)) {
+        ac.sentLevels = [];
+        ac.unansweredSince = 0;
+        this.lastConfirmAt.set(ac.setup.deviceId, this.now);
+      }
       this.trackSatisfied(ac);
       return {
         deviceId: ac.setup.deviceId,
@@ -866,6 +892,7 @@ export class Scenario {
           // assume the device is where the shadow says).
           ac.sentLevels.push(cmd.level);
           ac.lastLevelSentAt = this.now;
+          if (ac.unansweredSince === 0) ac.unansweredSince = this.now;
           if (this.line === "gen" && cmd.level > ac.shadowLevel && ac.shadowLevel >= 1) {
             const view = meterView(this.meterState, this.now);
             ac.jumpDebit = {
@@ -877,7 +904,11 @@ export class Scenario {
           } else {
             ac.jumpDebit = null;
           }
-          if (!(ac.setup.ignoreLevels ?? []).includes(cmd.level)) {
+          // A dead circuit hears nothing. The send still happened — the
+          // envelope must charge for it, and the unanswered clock must run —
+          // but the firmware is not there to apply it. This morning's four
+          // FLOORS resends were exactly this.
+          if (!this.lineDead && !(ac.setup.ignoreLevels ?? []).includes(cmd.level)) {
             ac.shadowLevel = ac.level; // shadow keeps the OLD level until confirm lag passes
             ac.level = cmd.level;
             ac.shadowLevelAt = this.now;

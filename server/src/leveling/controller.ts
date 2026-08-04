@@ -61,6 +61,7 @@ import {
 import {
   ENTRY_COLLAPSE_DWELL_MS,
   entryCollapseEvidence,
+  type RoomLiveness,
   houseIsDead,
   meterIsSteady,
   modeledGapAmps,
@@ -398,6 +399,26 @@ export class LevelingControllerV2 {
   private entryCollapseSince: number | null = null;
   private entryCollapseLatched = false;
   private recoveryAdmissionUntil = 0;
+  /**
+   * When the CURRENT source session began. The entry-collapse evidence is
+   * anchored to this rather than to a shadow-report cadence: TCL modules report
+   * on state change, not on a keepalive, so a healthy quiet room can sit silent
+   * for 5.5 minutes and longer (measured 2026-08-04). "Nothing since the
+   * changeover" is a statement about a known event; "nothing for N minutes" is
+   * a bet on chatter that a working house loses. 0 = no anchor, no claim.
+   */
+  private sourceSince = 0;
+  /** When we last saw one of our sends CONFIRM on each room's shadow. */
+  private lastConfirmAt = new Map<string, number>();
+  /**
+   * When each room's current run of UNANSWERED sends began (cleared on any
+   * confirm). Deliberately not the reconciler's per-level `sentAt`: that is a
+   * resend-spacing clock, refreshed every `LEVEL_RESEND_SPACING_MS` by the
+   * FLOORS re-assertion, so it can never age past 30 s however dead the device
+   * is. This one measures what the entry-collapse evidence actually asks —
+   * how long we have been talking to something that is not answering.
+   */
+  private unansweredSince = new Map<string, number>();
   /**
    * Level-RAISE commitments the meter has not shown yet, per device: the priced
    * jump, the house load when it was sent, and the peak rise since. Same shape
@@ -749,6 +770,10 @@ export class LevelingControllerV2 {
           this.entryCollapseSince = null;
           this.entryCollapseLatched = false;
           this.recoveryAdmissionUntil = 0;
+          // The anchor every "since entry" test is measured against.
+          this.sourceSince = now;
+          this.lastConfirmAt.clear();
+          this.unansweredSince.clear();
           // Both cooldowns are per-line physics — a wind-down on the source we
           // just left says nothing about this one, and holding them across a
           // changeover strands a room through the entry window that is supposed
@@ -1279,10 +1304,23 @@ export class LevelingControllerV2 {
       source,
       commandedCutCreditAmps: view.commandedCutCreditAmps,
     });
-    const devices = ctx
+    const rooms: RoomLiveness[] = ctx
       .filter((c) => c.managed && c.device.power && !this.shedIds.has(c.device.id))
-      .map((c) => c.device);
-    const evidence = entryCollapseEvidence({ gapAmps, devices, now });
+      .map((c) => {
+        const unanswered = this.unansweredSince.get(c.device.id);
+        return {
+          isOnline: c.device.isOnline,
+          lastSeenAt: c.device.lastSeenAt,
+          lastConfirmAt: this.lastConfirmAt.get(c.device.id) ?? null,
+          unconfirmedSendAgeMs: unanswered == null ? 0 : now - unanswered,
+        };
+      });
+    const evidence = entryCollapseEvidence({
+      gapAmps,
+      rooms,
+      sinceEntry: this.sourceSince,
+      now,
+    });
     if (!evidence) {
       this.entryCollapseSince = null;
       if (this.entryCollapseLatched) {
@@ -1583,12 +1621,27 @@ export class LevelingControllerV2 {
     // Drift reconciliation per ON managed device.
     for (const { device, managed } of ctx) {
       if (!device.power || !managed) continue;
+      // A shadow that came back at a level WE sent is a device that heard us —
+      // the active half of the entry-collapse liveness test (dead-window.ts).
+      // Deliberately not "confirmedLevel changed": the TCL shadow is PERSISTED,
+      // so a dead room still serves its last known level to the poller and
+      // adopting that would read as life. Only a send we made, coming back, is
+      // evidence that anything is listening.
+      const answeredSend = unconfirmedLevels(this.recon, device.id, now).includes(device.generatorMode);
       const { state: recon2, result } = observeLevel(this.recon, device.id, device.generatorMode, {
         inSettle,
         collapsed: view.collapsed,
         maxLevel: device.maxGeneratorLevel || 3,
       });
       this.recon = recon2;
+      // A shadow that MOVED is a device that is listening — the active half of
+      // the entry-collapse liveness test (dead-window.ts). A room already at its
+      // floor is never sent anything and so can only prove itself by reporting;
+      // a room the entry policy clamped proves itself here.
+      if (answeredSend || result.kind === "late_confirm") {
+        this.lastConfirmAt.set(device.id, now);
+        this.unansweredSince.delete(device.id);
+      }
       if (result.kind === "manual" && this.acts()) {
         // Shadow mode never mints intents (v1's own commands would read as manual).
         if (result.intent === "cap") {
@@ -2116,6 +2169,9 @@ export class LevelingControllerV2 {
             await tcl.sendControl(cmd.deviceId, "set_generator_mode", cmd.level);
             const noted = noteLevelSend(this.recon, cmd.deviceId, cmd.level, now);
             this.recon = noted.state;
+            // First send of a run nobody has answered yet — the clock the
+            // entry-collapse evidence reads (see `unansweredSince`).
+            if (!this.unansweredSince.has(cmd.deviceId)) this.unansweredSince.set(cmd.deviceId, now);
             this.armJumpDebit(cmd.deviceId, cmd.level, view, now);
             if (noted.marked) {
               log.warn(`[leveler2] ${name}: firmware never confirmed L${cmd.level} after ${4} sends — marked unreachable, falling back to L${noted.fallback}`);

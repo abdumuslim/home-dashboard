@@ -1209,8 +1209,10 @@ describe("LevelingControllerV2 — a session that begins with a dead circuit", (
     });
     const pushes: string[] = [];
     const sent: Array<{ deviceId: string; value: number }> = [];
+    // At L3, as they are after a grid session — so the gen entry actually has
+    // floors to clamp, which is what puts a send on the wire to go unanswered.
     const devices = ["abdullah", "najat", "abdu"].map(
-      (id) => ({ ...(acDevice(id, true, 1) as object), isOnline: true, lastSeenAt: Date.now() }) as unknown as LiveDevice,
+      (id) => ({ ...(acDevice(id, true, 3) as object), isOnline: true, lastSeenAt: Date.now() }) as unknown as LiveDevice,
     );
     const deps: LevelingDeps = {
       ...createDeps(),
@@ -1250,7 +1252,15 @@ describe("LevelingControllerV2 — a session that begins with a dead circuit", (
     return { mock, controller, devices, pushes, sent, run };
   }
 
-  /** Past ENTRY_COLLAPSE_STALE_MS (4 min) + ENTRY_COLLAPSE_DWELL_MS (60s). */
+  /**
+   * The modules ride the AC circuit, so the breaker opening is the last anyone
+   * hears from them — well before the changeover the leveler anchors "since
+   * entry" to.
+   */
+  const goDark = (devices: LiveDevice[]) => {
+    for (const d of devices) d.lastSeenAt = Date.now() - 60_000;
+  };
+  /** Past ENTRY_COLLAPSE_UNCONFIRMED_MS (2 min) + ENTRY_COLLAPSE_DWELL_MS (60s). */
   const DEAD_STEPS = 72; // 360s
 
   it("latches the collapse, derates the line, and says so out loud", async () => {
@@ -1276,8 +1286,14 @@ describe("LevelingControllerV2 — a session that begins with a dead circuit", (
       expect(
         mock.journal.slice(before).some((r) => r.reason === "collapse_on_entry"),
       ).toBe(true);
-      // Nothing is commanded into a dead line.
-      expect(sent).toHaveLength(0);
+      // Everything that DID go out before we knew was the gen-entry floor clamp
+      // — a source-entry batch, which must keep shipping while the evidence is
+      // still only suspicion. Nothing ever climbed.
+      expect(sent.filter((c) => c.value !== 1)).toHaveLength(0);
+      // …and once latched, the line gets nothing at all.
+      const atLatch = sent.length;
+      await run(5.0, 24, "gen", true);
+      expect(sent.length).toBe(atLatch);
     } finally {
       vi.useRealTimers();
     }
@@ -1341,10 +1357,11 @@ describe("LevelingControllerV2 — a session that begins with a dead circuit", (
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-08-04T08:10:00Z"));
-      const { controller, sent, run } = setup();
+      const { controller, devices, sent, run } = setup();
       await controller.ensureLoaded();
 
       await run(13.0, 40, "grid");
+      goDark(devices);
       await run(5.0, DEAD_STEPS, "gen", true);
       expect(controller.getStatus().mode).toBe("COLLAPSED");
       sent.length = 0;

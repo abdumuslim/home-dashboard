@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
   DEAD_WINDOW_GAP_AMPS,
-  deviceIsDark,
   ENTRY_COLLAPSE_DWELL_MS,
   ENTRY_COLLAPSE_STALE_MS,
+  ENTRY_COLLAPSE_UNCONFIRMED_MS,
   entryCollapseEvidence,
+  roomIsDark,
+  type RoomLiveness,
   houseIsDead,
   meterIsSteady,
   modeledGapAmps,
@@ -141,48 +143,80 @@ describe("whole-house dead-window evidence", () => {
 // ---------------------------------------------------------------------------
 
 describe("entry-collapse evidence", () => {
-  const dark = { lastSeenAt: T - ENTRY_COLLAPSE_STALE_MS - 1_000 };
-  const fresh = { lastSeenAt: T - 30_000 };
+  const ENTRY = T - 10 * 60_000;
+  /** A room that has neither reported nor confirmed since the changeover. */
+  const dark = (extra: Partial<Parameters<typeof roomIsDark>[0]> = {}) => ({
+    lastSeenAt: ENTRY - 60_000,
+    lastConfirmAt: null,
+    unconfirmedSendAgeMs: 0,
+    ...extra,
+  });
+  /** …and one that has. */
+  const alive = (extra = {}) => ({ lastSeenAt: ENTRY + 30_000, ...extra });
+  /** The FLOORS send nothing ever confirmed — the active anchor. */
+  const stranded = dark({ unconfirmedSendAgeMs: ENTRY_COLLAPSE_UNCONFIRMED_MS });
   /** 6.1A metered against the 11.4A floor set — the live 11:18 reading. */
   const deadGap = modeledGapAmps({ smoothedAmps: 6.1, acs: floored(), config: cfg, source: "gen" });
+  const evidence = (rooms: RoomLiveness[], gapAmps = deadGap) =>
+    entryCollapseEvidence({ gapAmps, rooms, sinceEntry: ENTRY, now: T });
 
-  it("latches when the model says we draw, the meter says nothing does, and every room is dark", () => {
-    expect(entryCollapseEvidence({ gapAmps: deadGap, devices: [dark, dark, dark], now: T })).toBe(true);
+  it("latches on this morning's fingerprint: nothing drawing, nothing listening", () => {
+    expect(evidence([stranded, dark(), dark()])).toBe(true);
   });
 
-  it("ONE room still reporting is a cloud problem, not a breaker", () => {
-    expect(entryCollapseEvidence({ gapAmps: deadGap, devices: [dark, dark, fresh], now: T })).toBe(false);
+  it("ONE room reporting since the changeover is a cloud problem, not a breaker", () => {
+    expect(evidence([stranded, dark(), alive()])).toBe(false);
   });
 
-  it("restart protection does not latch — the modules stay powered and keep reporting", () => {
-    // The whole point of signal (b): a compressor that has not started looks
-    // exactly like a dead circuit on the meter. The shadows are what differ.
-    expect(entryCollapseEvidence({ gapAmps: deadGap, devices: [fresh, fresh, fresh], now: T })).toBe(false);
+  it("a room that CONFIRMED our entry clamp is alive, whatever its report cadence", () => {
+    // The load-bearing case for a healthy changeover: restart protection holds
+    // the compressor off but never touches the Wi-Fi module, so the clamp comes
+    // back confirmed while the amp gap still looks dead.
+    expect(evidence([stranded, dark(), dark({ lastConfirmAt: ENTRY + 45_000 })])).toBe(false);
+  });
+
+  it("silence alone never latches — a send of ours has to be going unanswered", () => {
+    // Without the active anchor this is just "nobody has spoken", which a
+    // healthy quiet house does for 5.5+ minutes at a time (measured 2026-08-04).
+    expect(evidence([dark(), dark(), dark()])).toBe(false);
+    // …and a send that is still young does not count either.
+    expect(evidence([dark({ unconfirmedSendAgeMs: ENTRY_COLLAPSE_UNCONFIRMED_MS - 1 }), dark(), dark()])).toBe(
+      false,
+    );
   });
 
   it("a house Wi-Fi outage cannot fake it — the ACs keep drawing, so the gap never holds", () => {
     const drawing = modeledGapAmps({ smoothedAmps: 13.9, acs: floored(), config: cfg, source: "gen" });
-    expect(entryCollapseEvidence({ gapAmps: drawing, devices: [dark, dark, dark], now: T })).toBe(false);
+    expect(evidence([stranded, dark(), dark()], drawing)).toBe(false);
   });
 
-  it("with nothing running there is no claim to contradict", () => {
-    expect(entryCollapseEvidence({ gapAmps: deadGap, devices: [], now: T })).toBe(false);
+  it("with nothing running, or no entry to measure from, there is no claim", () => {
+    expect(evidence([])).toBe(false);
+    expect(
+      entryCollapseEvidence({ gapAmps: deadGap, rooms: [stranded, dark()], sinceEntry: 0, now: T }),
+    ).toBe(false);
   });
 
   it("darkness is POSITIVE evidence only — unknown liveness never latches", () => {
-    // Every test fixture and every pre-liveness code path leaves these unset.
-    expect(deviceIsDark({}, T)).toBe(false);
-    expect(deviceIsDark({ lastSeenAt: null }, T)).toBe(false);
-    // …and either signal alone is enough once it IS known.
-    expect(deviceIsDark({ isOnline: false }, T)).toBe(true);
-    expect(deviceIsDark({ isOnline: true, lastSeenAt: T - ENTRY_COLLAPSE_STALE_MS - 1 }, T)).toBe(true);
-    expect(deviceIsDark({ isOnline: true, lastSeenAt: T - 60_000 }, T)).toBe(false);
+    // Every pre-liveness fixture and code path leaves these unset. An unknown
+    // room must not be assumed dead…
+    expect(roomIsDark({ lastSeenAt: null }, { sinceEntry: ENTRY, now: T })).toBe(true);
+    expect(roomIsDark({ lastSeenAt: ENTRY + 1 }, { sinceEntry: ENTRY, now: T })).toBe(false);
+    // …but TCL saying so outright is evidence on its own.
+    expect(roomIsDark({ isOnline: false, lastSeenAt: T }, { sinceEntry: ENTRY, now: T })).toBe(true);
   });
 
-  it("staleness plus dwell has to fit inside a real dead window", () => {
-    // This morning's was ~6 minutes from changeover to manual reset, and the
-    // two clocks are cumulative: darkness accrues from the last report, and
-    // only then can the evidence start its dwell.
-    expect(ENTRY_COLLAPSE_STALE_MS + ENTRY_COLLAPSE_DWELL_MS).toBeLessThan(6 * 60_000);
+  it("the passive bar sits ABOVE measured healthy silence", () => {
+    // 2026-08-04, two samples a minute apart: 248/157/269 s then 305/214/326 s,
+    // none advancing, two rooms actively cooling. A bar under that calls a
+    // working house dead — which is why the latch runs on the entry anchor and
+    // this is only the long stop.
+    expect(ENTRY_COLLAPSE_STALE_MS).toBeGreaterThan(5.5 * 60_000);
+  });
+
+  it("the earliest possible latch still fits inside a real dead window", () => {
+    // This morning's was ~6 minutes from changeover to manual reset; the send
+    // anchor must age, then the evidence must dwell.
+    expect(ENTRY_COLLAPSE_UNCONFIRMED_MS + ENTRY_COLLAPSE_DWELL_MS).toBeLessThan(6 * 60_000);
   });
 });
