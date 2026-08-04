@@ -330,6 +330,12 @@ export function boostFloor(
  * is therefore L3 → L2 → off, and the off is priced as an off (invariants
  * 36/39), which is what sends it to the coolest room instead.
  *
+ * `AcView.boostFloorHard` carries EITHER source of that hardness — the
+ * configured band, or a live LEARNED hold (level-hold.ts) recorded against the
+ * outdoor temperature at which this house watched the level fail. The second
+ * exists because the first is the user's estimate of where the compressor
+ * starts to fail, and the compressor is the authority on that.
+ *
  * ⚠ Manual wins in both directions (invariant 42): `floorOf` already clamps to
  * `manualTarget`/`manualCap`, so a user who pins L1 under an active boost gets
  * a hard floor of 1 and the rung back. Declining the floor is the user's to do.

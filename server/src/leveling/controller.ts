@@ -93,9 +93,19 @@ import {
   floorOf,
   nearTargetNeedCap,
   nextSubFloorWatch,
+  SUBFLOOR_WATCH_MS,
   type SubFloorWatch,
   worstCaseLevel,
 } from "./needs.js";
+import {
+  LEVEL_HOLD_TTL_MS,
+  levelHoldDetail,
+  levelHoldExpiresAt,
+  levelHoldFloor,
+  levelHoldLive,
+  recordLevelHold,
+  type LevelHold,
+} from "./level-hold.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
 import { fanTrimSavings, modelCutAmps, raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, turnOnAmps, updateCost, type CostBook } from "./costs.js";
 import { LevelingStore } from "./store.js";
@@ -166,6 +176,18 @@ const SHED_RESEND_SPACING_MS = 30_000;
  * back rather than being stranded.
  */
 const FUNDING_COOLDOWN_MS = 120_000;
+/**
+ * How old the outdoor reading may be and still key a learned non-cooling hold
+ * (level-hold.ts).
+ *
+ * Largest single increment that can consume it (hard rule 5c): the swing of a
+ * Baghdad afternoon over ten minutes, which is a fraction of a degree — well
+ * inside `LEVEL_HOLD_RELEASE_C`. Compared against nothing but the clock. It is
+ * the same freshness contract `levelBoosts` already works to, restated here
+ * because the manual-raise trigger arrives on an HTTP request with no weather
+ * in hand and has to reach for the last tick's value.
+ */
+const OUTDOOR_FRESH_MS = 10 * 60_000;
 /**
  * How long a room the reducer just cut must wait before it may climb back.
  *
@@ -446,6 +468,13 @@ export class LevelingControllerV2 {
    * stale outdoor reading holds the last zone — both need the previous value.
    */
   private boostZone = new Map<string, BoostZone>();
+  /**
+   * The LEARNED non-cooling hold per room (level-hold.ts): what this house has
+   * observed about a level, against the outdoor temperature it observed it at.
+   * Write-through to `ac_leveling_level_hold` — the whole point of a 6-hour
+   * hold is that it survives the deploy that happens inside those six hours.
+   */
+  private levelHolds = new Map<string, LevelHold>();
   /** When each room's current uninterrupted satisfied stretch began (demote dwell). */
   private satisfiedSince = new Map<string, number>();
   /** Start of the current below-floor stretch, and the need it has yet to beat. */
@@ -480,6 +509,15 @@ export class LevelingControllerV2 {
   private lastPruneAt = 0;
   /** First tick timestamp — house sampling holds off until inputs are warm. */
   private firstTickAt: number | null = null;
+  /**
+   * The outdoor temperature the last tick was handed (the same ≤10-min-fresh
+   * feed `levelBoosts` reads), and when. Kept because the learned non-cooling
+   * hold can be armed from a USER action — a manual raise off L1 — which
+   * arrives on its own HTTP request with no weather in hand, and a hold with no
+   * `T_obs` is a six-hour ban rather than a temperature bar.
+   */
+  private lastOutdoorC: number | null = null;
+  private lastOutdoorAt = 0;
   private lastConfigReloadAt = 0;
   /** Controller flavor at the last reload — detects a live flip to acting v2. */
   private prevFlavor: ControllerFlavor | null = null;
@@ -508,7 +546,7 @@ export class LevelingControllerV2 {
    * and again when this instance becomes the acting controller (v1 may have
    * written these rows while it was acting and we only snapshot them once).
    */
-  private async loadPersistedState(): Promise<{ sheds: number; holds: number; remembered: number }> {
+  private async loadPersistedState(): Promise<{ sheds: number; holds: number; remembered: number; levelHolds: number }> {
     const shedRes = await this.pool.query("SELECT device_id, shed_at FROM ac_leveling_shed");
     this.shedIds = new Set<string>();
     this.shedTimes = new Map<string, number>();
@@ -533,7 +571,18 @@ export class LevelingControllerV2 {
     this.rememberedLevel = new Map<string, number>();
     const remRes = await this.pool.query("SELECT device_id, level FROM ac_leveling_remembered_level");
     for (const row of remRes?.rows ?? []) this.rememberedLevel.set(row.device_id, Number(row.level));
-    return { sheds: this.shedIds.size, holds: Object.keys(this.fanHolds).length, remembered: this.rememberedLevel.size };
+    // The learned non-cooling holds. A deploy is exactly the event a 6-hour TTL
+    // must not care about — the heat that produced the observation outlives our
+    // release cadence by hours (2026-08-04).
+    this.levelHolds = new Map<string, LevelHold>(
+      Object.entries(await this.store.loadLevelHolds().catch(() => ({}))),
+    );
+    return {
+      sheds: this.shedIds.size,
+      holds: Object.keys(this.fanHolds).length,
+      remembered: this.rememberedLevel.size,
+      levelHolds: this.levelHolds.size,
+    };
   }
 
   /**
@@ -563,7 +612,8 @@ export class LevelingControllerV2 {
       const counts = await this.loadPersistedState();
       this.book = await this.store.loadCosts();
       log.info(
-        `[leveler2] Became acting controller — resynced ${counts.sheds} shed(s), ${counts.holds} fan hold(s), ${counts.remembered} remembered level(s)`,
+        `[leveler2] Became acting controller — resynced ${counts.sheds} shed(s), ${counts.holds} fan hold(s), ` +
+          `${counts.remembered} remembered level(s), ${counts.levelHolds} learned level hold(s)`,
       );
     }
     this.prevFlavor = this.config.controller;
@@ -1051,6 +1101,20 @@ export class LevelingControllerV2 {
       log.info(`[leveler2] Manual gen reduction on ${deviceId} → cap L${target}`);
       return { reverted: false, level: target };
     }
+    // R14's second trigger, and the more authoritative of the two: a hand raise
+    // OFF L1 is the user telling us L1 was not working (2026-08-04, "by own
+    // observation or manual raise"). No watch clock has to run out first — he
+    // is in the room.
+    //
+    // Recorded BEFORE the breaker check on purpose. Whether we can AFFORD the
+    // level he asked for has nothing to do with whether the level he is leaving
+    // cools his room; a reverted raise leaves that room at L1 and not cooling,
+    // which is precisely the state the hold exists to stop the ladder choosing
+    // on its own. The pin itself wins for as long as it stands (invariant 42) —
+    // the hold is what survives him clearing it.
+    if (confirmed === 1 && target > 1) {
+      await this.noteLevelHold(deviceId, 1, this.freshOutdoorC(now), now, "user raised the room off L1 by hand");
+    }
     // Increment: hard pin unless the METER says it would breach the breaker.
     const view = meterView(this.meterState, now);
     const source = view.source;
@@ -1519,6 +1583,10 @@ export class LevelingControllerV2 {
     const tcl = this.deps.getTclCloud();
     if (tcl == null) return;
     const now = Date.now();
+    if (outdoorTempC != null) {
+      this.lastOutdoorC = outdoorTempC;
+      this.lastOutdoorAt = now;
+    }
 
     // Structural changes: power flips.
     this.freshlyOn = [];
@@ -1649,6 +1717,7 @@ export class LevelingControllerV2 {
       // adopting that would read as life. Only a send we made, coming back, is
       // evidence that anything is listening.
       const answeredSend = unconfirmedLevels(this.recon, device.id, now).includes(device.generatorMode);
+      const wasConfirmedAt = this.recon[device.id]?.confirmedLevel ?? null;
       const { state: recon2, result } = observeLevel(this.recon, device.id, device.generatorMode, {
         inSettle,
         collapsed: view.collapsed,
@@ -1673,6 +1742,12 @@ export class LevelingControllerV2 {
           this.manualTarget.set(device.id, result.level);
           this.manualCap.delete(device.id);
           log.info(`[leveler2] ${device.name}: external gen increment observed → target L${result.level}`);
+          // Same evidence as a dashboard raise, arriving by remote or by the
+          // vendor app instead (R14): somebody in the room decided L1 was not
+          // doing anything. The hold outlives the pin.
+          if (wasConfirmedAt === 1 && result.level > 1) {
+            await this.noteLevelHold(device.id, 1, outdoorTempC, now, "raised off L1 externally");
+          }
         }
       } else if (result.kind === "late_confirm") {
         log.info(`[leveler2] ${device.name}: L${result.level} confirmed late — unreachable mark cleared`);
@@ -1738,8 +1813,19 @@ export class LevelingControllerV2 {
     // collapse, latched here because the readings alone cannot see it.
     await this.assessEntryCollapse(ctx, view, now);
 
+    // Retire any learned non-cooling hold the weather or the clock has released,
+    // BEFORE the views read them — a hold that no longer binds must not govern
+    // even one evaluation (R14, level-hold.ts).
+    if (this.acts()) await this.sweepLevelHolds(outdoorTempC, now);
+
     // Build views.
     const acs = this.buildViews(ctx, outdoorTempC, now);
+    // …and arm a hold from our OWN evidence, now that the watch clocks for this
+    // tick exist. Deliberately AFTER the views: the hold changes the floor, and
+    // a floor that moves mid-evaluation would price this tick's plan against
+    // one picture and execute it against another. It takes effect next tick,
+    // which is the same lag every other observation in this shell carries.
+    if (this.acts()) await this.noteLevelHoldEvidence(acs, outdoorTempC, now);
     const onManaged = acs.filter((a) => a.on && a.managed && !a.shed);
     this.modeState = clearFloorsIfDone(this.modeState, {
       allConfirmedAtFloor: onManaged.every((a) => a.currentLevel > 0 && a.currentLevel <= floorOf(a)),
@@ -1967,6 +2053,102 @@ export class LevelingControllerV2 {
     return r.stalledMs;
   }
 
+  /**
+   * The last outdoor reading, if it is still fresh enough to key a hold on.
+   * Same ≤10-min contract `levelBoosts` works to; an older one is not a
+   * statement about the weather the compressor is failing in.
+   */
+  private freshOutdoorC(now: number): number | null {
+    return this.lastOutdoorC != null && now - this.lastOutdoorAt <= OUTDOOR_FRESH_MS
+      ? this.lastOutdoorC
+      : null;
+  }
+
+  /**
+   * Record (or renew) the learned non-cooling hold for a room — R14, the user's
+   * own rule, 2026-08-04: "when the system observe that abdullah is not working
+   * on l1 (by own observation or manual raise), it should state the outside
+   * temp, so it will never reduce the level to l1 untill it drop below that
+   * temp or after [6] h".
+   *
+   * `outdoorC` is the same ≤10-min-fresh feed `levelBoosts` reads. Without a
+   * reading there is no `T_obs` to key the hold on, and a hold with no
+   * temperature bar is just a six-hour ban — so we decline to record and say so.
+   * The evidence recurs every tick the room keeps failing, so nothing is lost
+   * but the ticks the station was down for.
+   */
+  private async noteLevelHold(
+    deviceId: string,
+    level: number,
+    outdoorC: number | null,
+    now: number,
+    why: string,
+  ): Promise<void> {
+    const name = this.deviceNames.get(deviceId) ?? deviceId;
+    if (outdoorC == null) {
+      log.info(`[leveler2] ${name}: L${level} looks non-cooling (${why}) but the outdoor feed is stale — no hold recorded`);
+      return;
+    }
+    const prev = this.levelHolds.get(deviceId) ?? null;
+    const next = recordLevelHold(prev, { level, outdoorC, observedAt: now });
+    const unchanged =
+      prev != null && prev.level === next.level && prev.outdoorC === next.outdoorC && prev.observedAt === next.observedAt;
+    if (unchanged) return;
+    this.levelHolds.set(deviceId, next);
+    await this.store.upsertLevelHold(deviceId, next).catch((err) => {
+      log.warn(`[leveler2] level hold persist failed for ${name}: ${String(err)}`);
+    });
+    if (prev == null || prev.outdoorC !== next.outdoorC) {
+      log.warn(`[leveler2] ${name}: ${levelHoldDetail(next)} (${why})`);
+    }
+  }
+
+  /**
+   * Retire holds the weather or the clock has released. Runs each tick, before
+   * the views are built, so a released hold never governs the ladder for even
+   * one evaluation — and the DB row goes with it, because a stale row loaded
+   * after a restart would resurrect a hold the weather already answered.
+   */
+  private async sweepLevelHolds(outdoorTempC: number | null, now: number): Promise<void> {
+    for (const [deviceId, hold] of [...this.levelHolds]) {
+      if (levelHoldLive(hold, outdoorTempC, now)) continue;
+      this.levelHolds.delete(deviceId);
+      await this.store.deleteLevelHold(deviceId).catch(() => undefined);
+      log.info(
+        `[leveler2] ${this.deviceNames.get(deviceId) ?? deviceId}: learned L${hold.level} hold released ` +
+          (now >= levelHoldExpiresAt(hold)
+            ? `(${(LEVEL_HOLD_TTL_MS / 3_600_000).toFixed(0)}h since the observation)`
+            : `(outdoor ${outdoorTempC?.toFixed(1) ?? "?"}°C is back under ${hold.outdoorC.toFixed(1)}°C)`),
+      );
+    }
+  }
+
+  /**
+   * Arm the learned hold from the system's OWN evidence: a room sitting at a
+   * level with the sub-floor watch already stalled there (`SUBFLOOR_WATCH_MS` of
+   * no cooling progress — needs.ts). The watch arms `BOOST_WATCH_BELOW_C`
+   * before the comfort floor does, which is precisely the window in which this
+   * evidence can be gathered BEFORE the heat that makes it matter.
+   *
+   * Scoped to L1, which is the only level either of the user's triggers names:
+   * the hold's whole job is to stop the ladder ending at a level that draws a
+   * fan and cools nothing, and L1 is the level his ACs do that at.
+   */
+  private async noteLevelHoldEvidence(acs: AcView[], outdoorTempC: number | null, now: number): Promise<void> {
+    for (const ac of acs) {
+      if (!ac.on || !ac.managed || ac.shed) continue;
+      if (ac.currentLevel !== 1) continue;
+      if (ac.subFloorStalledMs < SUBFLOOR_WATCH_MS) continue;
+      await this.noteLevelHold(
+        ac.deviceId,
+        1,
+        outdoorTempC,
+        now,
+        `no cooling progress in ${Math.round(ac.subFloorStalledMs / 60_000)} min at L1`,
+      );
+    }
+  }
+
   /** Live turn-on start baseline for a device, or null once the window closed. */
   private startBaselineFor(deviceId: string, on: boolean, now: number): number | null {
     const open = this.startBaseline.get(deviceId);
@@ -1992,6 +2174,19 @@ export class LevelingControllerV2 {
         this.boostZone.get(device.id) ?? "none",
       );
       this.boostZone.set(device.id, boost.zone);
+      // R14 LEARNED hold. What the CONFIG says (boost) and what this house has
+      // OBSERVED (hold) are independent statements about the same room, so the
+      // stricter one governs — `max`, never a replacement. The hold extends the
+      // configured floor's hardness BELOW its threshold on evidence: the user
+      // picked 39°C for a compressor whose real failure point moves, and a room
+      // that demonstrably will not cool at L1 at 36°C must not be sent there at
+      // 36°C just because the configured band has not armed yet.
+      //
+      // ⚠ Manual still wins in BOTH directions (invariant 42): `floorOf` clamps
+      // to `manualTarget`/`manualCap`, so a user who pins L1 under a live hold
+      // gets L1 and the sub-floor rung back. Declining is his to do.
+      const maxLevel = device.maxGeneratorLevel || 3;
+      const holdFloor = levelHoldFloor(this.levelHolds.get(device.id) ?? null, outdoorTempC, now, maxLevel);
       const recon = this.recon[device.id];
       const ramping = (this.rampUntil.get(device.id) ?? 0) > now && device.power;
       // During settle the shadow reflects the pre-command state — use pending.
@@ -2049,9 +2244,14 @@ export class LevelingControllerV2 {
         // 2026-08-04: "starting from 3 degrees below that temp and above").
         // That is the earliest the evidence exists, and evidence is what the
         // raise path needs to lift the room before the heat arrives.
+        //
+        // The learned hold joins the watch minimum too: once a hold makes L1
+        // sub-floor for a room with no configured boost at all, that room must
+        // still be watched at L1 — otherwise the only evidence that could renew
+        // (or contradict) the hold stops being gathered the moment it arms.
         subFloorStalledMs: this.subFloorStalledMs(
           device.id,
-          observed >= 1 && observed < boost.watchMinLevel,
+          observed >= 1 && observed < Math.max(boost.watchMinLevel, holdFloor),
           needDelta,
           // computeAcNeed's dead-sensor sentinel is delta 1 — see the guard.
           device.currentTemp != null && device.currentTemp > 0,
@@ -2060,8 +2260,12 @@ export class LevelingControllerV2 {
           this.shedIds.has(device.id),
           now,
         ),
-        minLevel: boost.minLevel,
-        boostFloorHard: boost.hard,
+        minLevel: Math.max(boost.minLevel, holdFloor),
+        // Hard in EITHER form: the configured band past its flex (R14-hard), or
+        // a live learned hold (R14-learned). Both say the same thing about the
+        // same room — below this floor the compressor does not engage — and a
+        // level the search can still enumerate is not a "never" (19ac1ba).
+        boostFloorHard: boost.hard || holdFloor > 1,
         manualCap: this.manualCap.get(device.id) ?? null,
         manualTarget: this.manualTarget.get(device.id) ?? null,
         slotCap: slotGenCap,
@@ -2607,6 +2811,21 @@ export class LevelingControllerV2 {
       .catch(() => undefined);
   }
 
+  /** The live learned hold for the status card, or null when nothing binds. */
+  private levelHoldStatus(
+    deviceId: string,
+    now: number,
+  ): { level: number; outdoorC: number; until: number; detail: string } | null {
+    const hold = this.levelHolds.get(deviceId);
+    if (hold == null || !levelHoldLive(hold, this.freshOutdoorC(now), now)) return null;
+    return {
+      level: hold.level,
+      outdoorC: hold.outdoorC,
+      until: levelHoldExpiresAt(hold),
+      detail: levelHoldDetail(hold),
+    };
+  }
+
   private buildStatus(
     acs: AcView[],
     view: ReturnType<typeof meterView>,
@@ -2666,6 +2885,7 @@ export class LevelingControllerV2 {
         unreachableLevels: Object.keys(this.recon[a.deviceId]?.unreachable ?? {}).map(Number).sort((x, y) => x - y),
         raiseCooldownMs: cooldownRemainingMs(this.pacing, a.deviceId, "raise", now),
         restoreCooldownMs: cooldownRemainingMs(this.pacing, a.deviceId, "restore", now),
+        levelHold: this.levelHoldStatus(a.deviceId, now),
       })),
       mode,
       calmMs: view.calmMs,

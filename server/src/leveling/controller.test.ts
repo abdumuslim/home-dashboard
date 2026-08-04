@@ -150,10 +150,35 @@ function createGradePool(
   shedIds: string[] = [],
   /** Seed rows keyed like the CostBook: `${deviceId}|${source}|${transition}`. */
   book: Record<string, { ewmaAmps: number; samples: number; updatedAt: number }> = {},
+  /** Persisted learned non-cooling holds (`ac_leveling_level_hold`). */
+  levelHolds: Map<string, { level: number; outdoorC: number; observedAt: number }> = new Map(),
 ) {
   const journal: Array<Record<string, unknown>> = [];
   const costs: Array<{ deviceId: string; transition: string; ewma: number }> = [];
   const query = vi.fn(async (sql: string, params: unknown[] = []) => {
+    // The learned non-cooling hold table — write-through, because a 6-hour hold
+    // a deploy erases is not a hold (R14).
+    if (sql.includes("INSERT INTO ac_leveling_level_hold")) {
+      levelHolds.set(String(params[0]), {
+        level: Number(params[1]),
+        outdoorC: Number(params[2]),
+        observedAt: Number(params[3]),
+      });
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("DELETE FROM ac_leveling_level_hold")) {
+      levelHolds.delete(String(params[0]));
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("FROM ac_leveling_level_hold")) {
+      const rows = Array.from(levelHolds, ([device_id, h]) => ({
+        device_id,
+        level: h.level,
+        outdoor_c: h.outdoorC,
+        observed_ms: h.observedAt,
+      }));
+      return { rows, rowCount: rows.length };
+    }
     if (sql.includes("FROM ac_leveling_costs") && sql.includes("ewma_amps")) {
       const rows = Object.entries(book).map(([key, v]) => {
         const [device_id, source, transition] = key.split("|");
@@ -195,7 +220,7 @@ function createGradePool(
     if (sql.includes("COUNT(*)") && sql.includes("ac_leveling_costs")) return { rows: [{ n: 7 }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   });
-  return { pool: { query } as never, journal, costs };
+  return { pool: { query } as never, journal, costs, levelHolds };
 }
 
 function acDevice(id: string, power: boolean, generatorMode: number) {
@@ -1445,6 +1470,181 @@ describe("LevelingControllerV2 — a session that begins with a dead circuit", (
 
       expect(controller.getStatus().mode).not.toBe("COLLAPSED");
       expect(controller.getStatus().limitAmps).toBeLessThan(15); // still cooling
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R14 LEARNED hold (user, 2026-08-04): "when the system observe that abdullah
+// is not working on l1 (by own observation or manual raise), it should state
+// the outside temp, so it will never reduce the level to l1 untill it drop
+// below that temp or after [6] h".
+//
+// SHELL tests. The hold is armed by shell-owned evidence (the sub-floor watch
+// clock, a manual raise arriving on its own HTTP request), keyed on the outdoor
+// feed only the shell sees, and PERSISTED — none of which scenario.ts models.
+// The pure release/merge arithmetic has its own guards in level-hold.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () => {
+  const HOT = "hot";
+  const COOL = "cool";
+
+  function setup(opts: {
+    holds?: Map<string, { level: number; outdoorC: number; observedAt: number }>;
+    hotLevel?: number;
+    levelBoosts?: Record<string, { minLevel: number; outdoorAtLeastC: number }>;
+    hotNeed?: number;
+  } = {}) {
+    const mock = createGradePool(
+      {
+        genLimitAmps: 15,
+        priority: [HOT, COOL],
+        genAmpModels: { [HOT]: { baseAmps: 2.3, stepAmps: 1.5 }, [COOL]: { baseAmps: 2.3, stepAmps: 1.5 } },
+        ...(opts.levelBoosts != null ? { levelBoosts: opts.levelBoosts } : {}),
+      },
+      [],
+      {},
+      opts.holds ?? new Map(),
+    );
+    const sent: Array<{ deviceId: string; value: number }> = [];
+    const offs: string[] = [];
+    const deps: LevelingDeps = {
+      ...createDeps(),
+      getTclCloud: () =>
+        ({
+          sendControl: async (id: string, cmd: string, value: number) => {
+            if (cmd === "set_generator_mode") sent.push({ deviceId: id, value });
+          },
+          executeAcAction: async (id: string, action: Record<string, unknown>) => {
+            if (action.power === 0) offs.push(id);
+          },
+        }) as never,
+    };
+    const controller = new LevelingControllerV2(mock.pool, deps);
+    const device = (id: string, level: number, temp: number) =>
+      ({ ...(acDevice(id, true, level) as object), currentTemp: temp }) as never;
+    const ctx = [
+      { device: device(HOT, opts.hotLevel ?? 2, 32), managed: true, needTier: "full" as const, needDelta: opts.hotNeed ?? 5, slotGenCap: null },
+      { device: device(COOL, 1, 27), managed: true, needTier: "full" as const, needDelta: 1, slotGenCap: null },
+    ];
+    let flip = 1;
+    const run = async (amps: number, steps: number, outdoorC: number | null) => {
+      for (let i = 0; i < steps; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: amps + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx as never, outdoorC);
+      }
+    };
+    return { mock, controller, sent, offs, run };
+  }
+
+  it("a hold loaded from the DB governs the ladder immediately — a deploy does not erase it", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
+      // Observed an hour ago at 39°C outdoor; it is 44°C now, so it binds.
+      const holds = new Map([[HOT, { level: 1, outdoorC: 39, observedAt: Date.now() - 3_600_000 }]]);
+      const { controller, sent, offs, run } = setup({ holds });
+      await controller.ensureLoaded();
+
+      // The 13:10:47 shape: a projected mild overshoot with the coolest room
+      // already at its floor, so the hottest room's L2→L1 is the only level rung
+      // left on the board. That is the cut the user banned.
+      await run(15.6, 14, 44);
+
+      expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.minLevel).toBe(2);
+      expect(sent.filter((c) => c.deviceId === HOT && c.value === 1)).toHaveLength(0);
+      // Something still had to give, and it is the coolest room — priced as an
+      // off either way (invariants 36/39), so it goes where the user sends it.
+      expect(offs.every((id) => id === COOL)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases when the weather goes back under the observation, and drops the row", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
+      const holds = new Map([[HOT, { level: 1, outdoorC: 39, observedAt: Date.now() }]]);
+      const { mock, controller, run } = setup({ holds });
+      await controller.ensureLoaded();
+
+      await run(12.0, 4, 44);
+      expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.levelHold?.outdoorC).toBe(39);
+      // 38.4°C — past the observation by more than the release hysteresis.
+      await run(12.0, 4, 38.4);
+      expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.levelHold ?? null).toBeNull();
+      expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.minLevel).toBe(1);
+      expect(mock.levelHolds.has(HOT)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("arms from a MANUAL raise off L1 — the user in the room outranks any clock", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
+      const { mock, controller, run } = setup({ hotLevel: 1 });
+      await controller.ensureLoaded();
+      // Settle so the reconciler has a CONFIRMED L1 to raise off. Near the
+      // limit on purpose: with headroom the leveler would buy the level itself
+      // and there would be no hand raise to learn from.
+      await run(14.6, 6, 41);
+
+      await controller.onUserGenLevel(HOT, 2);
+      await run(14.6, 1, 41);
+
+      expect(mock.levelHolds.get(HOT)).toMatchObject({ level: 1, outdoorC: 41 });
+      expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.levelHold?.detail).toContain("41.0°C outdoor");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("arms from the system's OWN evidence — the watch zone, three degrees before the floor", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
+      // 37°C: inside Abdullah's watch zone (39 − 3) and BELOW his configured
+      // floor, so the boost has not armed — this is exactly the window in which
+      // the evidence can be gathered before the heat that makes it matter.
+      const { mock, controller, run } = setup({
+        hotLevel: 1,
+        levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 39 } },
+      });
+      await controller.ensureLoaded();
+
+      // 3 min of no cooling progress at L1 (SUBFLOOR_WATCH_MS) at a fixed need,
+      // riding near the limit so the raise path cannot lift the room out of the
+      // very level the evidence is about.
+      await run(14.6, 45, 37);
+
+      expect(mock.levelHolds.get(HOT)).toMatchObject({ level: 1, outdoorC: 37 });
+      // …and the hold now extends the hard floor BELOW the configured 39°C bar,
+      // which is the whole point of learning it.
+      expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.minLevel).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records nothing when the outdoor feed is stale — a hold with no bar is a six-hour ban", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
+      const { mock, controller, run } = setup({
+        hotLevel: 1,
+        levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 39 } },
+      });
+      await controller.ensureLoaded();
+      await run(14.6, 45, null);
+      expect(mock.levelHolds.size).toBe(0);
     } finally {
       vi.useRealTimers();
     }

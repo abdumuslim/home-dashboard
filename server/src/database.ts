@@ -244,6 +244,18 @@ const MIGRATIONS: string[] = [
     user_agent TEXT
   )`,
   "CREATE INDEX IF NOT EXISTS ac_control_audit_at_brin ON ac_control_audit USING BRIN (at)",
+  // Leveling v2: the LEARNED non-cooling hold (user, 2026-08-04). When the
+  // system observes — or the user demonstrates by raising the room by hand —
+  // that a level does not cool, it records the outdoor temperature it observed
+  // that at, and stops targeting the level until the weather drops back under
+  // it or the record ages out. Persisted because a 6-hour hold that a deploy
+  // silently erases is a trap: the heat outlives our release cadence.
+  `CREATE TABLE IF NOT EXISTS ac_leveling_level_hold (
+    device_id   TEXT PRIMARY KEY,
+    level       SMALLINT NOT NULL,
+    outdoor_c   REAL NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

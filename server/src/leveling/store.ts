@@ -1,11 +1,13 @@
-// DB persistence for leveling v2 (tables: ac_leveling_costs, ac_leveling_journal;
-// the shed / fan-hold / remembered-level tables are reused as-is by the
-// controller shell). Thin CRUD only — no decision logic here.
+// DB persistence for leveling v2 (tables: ac_leveling_costs,
+// ac_leveling_journal, ac_leveling_level_hold; the shed / fan-hold /
+// remembered-level tables are reused as-is by the controller shell). Thin CRUD
+// only — no decision logic here.
 
 import pg from "pg";
 import { childLogger } from "../logger.js";
 import type { CostBook } from "./costs.js";
 import { COST_SEEDS } from "./costs.js";
+import type { LevelHold } from "./level-hold.js";
 import type { Command, Decision, LearnedCost, Mode, PowerSource, Severity } from "./types.js";
 
 const log = childLogger("leveling-store");
@@ -120,6 +122,37 @@ export class LevelingStore {
       [String(Math.max(1, Math.min(24 * 60, hours))), limit],
     );
     return res.rows;
+  }
+
+  // ---- learned non-cooling holds ----
+
+  async loadLevelHolds(): Promise<Record<string, LevelHold>> {
+    const res = await this.pool.query(
+      "SELECT device_id, level, outdoor_c, EXTRACT(EPOCH FROM observed_at) * 1000 AS observed_ms FROM ac_leveling_level_hold",
+    );
+    const holds: Record<string, LevelHold> = {};
+    for (const row of res?.rows ?? []) {
+      holds[String(row.device_id)] = {
+        level: Number(row.level),
+        outdoorC: Number(row.outdoor_c),
+        observedAt: Number(row.observed_ms),
+      };
+    }
+    return holds;
+  }
+
+  async upsertLevelHold(deviceId: string, hold: LevelHold): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO ac_leveling_level_hold (device_id, level, outdoor_c, observed_at)
+       VALUES ($1, $2, $3, to_timestamp($4 / 1000.0))
+       ON CONFLICT (device_id)
+       DO UPDATE SET level = $2, outdoor_c = $3, observed_at = to_timestamp($4 / 1000.0)`,
+      [deviceId, hold.level, hold.outdoorC, hold.observedAt],
+    );
+  }
+
+  async deleteLevelHold(deviceId: string): Promise<void> {
+    await this.pool.query("DELETE FROM ac_leveling_level_hold WHERE device_id = $1", [deviceId]);
   }
 
   /** Retention prune — call opportunistically (e.g. daily from the controller). */

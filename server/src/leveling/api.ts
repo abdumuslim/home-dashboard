@@ -52,6 +52,14 @@ export interface LevelingAcStatusV2 {
   /** v2 extras */
   raiseCooldownMs?: number;
   restoreCooldownMs?: number;
+  /**
+   * The LEARNED non-cooling hold, when one is live (level-hold.ts): why this
+   * room's floor sits above L1 even though nothing in the config says so. The
+   * user asked for this in as many words — the status must say "L1 non-cooling
+   * observed at 44.1° outdoor, holds until below that or <time>" — because a
+   * floor nobody can explain is a floor nobody trusts.
+   */
+  levelHold?: { level: number; outdoorC: number; until: number; detail: string } | null;
 }
 
 export interface LevelingStatusV2 {

@@ -295,7 +295,16 @@ export function planReduction(input: ReduceInput): ReducePlan {
     // live batch still executed it, because the reducer will pay any price when
     // the alternative is infeasible. A target the search cannot enumerate is
     // the only form of "never" that holds.
-    const HARD_FLOOR = hardFloorOf(ac);
+    //
+    // Clamped to `upper` — a room already BELOW its hard floor (the learned
+    // hold can arm while a room sits at L1, and a boost band can arm around it)
+    // must still be able to STAY there. Without the clamp such a room
+    // enumerates no level move at all, and the only thing left on its board is
+    // the power_off: the search would answer "L1 is not a target" by switching
+    // the room off. The hard floor bans DESCENDING past it; buying the room
+    // back up is the raise path's job (invariant 25's ⚠ — re-asserting a
+    // comfort floor outside the raise path is the 2026-08-02 limit cycle).
+    const HARD_FLOOR = Math.min(hardFloorOf(ac), upper);
     for (let level = HARD_FLOOR; level <= upper; level++) {
       const belowFloorSteps = Math.max(0, floor - level);
       const steps = Math.max(0, effFrom - level);

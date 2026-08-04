@@ -414,12 +414,19 @@ export interface AcView {
   /** Boost floor (≥1; >1 when an outdoor-heat boost is active). */
   minLevel: number;
   /**
-   * The outdoor temperature is more than `BOOST_FLOOR_FLEX_C` past this room's
-   * configured boost threshold, so levels below its comfort floor are not legal
-   * AUTOMATIC targets at all — see `hardFloorOf`. Below the floor the
-   * compressor does not engage up here, which makes "cut a level" and "switch
-   * the room off" the same physical act with only one of them visible (user,
-   * 2026-08-04 at 47°C: "that should never put it at l1").
+   * Levels below this room's floor are not legal AUTOMATIC targets at all — see
+   * `hardFloorOf`. Below the floor the compressor does not engage up here, which
+   * makes "cut a level" and "switch the room off" the same physical act with
+   * only one of them visible (user, 2026-08-04 at 47°C: "that should never put
+   * it at l1").
+   *
+   * Set by EITHER of the two things that can know it, and they are independent:
+   *  - the CONFIGURED band, more than `BOOST_FLOOR_FLEX_C` past this room's
+   *    boost threshold (`boostZoneOf` → `hard`); or
+   *  - a live LEARNED hold (level-hold.ts): this house has observed the level
+   *    failing, and recorded the outdoor temperature it observed it at. That
+   *    one extends the same hardness BELOW the configured threshold, which is
+   *    the whole point — the threshold is an estimate.
    *
    * Narrows invariant 25's sub-floor rung; never deletes it. A room whose boost
    * condition does not currently hold, and any non-boost floor, keeps the rung.
