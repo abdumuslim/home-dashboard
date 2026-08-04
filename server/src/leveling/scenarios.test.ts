@@ -1618,3 +1618,108 @@ describe("the 2026-08-01 level rebalance (the extra level follows the hotter roo
     expect(s.sim("abdu").level).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The changeover dead window (2026-08-04, 11:16-11:23 Baghdad, 15A gen).
+//
+// The grid→gen changeover power-cycled all three ACs. FLOORS clamped Abdullah
+// to his L2 boost floor and the others to L1 — correctly — and then TCL
+// compressor restart protection kept every compressor OFF for about six
+// minutes, each room drawing roughly its fan.
+//
+// `rearmRamp`'s 240s windows expired ON THE CLOCK at ~11:20:10 with nothing
+// running. FLOORS cleared four seconds later (it waits for "nothing ramping"),
+// the freed sampler booked `max(0, 6.1 − 10.4) = 0` as the house, and the raise
+// path opened onto a 6.1A meter that was pure house load: Abdullah L2→L3 at
+// 11:20:14 and Abdu L1→L2 at 11:20:49, both admitted "incl. 0.0A house". At
+// 11:22:10-49 every compressor engaged together — 6.4 → 15.7 → 16.6A smoothed,
+// two severe cuts, and the user switching a room off by hand.
+//
+// `restartDelayMs` is the harness debt this needed, exactly as `residualAmps`
+// was for the 08-02 breaks: without it the sim's compressors always restart
+// instantly and the failure is unreachable.
+// ---------------------------------------------------------------------------
+
+describe("the changeover dead window (2026-08-04)", () => {
+  // Restart protection outlasts the ramp window by the same ratio it did live
+  // (~6.5 min against a 4-min window); the harness's compressors ramp in 60s,
+  // so 150s is the same shape at test speed — and still inside the 3-window cap.
+  const DEAD_MS = 150_000;
+  // Demands chosen so the FLOOR state fits the 14.9A gen (3.9 + 4.1 + 2.2 +
+  // 3.5 house ≈ 14.0) while the two raises live admitted would not
+  // (5.3 + 6.5 + 2.2 + 3.5 ≈ 17.8).
+  const trio = (): SimAcSetup[] => [
+    { ...ABDULLAH, level: 3, minLevel: 2, demandAmps: 5.3, needDelta: 3, restartDelayMs: DEAD_MS, rampSeconds: 60 },
+    { ...ABDU, level: 3, demandAmps: 6.5, needDelta: 2.5, restartDelayMs: DEAD_MS, rampSeconds: 60 },
+    { ...NAJAT, level: 3, demandAmps: 2.2, needDelta: 1, restartDelayMs: DEAD_MS, rampSeconds: 60 },
+  ];
+  const changeover = () => {
+    const s = new Scenario(cfg, trio(), { nonAcAmps: 3.5, source: "grid", seed: 20260804 });
+    s.advance(300); // a settled grid session, everyone at their ceiling
+    s.setSource("gen");
+    return s;
+  };
+  /** A command that raises a room above the level gen entry put it at. */
+  const spends = (s: Scenario, since: number) =>
+    setLevels(s, since).filter((e) => e.cmd.level > (e.cmd.deviceId === "abdullah" ? 2 : 1));
+
+  it("still lands the gen-entry floors while every compressor is dead", () => {
+    // The thing that must NOT regress: FLOORS is a source-entry batch, not a
+    // spend, and it has to ship through the whole dead window.
+    const s = changeover();
+    const t0 = s.now;
+    s.advance(60);
+    const clamps = setLevels(s, t0);
+    expect(clamps.some((e) => e.cmd.deviceId === "abdullah" && e.cmd.level === 2)).toBe(true);
+    expect(clamps.some((e) => e.cmd.deviceId === "abdu" && e.cmd.level === 1)).toBe(true);
+    expect(clamps.some((e) => e.cmd.deviceId === "najat" && e.cmd.level === 1)).toBe(true);
+  });
+
+  it("spends nothing for the whole dead window — a timer is not evidence of draw", () => {
+    const s = changeover();
+    const t0 = s.now;
+    s.advance(150);
+    const raised = spends(s, t0);
+    expect(raised, JSON.stringify(raised.map((e) => e.cmd))).toHaveLength(0);
+    expect(s.commandsSince(t0, "power_on")).toHaveLength(0);
+  });
+
+  it("feeds the envelope the house it can actually see, not a fictitious zero", () => {
+    const s = changeover();
+    s.advance(150);
+    // 3.5A of house plus three fans, MEASURED off the meter — never handed to
+    // the planner from the sim's ground truth.
+    expect(s.measuredHouseAmps()).toBeGreaterThan(3);
+    expect(s.measuredHouseAmps()).toBeLessThan(4.5);
+  });
+
+  it("rides the simultaneous restart without an overload or a shed", () => {
+    const s = changeover();
+    const t0 = s.now;
+    s.advance(150);
+    let peak = 0;
+    for (let i = 0; i < 60; i++) {
+      s.step();
+      peak = Math.max(peak, meterView(s.meterState, s.now).smoothedAmps);
+    }
+    // Every compressor engaged at once — with nothing extra admitted while they
+    // were dead, the floor state is what arrives, and it fits.
+    expect(peak).toBeLessThanOrEqual(cfg.genLimitAmps);
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(0);
+    expect(s.acsOn()).toEqual(["abdu", "abdullah", "najat"]);
+  });
+
+  it("hands the raise path back once the compressors prove they are drawing", () => {
+    // The other half: the hold must not become a freeze. Once the meter shows
+    // the draw, the windows close on their ordinary terms.
+    const s = changeover();
+    s.advance(150 + 300);
+    const t0 = s.now;
+    s.advance(300);
+    const stillRamping = s.plans
+      .slice(-40)
+      .some((p) => p.decisions.some((d) => d.blockedBy === "ramping"));
+    expect(stillRamping).toBe(false);
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(0);
+  });
+});

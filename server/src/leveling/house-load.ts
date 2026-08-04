@@ -48,10 +48,31 @@
 // while the meter sat at 11–12A, until the user raised Abdu to L2 by hand.
 // Raises need no cooldown: the modeled side RISES ahead of the meter, the
 // residual dips, and a dip never wins a max.
+//
+// …and the OTHER half of that guard, missing until 2026-08-04: the residual can
+// be wrong-LOW too. `max(0, …)` books a confident 0.0A whenever the model sits
+// above the meter, which is exactly what a dead compressor looks like. On the
+// morning of 08-04 a changeover left all three compressors in restart
+// protection for six minutes; the sampler booked 0.0A of house for the current
+// running set, the envelope admitted two raises "incl. 0.0A house" against a
+// real ~6A, and the line went to 16.6A when the compressors finally engaged
+// together. So a reading whose model sits more than `RESIDUAL_TRUST_GAP_AMPS`
+// above the meter yields NO sample at all — and when the whole house is
+// provably dead (dead-window.ts), the meter itself IS the house and is recorded
+// as such, which is the measurement that would have refused those raises.
+//
+// Finally, the records are per source but the HOUSE is not. When the active
+// source has no sample it can use, the other source's peak stands in (same
+// set/superset rules, same 15-minute window). A changeover ages the new
+// source's record out by definition — that is how the 08-04 envelope came to
+// price a 6A house at 0.0A — and of the two possible answers, "the house we
+// measured four minutes ago on the other line" is right far more often than
+// "no house at all". Sole consumer is the raise envelope, so a stale carry
+// over-blocks; a missing one admits a raise that does not fit.
 
 import type { AcView, PowerSource } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
-import { modelFor, steadyDraw } from "./costs.js";
+import { modeledRunningAmps, RESIDUAL_TRUST_GAP_AMPS } from "./dead-window.js";
 
 /** How far back the peak looks. Long enough to span a compressor duty cycle. */
 export const HOUSE_LOAD_WINDOW_MS = 15 * 60_000;
@@ -89,25 +110,11 @@ interface SourceHouseLoad {
   readonly cooldownUntil: number;
 }
 
-/** Per-source records. Sources never share: a gen residual says nothing about grid. */
+/** Per-source records; the cross-source carry in `houseLoadAmps` is the one bridge. */
 export type HouseLoadState = Readonly<Record<string, SourceHouseLoad>>;
 
 export function initialHouseLoad(): HouseLoadState {
   return {};
-}
-
-function modeledRunningAmps(
-  acs: readonly AcView[],
-  config: LevelingConfigV2,
-  source: Exclude<PowerSource, "none">,
-): number {
-  return acs
-    .filter((a) => a.on && a.managed && !a.shed)
-    .reduce(
-      (sum, a) =>
-        sum + steadyDraw(a.currentLevel, a.maxLevel, modelFor(config, a.deviceId, source)),
-      0,
-    );
 }
 
 /**
@@ -122,7 +129,11 @@ export function houseLoadResidual(
 ): number | null {
   const running = acs.filter((a) => a.on && a.managed && !a.shed);
   if (running.some((a) => a.ramping)) return null;
-  return Math.max(0, smoothedAmps - modeledRunningAmps(acs, config, source));
+  const modeled = modeledRunningAmps(acs, config, source);
+  // The model above the meter is not a small house — it is a compressor that is
+  // not running, and `max(0, …)` would book that as a confident zero.
+  if (modeled - smoothedAmps > RESIDUAL_TRUST_GAP_AMPS) return null;
+  return Math.max(0, smoothedAmps - modeled);
 }
 
 export function sampleHouseLoad(
@@ -133,12 +144,36 @@ export function sampleHouseLoad(
     smoothedAmps: number;
     acs: readonly AcView[];
     config: LevelingConfigV2;
+    /**
+     * Every running managed AC is inside a power-event dead window and the
+     * whole-house evidence agrees (dead-window.ts) — so nothing of OURS is on
+     * the line and the meter is a DIRECT measurement of the house.
+     *
+     * The caller owns this decision because it needs shell state the pure layer
+     * has no business knowing (which ramps a power event opened, and how long
+     * they have been held). Three of the ordinary guards are deliberately
+     * bypassed here, and each for the same reason: they exist to keep a residual
+     * honest, and this is not a residual.
+     *  - the ramping skip — during a dead window every AC is ramping by
+     *    construction, so honouring it would refuse the only usable reading;
+     *  - the trust gap — the gap IS the evidence;
+     *  - the modeled-drop cooldown — it exists because the meter still carries a
+     *    dying compressor, i.e. sits ABOVE the model, which is the exact
+     *    opposite of the condition that arms a dead window. The two cannot both
+     *    be true, so honouring it here would only blind us to the reading that
+     *    matters (an entry FLOORS clamp drops the model at exactly the wrong
+     *    moment).
+     * Tagged with the current running set as usual: those rooms' contribution at
+     * sample time is genuinely ~0, so the superset reuse rules stay honest.
+     */
+    deadWindow?: boolean;
   },
 ): HouseLoadState {
+  const direct = opts.deadWindow === true;
   const running = opts.acs.filter((a) => a.on && a.managed && !a.shed);
   // A ramping tick is unusable AND must not advance the drop detector — the
   // modeled side already carries draw the meter has not seen.
-  if (running.some((a) => a.ramping)) return state;
+  if (!direct && running.some((a) => a.ramping)) return state;
   const modeled = modeledRunningAmps(opts.acs, opts.config, opts.source);
   const rec = state[opts.source];
   const dropped = rec != null && modeled < rec.lastModeledAmps - MODELED_DROP_EPSILON_AMPS;
@@ -146,31 +181,80 @@ export function sampleHouseLoad(
   const kept = (rec?.samples ?? [])
     .filter((s) => opts.at - s.at < HOUSE_LOAD_WINDOW_MS)
     .slice(-(MAX_SAMPLES - 1));
-  const samples =
-    opts.at < cooldownUntil
-      ? kept
-      : [
-          ...kept,
-          {
-            at: opts.at,
-            amps: Math.max(0, opts.smoothedAmps - modeled),
-            runningSet: runningSetOf(opts.acs),
-          },
-        ];
+  const usable =
+    direct ||
+    (opts.at >= cooldownUntil && modeled - opts.smoothedAmps <= RESIDUAL_TRUST_GAP_AMPS);
+  const samples = usable
+    ? [
+        ...kept,
+        {
+          at: opts.at,
+          amps: direct ? opts.smoothedAmps : Math.max(0, opts.smoothedAmps - modeled),
+          runningSet: runningSetOf(opts.acs),
+        },
+      ]
+    : kept;
   return { ...state, [opts.source]: { samples, lastModeledAmps: modeled, cooldownUntil } };
 }
 
 /**
- * Worst-case non-AC load on `source`. The peak residual still inside the
- * window and taken with the SAME set of ACs running is the answer of record;
- * when that set has no samples yet (its first minutes after a set change fall
- * inside the cooldown), the peak among samples whose set modeled every room
- * now running stands in — a superset sample cannot double-count anyone, and
- * it is what keeps the envelope honest across a turn-off (and across the
- * shed-and-restore trough of the 2026-07-31 trip). 0 when nothing comparable
- * has been sampled: the honest answer for an unmeasured house, reproducing
- * the old AC-only envelope rather than inventing a reserve, so a fresh boot
- * is never MORE permissive than the code this replaced.
+ * Peak usable residual in one source's record, or null when it holds nothing
+ * comparable. The peak still inside the window and taken with the SAME set of
+ * ACs running is the answer of record; when that set has no samples yet (its
+ * first minutes after a set change fall inside the cooldown), the peak among
+ * samples whose set modeled every room now running stands in — a superset
+ * sample cannot double-count anyone, and it is what keeps the envelope honest
+ * across a turn-off (and across the shed-and-restore trough of the 2026-07-31
+ * trip).
+ *
+ * null and 0 are different answers on purpose: an exact-set sample of 0.0 A is
+ * a real measurement of a house that owes nothing, and it must outrank both a
+ * superset carry and the cross-source carry below.
+ */
+function peakUsableAmps(
+  rec: SourceHouseLoad | undefined,
+  now: number,
+  acs: readonly AcView[],
+): number | null {
+  if (rec == null) return null;
+  const runningSet = runningSetOf(acs);
+  const members = runningSet === "" ? [] : runningSet.split(",");
+  let exactPeak: number | null = null;
+  let carriedPeak: number | null = null;
+  for (const s of rec.samples) {
+    if (now - s.at >= HOUSE_LOAD_WINDOW_MS) continue;
+    if (s.runningSet === runningSet) {
+      if (exactPeak == null || s.amps > exactPeak) exactPeak = s.amps;
+    } else {
+      const sampled = s.runningSet.split(",");
+      if (members.every((id) => sampled.includes(id)) && (carriedPeak == null || s.amps > carriedPeak)) {
+        carriedPeak = s.amps;
+      }
+    }
+  }
+  return exactPeak ?? carriedPeak;
+}
+
+/**
+ * Worst-case non-AC load on `source`. Fresh same-source evidence always wins;
+ * failing that, the OTHER source's record stands in under the same set/superset
+ * and 15-minute rules (2026-08-04).
+ *
+ * The non-AC house does not care which line feeds it, and a changeover ages the
+ * new source's record out by definition — which is precisely when the envelope
+ * most needs a number, because entry re-levels the whole house. On 08-04 that
+ * hole read as `0.0A house` and admitted two raises onto a 6A house. Of the two
+ * available answers, "measured on the other line minutes ago" beats "no house at
+ * all" — 0 is the one value known to be wrong.
+ *
+ * Direction of the failure: the sole consumer is the RAISE envelope on gen
+ * (`RaiseInput.nonAcAmps`), and the generator feeds at most what the grid does,
+ * so a grid figure carried onto gen over-states the house and over-blocks. That
+ * is the safe direction, and it self-corrects the moment gen samples exist.
+ *
+ * 0 when neither record holds anything comparable: the honest answer for an
+ * unmeasured house, reproducing the old AC-only envelope rather than inventing a
+ * reserve, so a fresh boot is never MORE permissive than the code this replaced.
  */
 export function houseLoadAmps(
   state: HouseLoadState,
@@ -178,22 +262,11 @@ export function houseLoadAmps(
   now: number,
   acs: readonly AcView[],
 ): number {
-  const rec = state[source];
-  if (rec == null) return 0;
-  const runningSet = runningSetOf(acs);
-  const members = runningSet === "" ? [] : runningSet.split(",");
-  let exactPeak = -1;
-  let carriedPeak = 0;
-  for (const s of rec.samples) {
-    if (now - s.at >= HOUSE_LOAD_WINDOW_MS) continue;
-    if (s.runningSet === runningSet) {
-      if (s.amps > exactPeak) exactPeak = s.amps;
-    } else {
-      const sampled = s.runningSet.split(",");
-      if (members.every((id) => sampled.includes(id)) && s.amps > carriedPeak) carriedPeak = s.amps;
-    }
-  }
-  return exactPeak >= 0 ? exactPeak : carriedPeak;
+  if (source === "none") return 0;
+  const own = peakUsableAmps(state[source], now, acs);
+  if (own != null) return own;
+  const other: PowerSource = source === "gen" ? "grid" : "gen";
+  return peakUsableAmps(state[other], now, acs) ?? 0;
 }
 
 /**

@@ -1067,3 +1067,118 @@ describe("LevelingControllerV2 — a turn-off's decay is not house", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// The changeover dead window (2026-08-04, 11:16-11:23 Baghdad, 15A gen). The
+// grid→gen changeover power-cycled all three ACs; TCL compressor restart
+// protection then held every compressor off for ~6 minutes while the rooms drew
+// about their fans. The 240s ramp windows expired ON THE CLOCK at 11:20:10 with
+// nothing running, FLOORS cleared four seconds later (it waits for "nothing
+// ramping"), and the raise path opened onto a 6.1A meter that was pure house:
+// Abdullah L2→L3 at 11:20:14, Abdu L1→L2 at 11:20:49, both admitted against a
+// house the freed sampler had just booked at 0.0A (`max(0, 6.1 − 10.4)`).
+//
+// SHELL tests on purpose. scenario.ts mirrors both halves of this — which ramp
+// a power event opened, and the direct house sample at the call site — and the
+// mirror is exactly what a one-sided change hides.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — a ramp closes on evidence, not on its timer", () => {
+  function setup() {
+    const mock = createGradePool({
+      genAmpModels: {
+        abdullah: { baseAmps: 2.3, stepAmps: 2.5 },
+        najat: { baseAmps: 2.3, stepAmps: 2.0 },
+        abdu: { baseAmps: 4.3, stepAmps: 2.5 },
+      },
+    });
+    const sent: Array<{ deviceId: string; value: number }> = [];
+    const devices = [
+      { id: "abdullah", name: "abdullah", power: true, generatorMode: 3, maxGeneratorLevel: 3, fanSpeed: 1 },
+      { id: "najat", name: "najat", power: true, generatorMode: 3, maxGeneratorLevel: 3, fanSpeed: 1 },
+      { id: "abdu", name: "abdu", power: true, generatorMode: 3, maxGeneratorLevel: 3, fanSpeed: 1 },
+    ];
+    const deps: LevelingDeps = {
+      ...createDeps(),
+      getTclCloud: () =>
+        ({
+          sendControl: async (id: string, cmd: string, value: number) => {
+            if (cmd !== "set_generator_mode") return;
+            sent.push({ deviceId: id, value });
+            for (const d of devices) if (d.id === id) d.generatorMode = value;
+          },
+          executeAcAction: async () => undefined,
+        }) as never,
+    };
+    const controller = new LevelingControllerV2(mock.pool, deps);
+    const ctx = devices.map((device, i) => ({
+      device: device as never,
+      managed: true,
+      needTier: "full" as const,
+      needDelta: [3, 1, 2.5][i],
+      slotGenCap: null,
+    }));
+    let flip = 1;
+    const run = async (amps: number, steps: number, line: "gen" | "grid") => {
+      for (let i = 0; i < steps; i++) {
+        flip = -flip;
+        const jitter = amps + 0.01 * flip;
+        controller.onPowerReading(
+          (line === "gen" ? { current_1: 0, current_2: jitter } : { current_1: jitter, current_2: 0 }) as never,
+        );
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx as never, 30);
+      }
+    };
+    return { mock, controller, sent, run };
+  }
+
+  /** Longer than AC_RAMP_MS (240s) — the live dead window ran ~6-7 minutes. */
+  const DEAD_STEPS = 84; // 420s
+
+  it("refuses to spend for the whole dead window, and still lands the gen floors", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T08:10:00Z"));
+      const { controller, sent, run } = setup();
+      await controller.ensureLoaded();
+
+      await run(15.5, 60, "grid"); // a settled grid session, everyone at L3
+      sent.length = 0;
+      // 11:16:10 — the changeover. Every compressor power-cycles, and the line
+      // carries the house alone: 2.0A against an 8.9A model once the floors land.
+      await run(2.0, DEAD_STEPS, "gen");
+
+      // Entry policy is NOT a spend and must still ship (FLOORS).
+      expect(sent.filter((c) => c.value === 1).map((c) => c.deviceId).sort()).toEqual(
+        expect.arrayContaining(["abdu", "najat"]),
+      );
+      // …and nothing at all climbs while no compressor has started. Live, two
+      // raises were admitted four seconds after the ramp windows expired.
+      const raises = sent.filter((c) => c.value > 1);
+      expect(raises, JSON.stringify(raises)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hands the raise path back once the meter shows a compressor", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T08:10:00Z"));
+      const { controller, sent, run } = setup();
+      await controller.ensureLoaded();
+
+      await run(15.5, 60, "grid");
+      await run(2.0, DEAD_STEPS, "gen");
+      sent.length = 0;
+      // The compressors finally engage: 8.9A of AC on top of the 2.0A house.
+      // The hold has to release, or the fix is a freeze rather than a guard.
+      await run(10.9, 90, "gen");
+
+      expect(sent.filter((c) => c.value > 1).length).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

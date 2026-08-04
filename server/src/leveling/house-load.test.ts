@@ -13,14 +13,18 @@ import type { AcView } from "./types.js";
 const T = 1_000_000;
 
 // The 2026-07-31 live models: Abdullah L2 4.8, Najat L1 2.3, Abdu L1 4.3 → 11.4A.
+const models = {
+  abdullah: { baseAmps: 2.3, stepAmps: 2.5 },
+  najat: { baseAmps: 2.3, stepAmps: 2.0 },
+  abdu: { baseAmps: 4.3, stepAmps: 2.5 },
+};
 const cfg: LevelingConfigV2 = {
   ...DEFAULT_LEVELING_CONFIG_V2,
   genLimitAmps: 15,
-  genAmpModels: {
-    abdullah: { baseAmps: 2.3, stepAmps: 2.5 },
-    najat: { baseAmps: 2.3, stepAmps: 2.0 },
-    abdu: { baseAmps: 4.3, stepAmps: 2.5 },
-  },
+  // Same models on both lines, so the cross-source carry tests below compare
+  // like with like: the house is the same house whichever line feeds it.
+  ampModels: models,
+  genAmpModels: models,
 };
 
 function ac(id: string, overrides: Partial<AcView> = {}): AcView {
@@ -66,7 +70,16 @@ describe("houseLoadResidual", () => {
   });
 
   it("floors at zero — a satisfied house cycling under its caps owes nothing", () => {
-    expect(houseLoadResidual(5.0, live(), cfg, "gen")).toBe(0);
+    // 10.7A against an 11.4A model: the compressors are drawing a little under
+    // their caps, which is ordinary and still an honest zero-house reading.
+    expect(houseLoadResidual(10.7, live(), cfg, "gen")).toBe(0);
+  });
+
+  it("refuses the reading entirely once the model sits well above the meter", () => {
+    // The 2026-08-04 11:20 shape: 6.1A metered against an 11.4A model, because
+    // every compressor was still in restart protection. `max(0, …)` would floor
+    // that to a confident 0.0A of house — fiction, not measurement.
+    expect(houseLoadResidual(6.1, live(), cfg, "gen")).toBeNull();
   });
 
   it("skips the sample entirely while a compressor is ramping", () => {
@@ -167,7 +180,7 @@ describe("houseLoadAmps — the rolling PEAK", () => {
     expect(houseLoadAmps(s, "gen", T + HOUSE_LOAD_WINDOW_MS, live())).toBe(0);
   });
 
-  it("never mixes sources — a gen residual says nothing about grid", () => {
+  it("is 0 with no power source, whatever either line has measured", () => {
     const s = sampleHouseLoad(initialHouseLoad(), {
       source: "gen",
       at: T,
@@ -175,7 +188,6 @@ describe("houseLoadAmps — the rolling PEAK", () => {
       acs: live(),
       config: cfg,
     });
-    expect(houseLoadAmps(s, "grid", T, live())).toBe(0);
     expect(houseLoadAmps(s, "none", T, live())).toBe(0);
   });
 
@@ -345,5 +357,167 @@ describe("turn-off decay contamination (2026-08-01)", () => {
     const resumed = T + 150_000 + COOLDOWN_MS + 1_000;
     s = sampleHouseLoad(s, { source: "gen", at: resumed, smoothedAmps: 8.4, acs: soloAbdu(), config: cfg });
     expect(houseLoadAmps(s, "gen", resumed, soloAbdu())).toBeCloseTo(4.1, 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-04, the changeover dead window (11:16–11:23 Baghdad, 15A gen). The
+// grid→gen changeover power-cycled all three ACs and TCL restart protection
+// held every compressor off for ~6 minutes. The sampler, freed the moment the
+// 240s ramp windows expired on the clock, recorded `max(0, 6.1 − 10.4) = 0` —
+// fictitious ZERO-amp house samples — and the envelope then admitted two raises
+// "incl. 0.0A house" against a house that was really ~6A. Everything engaged at
+// once at 11:22 and the meter went to 16.6A.
+//
+// The residual can be wrong-LOW, not only wrong-high (invariant 20's blind
+// side), and wrong-low is the permissive direction.
+// ---------------------------------------------------------------------------
+
+describe("the dead window (2026-08-04)", () => {
+  it("records nothing at all while the model sits above the meter", () => {
+    const s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 6.1, // vs an 11.4A model — no compressor is running
+      acs: live(),
+      config: cfg,
+    });
+    expect(s.gen?.samples ?? []).toHaveLength(0);
+  });
+
+  it("a dead-compressor tick must not displace the honest peak it would replace", () => {
+    // The discriminating shape: an honest sample tagged with all three rooms,
+    // then one room off (its cooldown expires), then the compressors are still
+    // dead — a changeover, a power cut, restart protection. The fiction would be
+    // tagged with the CURRENT set, and an exact-set sample outranks the superset
+    // carry, so a single 0.0 would erase 2.5A of measured house.
+    const pair = () => [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("abdu")];
+    let s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 13.9, // honest 2.5 with all three modeled (11.4)
+      acs: live(),
+      config: cfg,
+    });
+    s = sampleHouseLoad(s, {
+      source: "gen",
+      at: T + 60_000,
+      smoothedAmps: 13.7, // najat off: the modeled drop arms the cooldown
+      acs: pair(),
+      config: cfg,
+    });
+    // Past the cooldown, but every compressor is dead: 6.1A metered against a
+    // 9.1A model.
+    const dead = T + 60_000 + COOLDOWN_MS + 5_000;
+    s = sampleHouseLoad(s, { source: "gen", at: dead, smoothedAmps: 6.1, acs: pair(), config: cfg });
+    expect(houseLoadAmps(s, "gen", dead, pair())).toBeCloseTo(2.5, 5);
+  });
+
+  it("records the METER itself as the house once every room is provably dead", () => {
+    // What would have told the envelope "house ≈ 6A" BEFORE the 11:20 raises.
+    const s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 6.1,
+      acs: live(),
+      config: cfg,
+      deadWindow: true,
+    });
+    expect(houseLoadAmps(s, "gen", T, live())).toBeCloseTo(6.1, 5);
+  });
+
+  it("the direct sample overrides the ramping skip and the modeled-drop cooldown", () => {
+    // Both guards keep a RESIDUAL honest, and this is not a residual. During a
+    // dead window every AC is ramping by construction, and the gen-entry FLOORS
+    // clamp drops the model at exactly the wrong moment — honouring either would
+    // blind the envelope to the only reading that can help it.
+    const ramping = () => [
+      ac("abdullah", { currentLevel: 2, minLevel: 2, ramping: true }),
+      ac("najat", { ramping: true }),
+      ac("abdu", { ramping: true }),
+    ];
+    let s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen",
+      at: T,
+      smoothedAmps: 13.9,
+      acs: live(),
+      config: cfg,
+    });
+    // FLOORS clamps Abdu L2→L1 five seconds in: modeled drops, cooldown arms.
+    const clamped = () => [
+      ac("abdullah", { currentLevel: 2, minLevel: 2, ramping: true }),
+      ac("najat", { ramping: true }),
+      ac("abdu", { currentLevel: 1, ramping: true }),
+    ];
+    s = sampleHouseLoad(s, { source: "gen", at: T + 5_000, smoothedAmps: 10.0, acs: clamped(), config: cfg });
+    s = sampleHouseLoad(s, {
+      source: "gen",
+      at: T + 60_000,
+      smoothedAmps: 6.1,
+      acs: clamped(),
+      config: cfg,
+      deadWindow: true,
+    });
+    expect(houseLoadAmps(s, "gen", T + 60_000, ramping())).toBeCloseTo(6.1, 5);
+  });
+});
+
+describe("houseLoadAmps — the cross-source carry (2026-08-04)", () => {
+  // A changeover ages the new source's record out by definition, which is
+  // exactly when the envelope most needs a house figure: entry re-levels the
+  // whole house. 0 is the one answer known to be wrong.
+  const gridHouse = () =>
+    sampleHouseLoad(initialHouseLoad(), {
+      source: "grid",
+      at: T,
+      smoothedAmps: 17.4, // 6.0A of house over the 11.4A model
+      acs: live(),
+      config: cfg,
+    });
+
+  it("stands in the other line's measured house when this one has nothing usable", () => {
+    expect(houseLoadAmps(gridHouse(), "gen", T + 60_000, live())).toBeCloseTo(6.0, 5);
+  });
+
+  it("a same-source sample outranks the carry the moment one exists", () => {
+    const s = sampleHouseLoad(gridHouse(), {
+      source: "gen",
+      at: T + 60_000,
+      smoothedAmps: 13.0, // 1.6A of house on this line
+      acs: live(),
+      config: cfg,
+    });
+    expect(houseLoadAmps(s, "gen", T + 60_000, live())).toBeCloseTo(1.6, 5);
+  });
+
+  it("even a same-source ZERO outranks the carry — that is a measurement too", () => {
+    const s = sampleHouseLoad(gridHouse(), {
+      source: "gen",
+      at: T + 60_000,
+      smoothedAmps: 10.7, // inside the trust gap: an honest house of 0
+      acs: live(),
+      config: cfg,
+    });
+    expect(houseLoadAmps(s, "gen", T + 60_000, live())).toBe(0);
+  });
+
+  it("ages the carry out on the same 15-minute window", () => {
+    expect(houseLoadAmps(gridHouse(), "gen", T + HOUSE_LOAD_WINDOW_MS, live())).toBe(0);
+  });
+
+  it("applies the same set rules to the other line — a partial overlap carries nothing", () => {
+    // Sampled on grid with {abdullah, najat}: any Abdu draw in that reading was
+    // booked as house, so reusing it while Abdu runs would double-count him —
+    // crossing lines does not relax that.
+    const withoutAbdu = [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("najat")];
+    const s = sampleHouseLoad(initialHouseLoad(), {
+      source: "grid",
+      at: T,
+      smoothedAmps: 8.6,
+      acs: withoutAbdu,
+      config: cfg,
+    });
+    expect(houseLoadAmps(s, "gen", T, live())).toBe(0);
+    expect(houseLoadAmps(s, "gen", T, withoutAbdu)).toBeCloseTo(1.5, 5);
   });
 });

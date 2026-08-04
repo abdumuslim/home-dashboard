@@ -56,6 +56,13 @@ import {
   type HouseLoadState,
 } from "./house-load.js";
 import {
+  houseIsDead,
+  meterIsSteady,
+  modeledGapAmps,
+  rampAbsorptionLanded,
+  type ModeledAc,
+} from "./dead-window.js";
+import {
   clearMarksOnManual,
   clearOnPowerOff,
   clearOnSourceChange,
@@ -102,6 +109,22 @@ const AC_RAMP_MS = 240_000;
  * of FLOORS — see `invariantCorrections`).
  */
 const START_WINDOW_MS = AC_RAMP_MS;
+/**
+ * Hard cap on a ramp window held open by dead-window evidence (see
+ * `holdPowerEventRamps` and dead-window.ts). A power event power-cycles every
+ * AC, and TCL compressor restart protection then keeps the compressors off for
+ * minutes the model knows nothing about — 2026-08-04 measured ~6–7 min after
+ * the 11:16 changeover, against a 240 s ramp window that expired on the clock
+ * and opened the raise path onto a house-only meter.
+ *
+ * Three ramps' worth (12 min) is ~2× the longest restart delay observed, and it
+ * is a CAP, not a duration: the window closes the moment the meter shows a
+ * compressor. Its job is the opposite case — a room whose wall switch is
+ * genuinely off looks identical to one in restart protection forever, and
+ * without a bound it would fence the raise path for the whole gen session
+ * (invariant 22's spirit: evidence may re-open a gate, nothing blocks unbounded).
+ */
+const POWER_EVENT_RAMP_MAX_MS = 3 * AC_RAMP_MS;
 /**
  * How long a fan restore's amps stay charged as committed-but-unmetered. A fan
  * gear changes almost immediately — nothing like the 4-minute compressor ramp —
@@ -347,6 +370,17 @@ export class LevelingControllerV2 {
    * wherever `rampBaseline` is: the two are only meaningful together.
    */
   private rampAbsorbed = new Map<string, number>();
+  /**
+   * Ramps opened by a POWER EVENT (changeover, collapse recovery) that are still
+   * under evidence review → when they armed, and when (if ever) they were first
+   * held past their nominal window.
+   *
+   * Only these ramps can be extended: a power event power-cycles the compressor,
+   * and the restart-protection delay that follows is physics the model cannot
+   * see. An ordinary raise's jump debit keeps its plain TTL (invariant 12) —
+   * nothing power-cycled there, so the amps really are on their way.
+   */
+  private powerEventRamp = new Map<string, { armedAt: number; heldSince: number | null }>();
   /**
    * Level-RAISE commitments the meter has not shown yet, per device: the priced
    * jump, the house load when it was sent, and the peak rise since. Same shape
@@ -689,6 +723,9 @@ export class LevelingControllerV2 {
           this.startBaseline.clear();
           this.rampBaseline.clear();
           this.rampAbsorbed.clear();
+          // Dead-window holds are about ramps on the line we just left; the
+          // entry re-arms them a tick later against the new line's readings.
+          this.powerEventRamp.clear();
           // Both cooldowns are per-line physics — a wind-down on the source we
           // just left says nothing about this one, and holding them across a
           // changeover strands a room through the entry window that is supposed
@@ -764,8 +801,13 @@ export class LevelingControllerV2 {
           );
           break;
         case "collapse_recovered":
-          // Compressors restarted with the line — re-arm the ramp windows.
-          this.rearmRamp([...this.prevPowerStates.entries()].filter(([, on]) => on).map(([id]) => id));
+          // Compressors restarted with the line — re-arm the ramp windows. A
+          // power event, so these windows close on evidence, not on the clock:
+          // restart protection outlasts AC_RAMP_MS (2026-08-04).
+          this.rearmRamp(
+            [...this.prevPowerStates.entries()].filter(([, on]) => on).map(([id]) => id),
+            { powerEvent: true },
+          );
           log.info(`[leveler2] Power collapse recovered on ${event.source} — ramps re-armed`);
           break;
         case "esp_gap":
@@ -929,8 +971,12 @@ export class LevelingControllerV2 {
    * compressor contributes, so it is the anchor `rampDebitAmps` measures
    * absorption against. Applies on both sources and to every cause — user
    * turn-on, automation turn-on, shed restore, changeover, collapse recovery.
+   *
+   * `powerEvent` marks the two causes that POWER-CYCLE a running compressor
+   * (changeover, collapse recovery). Those windows may be held open past their
+   * timer on evidence — see `holdPowerEventRamps`.
    */
-  rearmRamp(deviceIds: string[]): void {
+  rearmRamp(deviceIds: string[], opts: { powerEvent?: boolean } = {}): void {
     const now = Date.now();
     const until = now + AC_RAMP_MS;
     const view = meterView(this.meterState, now);
@@ -942,7 +988,125 @@ export class LevelingControllerV2 {
       this.rampAbsorbed.delete(id);
       if (baseline == null) this.rampBaseline.delete(id);
       else this.rampBaseline.set(id, baseline);
+      if (opts.powerEvent === true) this.powerEventRamp.set(id, { armedAt: now, heldSince: null });
+      else this.powerEventRamp.delete(id);
     }
+  }
+
+  /**
+   * Hold a POWER-EVENT ramp open on EVIDENCE instead of the clock, and report
+   * whether the whole house is currently dead (2026-08-04 — see dead-window.ts
+   * for the incident and the thresholds).
+   *
+   * A window is extended only once its ordinary `AC_RAMP_MS` has run out, and
+   * only while BOTH pieces of evidence hold: this compressor has absorbed
+   * essentially nothing, AND the modeled running total sits `DEAD_WINDOW_GAP_AMPS`
+   * above the meter with no commanded cut of ours to explain the gap. Either one
+   * failing releases the window, as does the 12-minute cap.
+   *
+   * Runs BEFORE `buildViews`, because `buildViews` is what turns `rampUntil`
+   * into `AcView.ramping` — a tick late here is the four seconds that separated
+   * the 11:20:10 expiry from the 11:20:14 raise. That ordering is why the
+   * modeled total is summed from the raw device context rather than from views:
+   * the views do not exist yet. The context's own shadow levels are the
+   * conservative choice anyway (during SETTLING the views substitute the level
+   * we just COMMANDED, which is lower after a FLOORS clamp, and a lower model
+   * means a smaller gap means less holding).
+   *
+   * Extension is the BLOCKING direction in every consumer (raise gate, ramp
+   * debit, house sampling), so a false hold costs a delayed raise and a false
+   * release is merely the behaviour that shipped before this existed.
+   */
+  private holdPowerEventRamps(
+    ctx: LevelerDeviceContext[],
+    view: ReturnType<typeof meterView>,
+    now: number,
+  ): boolean {
+    if (this.powerEventRamp.size === 0) return false;
+    // No trustworthy meter, no evidence either way — leave the timer in charge.
+    if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return false;
+    const source = view.source;
+    const running: ModeledAc[] = ctx
+      .filter((c) => c.managed && c.device.power && !this.shedIds.has(c.device.id))
+      .map((c) => ({
+        deviceId: c.device.id,
+        on: true,
+        managed: true,
+        shed: false,
+        currentLevel: c.device.generatorMode,
+        maxLevel: c.device.maxGeneratorLevel || 3,
+      }));
+    const gapAmps = modeledGapAmps({
+      smoothedAmps: view.smoothedAmps,
+      acs: running,
+      config: this.config,
+      source,
+      commandedCutCreditAmps: view.commandedCutCreditAmps,
+    });
+    const dead = houseIsDead(gapAmps);
+    for (const [deviceId, ramp] of [...this.powerEventRamp]) {
+      // Inside the ordinary window there is nothing to decide: the timer is
+      // still doing its job, and NEITHER piece of evidence means anything yet —
+      // the smoothed meter spends the first readings after a changeover
+      // draining the OTHER line's load through the median, which reads as "the
+      // model is below the meter" and would retire the window before it was
+      // ever needed. Judge at the boundary, which is where the question is.
+      if (now < ramp.armedAt + AC_RAMP_MS) continue;
+      const ac = running.find((a) => a.deviceId === deviceId);
+      const absorbed = this.rampAbsorbed.get(deviceId) ?? 0;
+      const capped = now >= ramp.armedAt + POWER_EVENT_RAMP_MAX_MS;
+      const landed = ac != null && rampAbsorptionLanded(absorbed, ac, this.config, source);
+      if (ac == null || capped || landed || !dead) {
+        this.powerEventRamp.delete(deviceId);
+        if (ramp.heldSince != null) {
+          const why = capped
+            ? `${POWER_EVENT_RAMP_MAX_MS / 60_000}-min cap`
+            : landed
+              ? `${absorbed.toFixed(1)}A absorbed`
+              : ac == null
+                ? "room off"
+                : `house gap ${gapAmps.toFixed(1)}A`;
+          log.info(
+            `[leveler2] ${this.deviceNames.get(deviceId) ?? deviceId}: compressor dead-window hold released ` +
+              `after ${Math.round((now - ramp.heldSince) / 1000)}s (${why})`,
+          );
+        }
+        continue;
+      }
+      // The compressor starts whenever restart protection lets it, so the ramp
+      // it then owes runs from THERE — hence a rolling window rather than one
+      // fixed end, bounded by the cap.
+      const until = Math.min(ramp.armedAt + POWER_EVENT_RAMP_MAX_MS, now + AC_RAMP_MS);
+      if (until > (this.rampUntil.get(deviceId) ?? 0)) this.rampUntil.set(deviceId, until);
+      if (ramp.heldSince == null) {
+        this.powerEventRamp.set(deviceId, { ...ramp, heldSince: now });
+        log.info(
+          `[leveler2] ${this.deviceNames.get(deviceId) ?? deviceId}: compressor has not started ` +
+            `${Math.round((now - ramp.armedAt) / 1000)}s after a power event ` +
+            `(${absorbed.toFixed(1)}A absorbed, house gap ${gapAmps.toFixed(1)}A) — ramp held open`,
+        );
+      }
+    }
+    // The meter is a DIRECT house measurement only when EVERY running room is
+    // inside a HELD window — one room drawing normally makes the reading a
+    // residual again, and residuals go through the ordinary sampler.
+    //
+    // `heldSince`, not mere membership: for the first `AC_RAMP_MS` after a
+    // changeover the ordinary ramp guard already stands sampling down, and the
+    // smoothed meter is still draining the old line's readings through the
+    // median — a "direct house measurement" taken there records the previous
+    // source's whole load as house (15.9A instead of 3.8A in the acceptance
+    // run). A window that has outlived its own timer is the honest signal.
+    //
+    // …and the meter has to be STILL, or the same median lag catches the other
+    // end of the window: the tick a compressor engages, the raw reading is
+    // already up and the mean is halfway there.
+    return (
+      dead &&
+      meterIsSteady(view) &&
+      running.length > 0 &&
+      running.every((a) => this.powerEventRamp.get(a.deviceId)?.heldSince != null)
+    );
   }
 
   /**
@@ -959,7 +1123,11 @@ export class LevelingControllerV2 {
     const view = meterView(this.meterState, now);
     if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return;
     for (const [id, baseline] of this.rampBaseline) {
-      if ((this.rampUntil.get(id) ?? 0) <= now) continue;
+      // A power-event ramp under review keeps ratcheting even past its nominal
+      // expiry: absorption is the evidence that decides whether the window may
+      // close at all (holdPowerEventRamps), and it must not stop being measured
+      // in the readings that land between two ticks.
+      if ((this.rampUntil.get(id) ?? 0) <= now && !this.powerEventRamp.has(id)) continue;
       const risen = view.smoothedAmps - baseline;
       if (risen > (this.rampAbsorbed.get(id) ?? 0)) this.rampAbsorbed.set(id, risen);
     }
@@ -1175,6 +1343,7 @@ export class LevelingControllerV2 {
           this.rampUntil.delete(device.id);
           this.rampBaseline.delete(device.id);
           this.rampAbsorbed.delete(device.id);
+          this.powerEventRamp.delete(device.id);
           this.recon = clearOnPowerOff(this.recon, device.id);
           this.manualCap.delete(device.id);
           this.manualTarget.delete(device.id);
@@ -1196,7 +1365,12 @@ export class LevelingControllerV2 {
     }
     if (this.armRampOnSourceChange) {
       this.armRampOnSourceChange = false;
-      this.rearmRamp(ctx.filter((c) => c.device.power).map((c) => c.device.id));
+      // The changeover restarted every running compressor — a power event, so
+      // these windows close on evidence rather than on the clock (2026-08-04).
+      this.rearmRamp(
+        ctx.filter((c) => c.device.power).map((c) => c.device.id),
+        { powerEvent: true },
+      );
     }
 
     const view = meterView(this.meterState, now);
@@ -1276,6 +1450,12 @@ export class LevelingControllerV2 {
 
     // Grade the pending batch (journal + cost learning + pacing success).
     await this.gradePending(view, now);
+
+    // A ramp opened by a power event closes on evidence, not on its timer —
+    // and while every room's compressor is still dead the meter IS the house
+    // (2026-08-04). Must precede buildViews: that is where `rampUntil` becomes
+    // `AcView.ramping`.
+    const houseIsDirect = this.holdPowerEventRamps(ctx, view, now);
 
     // Build views.
     const acs = this.buildViews(ctx, outdoorTempC, now);
@@ -1367,6 +1547,10 @@ export class LevelingControllerV2 {
     // deploy's very first gen sample read 11.1A of "house" (real ~4.1A), an
     // over-blocking peak that stood until honest same-set samples outranked it.
     //
+    // The DEAD-WINDOW flag is the opposite case, decided just above: with every
+    // room power-cycled and no compressor yet drawing, the residual is not
+    // under-measured, it is meaningless — and the meter is the house itself.
+    //
     // It also holds off while ANY power_on is unconfirmed — ours or a user's.
     // `AcView.ramping` is `rampUntil > now && device.power`, and `device.power`
     // is the SHADOW, so the ramping guard inside house-load.ts does not cover
@@ -1391,6 +1575,10 @@ export class LevelingControllerV2 {
         smoothedAmps: view.smoothedAmps,
         acs,
         config: this.config,
+        // Every room power-cycled and still dead: the meter carries the house
+        // and nothing else, so record it directly instead of a residual that
+        // `max(0, …)` would floor at a fictitious zero.
+        deadWindow: houseIsDirect,
       });
     }
 

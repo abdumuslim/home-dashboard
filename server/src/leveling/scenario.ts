@@ -52,6 +52,7 @@ import {
   voidSamples,
   type HouseLoadState,
 } from "./house-load.js";
+import { houseIsDead, meterIsSteady, modeledGapAmps, rampAbsorptionLanded } from "./dead-window.js";
 
 export interface SimAcSetup {
   deviceId: string;
@@ -83,6 +84,18 @@ export interface SimAcSetup {
    * trip. Defaults to 0 (instant) so existing scenarios are unchanged.
    */
   offLagMs?: number;
+  /**
+   * TCL compressor restart protection: how long after a POWER EVENT (changeover,
+   * post-trip recovery) this compressor refuses to start, drawing about its fan.
+   * The ramp itself then begins when the compressor actually engages.
+   *
+   * Precedent: `residualAmps` was added for exactly this reason — the harness
+   * modelled a physics the live failure needed and did not have, so the failure
+   * was unreachable in simulation. Live 2026-08-04 measured ~6–7 min after the
+   * 11:16 changeover, against a 240 s ramp window. Defaults to 0 (compressors
+   * restart instantly) so existing scenarios are unchanged.
+   */
+  restartDelayMs?: number;
   /** Firmware silently ignores these level commands (unreachable). */
   ignoreLevels?: number[];
 }
@@ -130,6 +143,14 @@ interface SimAc {
   rampBaseline: number | null;
   /** Peak rise above `rampBaseline` seen since it armed (shell: rampAbsorbed). */
   rampAbsorbed: number;
+  /** When the current ramp window armed (shell: powerEventRamp.armedAt). */
+  rampArmedAt: number;
+  /** This ramp was opened by a power event, so it may be held (shell: powerEventRamp). */
+  powerEventRamp: boolean;
+  /** Dead-window extension of the ramp window (shell: an extended rampUntil). */
+  rampHeldUntil: number;
+  /** Compressor restart protection: no draw at all until this moment. */
+  compressorIdleUntil: number;
   /** Compressor still spinning down after an off was sent (0 = already stopped). */
   drawingUntil: number;
   /** Shell parity: a level RAISE's committed-but-unmetered amps (gen only). */
@@ -187,6 +208,8 @@ export class Scenario {
   private lastSentReading: { gridAmps: number; genAmps: number } | null = null;
   /** Devices the controller shell would have in `freshlyOn` on the next tick. */
   private freshlyOn: string[] = [];
+  /** Shell parity: re-arm every running compressor's ramp a tick after a changeover. */
+  private armRampOnSourceChange = false;
   /** Shell parity: rooms on whose shadow has not confirmed (house sampling off). */
   private pendingOn = new Map<string, number>();
   /** Shell parity: rooms that funded a peer's raise → when they were demoted. */
@@ -240,6 +263,10 @@ export class Scenario {
       startBaseline: null,
       rampBaseline: null,
       rampAbsorbed: 0,
+      rampArmedAt: 0,
+      powerEventRamp: false,
+      rampHeldUntil: 0,
+      compressorIdleUntil: 0,
       drawingUntil: 0,
       jumpDebit: null,
       fanDebit: null,
@@ -250,10 +277,19 @@ export class Scenario {
   /**
    * Shell parity for `rearmRamp`: every arming point snapshots the house load
    * measured BEFORE this compressor contributes, which is what the ramp debit
-   * measures absorption against.
+   * measures absorption against. `powerEvent` marks the two causes that
+   * power-cycle a running compressor — those windows close on evidence rather
+   * than on the clock (shell: `powerEventRamp` / `holdPowerEventRamps`).
    */
-  private startRamp(ac: SimAc): void {
+  private startRamp(ac: SimAc, opts: { powerEvent?: boolean } = {}): void {
     ac.turnedOnAt = this.now;
+    ac.rampArmedAt = this.now;
+    ac.powerEventRamp = opts.powerEvent === true;
+    ac.rampHeldUntil = 0;
+    // Restart protection is a POWER-EVENT physics: an ordinary turn-on starts
+    // its compressor immediately.
+    ac.compressorIdleUntil =
+      opts.powerEvent === true ? this.now + (ac.setup.restartDelayMs ?? 0) : 0;
     const view = meterView(this.meterState, this.now);
     ac.rampBaseline = view.source !== "none" && view.sampleCount >= 2 ? view.smoothedAmps : null;
     ac.rampAbsorbed = 0;
@@ -272,13 +308,86 @@ export class Scenario {
           debit.absorbed = Math.max(debit.absorbed, view.smoothedAmps - debit.baseline);
         }
       }
-      if (ac.rampBaseline == null || !this.isRamping(ac)) continue;
+      // Shell parity: a power-event ramp under review keeps ratcheting past its
+      // nominal window — its absorption is the evidence that closes it.
+      if (ac.rampBaseline == null || !(this.isRamping(ac) || ac.powerEventRamp)) continue;
       ac.rampAbsorbed = Math.max(ac.rampAbsorbed, view.smoothedAmps - ac.rampBaseline);
     }
   }
 
   private isRamping(ac: SimAc): boolean {
-    return ac.on && ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < ac.setup.rampSeconds * 1000;
+    if (!ac.on) return false;
+    if (ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < ac.setup.rampSeconds * 1000) return true;
+    return ac.rampHeldUntil > this.now;
+  }
+
+  /**
+   * Shell parity for `holdPowerEventRamps` — hold a power-event ramp open while
+   * this compressor has absorbed nothing AND the whole-house model sits above
+   * the meter, capped at three ramp windows. Returns whether EVERY running room
+   * is inside such a hold, which is what makes the meter a direct measurement of
+   * the house.
+   *
+   * The windows are scaled to the harness's own `rampSeconds` rather than the
+   * shell's 240 s: `rampSeconds` IS this harness's ramp window, so the mirror is
+   * structural (nominal → extend by one window → cap at three), not numeric.
+   */
+  private holdPowerEventRamps(): boolean {
+    if (this.line === "none") return false;
+    const view = meterView(this.meterState, this.now);
+    if (view.source === "none" || view.frozen || view.collapsed || view.sampleCount < 2) return false;
+    const running = this.acs
+      .filter((a) => a.on && !a.shed)
+      .map((a) => ({
+        deviceId: a.setup.deviceId,
+        on: true,
+        managed: true,
+        shed: false,
+        currentLevel: this.observedLevelOf(a),
+        maxLevel: 3,
+      }));
+    const dead = houseIsDead(
+      modeledGapAmps({
+        smoothedAmps: view.smoothedAmps,
+        acs: running,
+        config: this.cfg,
+        source: this.line,
+        commandedCutCreditAmps: view.commandedCutCreditAmps,
+      }),
+    );
+    for (const ac of this.acs) {
+      if (!ac.powerEventRamp) continue;
+      const rampMs = ac.setup.rampSeconds * 1000;
+      // Shell parity: judge only at the boundary. Inside the ordinary window the
+      // timer is in charge and the smoothed meter is still draining the other
+      // line's load, which reads as "not dead" and would retire the window
+      // before it was ever needed.
+      if (this.now < ac.rampArmedAt + rampMs) continue;
+      const modeled = running.find((r) => r.deviceId === ac.setup.deviceId);
+      const landed =
+        modeled != null && rampAbsorptionLanded(ac.rampAbsorbed, modeled, this.cfg, this.line);
+      if (modeled == null || landed || !dead || this.now >= ac.rampArmedAt + 3 * rampMs) {
+        ac.powerEventRamp = false;
+        continue;
+      }
+      ac.rampHeldUntil = Math.max(
+        ac.rampHeldUntil,
+        Math.min(ac.rampArmedAt + 3 * rampMs, this.now + rampMs),
+      );
+    }
+    // Shell parity: a window that has outlived its own timer, not merely one
+    // that was armed — for the first window after a changeover the ordinary ramp
+    // guard already covers sampling, and the smoothed meter is still draining
+    // the OLD line's readings through the median.
+    return (
+      dead &&
+      meterIsSteady(view) &&
+      running.length > 0 &&
+      running.every((r) => {
+        const ac = this.sim(r.deviceId);
+        return ac.powerEventRamp && ac.rampHeldUntil > this.now;
+      })
+    );
   }
 
   setNonAc(amps: number): void {
@@ -297,10 +406,14 @@ export class Scenario {
       // keeps unconfirmed sends so a level already on its way to the firmware
       // is still clamped and still priced after a changeover.
     }
-    if (line === "gen" || line === "grid") {
-      // A real changeover restarts every running compressor.
-      for (const ac of this.acs) if (ac.physicalOn) this.startRamp(ac);
-    }
+    // A real changeover restarts every running compressor — and restart
+    // protection may hold them off for minutes (see `restartDelayMs`). Armed
+    // for the NEXT step, exactly like the shell: `source_changed` clears the
+    // ramp baselines and `armRampOnSourceChange` re-arms them a tick later,
+    // against the new line's first readings. Anchoring here instead would
+    // snapshot the OLD line's meter as the baseline, and absorption measured
+    // from that can never ratchet.
+    if (line === "gen" || line === "grid") this.armRampOnSourceChange = true;
   }
 
   /** Breaker trips: the AC circuits go dead, a small residual stays on the line. */
@@ -311,7 +424,7 @@ export class Scenario {
   /** Power returns after a trip: compressors restart at their firmware levels. */
   recoverLine(): void {
     this.lineDead = false;
-    for (const ac of this.acs) if (ac.physicalOn) this.startRamp(ac);
+    for (const ac of this.acs) if (ac.physicalOn) this.startRamp(ac, { powerEvent: true });
   }
 
   /** The user pins a level from the dashboard — manual beats every need cap. */
@@ -367,6 +480,9 @@ export class Scenario {
     ac.rampBaseline = null;
     ac.rampAbsorbed = 0;
     ac.turnedOnAt = 0;
+    ac.powerEventRamp = false;
+    ac.rampHeldUntil = 0;
+    ac.compressorIdleUntil = 0;
     this.pendingOn.delete(deviceId);
     this.meterState = resetCalm(this.meterState);
   }
@@ -481,6 +597,14 @@ export class Scenario {
     return this.nonAcAmps + this.acs.reduce((sum, ac) => sum + this.drawOf(ac), 0);
   }
 
+  /**
+   * The non-AC house load the controller has MEASURED — what the raise envelope
+   * is charged, never the sim's ground-truth `nonAcAmps`. Introspection only.
+   */
+  measuredHouseAmps(): number {
+    return houseLoadAmps(this.houseLoad, this.line, this.now, this.buildViews());
+  }
+
   // ---- simulation core ----
 
   private drawOf(ac: SimAc): number {
@@ -491,15 +615,20 @@ export class Scenario {
     // draw holds at its last steady value until the compressor really stops.
     if (!ac.physicalOn) return this.now < ac.drawingUntil ? this.lastSteadyDraw(ac) : 0;
     const cap = ac.level <= 0 ? Number.POSITIVE_INFINITY : ac.setup.capAmps[Math.min(ac.level, 3) - 1];
+    const fanOnly = ac.fan > 1 ? (ac.fan - 1) * 0.05 : 0;
+    // Compressor restart protection after a power event: the room is ON, the
+    // model prices its whole cap, and it is drawing about its fan.
+    if (this.now < ac.compressorIdleUntil) return fanOnly;
     const rampMs = ac.setup.rampSeconds * 1000;
-    const sinceOn = this.now - ac.turnedOnAt;
+    // The ramp starts when the compressor engages, not when the line came back.
+    const engagedAt = Math.max(ac.turnedOnAt, ac.compressorIdleUntil);
+    const sinceOn = this.now - engagedAt;
     const ramping = ac.turnedOnAt > 0 && sinceOn < rampMs;
     // Startup transient may exceed the cap (surgeFactor > 1); steady state is capped.
     const effectiveCap = ramping ? cap * (ac.setup.surgeFactor ?? 1) : cap;
     const steady = Math.min(ac.demandAmps, effectiveCap);
     const rampFactor = ramping ? Math.max(0.2, sinceOn / rampMs) : 1;
-    const fanExtra = ac.fan > 1 ? (ac.fan - 1) * 0.05 : 0;
-    return steady * rampFactor + fanExtra;
+    return steady * rampFactor + fanOnly;
   }
 
   /** Steady (post-ramp) draw of an AC whose off is still in flight. */
@@ -537,6 +666,11 @@ export class Scenario {
     return r.stalledMs;
   }
 
+  /** The level the cloud SHADOW reports right now (it lags the firmware). */
+  private observedLevelOf(ac: SimAc): number {
+    return this.now - ac.shadowLevelAt >= ac.setup.confirmDelayMs ? ac.level : ac.shadowLevel;
+  }
+
   private buildViews(): AcView[] {
     // Priority-sorted, like the controller shell will pass them (priority list
     // first, unknowns after in setup order).
@@ -549,7 +683,7 @@ export class Scenario {
     );
     return sorted.map((ac) => {
       // Shadow lags firmware by confirmDelayMs.
-      const observedLevel = this.now - ac.shadowLevelAt >= ac.setup.confirmDelayMs ? ac.level : ac.shadowLevel;
+      const observedLevel = this.observedLevelOf(ac);
       // Any confirm clears every unconfirmed send (reconciler parity).
       if (ac.sentLevels.includes(observedLevel)) ac.sentLevels = [];
       this.trackSatisfied(ac);
@@ -770,6 +904,17 @@ export class Scenario {
       this.modeState = applyMeterEvent(this.modeState, event, this.now);
       if (event.kind === "source_changed") this.pacing = resetPacing(this.pacing, event.to);
     }
+    // Shell parity (`armRampOnSourceChange`): the changeover re-arms every
+    // running compressor's ramp on a LATER tick, against the new line's own
+    // readings. Held until the ring has two of them, which is the ordinary
+    // production sequence — the ESP delivers readings faster than the collector
+    // ticks — and it is what makes the ramp baseline (and therefore absorption)
+    // measurable at all: `rearmRamp` takes no baseline below `sampleCount` 2,
+    // and no baseline means no absorption evidence for the whole window.
+    if (this.armRampOnSourceChange && meterView(this.meterState, this.now).sampleCount >= 2) {
+      this.armRampOnSourceChange = false;
+      for (const ac of this.acs) if (ac.physicalOn) this.startRamp(ac, { powerEvent: true });
+    }
     this.noteRampAbsorption();
     // Shell parity: the structural off→on scan runs at tick start, so an
     // external turn-on is discovered when its SHADOW flips, not when the
@@ -783,6 +928,11 @@ export class Scenario {
         this.pendingOn.delete(deviceId);
       }
     }
+
+    // Shell parity: a ramp opened by a power event closes on evidence, not on
+    // its timer — decided BEFORE the views, because the views are where the
+    // window becomes `AcView.ramping`.
+    const houseIsDirect = this.holdPowerEventRamps();
 
     // FLOORS / GRID_FULL exit checks against confirmed shadows + ramps.
     const views = this.buildViews();
@@ -823,6 +973,9 @@ export class Scenario {
         smoothedAmps: view.smoothedAmps,
         acs: views,
         config: this.cfg,
+        // Shell parity: with every room power-cycled and no compressor drawing,
+        // the meter IS the house — a residual would floor at a fictitious zero.
+        deadWindow: houseIsDirect,
       });
     }
     const out = plan({
