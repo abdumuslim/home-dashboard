@@ -15,7 +15,101 @@ timestamp: 2026-07-28
 
 > **Status:** v2 is the **acting controller** (config `controller: "v2"` in `ac_leveling_config` row id=2). v1 (`ac-leveler.ts` + `ac-leveling.ts`) is kept only as the **instant rollback target** — flip the flag back to `"v1"` via `PUT /api/ac/leveling` and `docker compose restart` (v1's boot-once state is stale after v2 acted). After a ≥1-week soak, delete v1 and its tests and fold this section's history into the main doc. **Everything below the "TL;DR (v1)" divider documents v1 — historical, rollback-only.**
 
-A ground-up rewrite lives in **`server/src/leveling/`** (19 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
+A ground-up rewrite lives in **`server/src/leveling/`** (21 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
+
+### 2026-08-04 — two breaker trips before lunch, and the day the ladder learned to read the meter
+
+Nineteen commits, all deployed. **SKILL invariants 44–55 are the normative list**; this is the
+incident record and the map of what moved. Two breaker trips (11:16–11:22 and 12:39:57) plus a
+near-miss at 17:27:18, and the through-line is the one hard rules 5b/5c name: a timer standing in for
+physics, and a guard sized against only part of what it guards.
+
+**Trip #1 — the changeover dead window (11:16:10 Baghdad).** The grid→gen changeover power-cycled all
+three ACs; FLOORS clamped them correctly. What nobody modelled is that the gen session started with
+the AC circuit **already dead** — user-confirmed, a physical breaker trip he reset by hand around
+11:21. The four FLOORS resends went to devices that could not hear them.
+
+| Live evidence | Cause | Fix (invariant) |
+|---|---|---|
+| 11:20:10 three 240 s ramps expire with **no compressor running**; FLOORS clears 4 s later | `rearmRamp`'s window is a TIMER, and TCL restart protection is physics it does not know about (~6 min) | Power-event ramps close on EVIDENCE: absorption < min(1.0 A, 40 % of model) AND a whole-house gap ≥ 2.0 A, capped at 3 × `AC_RAMP_MS` (**44**) |
+| Raises at 11:20:14 and 11:20:49 admitted "worst case 11.9 A **incl. 0.0 A house**" against a real ~6 A house | `max(0, smoothed − modeled)` assumes the residual can only be wrong-HIGH; with the compressors dead it is wrong-LOW | No residual sample while the model sits > 1.0 A above the meter; in a full dead window the meter IS the house and is recorded directly; a source change carries the other line's peak rather than 0 (**44**) |
+| 6.4 → 15.7 → 16.6 A in 90 s at 11:22, two severe cuts, the user killing a room by hand | Every compressor engaged at once when the breaker closed | — the response was correct; the entry arithmetic was already lost (see **46**) |
+| No collapse ever latched | Invariants 31 and 5 both describe a FALL inside one session; a session that BEGINS dead has no cliff | `entryCollapseEvidence`: dead-window gap + EVERY room dark + an unanswered send of ours ≥ 2 min + a 60 s dwell → the SAME machinery a fall-latched collapse arms (**45**) |
+| The first cut of that latch read darkness off a shadow-freshness bar | **MEASURED**: healthy last-seen ages of 248/157/269 s, then 305/214/326 s a minute later — two of those rooms actively cooling. TCL shadows report on STATE CHANGE, not on a keepalive | Anchored to the changeover and to sends WE made: "silence we provoked", never silence we merely observed (**45**) |
+| ESP power gaps of 28/34/41/47 s at 11:31–11:36 while riding 14.3–14.8 A, reported healthy throughout | At 46 °C a genset delivers under its plate rating, and this house has no voltage channel | Strain derate: two gaps within 10 min while sitting within 1.5 A of the limit ⇒ −0.5 A of ceiling, stacking to 1.5 A, stepped hand-back. Latches nothing, freezes nothing (**47**) |
+| 17:22:57 entry: floors 10.4 A modeled + ~5 A carried house on a 15 A gen ⇒ 16.5 A severe at 17:27:18 | Every admission-side guard held; the entry was over before the first reading existed | Envelope-judged recovery admission on EVERY gen entry, hottest first, shedding what does not fit through ordinary shed rows (**46**) |
+
+**Trip #2 — the ladder (12:39:57).** Fan trims at 12:38:23 and a level cut at 12:38:26 commanded
+~3.0 A off; the meter fell **0.49 A in 91 seconds** and the breaker went first. `requiredAmps` is the
+CREDITED figure and invariant 33's extreme rung is gated on `required > 0`, so three amps of credit
+silenced the last rung on the ladder while the mean sat 0.6–1.1 A over. Invariant 38 could not fire —
+it revokes when the meter RISES above the cut's anchor, and this one sat pinned at it. Thirteen
+minutes later, the opposite face: at 12:56:39 a second room went off 13 s after a cut whose 2.3 of
+2.9 commanded amps had already left the house, because the sustained-over clock does not pause for a
+landing cut and the escalation settle covered MILD only. One predicate now answers both —
+`cutTrendOf` → `none | settling | arriving | stalled`, with three consumers and no room for a third
+opinion (**48**).
+
+**The extreme rung's invented bill (15:53:45).** `over_extreme required 4.57 A` at a smoothed 15.0
+against a limit of 15.0 — and it shed both remaining rooms. `min(severe readings)` over a set of
+**one** is the spike: the banked ring held a single 19.5 A inrush sample, and a flicker pinned at its
+1.5 A cap had raised the severe bar to 17.5 A, disqualifying every other reading. Reverting the guard
+reproduces `4.5699999999999985` from the live readings. The newest two banked readings must now ALL
+be severe before their min may speak, and the extreme tier no longer sizes the general reducer's shed
+ceiling (**49**).
+
+**The user's rulings, in the order he gave them.**
+
+- *"coolest in real temp, not feels like"* (~13:05). `computeAcNeed` returns a feels-like delta for
+  one room and a real-temperature delta for the others, so every cross-room comparison was asking two
+  different questions and comparing the answers. `AcView.rankNeedDelta` asks ONE question of every
+  room; per-room ABSOLUTE logic keeps its own metric. A dead thermometer falls back to `needDelta`,
+  which is exactly the old ordering (**50**).
+- *"if the system knows that it can cover with the coolest room ac, let it do it… if the spike is too
+  much and no single ac can cover it, let it turn off the coolest 2 acs"* (~17:25) — which is what
+  the reducer's search already expresses once the deficit is honest and the ranking is real. The
+  ceiling stops at two, which is what makes "the hottest room always survives" true with three rooms
+  and no cap at all with two (**50**).
+- *"1 c is enough to switch between acs"* — `SHED_NEED_GAP_C` 1.5 → 1.0.
+- *"no need for 10 min, 3 min is enough"* — `SUBFLOOR_WATCH_MS` 10 → 3 min.
+- *"it is already 47 outside (8 c above what specifyed for abdullah lowest level temp) that should
+  never put it at l1"* (~17:35), refined twice more into the whole gradient: `< 36` nothing special ·
+  `36–39` watched at L1 · `39–41` the floor binds but the sub-floor rung may still use L1 · `> 41`
+  never L1. One function, `boostZoneOf`, because four conditionals in four files is how a per-room
+  rule drifts (**51**).
+- *"when the system observe that abdullah is not working on l1 (by own observation or manual raise),
+  it should state the outside temp, so it will never reduce the level to l1 untill it drop below that
+  temp or after [6] h"* (~13:2x, TTL revised down from 12 h that afternoon). The LEARNED hold,
+  persisted in `ac_leveling_level_hold` (**52**).
+- *"an off with 1 amp or less of drop means the compressor was not running"* — his own experiment,
+  now a signal: `compressorOffLikely` from a graded lone off's drop, feeding `isNonCooling`, arming
+  the learned hold, and surfaced as `coolingState` per AC (**55**).
+
+**Queue items from the night before.** A restore refused at "floors 16.5 A vs 14.9 A" with
+`savingsAtFloors` reading ZERO while a peer raised in the same batch — three times in twelve minutes.
+The two terms were pricing peers at different levels, and the fix had to move the EMISSION with the
+credit, or the plan promises savings it never commands (**53**). The same rows showed raise-vs-raise
+contention (the mildest room took 2.0 A while the hottest was refused by 0.2 A), closed with the same
+`SHED_NEED_GAP_C` the recovery admission already uses rather than a second constant (**53**). And a
+restore admitted 31 s after its own shed, which is the per-room trough bar (**54**).
+
+**Rejected on evidence, for the second time.** Invariant 39's reduction term was flipped
+unconditional once the restore-bounce backoff existed — the named prerequisite — and reverted: 41
+commands in 40 minutes against the conditional form's 4, in two shed→raise→restore rounds on a line
+whose MEAN sat under the limit. The backoff was never what was missing; the shed frees real headroom,
+the raise path is entitled to it, and the line goes over again. Closing it needs the user's parked
+*gated proactive shed*. The measurement is recorded in the comment beside the term so the next
+session does not re-litigate it from scratch.
+
+**Config-only, applied by hand after the deploy (deliberately not in code):** gen amp models
+corrected toward the user-verified hardware truth — Najat `stepAmps` 2.0 → 1.5, Abdu `baseAmps`
+4.3 → 4.1 and `stepAmps` 2.5 → 2.45.
+
+**New modules:** `dead-window.ts` (ramp-release evidence, the whole-house gap, entry-collapse
+liveness, off-drop verdicts) and `level-hold.ts` (the learned non-cooling hold). **New table:**
+`ac_leveling_level_hold` — see [database.md](database.md). **New status fields:** per-AC
+`coolingState`, `subFloorStalledMs` and `levelHold`, with one inline indicator on the leveling card's
+AC row ("Compressor Off" / "Not Cooling", and `min L2 learned` when a hold is what raised the floor).
 
 ### 2026-08-03 — the two breaks the flicker rework did not stop (and the ones it caused)
 

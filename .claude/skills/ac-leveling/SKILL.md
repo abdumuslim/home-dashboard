@@ -5,7 +5,7 @@ type: Skill
 title: Smart AC Leveling — navigation + invariants
 tags: [home, leveling, power, claude-code, current]
 maintainer: claude-code
-timestamp: 2026-07-31
+timestamp: 2026-08-04
 ---
 
 # Smart AC Leveling
@@ -21,7 +21,7 @@ read that slice).
 `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns
 its own row; merged with id=2 winning; re-read every 30 s ⇒ **live-flippable**).
 
-Implementation: **`server/src/leveling/`** — 19 small modules, pure decision functions + one stateful
+Implementation: **`server/src/leveling/`** — 21 small modules, pure decision functions + one stateful
 shell. `controller: "v1" | "shadow" | "v2"`; in `shadow`, v1 acts while v2 journals every decision
 with `executed=false`.
 
@@ -361,7 +361,7 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     reads zero exactly when the cut is arriving (3 batches / 13 s, 12.9 A
     commanded for a 0.4 A deficit).
 
-**Known harness debt (2026-08-03) — the reason none of 31–35 was caught in test:**
+**Known harness debt (2026-08-03; still current) — the reason none of 31–35 was caught in test:**
 its `trip()` modelled a fixed ~4 A residual, *under* the old absolute collapse
 floor, so the live failure was unreachable in simulation (now settable via
 `residualAmps`); `pendingOn` was declared and never written (now wired: set on
@@ -371,7 +371,13 @@ the send-side dedupe (`shouldSendLevel`/`lastFanSent`/`lastOffSentAt` and the
 all-filtered early return), the collector's `LEVELING_RERUN_MIN_MS`
 re-entrancy, and the whole grading shell (`pendingGrades`, `bornContaminated`,
 `lastLoadAddAt`/`lastLoadDropAt`) — changes there need `controller.test.ts`
-guards, because `scenarios.test.ts` cannot see them.
+guards, because `scenarios.test.ts` cannot see them. Added to that list
+2026-08-04: **device LIVENESS** (invariant 45 reads `isOnline`/`lastSeenAt` off
+the TCL shadow, which the harness can only mirror), the **outdoor feed** and the
+**learned hold's persistence** (invariant 52), and the **graded off-drop**
+(invariant 55, which lives in the grading shell). Mirrored the same day: the
+dead-window hold, the entry-collapse state machine, the recovery admission, the
+per-room shed bar, and `compressorOffLikely`.
 
 **Added 2026-08-03 (midday) after the top-priority room sat 20 min at a level its compressor will not run at:**
 36. **A level that does not cool is an off — in BOTH directions.** A comfort
@@ -495,6 +501,246 @@ guards, because `scenarios.test.ts` cannot see them.
     original rule stands, and it should: flipping your AC on must not switch off
     a comparably warm room instead.
 
+**Added 2026-08-04 after TWO real breaker trips before lunch, neither of which the controller saw:**
+44. **A timer is not a compressor.** A grid→gen changeover power-cycles every AC
+    and TCL restart protection then holds the compressors off for ~6 minutes the
+    model knows nothing about. The three 240 s ramp windows EXPIRED ON THE CLOCK
+    at 11:20:10 with nothing running, FLOORS cleared four seconds later (it
+    waits for "nothing ramping"), and the raise path opened onto a 6.1 A meter
+    that was pure house — two raises admitted at "worst case 11.9 A **incl. 0.0 A
+    house**". The sampler had booked that 0.0 itself: `max(0, smoothed −
+    modeled)` assumes a residual can only be wrong-HIGH (invariant 20's dying
+    compressor), and with the compressors dead it is wrong-LOW, which is the
+    permissive direction. A ramp opened by a POWER EVENT now extends past
+    `AC_RAMP_MS` while BOTH hold — that room has absorbed less than
+    `min(RAMP_RELEASE_MAX_AMPS 1.0, RAMP_RELEASE_FRACTION 40 % of its modeled
+    steady draw)`, and the modeled running total sits ≥ `DEAD_WINDOW_GAP_AMPS`
+    (2.0) above the smoothed meter with no commanded cut to explain it — capped
+    at 3 × `AC_RAMP_MS`, because a room switched off at the wall looks identical
+    forever and nothing may block unbounded (invariant 22's spirit). ⚠️ 40 %,
+    not 100 %: a compressor drawing under its model (Abdullah, 1.8 A against a
+    2.3 A model) must release normally or every healthy house freezes its own
+    raise path. Sampling side: never record a residual while the model sits >
+    `RESIDUAL_TRUST_GAP_AMPS` (1.0) above the meter, and when EVERY power-cycled
+    room is still dead the meter IS the house — recorded directly, guarded by
+    `DIRECT_SAMPLE_DRIFT_AMPS` (1.6) so the tick a compressor finally engages
+    cannot book a half-risen median as house. A source change carries the OTHER
+    line's peak rather than 0: the non-AC house does not care which line feeds
+    it, and 0 is the one answer known to be wrong.
+45. **A session that BEGINS dead has no cliff to latch on.** User-confirmed: the
+    breaker physically tripped that morning and he reset it by hand. 11:16–11:21
+    was an OPEN BREAKER, the four FLOORS resends went to devices that could not
+    hear them, and the reset brought all three rooms back at once with restart
+    protection already served — 6.4 → 16.6 A in ninety seconds. The third missed
+    trip in ten days, and a new hole class: invariant 31 fixed the collapse
+    FLOOR and invariant 5 the CREDIT, but both still describe a fall inside one
+    session. `entryCollapseEvidence` latches on four things together — the
+    dead-window gap (44), EVERY managed running room dark, at least one send of
+    ours unanswered for `ENTRY_COLLAPSE_UNCONFIRMED_MS` (120 s), and
+    `ENTRY_COLLAPSE_DWELL_MS` (60 s) of it holding — arming the SAME machinery a
+    fall-latched collapse arms (stacked derate, COLLAPSED, critical push, FLOORS
+    on the way back), released on evidence and never on a clock. ⚠️ "Dark" is
+    anchored to the CHANGEOVER and to sends WE made, never to a freshness bar:
+    measured twice a minute apart, healthy last-seen ages ran 248/157/269 s then
+    305/214/326 s with two of those rooms actively cooling — TCL shadows report
+    on STATE CHANGE, not on a keepalive, so any passive bar under ~5.5 min calls
+    a working house dead, and the amp gap cannot save it because restart
+    protection satisfies the gap on EVERY ordinary changeover. Silence we
+    provoked is evidence; silence we merely observed is not.
+46. **A changeover is a collapse recovery without the collapse.** The floor set
+    is admitted against the ENVELOPE on every gen ENTRY, hottest room first,
+    while `Σ floor models + carried house ≤ limit − margin`; the rest are shed
+    through ordinary shed rows and come back on the ordinary restore queue. The
+    morning's arithmetic was lost before the first reading existed — floors
+    10.4 A modeled + ~6 A house on a 15 A generator — and the same shape
+    recurred at 17:22:57 with every one of the day's admission-side protections
+    holding (R11b): nothing was wrong with the response, the entry was already
+    over. A normal changeover power-cycles every compressor exactly as a reset
+    breaker does. Free when the arithmetic fits: an entry with room to spare
+    journals `floors` and commands what it always did. Manual pins are admitted
+    before the budget is spent at all — this phase never sheds a room the user
+    asked for.
+47. **A brownout is the only voltmeter this house has.** After the 11:22 surge
+    the ESP logged power gaps of 28/34/41/47 s between 11:31 and 11:36 while the
+    controller rode 14.3–14.8 A on a 15 A generator calling itself healthy. At
+    46 °C a genset delivers under its plate rating, and with no voltage channel
+    a gap in the reading stream while we sit within `STRAIN_NEAR_LIMIT_AMPS`
+    (1.5) of the ceiling is the only evidence it can produce. Two such events
+    inside ten minutes take 0.5 A off the gen ceiling, stacking to 1.5 A,
+    recovered one rung per quiet 20 min exactly like the collapse derate
+    (invariant 15 — a cliff hand-back is spent by the raise path in seconds).
+    ONE event does nothing: a generator has moments. ⚠️ It is NOT a collapse —
+    nothing latches, nothing freezes, no push, no restore waits. It only shrinks
+    the ceiling the ordinary ladder already respects, which is the whole
+    difference between "the breaker opened" and "the generator is working too
+    hard". Kept in its own record beside `derate` so the two decay independently.
+
+**Added 2026-08-04 (midday) after the SECOND trip, this one on the ladder:**
+48. **A credit is late amps only while the lateness is SHRINKING — and while it
+    IS shrinking, nothing may escalate past it.** 12:38:23 fan trims, 12:38:26 a
+    level cut, ~3.0 A commanded; the meter fell 0.49 A in 91 s and the breaker
+    went at 12:39:57. Fan trims land in seconds; a level cut's compressor winds
+    down over minutes the breaker's thermal curve at 46 °C does not have — and
+    because `requiredAmps` is the CREDITED figure and invariant 33's extreme
+    rung is gated on `required > 0`, three amps of credit silenced the last rung
+    while the mean sat 0.6–1.1 A over for two and a half minutes. Invariant 38
+    could not help: it revokes when the meter RISES above the anchor, and this
+    one sat pinned at it. The other face arrived thirteen minutes later — at
+    12:56:39 a SECOND room was shed 13 s after a cut whose 2.3 of 2.9 commanded
+    amps had already left the house, because the sustained-over clock does not
+    pause for a cut that is landing and the escalation settle covered MILD only.
+    One predicate now answers both, `cutTrendOf` over the four numbers the meter
+    already publishes: `settling` inside `CREDIT_LANDING_GRACE_MS` (60 s),
+    `arriving` once `CREDIT_LANDING_FRACTION` (35 %) of the commanded amps have
+    demonstrably left, `stalled` past the grace with the fall still short. The
+    extreme rung fires on `stalled`; the sustained clock REBASES and the settle
+    hold extends to severe on `arriving`. ⚠️ A fired shed re-arms both credit
+    and anchor, so the tick after an escalation looks like a fresh cut — that is
+    what keeps the 2026-07-31 and 08-03 double-shed shapes covered.
+49. **The last rung sheds ONE room, and its bill must be real.** 15:53:45,
+    `over_extreme required 4.57 A` at a smoothed 15.0 against a limit of 15.0 —
+    and it shed BOTH remaining rooms. Two guards sized against part of what they
+    guard, lining up: `requiredSavingsAmps` sized from `min(severe readings)`,
+    whose safety argument holds only when there ARE several, and the banked ring
+    held exactly one 19.5 A compressor-inrush sample (a flicker pinned at its
+    1.5 A cap had raised the severe bar to 17.5 A, disqualifying every other
+    reading) — min over a set of one is the spike. The newest
+    `SEVERE_STREAK_READINGS` (2) banked readings must now ALL be severe before
+    their min may speak; newest, not merely two anywhere, because two spikes
+    minutes apart are still two spikes. It costs no reaction time: a severe
+    reading drains 3 of the bucket's 5 points, so a genuine step-up has always
+    banked its second before this is consulted. And the extreme tier's deficit
+    no longer sizes the general reducer's shed ceiling — that rung exists to
+    relieve a sustained strain, not to clear an arithmetic bill.
+50. **Which room is cooler is not that room's own business.** `computeAcNeed`
+    returns a FEELS-LIKE delta for a room whose range rule uses it and a
+    real-temperature delta for every other room, so every cross-room comparison
+    was asking two different questions and comparing the answers — humidity
+    alone could make a milder room outrank a hotter one and take its amps.
+    `AcView.rankNeedDelta` asks ONE question of every room (its own thermometer
+    against the shared comfort target, inverted in heat mode exactly as
+    `computeAcNeed` does it), and every room-vs-room use moves onto it: shed
+    selection and `SHED_NEED_GAP_C`, the reduction cost weights, the sub-floor
+    protection term, restore/yield precedence, the rebalance donor gap, the
+    recovery admission. Per-room ABSOLUTE logic keeps `needDelta` and its
+    configured metric — whether a room is comfortable is that room's own
+    business. A dead thermometer falls back to `needDelta`, which is precisely
+    the old ordering, so the change can never be worse than what it replaces;
+    both figures are journaled on every shed. On top of it, the user's full
+    shed-choice policy (2026-08-04): **shed the COOLEST room whose single off
+    covers the deficit; if none does, the coolest TWO in one batch** — which is
+    what the existing search expresses once the deficit is honest (49) and the
+    ranking is real, with `SHED_BATCH_MAX` (2) making "the hottest room always
+    survives" true for three rooms and no cap at all for two.
+
+**Added 2026-08-04 (evening), the user watching his own room at L1 in 47 °C heat:**
+51. **Above the band, L1 is not a level — it is the room off.** Invariant 39
+    already PRICES that cut as an off, and the 17:27:18 batch executed it anyway:
+    the reducer will pay any price when the alternative is infeasible. A target
+    the search cannot ENUMERATE is the only form of "never" that holds, so
+    `hardFloorOf` now bounds the move enumeration itself. One function,
+    `boostZoneOf`, owns the whole gradient rather than four conditionals in four
+    files — Abdullah's configured 39 °C: **< 36** nothing special · **36–39
+    `watch`** L1 is still his legitimate floor and he is WATCHED there
+    (`subFloorStalledMs` measures against the boost minimum, `BOOST_WATCH_BELOW_C`
+    = 3 °C early, which is the only window in which the evidence can be gathered
+    BEFORE the heat that makes it matter, and the RAISE path is what lifts him
+    on it) · **39–41 `flex`** the floor binds raises and entry clamps as always
+    and the sub-floor rung may STILL use L1, because at ~39 °C on 2026-08-03 he
+    was genuinely cooling there (`BOOST_FLOOR_FLEX_C` = 2) · **> 41 `hard`** not
+    a legal automatic target, no evidence needed. Every boundary carries the
+    boost floor's own 1 °C release hysteresis, and a stale outdoor reading holds
+    the LAST zone rather than falling back to permissive — the weather does not
+    become mild because the station went quiet. ⚠️ This NARROWS invariant 25's
+    sub-floor rung; it does not delete it. Its birth incident still binds for
+    every room below its band and every non-boost floor. Manual wins in both
+    directions: `floorOf` clamps to the pin, so a user who pins L1 gets the rung
+    back (invariant 42).
+52. **What the configuration estimates, the house can measure.** 39 °C is the
+    user's estimate of where the compressor starts to fail, and the real number
+    moves with humidity, condenser fouling and the generator's voltage — so the
+    system records its own bar (user: "when the system observe that abdullah is
+    not working on l1, by own observation or manual raise, it should state the
+    outside temp, so it will never reduce the level to l1 untill it drop below
+    that temp or after 6 h"). Armed by the sub-floor watch stalling at L1, by
+    R6's fan-sized off-drop (55), or by a hand raise OFF L1 — recorded BEFORE
+    the breaker check that may revert it, because whether we can AFFORD the
+    level he asked for says nothing about whether the level he is leaving cools
+    his room. Keyed on the outdoor temperature of the observation, so the LOWER
+    observation always wins (L1 failing at 39° implies it fails at 44°) and it
+    releases when the weather really goes back under it, `LEVEL_HOLD_RELEASE_C`
+    (0.5) of hysteresis so a reading on the bar cannot flap a room's whole
+    ladder. `LEVEL_HOLD_TTL_MS` (6 h) is the backstop for what the bar cannot
+    see — the hardware itself changing. A stale outdoor feed HOLDS, for the same
+    reason 51 holds its zone. It composes into `minLevel` by `max` with the
+    configured boost and sets `boostFloorHard`, extending 51's hardness BELOW
+    the configured threshold on evidence. ⚠️ It **persists**
+    (`ac_leveling_level_hold`): a six-hour hold a deploy erases is not a hold,
+    and eleven deploys landed inside those six hours. ⚠️ `hardFloorOf` is
+    clamped to the room's current level in the reducer — a hold can arm while a
+    room is ALREADY at L1, and an unclamped hard floor leaves that room no level
+    move at all, so the search would answer "L1 is not a target" with a
+    power_off.
+53. **A level still in flight is recoverable, and a refusal has to cost
+    something.** The restore refusal is `committedAmps − savingsAtFloors + cost`,
+    and the two terms described different houses: `committedAmps` charges a
+    raise's committed-but-unmetered jump the instant it is SENT (invariant 12)
+    while `savingsAtFloors` read `currentLevel`, which does not move until the
+    firmware confirms — seconds to fifteen minutes (invariant 7). Live
+    2026-08-03 17:13:36 / 17:19:03 / 17:25:31, the same shape three times in
+    twelve minutes: a shed room refused at "floors 16.5 A vs 14.9 A" with
+    `savingsAtFloors` reading ZERO and a peer raise in the same batch. Both
+    sides now price peers at `chargedLevelOf`, and the EMISSION moved with it —
+    crediting an in-flight level while still emitting floor-downs off
+    `currentLevel` admits a restore and sends nothing to pay for it. The second
+    half is raise-vs-raise: at 17:13:36 the mildest room (need 1.9) took 2.0 A
+    while the hottest (need 8.0) was refused its step by 0.2 A. Sorted
+    hottest-first is not the same as ranked, so a room refused for AMPS now
+    records its need and a milder one may take those amps only if it is at least
+    `SHED_NEED_GAP_C` (1.0 °C) milder — the same constant and the same question
+    the recovery admission asks in the other direction. ⚠️ Only AMPS refusals
+    arm it: a room waiting out its own calm, backoff, victim or funding cooldown
+    is serving a sentence that expires on its own, and fencing its peers behind
+    it would turn every cooldown into a house-wide freeze.
+54. **The trough a shed digs outlives the credit that explains it.** Invariant
+    41 floors the committed meter at `cutAnchorAmps − commandedCutAmps` while a
+    cut is in flight, and that claim dies twice over — with `PENDING_CUT_MS`
+    (180 s) and with the absorption that spends it. Live 07:19→07:20 a restore
+    was admitted THIRTY-ONE SECONDS after the shed that caused it. The bar is
+    therefore also kept per ROOM for one `ATTEMPT_BLAME_WINDOW_MS` — deliberately
+    the same window as the bounce blame, since a shed inside it is already that
+    restore's failure and this is the identical judgment read from the other
+    end. ⚠️ A room blocked ONLY by its own bar RESERVES its amps instead of
+    being skipped: the skip exists for rooms physics cannot carry, and this is
+    the opposite case — the bar is a claim about the HOUSE, so if the shed room
+    cannot be afforded at that figure then nobody can, and a peer's raise taking
+    them spends the very trough the bar exists to disbelieve. ⚠️ Invariant 39's
+    unconditional form was re-tested on top of this and **rejected a second
+    time**: 41 commands in 40 minutes against the conditional form's 4, in two
+    shed→raise→restore rounds. The backoff was never what was missing — the shed
+    frees real headroom, the raise path is entitled to it, and the line goes
+    over again. Closing it needs a shed that does not hand its amps straight
+    back (the user's parked "gated proactive shed").
+55. **Ask the METER whether the compressor ran.** The sub-floor watch answers it
+    from the thermometer and needs three minutes; a lone shed's off-drop answers
+    it in one grading window, and the shed was going to happen anyway (user's own
+    experiment: "an off with 1 amp or less of drop means the compressor was not
+    running"). `AcView.compressorOffLikely` carries the verdict from two
+    ATTRIBUTABLE sources — a graded LONE off whose drop was ≤
+    `COMPRESSOR_OFF_DROP_AMPS` (1.2) while the model claimed ≥
+    `COMPRESSOR_OFF_MODEL_AMPS` (2.0), retained per device+LEVEL and per source
+    until `COMPRESSOR_ON_DROP_AMPS` of graded fall or an amp of ramp absorption
+    retires it; and the dead window of 44. It feeds `isNonCooling` (so both
+    ladder directions treat it exactly as they treat a stalled room), arms 52's
+    learned hold, and surfaces as `coolingState` per AC. ⚠️ Never from the
+    standing residual — `smoothed − modelled` moves when a room under-draws its
+    model, so reading it to decide whether the room is under-drawing is circular
+    (invariant 40, and that reasoning already produced one wrong diagnosis). A
+    graded lone off is not circular: one actuator, over a window the pipeline
+    has already certified uncontaminated (23) and settled (29). Read BEFORE the
+    0.2 A learn threshold, because a room that dropped almost nothing is exactly
+    the case this is about and exactly the case that gate discards.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's
@@ -510,9 +756,10 @@ requireShed ≥ max(3 A, 20%).
 **Mode machine:** COLLAPSED > FLOORS > GRID_FULL > SETTLING > NORMAL. FLOORS arms on ANY entry into
 gen (incl. cold start); GRID_FULL on any entry into grid.
 
-**Reduction ladder:** levels → floor → fans → **sub-floor levels** → ONE room off → (re-evaluate) →
-next room off (invariants 17, 18, 25, 26). Once a rung reaches an off, a hot room's sub-floor cut is
-priced as an off too (invariant 36).
+**Reduction ladder:** levels → floor → fans → **sub-floor levels** → the COOLEST room whose single
+off covers the deficit → (only if none does) the coolest TWO in one batch (invariants 17, 18, 25, 26,
+50). Once a rung reaches an off, a hot room's sub-floor cut is priced as an off too (invariant 36),
+and past a room's boost band its sub-floor levels are not enumerable at all (51/52).
 
 **Fans are last-resort trim only** — a plan may cut a fan only if its end-state leaves EVERY AC at its
 floor (invariant 17); restores are bounded and cooldown-gated (invariant 18). (v1 cut fans while level
