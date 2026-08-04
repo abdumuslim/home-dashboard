@@ -72,6 +72,11 @@ export interface PlanInput {
    * branch. Defaults to the ordinary "clamp everyone to their floor".
    */
   recoveryAdmission?: boolean;
+  /**
+   * Per-room meter bar for a restore whose own shed is still recent — see
+   * `RaiseInput.shedBarAmps`. Defaults to "no bar" (the pre-R9 admission).
+   */
+  shedBarAmps?: (deviceId: string) => number;
 }
 
 export interface PlanOutput extends Plan {
@@ -570,6 +575,10 @@ export function plan(input: PlanInput): PlanOutput {
       // bounce passes on the other gates (calm, settle, envelope), which is why
       // a missing wire could sit here unnoticed.
       victimCooldown: input.victimCooldown,
+      // …and the per-room half of "judge a restore on where the meter is
+      // heading" (invariant 41): the trough a room's own shed digs outlives the
+      // commanded-cut credit, so the bar does too (R9).
+      shedBarAmps: input.shedBarAmps,
     });
     if (raisePlan.commands.length > 0 || corrections.commands.length > 0) {
       // A gentle restore (power_on carrying a pinned fan) records a fan hold so

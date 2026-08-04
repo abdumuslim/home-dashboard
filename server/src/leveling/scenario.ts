@@ -30,6 +30,7 @@ import {
 } from "./modes.js";
 import { GRADE_TURN_ON_MS, plan, type PlanOutput } from "./pipeline.js";
 import {
+  ATTEMPT_BLAME_WINDOW_MS,
   attemptedRecently,
   attemptedWithin,
   initialPacingState,
@@ -258,6 +259,12 @@ export class Scenario {
   private fundingDemotedAt = new Map<string, number>();
   /** Shell parity: rooms the reducer cut → when (they may not climb straight back). */
   private reducedAt = new Map<string, number>();
+  /**
+   * Shell parity (R9): the meter bar a room's OWN shed left — the smoothed
+   * meter when the shedding batch went out, less what it was priced to save.
+   * A restore is judged against that, not against the trough its shed dug.
+   */
+  private shedBar = new Map<string, { amps: number; at: number }>();
   private attempts: Array<{ deviceId: string; kind: AttemptKind; at: number }> = [];
 
   constructor(
@@ -1171,6 +1178,17 @@ export class Scenario {
       // the floor set is admitted on the envelope rather than on a meter that
       // has seen none of it yet.
       recoveryAdmission: this.now < this.recoveryAdmissionUntil,
+      // Shell parity: a room's own shed leaves a hole its restore must not read
+      // as headroom, for a full blame window (R9).
+      shedBarAmps: (deviceId) => {
+        const bar = this.shedBar.get(deviceId);
+        if (bar == null) return 0;
+        if (this.now - bar.at > ATTEMPT_BLAME_WINDOW_MS) {
+          this.shedBar.delete(deviceId);
+          return 0;
+        }
+        return Math.max(0, bar.amps);
+      },
     });
     this.freshlyOn = [];
     this.plans.push(out);
@@ -1214,6 +1232,12 @@ export class Scenario {
         // parity): gen's start policy is a floor clamp, which can only agree
         // with the reducer, and a gen turn-on is over-limit by definition.
         if (this.line === "grid") for (const ac of this.acs) ac.startBaseline = null;
+      }
+      // Shell parity (R9): stamp the bar each shed leaves behind, from the
+      // PRE-batch meter less what the batch was priced to save.
+      for (const cmd of out.commands) {
+        if (cmd.kind !== "power_off") continue;
+        this.shedBar.set(cmd.deviceId, { amps: view.smoothedAmps - out.commandedCutAmps, at: this.now });
       }
       // Failure attribution: a reduction that undoes a recent raise/restore is
       // that attempt's failure (the bounce, hybrid-backoff side).

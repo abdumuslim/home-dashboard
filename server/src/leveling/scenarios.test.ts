@@ -553,7 +553,11 @@ describe("restore backoff (kills the 49m/1h18m strands, bounds the shed↔restor
       { nonAcAmps: 5.7, source: "gen" }, // total with Najat off ≈ 12.0
     );
     const t0 = s.now;
-    s.advance(30 * 60);
+    // An hour, not the original half: since R9 a room's own shed leaves a meter
+    // BAR for one blame window (5 min), so the first few retries are paced by
+    // that rather than by the ladder and their gaps come out equal. The ladder
+    // only visibly overtakes it at the 15-minute rung.
+    s.advance(60 * 60);
     const restores = s.commandsSince(t0, "power_on");
     const sheds = s.commandsSince(t0, "power_off");
     // Retries keep happening (no strand)…

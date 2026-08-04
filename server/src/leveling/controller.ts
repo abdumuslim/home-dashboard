@@ -37,6 +37,7 @@ import {
 import { plan, type PlanOutput } from "./pipeline.js";
 import { GRADE_FAN_MS, GRADE_TURN_ON_MS } from "./pipeline.js";
 import {
+  ATTEMPT_BLAME_WINDOW_MS,
   attemptedRecently,
   attemptedWithin,
   cooldownRemainingMs,
@@ -372,6 +373,16 @@ export class LevelingControllerV2 {
   private reducedAt = new Map<string, number>();
   /** Shed rooms whose shadow said ON at boot → when first seen (see BOOT_SHED_CLEAR_GRACE_MS). */
   private bootShedOnSince = new Map<string, number>();
+  /**
+   * Per-room meter bar left by that room's OWN shed: the smoothed meter when the
+   * shedding batch went out, less what the batch was priced to save, and when.
+   *
+   * The global `pendingCut` answers the same question for `PENDING_CUT_MS` and
+   * is spent by absorption; this one is per-room and lives a full blame window,
+   * because the TROUGH a shed digs outlives its credit. Live 07:19→07:20 today
+   * a restore was admitted 31 s after the shed that caused it (R9, invariant 41).
+   */
+  private shedBar = new Map<string, { amps: number; at: number }>();
   /** Last fan TRIM actually sent per device — the fan half of send dedupe. */
   private lastFanSent = new Map<string, { fan: number; at: number }>();
   /** Last shed actually sent per device — the power_off half of send dedupe. */
@@ -817,6 +828,10 @@ export class LevelingControllerV2 {
           this.startBaseline.clear();
           this.rampBaseline.clear();
           this.rampAbsorbed.clear();
+          // A shed bar is a claim about one line's meter (R9) — 15A of gen and
+          // 30A of grid are not the same number, and carrying it across would
+          // strand a room off on the roomy source.
+          this.shedBar.clear();
           // Dead-window holds are about ramps on the line we just left; the
           // entry re-arms them a tick later against the new line's readings.
           this.powerEventRamp.clear();
@@ -1062,6 +1077,9 @@ export class LevelingControllerV2 {
 
   async onUserPowerOn(deviceId: string): Promise<void> {
     if (!this.isManaged(deviceId)) return;
+    // He put the room back himself. Our own shed's bar has nothing left to
+    // protect (R9) — the room is on, and the next thing to judge is the meter.
+    this.shedBar.delete(deviceId);
     await this.clearShed(deviceId, "user_power_on");
     this.rearmRamp([deviceId]);
     // Fires before the shadow flips — the meter here is still the pre-start
@@ -1972,6 +1990,10 @@ export class LevelingControllerV2 {
       // The rooms are coming back from a dead circuit all at once — admit the
       // floor set on the envelope, because the meter has seen none of it yet.
       recoveryAdmission: now < this.recoveryAdmissionUntil,
+      // A room's own shed left a hole in the meter; its restore is judged
+      // against the meter BEFORE that hole, for as long as the shed can still
+      // be blamed for a bounce (R9).
+      shedBarAmps: (deviceId) => this.shedBarFor(deviceId, now),
     });
     this.fanHolds = out.fanHolds;
 
@@ -2051,6 +2073,32 @@ export class LevelingControllerV2 {
     if (r.watch != null) this.subFloorSince.set(deviceId, r.watch);
     else this.subFloorSince.delete(deviceId);
     return r.stalledMs;
+  }
+
+  /**
+   * The meter bar this room's own shed left, or 0 once it has aged out.
+   *
+   * Deliberately the SAME window as `ATTEMPT_BLAME_WINDOW_MS` rather than a new
+   * constant: a shed inside that window is already treated as a restore's
+   * failure, and this is the identical judgment read from the other end — is
+   * this restore a bounce off that shed? One number, so the two halves of the
+   * bounce cannot drift apart.
+   *
+   * What consumes it (hard rule 5c): the shed room's own draw leaving the meter
+   * (seconds to minutes) PLUS the survivors finishing the duty cycle that makes
+   * the trough look affordable. `PENDING_CUT_MS` (180 s) sizes only the first,
+   * which is why the credit expiring was never the same thing as the trough
+   * closing — live 2026-08-03, four restores of one room in 23 minutes, every
+   * one admitted at a 9.5–12.5 A meter whose settled value was ~15 A.
+   */
+  private shedBarFor(deviceId: string, now: number): number {
+    const bar = this.shedBar.get(deviceId);
+    if (bar == null) return 0;
+    if (now - bar.at > ATTEMPT_BLAME_WINDOW_MS) {
+      this.shedBar.delete(deviceId);
+      return 0;
+    }
+    return Math.max(0, bar.amps);
   }
 
   /**
@@ -2569,7 +2617,24 @@ export class LevelingControllerV2 {
       if (view.source === "grid") this.startBaseline.clear();
     }
 
+    // A room we just shed leaves a hole in the meter that its own restore must
+    // not read as headroom. Anchored to the PRE-batch meter less what the batch
+    // was priced to save — invariant 41's landing figure, frozen per room so it
+    // outlives the shared credit (R9). Only rooms actually SENT an off.
+    for (const cmd of commands) {
+      if (cmd.kind !== "power_off") continue;
+      this.shedBar.set(cmd.deviceId, { amps: view.smoothedAmps - out.commandedCutAmps, at: now });
+    }
+
     // Failure attribution: an over-limit cut/shed of a recently-attempted AC.
+    //
+    // R9 asked whether this covers the RE-SHED path and not only a failed
+    // admission. It does, and always has: `attemptedRecently` spans
+    // ATTEMPT_BLAME_WINDOW_MS (300 s), so a restore re-shed inside five minutes
+    // grows the ladder. Nor is the `over` gate a hole — the only other branch
+    // that can emit a `power_off` is the FLOORS recovery admission, and FLOORS
+    // arms on a source ENTRY, which has just called `resetPacing`; a restore
+    // cannot have been attempted in between, because FLOORS blocks restores.
     if (out.reason.startsWith("over")) {
       for (const cmd of commands) {
         if (cmd.kind !== "set_level" && cmd.kind !== "power_off") continue;

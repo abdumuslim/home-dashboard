@@ -222,6 +222,17 @@ export interface RaiseInput {
    * into the same overload. Defaults to "nothing cooling".
    */
   victimCooldown?: (deviceId: string) => boolean;
+  /**
+   * The meter bar a room's OWN restore must clear while its shed is still
+   * recent: the smoothed meter as it stood when that room was shed, less what
+   * the shedding batch was priced to save. 0 when there is nothing to say.
+   *
+   * `cutAnchorAmps`/`commandedCutAmps` answer the same question globally and
+   * for `PENDING_CUT_MS` only; this one is per-room and outlives the credit,
+   * because the trough a shed digs outlives it too (R9 — see `barFor`).
+   * Defaults to "no bar", i.e. exactly the pre-R9 admission.
+   */
+  shedBarAmps?: (deviceId: string) => number;
 }
 
 export interface RaisePlan {
@@ -413,6 +424,22 @@ export function planRaise(input: RaiseInput): RaisePlan {
   // flight is taking it.
   const committedAmps = Math.max(input.smoothedAmps + input.rampDebitAmps, landingAmps);
   const rampNote = input.rampDebitAmps > 0 ? ` (+${input.rampDebitAmps.toFixed(1)}A ramping in)` : "";
+  /**
+   * The same claim as `landingAmps`, but about ONE room and for longer: where
+   * the meter stood when THIS room was shed, less what that batch was priced to
+   * save (R9).
+   *
+   * `landingAmps` expires with `PENDING_CUT_MS` (180 s), and it is shared — any
+   * later cut re-anchors it, and any absorption spends it. Both are correct for
+   * the question it answers ("is the house still falling"), and both are wrong
+   * for this one: 30 seconds after a shed the credit can already be gone, the
+   * meter is sitting in the trough its own shed dug, and the room that shed
+   * looks affordable again. Live 07:19→07:20 today a restore was admitted 31
+   * seconds after the shed that caused it; on 2026-08-02 the same shape ran
+   * four times. Invariant 41 named the trough; this is the part of it that
+   * outlives the credit.
+   */
+  const barFor = (deviceId: string): number => input.shedBarAmps?.(deviceId) ?? 0;
 
   const shedCandidates = acs
     .filter((a) => a.shed && a.managed && !a.on)
@@ -479,6 +506,12 @@ export function planRaise(input: RaiseInput): RaisePlan {
       break;
     }
     const floor = floorOf(candidate);
+    // What THIS room's return is judged against: the committed meter, never
+    // below the bar its own shed left (R9). Everything downstream — the fit
+    // tests, the probe re-arm anchor, and the anchor stamped on the attempt —
+    // reads this figure, so a trough the room dug itself cannot readmit it from
+    // any direction.
+    const candidateCommitted = Math.max(committedAmps, barFor(candidate.deviceId));
     // On gen every restore ships GENTLE (fan pinned to 1), but gentleness is
     // NOT a discount: 2026-07-27 proved the pin doesn't shrink the compressor
     // draw — three fan-pinned restores of Najat admitted at her steady 2.3A
@@ -546,8 +579,8 @@ export function planRaise(input: RaiseInput): RaisePlan {
     const floorOverrides = Object.fromEntries(onManaged.map((a) => [a.deviceId, floorOf(a)]));
     const envelopeFloorsOk = !envelopeGuard || envelopeWith(floorOverrides, candidateEntry) <= envelopeCeiling;
     const fitsWith = (amps: number): { plain: boolean; atFloors: boolean } => ({
-      plain: envelopePlainOk && committedAmps + amps <= restoreCeiling,
-      atFloors: envelopeFloorsOk && committedAmps - savingsAtFloors + amps <= restoreCeiling,
+      plain: envelopePlainOk && candidateCommitted + amps <= restoreCeiling,
+      atFloors: envelopeFloorsOk && candidateCommitted - savingsAtFloors + amps <= restoreCeiling,
     });
 
     let cost = plainCost;
@@ -574,7 +607,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       gentleRestore &&
       plainCost.amps > probeCost.amps + 1e-9 &&
       (restoreFailures(pacing, candidate.deviceId) === 0 ||
-        probeRearmed(pacing, candidate.deviceId, committedAmps))
+        probeRearmed(pacing, candidate.deviceId, candidateCommitted))
     ) {
       const probeFits = fitsWith(probeCost.amps);
       if (probeFits.plain || probeFits.atFloors) {
@@ -585,6 +618,36 @@ export function planRaise(input: RaiseInput): RaisePlan {
     }
     const fitsPlain = fits.plain;
     const fitsAtFloors = fits.atFloors;
+    const bar = barFor(candidate.deviceId);
+    /** Would it fit if we judged it on the trough its own shed dug? */
+    const fitsIgnoringBar =
+      (envelopePlainOk && committedAmps + cost.amps <= restoreCeiling) ||
+      (envelopeFloorsOk && committedAmps - savingsAtFloors + cost.amps <= restoreCeiling);
+    const barIsTheBlocker = !fitsPlain && !fitsAtFloors && bar > committedAmps && fitsIgnoringBar;
+
+    // Blocked ONLY by its own shed bar (R9): the room fits the meter in front of
+    // us and does not fit the meter this house really has. RESERVE, don't skip.
+    //
+    // The skip below exists for rooms physics cannot carry — parking raises on
+    // those would strand a running room forever. This case is the opposite: the
+    // bar is a claim about the HOUSE, so if the shed room cannot be afforded at
+    // that figure then nobody can, and letting a raise take the amps would be
+    // spending the very trough the bar exists to disbelieve. Bounded by the bar
+    // itself (one blame window from the shed), and a bar can only be renewed by
+    // another shed — which is itself a bounce that grows the backoff.
+    if (barIsTheBlocker) {
+      reservedAmps = Math.max(reservedAmps, cost.amps);
+      decisions.push({
+        at: now,
+        deviceId: candidate.deviceId,
+        action: "restore",
+        blockedBy: "own shed trough",
+        detail:
+          `meter ${committedAmps.toFixed(1)}A is the hole this room's own shed dug — ` +
+          `judged at ${bar.toFixed(1)}A, needs ${cost.amps.toFixed(1)}A vs ${restoreCeiling.toFixed(1)}A`,
+      });
+      continue;
+    }
 
     // Can't return this tick even with peer floor-downs → reserve NOTHING
     // (raises don't change floors math, so parking here would be a permanent
@@ -598,7 +661,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
         // floors); if even that is over the breaker model, physics is the
         // blocker, not the meter — label it so the journal is diagnosable.
         blockedBy: !envelopeFloorsOk ? "physics envelope" : "no headroom",
-        detail: `floors ${(committedAmps - savingsAtFloors + cost.amps).toFixed(1)}A vs ${restoreCeiling.toFixed(1)}A${rampNote}`,
+        detail: `floors ${(candidateCommitted - savingsAtFloors + cost.amps).toFixed(1)}A vs ${restoreCeiling.toFixed(1)}A${rampNote}`,
       });
       continue;
     }
@@ -667,7 +730,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       : undefined;
     if (fitsPlain) {
       commands.push(restoreCmd());
-      attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: committedAmps });
+      attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: candidateCommitted });
       decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}`, detail: probeDetail });
       return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors };
     }
@@ -690,7 +753,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       }
     }
     commands.push(restoreCmd());
-    attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: committedAmps });
+    attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: candidateCommitted });
     decisions.push({
       at: now,
       deviceId: candidate.deviceId,

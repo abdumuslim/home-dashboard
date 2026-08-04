@@ -125,6 +125,90 @@ describe("a restore is judged on where the meter is HEADING (2026-08-03 shed/res
 });
 
 // ---------------------------------------------------------------------------
+// R9 — the trough a shed digs outlives the credit that explains it.
+//
+// Invariant 41 floors the committed meter at `cutAnchorAmps − commandedCutAmps`
+// while a cut is in flight, and that claim dies with `PENDING_CUT_MS` (180 s) or
+// with the absorption that spends it. Live 07:19→07:20 on 2026-08-04 a restore
+// was admitted THIRTY-ONE SECONDS after the shed that caused it, and four times
+// on 2026-08-02 — the credit had cleared early, the meter was sitting in the
+// hole the room's own departure made, and the room looked affordable again.
+//
+// So the bar is also kept per ROOM, for one blame window from its own shed.
+// ---------------------------------------------------------------------------
+describe("a room's own shed leaves a bar its restore must clear (R9)", () => {
+  const shedRoom = (): AcView[] => [
+    ac("a", { needDelta: 2 }),
+    ac("b", { on: false, shed: true, needDelta: 4 }),
+  ];
+
+  it("refuses the restore judged on the trough, once the credit has already cleared", () => {
+    // No cut in flight at all — exactly the state 31 s after a shed whose credit
+    // expired or was absorbed. The meter reads 9.5A; the house this room was
+    // shed OUT OF was 12.9A, and its 2.0A return does not fit there.
+    const p = raise(shedRoom(), {
+      smoothedAmps: 9.5,
+      headroomAmps: 5.2,
+      cutAnchorAmps: 0,
+      commandedCutAmps: 0,
+      limitAmps: 13.0,
+      shedBarAmps: (id) => (id === "b" ? 12.9 : 0),
+    });
+    expect(p.commands).not.toContainEqual(
+      expect.objectContaining({ deviceId: "b", kind: "power_on" }),
+    );
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "b", blockedBy: "own shed trough" }),
+    );
+  });
+
+  it("reserves those amps rather than handing them to a peer's raise", () => {
+    // The bar is a claim about the HOUSE: if the shed room cannot be afforded at
+    // that figure, nobody can. Skipping (reserving nothing) would let the raise
+    // phase spend the very trough the bar exists to disbelieve.
+    const p = raise(shedRoom(), {
+      smoothedAmps: 9.5,
+      headroomAmps: 5.2,
+      cutAnchorAmps: 0,
+      commandedCutAmps: 0,
+      limitAmps: 13.0,
+      shedBarAmps: (id) => (id === "b" ? 12.9 : 0),
+    });
+    expect(p.reservedAmps).toBeGreaterThan(0);
+    expect(p.commands.filter((c) => c.kind === "set_level")).toHaveLength(0);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ action: "raises", blockedBy: "restore reservation" }),
+    );
+  });
+
+  it("admits it once the bar has aged out — a bar is a window, not a verdict", () => {
+    const p = raise(shedRoom(), {
+      smoothedAmps: 9.5,
+      headroomAmps: 5.2,
+      limitAmps: 13.0,
+      shedBarAmps: () => 0,
+    });
+    expect(p.commands).toContainEqual(
+      expect.objectContaining({ deviceId: "b", kind: "power_on", reason: "restore" }),
+    );
+  });
+
+  it("a bar BELOW the live meter changes nothing — the meter is the truth again", () => {
+    // The house grew since the shed; judging on the older, lower figure would be
+    // the mirror of the bug (admitting on a stale claim instead of a trough).
+    const p = raise(shedRoom(), {
+      smoothedAmps: 9.5,
+      headroomAmps: 5.2,
+      limitAmps: 13.0,
+      shedBarAmps: (id) => (id === "b" ? 8.0 : 0),
+    });
+    expect(p.commands).toContainEqual(
+      expect.objectContaining({ deviceId: "b", kind: "power_on", reason: "restore" }),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // R8 — the raise and the restore have to describe the same house.
 // Live 2026-08-03 17:13:36 / 17:19:03 / 17:25:31, the same shape three times in
 // twelve minutes: Abdu shed, his restore refused at "floors 16.5A vs 14.9A"

@@ -205,6 +205,7 @@ function createGradePool(
     }
     if (sql.includes("INSERT INTO ac_leveling_journal")) {
       journal.push({
+        at: params[0],
         reason: params[4],
         requiredAmps: params[5],
         preAmps: params[6],
@@ -1645,6 +1646,121 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
       await controller.ensureLoaded();
       await run(14.6, 45, null);
       expect(mock.levelHolds.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R9 — the shell half. The BAR a shed leaves behind is stamped from the
+// pre-batch meter and the batch's own priced saving, and a shed counts as a
+// restore's bounce whichever planner decided it. Both live in the shell, which
+// is why they need a guard here as well as in raise.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — a room's own shed bars its restore (R9)", () => {
+  function setup(shedIds: string[] = []) {
+    const mock = createGradePool(
+      {
+        genLimitAmps: 15,
+        priority: ["big", "small"],
+        genAmpModels: { big: { baseAmps: 4.1, stepAmps: 2.45 }, small: { baseAmps: 2.3, stepAmps: 1.5 } },
+      },
+      shedIds,
+    );
+    const offs: string[] = [];
+    const ons: string[] = [];
+    const deps: LevelingDeps = {
+      ...createDeps(),
+      getTclCloud: () =>
+        ({
+          sendControl: async () => undefined,
+          executeAcAction: async (id: string, action: Record<string, unknown>) => {
+            if (action.power === 0) offs.push(id);
+            if (action.power === 1) ons.push(id);
+          },
+        }) as never,
+    };
+    const controller = new LevelingControllerV2(mock.pool, deps);
+    const power = new Map<string, boolean>([
+      ["big", !shedIds.includes("big")],
+      ["small", !shedIds.includes("small")],
+    ]);
+    const room = (id: string, temp: number, need: number) => ({
+      device: { ...(acDevice(id, power.get(id) === true, 1) as object), power: power.get(id) === true, currentTemp: temp } as never,
+      managed: true,
+      needTier: "full" as const,
+      needDelta: need,
+      slotGenCap: null,
+    });
+    const ctxOf = () => [room("big", 30, 3), room("small", 28, 2)] as never;
+    let flip = 1;
+    const run = async (amps: number, steps: number) => {
+      for (let i = 0; i < steps; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: amps + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctxOf(), 40);
+      }
+    };
+    const decisionsOf = () =>
+      mock.journal.flatMap(
+        (r) => JSON.parse(String(r.decisions ?? "[]")) as Array<{ blockedBy?: string; deviceId?: string }>,
+      );
+    return { mock, controller, offs, ons, power, run, decisionsOf };
+  }
+
+  it("does not re-admit the room into the hole its own shed dug", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T04:15:00Z"));
+      const { controller, offs, ons, power, run, decisionsOf } = setup();
+      await controller.ensureLoaded();
+
+      // Ride over the limit until the reducer sheds exactly one room, then stop
+      // pressing — a second shed would change the arithmetic being tested.
+      for (let i = 0; i < 40 && offs.length === 0; i++) await run(15.7, 1);
+      expect(offs).toHaveLength(1);
+      power.set(offs[0], false);
+
+      // The trough its own departure left: 12.5A, comfortably under the 14.9A
+      // ceiling for a 2.3A return — and a lie, because the house it was shed out
+      // of was 15.7A less the 2.3A that shed was priced to save. This is the
+      // 07:19→07:20 shape, with the commanded-cut credit already spent.
+      ons.length = 0;
+      await run(12.5, 40);
+
+      expect(ons).toHaveLength(0);
+      expect(decisionsOf().some((d) => d.blockedBy === "own shed trough")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a re-shed inside the blame window grows the restore ladder", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T04:15:00Z"));
+      const { controller, offs, ons, power, run } = setup(["small"]);
+      await controller.ensureLoaded();
+
+      // Plenty of room: the shed room comes back. Stop the moment it does, so
+      // the re-shed lands inside the blame window rather than after a grade has
+      // already called the restore a success.
+      for (let i = 0; i < 90 && ons.length === 0; i++) await run(7.0, 1);
+      expect(ons).toContain("small");
+      power.set("small", true);
+
+      // …and the line objects, so it goes straight back off. R9 asked whether
+      // `noteFailure` covers this path rather than only a failed ADMISSION, and
+      // it does — pinned here because the unconditional non-cooling pricing
+      // (R9b) has nowhere stable to land without it.
+      offs.length = 0;
+      for (let i = 0; i < 24 && offs.length === 0; i++) await run(16.4, 1);
+      expect(offs).toContain("small");
+      const cooldown = controller.getStatus().acs.find((a) => a.deviceId === "small")?.restoreCooldownMs ?? 0;
+      expect(cooldown).toBeGreaterThan(0);
     } finally {
       vi.useRealTimers();
     }
