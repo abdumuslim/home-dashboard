@@ -269,6 +269,84 @@ export const COLLAPSE_DERATE_MS = 20 * 60_000;
 export const COLLAPSE_DERATE_RECOVERY_STEP = 0.5;
 
 /**
+ * Generator STRAIN (user, 2026-08-04: "consider the gen flickering, without
+ * leading to a power break").
+ *
+ * After the 11:22 surge the ESP logged power gaps of 28–47 s at 11:31–11:36
+ * while the controller rode 14.3–14.8A on the 15A generator and reported itself
+ * healthy. Those gaps are brownouts: at 46 °C ambient a genset delivers less
+ * than its plate rating, and the line browning out while we sit within an amp
+ * of the limit is the only evidence this house can produce that the real
+ * ceiling is lower than the configured one.
+ *
+ * A strain event is an ESP gap of at least `ESP_GAP_EVENT_MS` that ENDS on gen
+ * with the pre-gap smoothed meter within `STRAIN_NEAR_LIMIT_AMPS` of the
+ * effective limit. It is deliberately NOT a collapse: nothing latches, nothing
+ * freezes, no push — the ceiling comes down and the ordinary ladder respects it.
+ */
+export const STRAIN_DERATE_AMPS = 0.5;
+/**
+ * Ceiling on the stacked strain derate. Three rungs — a generator that cannot
+ * hold 1.5A under its rating is a hardware problem, not something the leveler
+ * should keep answering by starving the house.
+ */
+export const STRAIN_DERATE_MAX_AMPS = 1.5;
+/**
+ * How near the limit the pre-gap mean must have been for a gap to count as
+ * strain rather than a Wi-Fi flake.
+ *
+ * Compared against `effectiveLimit − smoothedAmps(pre-gap)`. The largest single
+ * increment that can consume it is supply flicker, capped at
+ * `FLICKER_MAX_AMPS` (1.5) on RAW readings — but this is measured on the
+ * SMOOTHED mean, where a 4-wide median has already removed the single-reading
+ * spikes, so a mean this close to the limit is genuine load. Live evidence:
+ * 14.3–14.8A against a 15A limit is 0.2–0.7A of margin, comfortably inside;
+ * an ESP dropout at a 9A house is 6A out and must do nothing.
+ */
+export const STRAIN_NEAR_LIMIT_AMPS = 1.5;
+/**
+ * Two strain events inside this window arm (or step) the derate. ONE brownout
+ * is a generator having a moment — a fuel slug, a governor hunting — and
+ * answering it would cost comfort for noise. Two is a pattern, and the live
+ * cluster was five gaps inside six minutes.
+ */
+export const STRAIN_WINDOW_MS = 10 * 60_000;
+/** Events needed inside `STRAIN_WINDOW_MS`. */
+export const STRAIN_EVENTS_TO_DERATE = 2;
+/**
+ * One rung of the strain derate, and how much is handed back per quiet rung.
+ * Same shape as the collapse derate for the same reason (invariant 15): a cliff
+ * hand-back is spent within seconds by the raise path, so the line earns its
+ * rating back in steps or not at all. A full 1.5A stack therefore takes an hour
+ * of quiet to retire.
+ */
+export const STRAIN_DERATE_MS = 20 * 60_000;
+export const STRAIN_DERATE_RECOVERY_STEP = 0.5;
+
+/**
+ * Live strain derate for `source` — the same stepped decay `derateFor` applies
+ * to a collapse, kept as its own record so the two caps stay independent and a
+ * brownout can never be mistaken for a trip.
+ */
+export function strainDerateFor(state: MeterState, source: PowerSource, now: number): number {
+  const d = state.strainDerate;
+  if (d == null || d.source !== source) return 0;
+  if (now < d.until) return d.amps;
+  const rungsElapsed = 1 + Math.floor((now - d.until) / STRAIN_DERATE_MS);
+  return Math.max(0, d.amps - rungsElapsed * STRAIN_DERATE_RECOVERY_STEP);
+}
+
+/**
+ * Everything shrinking the ceiling on `source` right now: a breaker that
+ * tripped, plus a generator that has been browning out. EVERY limit consumer
+ * must read this one — the leaky bucket, the reducer and the raise envelope
+ * disagreeing about what "over" means is how episodes drag.
+ */
+export function totalDerateFor(state: MeterState, source: PowerSource, now: number): number {
+  return derateFor(state, source, now) + strainDerateFor(state, source, now);
+}
+
+/**
  * Live derate for `source`, or 0 (fully recovered / different line / never
  * tripped). Pure function of time: `until` ends the CURRENT rung, and every
  * further elapsed rung hands back one `COLLAPSE_DERATE_RECOVERY_STEP`. A line
@@ -349,6 +427,8 @@ export function initialMeterState(): MeterState {
     flickerSamples: 0,
     smoothedOverSince: null,
     collapse: null,
+    strainDerate: null,
+    strainEvents: [],
     lastRaw: null,
     lastMicroChangeAt: 0,
     frozen: false,
@@ -452,8 +532,9 @@ export function ingestReading(
   const events: MeterEvent[] = [];
 
   const gapped = prev.lastReadingAt > 0 && now - prev.lastReadingAt > ESP_GAP_EVENT_MS;
+  const gapMs = now - prev.lastReadingAt;
   if (gapped) {
-    events.push({ kind: "esp_gap", gapMs: now - prev.lastReadingAt });
+    events.push({ kind: "esp_gap", gapMs });
   }
 
   // Frozen-meter tracking (device-level — survives source changes): a live CT
@@ -502,6 +583,10 @@ export function ingestReading(
       flickerSamples: 0,
       smoothedOverSince: null,
       collapse: null,
+      // Knowledge about a LINE rides through (it carries its own source tag);
+      // the events that produced it are episode bookkeeping and do not.
+      strainDerate: prev.strainDerate,
+      strainEvents: [],
       lastRaw,
       lastMicroChangeAt,
       frozen,
@@ -620,9 +705,47 @@ export function ingestReading(
     // still retires while the house is on grid).
     derate = null;
   }
+
   // Classify this reading against the derated limit, so the leaky bucket and
   // the reducer can never disagree about what "over" means.
-  const limit = effectiveLimit(config, source, derateFor({ ...state, derate }, source, now));
+  const limit = effectiveLimit(config, source, totalDerateFor({ ...state, derate }, source, now));
+
+  // GENERATOR STRAIN (2026-08-04). A gap in the reading stream that ENDS here,
+  // with the pre-gap mean sitting within an amp and a half of the ceiling, is
+  // the generator browning out under a load we chose. It is the only evidence
+  // this house produces that a 46 °C genset holds less than its plate rating —
+  // there is no voltage channel — and the answer is to back away from the edge,
+  // never to latch anything: a strain derate freezes no restore and latches no
+  // collapse, it just lowers the ceiling the ordinary ladder already respects.
+  //
+  // Gaps on grid do nothing (the grid does not brown out under our AC load),
+  // and a gap at a quiet house is a Wi-Fi flake, which is most of them.
+  let strainDerate = state.strainDerate;
+  let strainEvents = state.strainEvents.filter((at) => now - at < STRAIN_WINDOW_MS);
+  const preGapAmps = smoothedAmps(state);
+  if (
+    gapped &&
+    source === "gen" &&
+    prev.source === "gen" &&
+    state.recent.length > 0 &&
+    limit - preGapAmps <= STRAIN_NEAR_LIMIT_AMPS
+  ) {
+    strainEvents = [...strainEvents, now].slice(-STRAIN_EVENTS_TO_DERATE * 4);
+    if (strainEvents.length >= STRAIN_EVENTS_TO_DERATE) {
+      const standing = strainDerateFor(state, source, now);
+      const amps = Math.min(STRAIN_DERATE_MAX_AMPS, standing + STRAIN_DERATE_AMPS);
+      // Already at the cap and still standing: re-arming would be a no-op that
+      // refreshes the rung forever. Let the existing one age.
+      if (amps > standing || now >= (strainDerate?.until ?? 0)) {
+        strainDerate = { source, amps, until: now + STRAIN_DERATE_MS };
+        // The clock restarts: the next pair is a fresh pattern, not this one.
+        strainEvents = [];
+        events.push({ kind: "strain_derate", amps, source, gapMs, preGapAmps });
+      }
+    }
+  } else if (strainDerate != null && strainDerateFor(state, strainDerate.source, now) <= 0) {
+    strainDerate = null;
+  }
 
   const recent = [...state.recent, measured].slice(-RECENT_RING);
 
@@ -768,6 +891,8 @@ export function ingestReading(
       lastMicroChangeAt,
       frozen,
       derate,
+      strainDerate,
+      strainEvents,
       pendingCut,
     },
     events,
@@ -809,7 +934,7 @@ export function resetCalm(state: MeterState): MeterState {
 export function meterView(state: MeterState, now: number): MeterView {
   const stale = state.lastReadingAt === 0 || now - state.lastReadingAt > STALE_POWER_MS;
   return {
-    derateAmps: stale ? 0 : derateFor(state, state.source, now),
+    derateAmps: stale ? 0 : totalDerateFor(state, state.source, now),
     source: stale ? "none" : state.source,
     smoothedAmps: smoothedAmps(state),
     latestAmps: state.recent.length > 0 ? state.recent[state.recent.length - 1] : 0,

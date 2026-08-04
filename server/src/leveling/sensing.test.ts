@@ -15,6 +15,11 @@ import {
   OVER_LIMIT_DRAIN_SEVERE,
   PENDING_CUT_MS,
   POWER_COLLAPSE_MAX_MS,
+  ESP_GAP_EVENT_MS,
+  STRAIN_DERATE_AMPS,
+  STRAIN_DERATE_MAX_AMPS,
+  STRAIN_DERATE_MS,
+  STRAIN_DERATE_RECOVERY_STEP,
   clearCollapse,
   determineSource,
   flickerAmps,
@@ -878,5 +883,125 @@ describe("collapse latched on entry", () => {
     expect(meterView(stillDead.state, stillDead.now).collapsed).toBe(true);
     const backAlive = feedGen([16, 16], { state: latched, startAt: now + 5_000 });
     expect(backAlive.events.some((e) => e.kind === "collapse_recovered")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Generator STRAIN (user, 2026-08-04: "consider the gen flickering, without
+// leading to a power break").
+//
+// After the 11:22 surge the ESP logged power gaps of 28–47 s at 11:31–11:36
+// while the controller rode 14.3–14.8A on the 15A generator and reported itself
+// healthy. Those gaps are brownouts — at 46 °C a genset delivers under its
+// plate rating — and they are the only evidence this house can produce that the
+// real ceiling is lower than the configured one (there is no voltage channel).
+//
+// Deliberately NOT a collapse: no latch, no freeze, no push. The ceiling comes
+// down and the ordinary ladder respects it.
+// ---------------------------------------------------------------------------
+
+describe("generator strain derate", () => {
+  /** Feed readings with a gap before the last one (the gap ENDS on that reading). */
+  const withGap = (before: number[], after: number, opts: { state?: MeterState; startAt?: number } = {}) => {
+    const seeded = feedGen(before, opts);
+    return ingestReading(
+      seeded.state,
+      { gridAmps: 0, genAmps: after },
+      cfg,
+      seeded.now + ESP_GAP_EVENT_MS + 10_000,
+    );
+  };
+
+  it("one brownout near the limit is a generator having a moment", () => {
+    // 14.6A on a 15A limit: 0.4A of margin, well inside the band. Once is not
+    // a pattern, and answering it would cost comfort for noise.
+    const r = withGap([14.6, 14.6, 14.6, 14.6], 14.6);
+    expect(r.events.some((e) => e.kind === "strain_derate")).toBe(false);
+    expect(meterView(r.state, r.state.lastReadingAt).derateAmps).toBe(0);
+  });
+
+  it("two inside the window bring the ceiling down", () => {
+    const first = withGap([14.6, 14.6, 14.6, 14.6], 14.6);
+    const second = withGap([14.6, 14.6, 14.6], 14.6, {
+      state: first.state,
+      startAt: first.state.lastReadingAt + 5_000,
+    });
+    expect(second.events.some((e) => e.kind === "strain_derate")).toBe(true);
+    const now = second.state.lastReadingAt;
+    expect(meterView(second.state, now).derateAmps).toBe(STRAIN_DERATE_AMPS);
+    expect(effectiveLimit(cfg, "gen", meterView(second.state, now).derateAmps)).toBe(14.5);
+    // …and it is NOT a trip: nothing latched, nothing frozen.
+    expect(meterView(second.state, now).collapsed).toBe(false);
+  });
+
+  it("stacks to a cap, then stops", () => {
+    let state = feedGen([14.6, 14.6, 14.6, 14.6]).state;
+    let at = state.lastReadingAt;
+    for (let i = 0; i < 12; i++) {
+      const r = withGap([14.6, 14.6, 14.6], 14.6, { state, startAt: at + 5_000 });
+      state = r.state;
+      at = state.lastReadingAt;
+    }
+    expect(meterView(state, at).derateAmps).toBe(STRAIN_DERATE_MAX_AMPS);
+  });
+
+  it("hands the rating back in steps, never in one jump", () => {
+    const first = withGap([14.6, 14.6, 14.6, 14.6], 14.6);
+    const second = withGap([14.6, 14.6, 14.6], 14.6, {
+      state: first.state,
+      startAt: first.state.lastReadingAt + 5_000,
+    });
+    const armed = second.state.lastReadingAt;
+    expect(meterView(second.state, armed).derateAmps).toBe(STRAIN_DERATE_AMPS);
+    // Invariant 15's shape: a cliff hand-back is spent by the raise path within
+    // seconds of expiring.
+    expect(meterView(second.state, armed + STRAIN_DERATE_MS + 1).derateAmps).toBe(
+      Math.max(0, STRAIN_DERATE_AMPS - STRAIN_DERATE_RECOVERY_STEP),
+    );
+  });
+
+  it("ignores gaps at a quiet house — that is a Wi-Fi flake", () => {
+    // 9A against a 15A limit is six amps of margin. Most gaps are this.
+    const first = withGap([9, 9, 9, 9], 9);
+    const second = withGap([9, 9, 9], 9, { state: first.state, startAt: first.state.lastReadingAt + 5_000 });
+    expect(meterView(second.state, second.state.lastReadingAt).derateAmps).toBe(0);
+  });
+
+  it("ignores gaps on grid — the grid does not brown out under our AC load", () => {
+    const seed = ingestReading(initialMeterState(), { gridAmps: 26.6, genAmps: 0 }, cfg, 1_000_000);
+    let state = seed.state;
+    let at = 1_000_000;
+    for (let i = 0; i < 6; i++) {
+      at += ESP_GAP_EVENT_MS + 10_000;
+      state = ingestReading(state, { gridAmps: 26.6, genAmps: 0 }, cfg, at).state;
+    }
+    expect(meterView(state, at).derateAmps).toBe(0);
+  });
+
+  it("adds to a collapse derate rather than replacing it — every consumer sees the sum", () => {
+    // A generator that tripped AND has been browning out is holding less than
+    // either fact alone says. The two records decay independently.
+    const tripped = feedGen([14, 14, 14, 14, 3, 13, 13, 13, 13]);
+    expect(meterView(tripped.state, tripped.now).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
+    const first = withGap([14.6, 14.6, 14.6], 14.6, { state: tripped.state, startAt: tripped.now + 5_000 });
+    const second = withGap([14.6, 14.6, 14.6], 14.6, {
+      state: first.state,
+      startAt: first.state.lastReadingAt + 5_000,
+    });
+    const now = second.state.lastReadingAt;
+    expect(meterView(second.state, now).derateAmps).toBe(COLLAPSE_DERATE_AMPS + STRAIN_DERATE_AMPS);
+  });
+
+  it("is per-source and survives a changeover, like the collapse derate", () => {
+    const first = withGap([14.6, 14.6, 14.6, 14.6], 14.6);
+    const second = withGap([14.6, 14.6, 14.6], 14.6, {
+      state: first.state,
+      startAt: first.state.lastReadingAt + 5_000,
+    });
+    const at = second.state.lastReadingAt + 5_000;
+    const onGrid = ingestReading(second.state, { gridAmps: 12, genAmps: 0 }, cfg, at);
+    expect(meterView(onGrid.state, at).derateAmps).toBe(0);
+    const backOnGen = ingestReading(onGrid.state, { gridAmps: 0, genAmps: 12 }, cfg, at + 5_000);
+    expect(meterView(backOnGen.state, at + 5_000).derateAmps).toBe(STRAIN_DERATE_AMPS);
   });
 });

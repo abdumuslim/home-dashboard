@@ -836,6 +836,46 @@ export class LevelingControllerV2 {
         case "esp_gap":
           this.deps.onPowerEvent?.(`ESP gap ${Math.round(event.gapMs / 1000)}s`);
           break;
+        case "strain_derate": {
+          // Not a trip: nothing is latched, nothing is frozen, no push. The
+          // generator browned out while we rode near its ceiling, so the
+          // ceiling comes down and the ordinary ladder respects it. Journaled
+          // because a limit that shrinks with no visible cause is the kind of
+          // thing that costs a forensic session to work out afterwards.
+          const derated =
+            event.source !== "none"
+              ? effectiveLimit(this.config, event.source, this.meterState.derate?.amps ?? 0) - event.amps
+              : null;
+          log.warn(
+            `[leveler2] Generator strain on ${event.source}: power gap ${Math.round(event.gapMs / 1000)}s ` +
+              `with the mean at ${event.preGapAmps.toFixed(1)}A — holding ${event.amps.toFixed(1)}A back` +
+              (derated != null ? `, limit now ${derated.toFixed(1)}A` : ""),
+          );
+          void this.store
+            .insertJournal({
+              at: now,
+              source: event.source,
+              mode: deriveMode(this.modeState, now),
+              severity: null,
+              reason: "strain_derate",
+              requiredAmps: null,
+              preAmps: event.preGapAmps,
+              commands: [],
+              decisions: [
+                {
+                  at: now,
+                  action: `strain derate ${event.amps.toFixed(1)}A`,
+                  detail:
+                    `second power gap inside the window (${Math.round(event.gapMs / 1000)}s) with the ` +
+                    `pre-gap mean at ${event.preGapAmps.toFixed(1)}A — the line is browning out under this load`,
+                },
+              ],
+              expectedDelta: null,
+              executed: this.acts(),
+            })
+            .catch(() => undefined);
+          break;
+        }
         case "meter_frozen":
           // 2026-07-23: the ESP hung showing ~14.8A for 17.5 min. A frozen
           // value is not evidence — sensing already blocks calm (no raises);

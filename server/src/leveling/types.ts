@@ -37,6 +37,12 @@ export interface MeterReading {
 export type MeterEvent =
   | { kind: "source_changed"; from: PowerSource; to: PowerSource }
   | { kind: "esp_gap"; gapMs: number }
+  /**
+   * The generator browned out while we were riding near its limit — an ESP
+   * power gap is the only evidence of it this house has. Not a trip and not a
+   * freeze: the ceiling comes down and the ordinary ladder respects it.
+   */
+  | { kind: "strain_derate"; amps: number; source: PowerSource; gapMs: number; preGapAmps: number }
   | { kind: "collapse"; fromAmps: number; toAmps: number; source: PowerSource }
   | { kind: "collapse_recovered"; source: PowerSource }
   /** A collapse-shaped drop the controller's own cut explains — latch withheld. */
@@ -117,6 +123,24 @@ export interface MeterState {
    * records which source it applies to.
    */
   derate: { source: PowerSource; amps: number; until: number } | null;
+  /**
+   * Generator STRAIN: brownouts we rode into, rather than a breaker that
+   * opened. 46 °C ambient derates a genset, and the honest evidence that the
+   * real safe ceiling is below the configured one is that the line browned out
+   * (an ESP power gap) while we sat within an amp of the limit. Separate from
+   * `derate` because the two answer different questions and carry different
+   * caps — and because a strain derate must never read as a trip: it latches
+   * nothing, freezes nothing, and only shrinks the ceiling the ladder already
+   * respects. Per-source, exactly like `derate`.
+   */
+  strainDerate: { source: PowerSource; amps: number; until: number } | null;
+  /**
+   * When each recent strain event happened (bounded, pruned to its window).
+   * ONE brownout is a generator having a moment; two inside ten minutes is the
+   * line telling us what it can actually hold. Episodic — reset per source,
+   * like the over-limit readings — while the derate it produces rides through.
+   */
+  strainEvents: readonly number[];
   /**
    * Load this controller has COMMANDED off/down but the meter has not shown yet
    * — the mirror of `rampAbsorbedAmps` for the falling direction. A shed's
