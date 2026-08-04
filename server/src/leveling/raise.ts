@@ -402,7 +402,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
 
   const shedCandidates = acs
     .filter((a) => a.shed && a.managed && !a.on)
-    .sort((a, b) => b.needDelta - a.needDelta || acs.indexOf(a) - acs.indexOf(b));
+    .sort((a, b) => b.rankNeedDelta - a.rankNeedDelta || acs.indexOf(a) - acs.indexOf(b));
 
   /**
    * Rooms parked BELOW an active comfort floor while they still want cooling.
@@ -420,7 +420,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
    */
   const strandedBelowFloor = onManaged
     .filter((a) => a.currentLevel >= 1 && isNonCooling(a, a.currentLevel))
-    .sort((a, b) => b.needDelta - a.needDelta);
+    .sort((a, b) => b.rankNeedDelta - a.rankNeedDelta);
 
   /**
    * Yield only to a floor recovery that is PHYSICALLY affordable — the same
@@ -447,14 +447,20 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // Candidates are most-needy-first, so a stranded room that outranks this
     // one outranks every candidate behind it: stand the whole phase down (no
     // reservation) and let the raise phase buy the floor back.
-    const needier = strandedBelowFloor.find((a) => a.needDelta > candidate.needDelta && floorRecoveryFits(a));
+    const needier = strandedBelowFloor.find((a) => a.rankNeedDelta > candidate.rankNeedDelta && floorRecoveryFits(a));
     if (needier != null) {
       decisions.push({
         at: now,
         deviceId: candidate.deviceId,
         action: "restore",
         blockedBy: "floor recovery",
-        detail: `${needier.name} is below its comfort floor and needier (${needier.needDelta.toFixed(1)}°C vs ${candidate.needDelta.toFixed(1)}°C)`,
+        // Both figures, because the ranking input is the thing to audit (R13):
+        // these rooms are ordered on REAL temperature, not on each room's own
+        // comfort metric — one of which is feels-like.
+        detail:
+          `${needier.name} is below its comfort floor and needier ` +
+          `(${needier.rankNeedDelta.toFixed(1)}°C vs ${candidate.rankNeedDelta.toFixed(1)}°C real` +
+          `${needier.roomTempC != null ? `, room ${needier.roomTempC.toFixed(1)}°C` : ""})`,
       });
       break;
     }
@@ -685,7 +691,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
     .filter((a) => a.currentLevel >= 1)
     .map((a) => ({ ac: a, ceil: ceilOf(a, config.nearTargetBandC) }))
     .filter(({ ac, ceil }) => ac.currentLevel < ceil)
-    .sort((x, y) => y.ac.needDelta - x.ac.needDelta || acs.indexOf(x.ac) - acs.indexOf(y.ac));
+    .sort((x, y) => y.ac.rankNeedDelta - x.ac.rankNeedDelta || acs.indexOf(x.ac) - acs.indexOf(y.ac));
 
   /**
    * Rooms parked above the level their own need justifies — dormant capacity a
@@ -728,9 +734,9 @@ export function planRaise(input: RaiseInput): RaisePlan {
           !a.ramping &&
           a.manualTarget == null &&
           a.currentLevel > floorOf(a) &&
-          a.needDelta + REBALANCE_NEED_GAP_C <= raiser.needDelta,
+          a.rankNeedDelta + REBALANCE_NEED_GAP_C <= raiser.rankNeedDelta,
       )
-      .sort((x, y) => x.needDelta - y.needDelta)
+      .sort((x, y) => x.rankNeedDelta - y.rankNeedDelta)
       .map((a) => ({ ac: a, target: Math.max(floorOf(a), a.currentLevel - 1) }));
   };
 

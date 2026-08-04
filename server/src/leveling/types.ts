@@ -355,8 +355,45 @@ export interface AcView {
   fanSpeed: number | null;
   /** User touched the fan this episode — never trim it again until the episode ends. */
   fanExempt: boolean;
-  /** °C above the target/satisfied point (≤0 = satisfied). Orders raises (desc) and sheds (asc). */
+  /**
+   * °C above this room's OWN satisfied point (≤0 = satisfied), measured with
+   * whatever metric that room's automation is configured for — real temperature
+   * for most, FEELS-LIKE for a room whose range rule uses it.
+   *
+   * Per-room ABSOLUTE decisions only: need tiers, `ceilOf`'s near-target cap,
+   * `isNonCooling`, the satisfied dwell. A room's own comfort is that room's own
+   * business, and feels-like is a perfectly good answer to "is this room
+   * comfortable?".
+   *
+   * ⚠ NEVER compare it between rooms — use `rankNeedDelta`.
+   */
   needDelta: number;
+  /**
+   * The AC's own thermometer in °C, or null when it is dead/stale (the
+   * dead-sensor rule from 86f8696: absent or ≤0 is not a reading). Reported in
+   * the journal beside `rankNeedDelta` so a shed decision can be audited on the
+   * input it actually ranked.
+   */
+  roomTempC: number | null;
+  /**
+   * The SAME question asked of every room in the same unit: how far this room's
+   * own thermometer sits past the shared comfort target (inverted in heat mode,
+   * exactly as `computeAcNeed` does it). Ordering by this is ordering by REAL
+   * room temperature — the user's rule, 2026-08-04: "coolest in real temp, not
+   * feels like".
+   *
+   * Every room-vs-room comparison ranks on this: shed selection and its
+   * `SHED_NEED_GAP_C`, the reduction cost weights, the sub-floor protection
+   * term, restore/yield precedence (invariant 36), the rebalance donor gap, and
+   * the recovery admission order. `needDelta` mixed units across rooms — a
+   * feels-like delta against real-temperature deltas — so humidity alone could
+   * make a milder room outrank a hotter one and take its amps.
+   *
+   * Falls back to `needDelta` when the thermometer is dead: the ordering is then
+   * exactly what it was before this existed, which is the best available answer
+   * and never worse than the old behaviour.
+   */
+  rankNeedDelta: number;
   /**
    * How long this room has been CONTINUOUSLY satisfied (needDelta at or below
    * the demote threshold), in ms; 0 when it is not satisfied right now. The

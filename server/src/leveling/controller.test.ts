@@ -202,6 +202,79 @@ function acDevice(id: string, power: boolean, generatorMode: number) {
   return { id, name: id, power, generatorMode, maxGeneratorLevel: 3, fanSpeed: 1 } as never;
 }
 
+// ---------------------------------------------------------------------------
+// R13 — room-vs-room comparisons rank on REAL temperature (user, 2026-08-04:
+// "coolest in real temp, not feels like"). `computeAcNeed` hands the leveler a
+// FEELS-LIKE delta for a room whose range rule uses that metric and a
+// real-temperature delta for every other room, so every cross-room comparison
+// mixed units and humidity alone could make a milder room outrank a hotter one.
+//
+// The shell is what derives the shared-unit figure from the AC's own
+// thermometer, so the guard belongs here: `scenarios.test.ts` is handed
+// `roomTempC` directly and cannot see whether buildViews computed it.
+// ---------------------------------------------------------------------------
+describe("shed ranking on real temperature (2026-08-04)", () => {
+  const twoRooms = async (opts: { coolTemp: number | undefined; coolNeed: number; hotTemp: number | undefined; hotNeed: number }) => {
+    const mock = createGradePool({
+      genLimitAmps: 15,
+      priority: ["cool", "hot"],
+      genAmpModels: { cool: { baseAmps: 2, stepAmps: 2 }, hot: { baseAmps: 2, stepAmps: 2 } },
+    });
+    const deps: LevelingDeps = {
+      ...createDeps(),
+      getTclCloud: () => ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never,
+    };
+    const controller = new LevelingControllerV2(mock.pool, deps);
+    await controller.ensureLoaded();
+    const dev = (id: string, currentTemp: number | undefined) =>
+      ({ ...(acDevice(id, true, 1) as object), currentTemp }) as never;
+    const ctx = [
+      { device: dev("cool", opts.coolTemp), managed: true, needTier: "full" as const, needDelta: opts.coolNeed, slotGenCap: null },
+      { device: dev("hot", opts.hotTemp), managed: true, needTier: "full" as const, needDelta: opts.hotNeed, slotGenCap: null },
+    ];
+    let flip = 1;
+    for (let i = 0; i < 10; i++) {
+      flip = -flip;
+      controller.onPowerReading({ current_1: 0, current_2: 15.6 + 0.01 * flip } as never);
+      vi.advanceTimersByTime(5_000);
+      await controller.tick(ctx, 30);
+    }
+    // The journal mock stores what the INSERT bound: commands arrive as JSON text.
+    return mock.journal.flatMap(
+      (r) => JSON.parse(String(r.commands ?? "[]")) as Array<{ kind: string; deviceId: string }>,
+    );
+  };
+
+  it("sheds the room its thermometer says is cooler, not the one its own metric says is milder", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
+      // `cool` carries the larger need on its own (feels-like) metric while its
+      // ROOM is five degrees cooler. Pre-R13 the hot room paid.
+      const commands = await twoRooms({ coolTemp: 27, coolNeed: 5, hotTemp: 32, hotNeed: 2 });
+      const offs = commands.filter((c) => c.kind === "power_off");
+      expect(offs).toHaveLength(1);
+      expect(offs[0].deviceId).toBe("cool");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to each room's own metric when the thermometers are dead", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
+      // No reading on either room → the ordering is exactly the pre-R13 one.
+      const commands = await twoRooms({ coolTemp: undefined, coolNeed: 5, hotTemp: undefined, hotNeed: 2 });
+      const offs = commands.filter((c) => c.kind === "power_off");
+      expect(offs).toHaveLength(1);
+      expect(offs[0].deviceId).toBe("hot");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("LevelingControllerV2 — grade queue", () => {
   it("a bounced attempt keeps its ladder position — a stale grade must not mark it a success", async () => {
     vi.useFakeTimers();

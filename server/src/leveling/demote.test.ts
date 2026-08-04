@@ -40,9 +40,11 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     reshedPenalized: false,
     satisfiedForMs: DEMOTE_DWELL_MS,
     subFloorStalledMs: 0,
+    roomTempC: null,
     unmeteredJumpAmps: 0,
     ...overrides,
     envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 3,
+    rankNeedDelta: overrides.rankNeedDelta ?? overrides.needDelta ?? 0.2,
   };
 }
 

@@ -46,9 +46,11 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     reshedPenalized: false,
     satisfiedForMs: 0,
     subFloorStalledMs: 0,
+    roomTempC: null,
     unmeteredJumpAmps: 0,
     ...overrides,
     envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 2,
+    rankNeedDelta: overrides.rankNeedDelta ?? overrides.needDelta ?? 2,
   };
 }
 
@@ -65,6 +67,30 @@ function plan(acs: AcView[], requiredAmps: number, overrides: Partial<ReduceInpu
     ...overrides,
   });
 }
+
+describe("room-vs-room ranks on REAL temperature (user, 2026-08-04)", () => {
+  // "coolest in real temp, not feels like". `computeAcNeed` returns a
+  // FEELS-LIKE delta for a room whose range rule uses that metric and a
+  // real-temperature delta for every other room, so cross-room comparisons
+  // mixed units and humidity alone could make a milder room outrank a hotter
+  // one. `rankNeedDelta` asks the same question of every room.
+  const room = (id: string, ownMetricNeed: number, realNeed: number): AcView =>
+    ac(id, { currentLevel: 1, fanSpeed: 1, needDelta: ownMetricNeed, rankNeedDelta: realNeed });
+
+  it("sheds the room that is coolest by thermometer, not by its own metric", () => {
+    // `humid` looks needier on its own feels-like metric (4.0 vs 2.0) while its
+    // ROOM is four degrees cooler. Ranked on the metric, the hot room pays.
+    const p = plan([room("humid", 4, 2), room("hot", 2, 6)], 1.5);
+    expect(p.toShed).toEqual(["humid"]);
+  });
+
+  it("falls back to the room's own metric when the thermometer is dead", () => {
+    // buildViews sets rankNeedDelta = needDelta for a dead sensor, so the
+    // ordering is exactly what it was before any of this existed.
+    const p = plan([room("dead-a", 4, 4), room("dead-b", 2, 2)], 1.5);
+    expect(p.toShed).toEqual(["dead-b"]);
+  });
+});
 
 describe("one room at a time (user, 2026-08-02)", () => {
   // Live 16:51:11 and 16:55:34/35: both remaining rooms went off together — the
@@ -92,27 +118,47 @@ describe("one room at a time (user, 2026-08-02)", () => {
     expect(p.satisfied).toBe(true);
   });
 
-  it("the EXTREME rung never escalates — one room, whatever the arithmetic says", () => {
-    // Live 2026-08-04 12:53:45Z (journal 7635): the sustained clock promoted to
-    // extreme with the mean sitting 0.025A over a 15A generator, carrying a
-    // 4.57A deficit invented from one inrush spike. No single room covered it,
-    // the one-shed ceiling lifted, and BOTH remaining rooms went off at once.
-    // The user: "it could only turn off only the coolest room and that would be
-    // enough." Invariant 33 says the same thing — this rung relieves a sustained
-    // strain, it does not clear an arithmetic bill.
-    const p = plan([atFloor("hot", 3), atFloor("cool", 0.3)], 4.57, { requireShed: true });
-    expect(p.toShed).toHaveLength(1);
-    // …and the room it takes is still the coolest one, not the biggest saving.
-    expect(p.toShed).toEqual(["cool"]);
-  });
+  // The user's full shed-choice policy, 2026-08-04 ~17:25, after watching
+  // 12:53:45Z shed both remaining rooms for a mean 0.025A over the limit:
+  // "if the system knows that it can cover with the coolest room ac, let it do
+  // it. if not, and knows the other 2 ton will be enough, it can turn it off
+  // only. if the spike is too much and no single ac can cover it, let it turn
+  // off the coolest 2 acs."
+  describe("shed choice — coolest that covers, else the coolest two (user, 2026-08-04)", () => {
+    // Live capacities: Abdu is the 2-ton, the other two are 1-tons.
+    const rooms = () => [
+      ac("big", { currentLevel: 1, fanSpeed: 1, needDelta: 2, rankNeedDelta: 2 }),
+      ac("hot", { currentLevel: 1, fanSpeed: 1, needDelta: 6, rankNeedDelta: 6 }),
+      ac("cool", { currentLevel: 1, fanSpeed: 1, needDelta: 0.3, rankNeedDelta: 0.3 }),
+    ];
+    // `big` draws 4.3A at L1 under the test models; `hot`/`cool` draw 2A.
 
-  it("a deficit that truly needs two still gets two — from the NEXT pass", () => {
-    // Same 4.57A, re-evaluated after the first shed landed: one room is gone, the
-    // deficit is re-priced against a meter that has seen it, and the rung takes
-    // the next one. One at a time, never one batch (invariant 26).
-    const first = plan([atFloor("hot", 3), atFloor("cool", 0.3)], 4.57, { requireShed: true });
-    const second = plan([atFloor("hot", 3)], 2.57, { requireShed: true });
-    expect([...first.toShed, ...second.toShed]).toEqual(["cool", "hot"]);
+    it("takes the coolest room when its own off covers the deficit (the 12:53:45Z fixture)", () => {
+      // The honest sizing of that live input is ~0.2A, not the 4.57A one inrush
+      // spike invented — and one room covers it many times over.
+      const p = plan(rooms(), 0.2, { requireShed: true });
+      expect(p.toShed).toEqual(["cool"]);
+    });
+
+    it("takes the 2-ton alone when the coolest cannot cover it but that one can", () => {
+      // 3.0A: neither 1-ton covers it, the 2-ton does. One room, not a pair.
+      const p = plan(rooms(), 3.0, { requireShed: true });
+      expect(p.toShed).toEqual(["big"]);
+    });
+
+    it("takes the COOLEST TWO in one batch when no single room covers it", () => {
+      // 5.0A: bigger than any single off. The hottest room survives.
+      const p = plan(rooms(), 5.0, { requireShed: true });
+      expect(p.toShed.slice().sort()).toEqual(["big", "cool"]);
+      expect(p.toShed).not.toContain("hot");
+    });
+
+    it("the hottest room survives even a deficit the coolest pair cannot cover", () => {
+      // 12A is more than the whole house; the ceiling still stops at two.
+      const p = plan(rooms(), 12, { requireShed: true });
+      expect(p.toShed).toHaveLength(2);
+      expect(p.toShed).not.toContain("hot");
+    });
   });
 });
 

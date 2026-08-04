@@ -72,6 +72,16 @@ export interface SimAcSetup {
   /** Unconstrained compressor demand right now (cool room → below cap1). */
   demandAmps: number;
   needDelta: number;
+  /**
+   * The room's own thermometer in °C. Absent = no live reading, which is the
+   * shell's dead-sensor case and makes `rankNeedDelta` fall back to `needDelta`
+   * — so every scenario written before R13 keeps exactly its old ordering.
+   *
+   * Set it when a scenario needs the two to DISAGREE, which is the whole point
+   * of R13: a room whose automation runs on feels-like carries a `needDelta`
+   * that humidity has inflated, and room-vs-room ranking must not see it.
+   */
+  roomTempC?: number;
   on?: boolean;
   /** Start already leveler-shed (off). */
   shed?: boolean;
@@ -821,6 +831,11 @@ export class Scenario {
         fanSpeed: ac.fan,
         fanExempt: false,
         needDelta: ac.needDelta,
+        // Mirrors buildViews: the shared-unit ranking figure, or the room's own
+        // metric when its thermometer is dead.
+        roomTempC: ac.setup.roomTempC ?? null,
+        rankNeedDelta:
+          ac.setup.roomTempC != null ? ac.setup.roomTempC - this.cfg.comfortTargetC : ac.needDelta,
         satisfiedForMs: this.satisfiedForMs(ac),
         subFloorStalledMs: this.subFloorStalledMs(ac, observedLevel),
         minLevel: ac.setup.minLevel ?? 1,

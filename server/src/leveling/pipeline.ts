@@ -315,6 +315,25 @@ export function plan(input: PlanInput): PlanOutput {
             } satisfies Decision,
           ]
         : []),
+      // Every shed records the figures it was RANKED on (R13): the real-temp
+      // need this room was compared to its peers with, and the thermometer
+      // behind it. `needDelta` rides along because for one room it is a
+      // feels-like figure, and a forensic pass that cannot see both cannot tell
+      // a humid room from a hot one.
+      ...reduction.toShed.map((deviceId) => {
+        const ac = onManaged.find((a) => a.deviceId === deviceId);
+        return {
+          at: now,
+          deviceId,
+          action: "shed choice",
+          detail:
+            ac == null
+              ? "ranked on real temperature"
+              : `real need ${ac.rankNeedDelta.toFixed(1)}°C` +
+                `${ac.roomTempC != null ? ` (room ${ac.roomTempC.toFixed(1)}°C)` : " (thermometer dead — ranked on its own metric)"}` +
+                `, own metric ${ac.needDelta.toFixed(1)}°C`,
+        } satisfies Decision;
+      }),
       ...(preferShed != null
         ? [
             {
@@ -389,7 +408,7 @@ export function plan(input: PlanInput): PlanOutput {
         .filter((a) => !pinned.includes(a))
         // Hottest first; `acs` is pre-sorted by priority, so the index is the
         // existing tiebreak.
-        .sort((a, b) => b.needDelta - a.needDelta || acs.indexOf(a) - acs.indexOf(b));
+        .sort((a, b) => b.rankNeedDelta - a.rankNeedDelta || acs.indexOf(a) - acs.indexOf(b));
       let total = (input.nonAcAmps ?? 0) + pinned.reduce((sum, a) => sum + floorDraw(a), 0);
       // Once a room has been refused, a COOLER one may still fit in the amps it
       // could not use — but only if it is at least `SHED_NEED_GAP_C` milder.
@@ -401,13 +420,13 @@ export function plan(input: PlanInput): PlanOutput {
       for (const ac of rest) {
         const draw = floorDraw(ac);
         const fits = total + draw <= ceiling;
-        const notColdEnough = refusedNeed != null && ac.needDelta + SHED_NEED_GAP_C > refusedNeed;
+        const notColdEnough = refusedNeed != null && ac.rankNeedDelta + SHED_NEED_GAP_C > refusedNeed;
         if (fits && !notColdEnough) {
           total += draw;
           continue;
         }
-        if (fits) refusedNeed = Math.max(refusedNeed ?? 0, ac.needDelta);
-        else refusedNeed = refusedNeed ?? ac.needDelta;
+        if (fits) refusedNeed = Math.max(refusedNeed ?? 0, ac.rankNeedDelta);
+        else refusedNeed = refusedNeed ?? ac.rankNeedDelta;
         admitted.delete(ac.deviceId);
         shedForFit.push(ac.deviceId);
       }

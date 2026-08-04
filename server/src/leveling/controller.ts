@@ -1963,6 +1963,7 @@ export class LevelingControllerV2 {
       return i === -1 ? this.config.priority.length : i;
     };
     const sorted = [...ctx].sort((a, b) => rank(a.device.id) - rank(b.device.id));
+    const comfortTargetC = this.config.comfortTargetC;
     return sorted.map(({ device, managed, needDelta, slotGenCap }) => {
       const boost = boostFloor(this.config.levelBoosts[device.id], outdoorTempC, this.boostActive.get(device.id) ?? false);
       this.boostActive.set(device.id, boost.active);
@@ -1972,6 +1973,22 @@ export class LevelingControllerV2 {
       const observed = deriveMode(this.modeState, now) === "SETTLING" && recon?.pendingLevel != null
         ? recon.pendingLevel
         : device.generatorMode;
+      // R13 — the one figure every ROOM-vs-ROOM comparison ranks on. Asked of
+      // every room in the same unit: its OWN thermometer against the shared
+      // comfort target, inverted in heat mode exactly as `computeAcNeed` does
+      // it, so ordering by this IS ordering by real room temperature. The
+      // per-room `needDelta` keeps whatever metric that room's automation is
+      // configured for — including feels-like, which is a fine answer to "is
+      // this room comfortable?" and a useless one to "which room is cooler?".
+      // Dead thermometer (the 86f8696 rule: absent or ≤0 is not a reading) →
+      // fall back to `needDelta`, which is exactly the old ordering.
+      const roomTempC = device.currentTemp != null && device.currentTemp > 0 ? device.currentTemp : null;
+      const rankNeedDelta =
+        roomTempC == null
+          ? needDelta
+          : device.mode === 4
+            ? comfortTargetC - roomTempC
+            : roomTempC - comfortTargetC;
       return {
         deviceId: device.id,
         name: device.name,
@@ -1987,6 +2004,8 @@ export class LevelingControllerV2 {
         fanSpeed: device.fanSpeed ?? null,
         fanExempt: this.fanExempt.has(device.id),
         needDelta,
+        roomTempC,
+        rankNeedDelta,
         satisfiedForMs: this.satisfiedForMs(
           device.id,
           needDelta,

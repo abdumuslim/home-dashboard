@@ -38,9 +38,11 @@ function ac(overrides: Partial<AcView> = {}): AcView {
     reshedPenalized: false,
     satisfiedForMs: 0,
     subFloorStalledMs: 0,
+    roomTempC: null,
     unmeteredJumpAmps: 0,
     ...overrides,
     envelopeLevel: overrides.envelopeLevel ?? overrides.currentLevel ?? 1,
+    rankNeedDelta: overrides.rankNeedDelta ?? overrides.needDelta ?? 2,
   };
 }
 

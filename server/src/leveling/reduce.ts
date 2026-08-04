@@ -171,7 +171,7 @@ interface ComboScore {
 /** Output order: least-needy first, top-priority last (historical shed-order semantics). */
 function reductionOutputOrder(acs: AcView[]): AcView[] {
   const [top, ...rest] = acs;
-  const sorted = rest.slice().sort((a, b) => a.needDelta - b.needDelta || acs.indexOf(b) - acs.indexOf(a));
+  const sorted = rest.slice().sort((a, b) => a.rankNeedDelta - b.rankNeedDelta || acs.indexOf(b) - acs.indexOf(a));
   return top ? [...sorted, top] : sorted;
 }
 
@@ -200,9 +200,9 @@ export function planReduction(input: ReduceInput): ReducePlan {
   const allowShed = requireShed || (input.allowShed ?? true);
   const preferShed = input.preferShed ?? null;
   const w = input.weights ?? DEFAULT_REDUCTION_WEIGHTS;
-  const needWeight = (ac: AcView): number => 1 + w.needK * Math.max(0, ac.needDelta);
+  const needWeight = (ac: AcView): number => 1 + w.needK * Math.max(0, ac.rankNeedDelta);
   const topId = acs[0]?.deviceId ?? null;
-  const needById = new Map(acs.map((a) => [a.deviceId, Math.max(0, a.needDelta)]));
+  const needById = new Map(acs.map((a) => [a.deviceId, Math.max(0, a.rankNeedDelta)]));
   const preferShedNeed = preferShed != null ? (needById.get(preferShed) ?? 0) : 0;
   /** Every room this plan sheds is clearly milder than the room that caused it. */
   const shedsOnlyMilder = (shedIds: string[]): boolean =>
@@ -332,7 +332,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
           // `isNonCooling` owns the test: within 2°C of target the level still
           // works (and the watch checks that against the thermometer), so those
           // rooms keep their sub-floor rung free.
-          subFloorNeed: isNonCooling(ac, level) ? Math.max(0, ac.needDelta) * SUBFLOOR_NEED_FRACTION : 0,
+          subFloorNeed: isNonCooling(ac, level) ? Math.max(0, ac.rankNeedDelta) * SUBFLOOR_NEED_FRACTION : 0,
           aboveFloor: level > floor,
         });
       }
@@ -352,7 +352,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
         cost: shedCost,
         commands: 1,
         disturbed: true,
-        shedNeed: Math.max(0, ac.needDelta),
+        shedNeed: Math.max(0, ac.rankNeedDelta),
         subFloorNeed: 0,
         aboveFloor: false, // a room that is off is not withholding a level
       });
@@ -456,17 +456,39 @@ export function planReduction(input: ReduceInput): ReducePlan {
   // deficit — which is exactly the "big pump" case, where waiting a pass would
   // only prolong the overload.
   //
-  // …except at EXTREME, where the ceiling never lifts. Invariant 33 defines that
-  // rung as "exactly ONE room off" — the user's own trade against losing the
-  // whole house — and it exists to relieve a sustained strain, not to clear an
-  // arithmetic bill. Live 2026-08-04 12:53:45Z the tier arrived with a 4.57A
-  // deficit invented from a lone inrush spike (see SEVERE_STREAK_READINGS), no
-  // single room covered it, the ceiling lifted, and BOTH remaining rooms went
-  // off at once for a mean sitting 0.025A over the limit. A deficit that
-  // genuinely needs a second room still gets one — from the NEXT evaluation,
-  // re-priced against a meter that has seen the first shed, one room at a time
-  // exactly as invariant 26 asks.
-  const shedCeiling = requireShed ? 1 : perAc.length;
+  // The ceiling stops at TWO, and the whole shed policy is the user's, stated
+  // in full on 2026-08-04 (~17:25) after he watched 12:53:45Z shed both
+  // remaining rooms for a mean sitting 0.025A over the limit:
+  //
+  //   "if the system knows that it can cover with the coolest room ac, let it
+  //    do it. if not, and knows the other 2 ton will be enough, it can turn it
+  //    off only. if the spike is too much and no single ac can cover it, let it
+  //    turn off the coolest 2 acs."
+  //
+  // Which is exactly what this search already expresses, once the deficit it is
+  // handed is honest (SEVERE_STREAK_READINGS — a lone inrush spike used to size
+  // 4.57A at zero real overshoot, and no single room could cover THAT):
+  //
+  //   maxSheds 1 → every feasible single-shed plan; the comparator ranks them
+  //                by `shedNeed`, which since R13 is REAL room temperature, so
+  //                the winner is the coolest room whose off actually covers it.
+  //                If the coolest cannot and the 2-ton can, the 2-ton is the
+  //                only feasible single and wins on feasibility.
+  //   maxSheds 2 → no single room covers it: the coolest PAIR, in one batch.
+  //
+  // Capping at two is what makes "the hottest room always survives" true with
+  // three rooms — and with two rooms it is no cap at all, so the 2026-08-02
+  // "big pump" case is unchanged. A deficit that outruns even the coolest pair
+  // leaves the batch infeasible and the next evaluation re-decides against a
+  // meter that has seen this one, which is invariant 26's own answer.
+  //
+  // ⚠ This SUPERSEDES the stage-1 rule (same afternoon) that capped the extreme
+  // rung at exactly one shed and left a second room to the next pass. Invariant
+  // 33's "exactly ONE room off" holds for every deficit a single room can cover,
+  // which is the case it was written for; the user's ruling is what governs the
+  // case where none can.
+  const SHED_BATCH_MAX = 2;
+  const shedCeiling = Math.min(perAc.length, SHED_BATCH_MAX);
   for (maxSheds = 1; maxSheds <= shedCeiling; maxSheds++) {
     best = null;
     recurse(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
