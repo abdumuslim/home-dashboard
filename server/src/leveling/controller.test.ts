@@ -764,7 +764,16 @@ describe("LevelingControllerV2 — a lone shed's off-drop grades the on-cost", (
         }
       };
 
-      await run(10, 8); // settle; recon confirms L1
+      // Settle close under the limit, not far below it: the off-drop is
+      // measured from `preAmps`, the SMOOTHED meter as the shed goes out, and
+      // at SMOOTH_WINDOW 8 (2026-08-05) that median still carries most of the
+      // settle level two readings into the breach. Settling at 10 made the
+      // baseline read 10 against a 13.5A post-shed meter — a RISE, so the
+      // window would learn nothing at all. At 14 the baseline reads 14 as the
+      // bucket empties, which is the same figure the 4-wide window produced
+      // from a 10A settle, so the sample under test is unchanged (0.5A).
+      // Same trap the R6 evidence test above names in its own settle.
+      await run(14, 8); // settle; recon confirms L1
       await run(18, 6); // hard over — the only cover is shedding a (single power_off)
       expect(a.power).toBe(false);
       // 13.5A after the off: the restore does not fit (13.5 + 2 > 14.9), so no

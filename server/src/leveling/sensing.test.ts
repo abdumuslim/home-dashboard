@@ -203,7 +203,7 @@ describe("flicker-aware bucket & calm (the 2026-08-02 ratchet)", () => {
     // entirely from them — at a smoothed 6.5A against a 15A limit. Severity
     // came from them too, which is what bypassed the inrush blanking and the
     // escalation settle (both mild-only, deliberately).
-    const spiked = feedGen([16.3, 16.5, 16.4, 16.6, 16.3]);
+    const spiked = feedGen([16.3, 16.5, 16.4, 16.6, 16.3, 16.5, 16.4, 16.6]);
     expect(spiked.state.overLimitReadings.length).toBeGreaterThan(0);
     expect(spiked.state.overLimitBudget).toBe(0);
     // The premise is "its cuts landed", so the cuts must be on the books: an
@@ -211,7 +211,7 @@ describe("flicker-aware bucket & calm (the 2026-08-02 ratchet)", () => {
     // collapse floor, and a latched collapse holds calm by design (that is the
     // 17:40 fix). Credit is what tells the two apart — invariant 5.
     const cutSent = noteCommandedCut(spiked.state, 10, spiked.now + 1_000);
-    const fell = feedGen([6.4, 6.5, 6.45], { state: cutSent, startAt: spiked.now + 5_000 });
+    const fell = feedGen([6.4, 6.5, 6.45, 6.4, 6.5], { state: cutSent, startAt: spiked.now + 5_000 });
     expect(fell.state.overLimitReadings).toHaveLength(0);
     // …and the bucket still waits out the calm refill: clearing the evidence is
     // not the same as declaring the episode closed, so a fresh breach still
@@ -356,7 +356,7 @@ describe("power-collapse latch — the residual is the HOUSE (2026-08-03)", () =
     // FLOORS on recovery, and the post-trip trough read as PERFECT calm. The
     // controller then raised three levels into a dead line and the second break
     // followed four minutes later.
-    const steady = feedGen([15.5, 15.7, 15.9, 15.7]);
+    const steady = feedGen([15.5, 15.7, 15.9, 15.7, 15.5, 15.7, 15.9, 15.7]);
     const r = ingestReading(steady.state, { gridAmps: 0, genAmps: 6.2 }, cfg, steady.now + 5_000);
     expect(r.events.some((e) => e.kind === "collapse")).toBe(true);
     expect(r.state.collapse).not.toBeNull();
@@ -368,7 +368,7 @@ describe("power-collapse latch — the residual is the HOUSE (2026-08-03)", () =
     // Same fall, same residual, but this one we know about (dashboard tap,
     // automation, or an observed off the shell priced). Without this the
     // relative floor would latch COLLAPSED every time the biggest room goes off.
-    const steady = feedGen([15.5, 15.7, 15.9, 15.7]);
+    const steady = feedGen([15.5, 15.7, 15.9, 15.7, 15.5, 15.7, 15.9, 15.7]);
     const known = noteCommandedCut(steady.state, 9.3, steady.now + 1_000);
     const r = ingestReading(known, { gridAmps: 0, genAmps: 6.2 }, cfg, steady.now + 5_000);
     expect(r.events.some((e) => e.kind === "collapse")).toBe(false);
@@ -377,13 +377,20 @@ describe("power-collapse latch — the residual is the HOUSE (2026-08-03)", () =
   });
 
   it("a fall that arrives in two steps still latches — the pre-fall mean is held", () => {
-    // The window used to be two readings wide and did not know it: with a
-    // 4-wide median the baseline flips on the third post-cliff reading, so a
-    // 10.5A fall reads as 4A and fails the test it would have passed.
-    const steady = feedGen([16, 16, 16, 16]);
-    const step1 = feedGen([9.5, 9.4, 9.3], { state: steady.state, startAt: steady.now + 5_000 });
+    // The window used to be two readings wide and did not know it: the median
+    // eventually flips to the post-fall level, so a 10.5A fall reads as 4A and
+    // fails the test it would have passed. At SMOOTH_WINDOW 8 the flip takes
+    // FIVE post-cliff readings instead of three, so the first stage is five
+    // readings long here — enough that the prior median really has moved to the
+    // low level and only the held anchor can carry the second stage. The whole
+    // sequence spans 25s, inside CLIFF_ANCHOR_MS (30s) with margin.
+    const steady = feedGen([16, 16, 16, 16, 16, 16, 16, 16]);
+    const step1 = feedGen([9.5, 9.4, 9.3, 9.2, 9.1], { state: steady.state, startAt: steady.now + 5_000 });
     expect(step1.events.some((e) => e.kind === "unexplained_fall")).toBe(true);
     expect(step1.state.cliffAnchor?.medianAmps).toBe(16);
+    // The prior median has genuinely given up the pre-fall level by now — this
+    // is what makes the anchor load-bearing rather than decorative.
+    expect(meterView(step1.state, step1.now).smoothedAmps).toBeLessThan(10);
     const step2 = ingestReading(step1.state, { gridAmps: 0, genAmps: 5.5 }, cfg, step1.now + 5_000);
     expect(step2.events.some((e) => e.kind === "collapse")).toBe(true);
   });
@@ -392,7 +399,7 @@ describe("power-collapse latch — the residual is the HOUSE (2026-08-03)", () =
     // Belt to the latch's braces: the line is still carrying load, so this is
     // not provably a trip — but it is equally not headroom, and the controller
     // may not spend into a trough it cannot explain.
-    const steady = feedGen([15.5, 15.7, 15.9, 15.7]);
+    const steady = feedGen([15.5, 15.7, 15.9, 15.7, 15.5, 15.7, 15.9, 15.7]);
     const fell = ingestReading(steady.state, { gridAmps: 0, genAmps: 8.5 }, cfg, steady.now + 5_000);
     expect(fell.events.some((e) => e.kind === "collapse")).toBe(false);
     const ev = fell.events.find((e) => e.kind === "unexplained_fall");
@@ -414,7 +421,7 @@ describe("power-collapse latch — the residual is the HOUSE (2026-08-03)", () =
   });
 
   it("the estimator forgets the ring after a trip — tolerance is lowest when the breaker is hot", () => {
-    const steady = feedGen([15.5, 15.7, 15.9, 15.7]);
+    const steady = feedGen([15.5, 15.7, 15.9, 15.7, 15.5, 15.7, 15.9, 15.7]);
     const tripped = ingestReading(steady.state, { gridAmps: 0, genAmps: 6.2 }, cfg, steady.now + 5_000);
     expect(flickerAmps(tripped.state)).toBe(0);
     // Even a wobbly post-trip line stays at zero until a full clean window.
@@ -465,12 +472,14 @@ describe("sustained-over clock (2026-08-03)", () => {
   it("counts only unbroken time with the MEAN over the limit", () => {
     const under = feedGen([14, 14, 14, 14]);
     expect(meterView(under.state, under.now).smoothedOverMs).toBe(0);
-    // The clock starts when the MEDIAN crosses, which takes two readings — not
-    // on the first raw reading over the line. The jitter is not decoration: a
-    // live CT always micro-moves, and a bit-identical stream is a hung sensor,
-    // which stops this clock by design.
+    // The clock starts when the MEDIAN crosses, which takes FIVE readings at
+    // SMOOTH_WINDOW 8 (it was two at 4) — not on the first raw reading over the
+    // line. That latency is the cost of the 2026-08-05 widening, and it is why
+    // this fixture feeds 15 readings for the same 45s of clock. The jitter is
+    // not decoration: a live CT always micro-moves, and a bit-identical stream
+    // is a hung sensor, which stops this clock by design.
     const over = feedGen(
-      Array.from({ length: 13 }, (_, i) => 15.6 + (i % 2) * 0.02),
+      Array.from({ length: 15 }, (_, i) => 15.6 + (i % 2) * 0.02),
       { state: under.state, startAt: under.now + 5_000 },
     );
     expect(meterView(over.state, over.now).smoothedOverMs).toBeGreaterThanOrEqual(SUSTAINED_OVER_SEVERE_MS);
@@ -489,15 +498,18 @@ describe("sustained-over clock (2026-08-03)", () => {
     // The 0.02A wobble is the live CT's micro-jitter: a bit-identical stream is
     // a hung sensor, and that stops this clock by design.
     const held = (amps: number, n: number): number[] => Array.from({ length: n }, (_, i) => amps + (i % 2) * 0.02);
-    const riding = feedGen(held(21, 14));
+    const riding = feedGen(held(21, 16));
     expect(meterView(riding.state, riding.now).smoothedOverMs).toBeGreaterThanOrEqual(SUSTAINED_OVER_SEVERE_MS);
 
     // 6.0A commanded off at a 21A anchor; the meter comes down to 18.5 — a 2.5A
     // fall, past the 35% bar — and the line is still 3.5A over the 15A limit,
-    // so nothing else could have reset the clock.
+    // so nothing else could have reset the clock. Five readings, not four: the
+    // fall is judged on the SMOOTHED meter, and at SMOOTH_WINDOW 8 the median
+    // does not clear the 35% bar until the majority of the window sits at the
+    // new level (2026-08-05).
     const cutAt = riding.now + 5_000;
     const armed = noteCommandedCut(riding.state, 6.0, cutAt);
-    const landing = feedGen(held(18.5, 4), { state: armed, startAt: cutAt });
+    const landing = feedGen(held(18.5, 5), { state: armed, startAt: cutAt });
     expect(meterView(landing.state, landing.now).smoothedAmps).toBeGreaterThan(15);
     expect(meterView(landing.state, landing.now).smoothedOverMs).toBe(0);
 
@@ -512,7 +524,7 @@ describe("sustained-over clock (2026-08-03)", () => {
 
 describe("power-collapse latch", () => {
   it("latches on a big drop to the floor and freezes calm", () => {
-    const steady = feedGen([13, 13.2, 12.8, 13.1]);
+    const steady = feedGen([13, 13.2, 12.8, 13.1, 13, 13.2, 12.8, 13.1]);
     const r = ingestReading(steady.state, { gridAmps: 0, genAmps: 4 }, cfg, steady.now + 5_000);
     expect(r.events.some((e) => e.kind === "collapse")).toBe(true);
     expect(r.state.collapse).not.toBeNull();
@@ -525,7 +537,7 @@ describe("power-collapse latch", () => {
     // Build genuine calm, then trip: calmSince must be null on the very reading
     // that latches (not merely masked by the view), and calm must rebuild from
     // scratch after recovery — never resurface a stale pre-collapse timestamp.
-    const calm = feedGen([12, 12, 12, 12]);
+    const calm = feedGen([12, 12, 12, 12, 12, 12, 12, 12]);
     expect(calm.state.calmSince).not.toBeNull();
     const tripped = ingestReading(calm.state, { gridAmps: 0, genAmps: 4 }, cfg, calm.now + 5_000);
     expect(tripped.state.collapse).not.toBeNull();
@@ -539,14 +551,14 @@ describe("power-collapse latch", () => {
   });
 
   it("does NOT latch on a modest drop or a drop that stays above the floor", () => {
-    const steady = feedGen([13, 13.2, 12.8, 13.1]);
+    const steady = feedGen([13, 13.2, 12.8, 13.1, 13, 13.2, 12.8, 13.1]);
     // Drop of ~5A but lands at 8A (> floor): a normal reduction, not a trip.
     const r = ingestReading(steady.state, { gridAmps: 0, genAmps: 8 }, cfg, steady.now + 5_000);
     expect(r.events.some((e) => e.kind === "collapse")).toBe(false);
   });
 
   it("recovers when measured returns near the pre-collapse median", () => {
-    const steady = feedGen([13, 13.2, 12.8, 13.1]);
+    const steady = feedGen([13, 13.2, 12.8, 13.1, 13, 13.2, 12.8, 13.1]);
     const tripped = ingestReading(steady.state, { gridAmps: 0, genAmps: 4 }, cfg, steady.now + 5_000);
     const rec = ingestReading(tripped.state, { gridAmps: 0, genAmps: 11.5 }, cfg, steady.now + 60_000);
     expect(rec.events.some((e) => e.kind === "collapse_recovered")).toBe(true);
@@ -554,7 +566,7 @@ describe("power-collapse latch", () => {
   });
 
   it("expires via the safety cap without a recovery event", () => {
-    const steady = feedGen([13, 13.2, 12.8, 13.1]);
+    const steady = feedGen([13, 13.2, 12.8, 13.1, 13, 13.2, 12.8, 13.1]);
     const tripped = ingestReading(steady.state, { gridAmps: 0, genAmps: 4 }, cfg, steady.now + 5_000);
     // The line stays dead through the latch window (readings keep arriving).
     const dead = feedGen(new Array(6).fill(4.1), { state: tripped.state, startAt: steady.now + 10_000 });
@@ -577,7 +589,7 @@ describe("power-collapse latch", () => {
 // controller itself commanded is not evidence of a breaker.
 describe("commanded-cut credit (self-inflicted collapse suppression)", () => {
   it("does NOT latch when our own shed explains the drop", () => {
-    const steady = feedGen([11.5, 11.6, 11.4, 11.5]);
+    const steady = feedGen([11.5, 11.6, 11.4, 11.5, 11.5, 11.6, 11.4, 11.5]);
     // The reducer shed a room it priced at 3.5A (learned on@L1).
     const cut = noteCommandedCut(steady.state, 3.5, steady.now);
     const r = ingestReading(cut, { gridAmps: 0, genAmps: 4.5 }, cfg, steady.now + 60_000);
@@ -592,7 +604,7 @@ describe("commanded-cut credit (self-inflicted collapse suppression)", () => {
   it("still latches when the drop is far bigger than what we commanded", () => {
     // The 2026-07-26 gen trip: a 0.4A mild trim was in flight when the breaker
     // went. 11.7A of the fall is unexplained — that is a trip.
-    const steady = feedGen([15.6, 15.7, 15.5, 15.6]);
+    const steady = feedGen([15.6, 15.7, 15.5, 15.6, 15.6, 15.7, 15.5, 15.6]);
     const cut = noteCommandedCut(steady.state, 0.4, steady.now);
     const r = ingestReading(cut, { gridAmps: 0, genAmps: 3.9 }, cfg, steady.now + 5_000);
     expect(r.events.some((e) => e.kind === "collapse")).toBe(true);
@@ -607,7 +619,7 @@ describe("commanded-cut credit (self-inflicted collapse suppression)", () => {
     // credit is live:
     //   model  4.0 → unexplained 13.5 − 2.5 − 4.0 = 7.0 ≥ 6 → LATCHES (correct)
     //   learned 7.2 → unexplained             = 3.8 <  6 → suppressed (silent)
-    const steady = feedGen([13.5, 13.6, 13.4, 13.5]);
+    const steady = feedGen([13.5, 13.6, 13.4, 13.5, 13.5, 13.6, 13.4, 13.5]);
     const modelPriced = noteCommandedCut(steady.state, 4.0, steady.now);
     const real = ingestReading(modelPriced, { gridAmps: 0, genAmps: 2.5 }, cfg, steady.now + 30_000);
     expect(real.events.some((e) => e.kind === "collapse")).toBe(true);
@@ -618,27 +630,31 @@ describe("commanded-cut credit (self-inflicted collapse suppression)", () => {
   });
 
   it("credit expires — a trip long after the shed is still a trip", () => {
-    const steady = feedGen([11.5, 11.6, 11.4, 11.5]);
+    const steady = feedGen([11.5, 11.6, 11.4, 11.5, 11.5, 11.6, 11.4, 11.5]);
     const cut = noteCommandedCut(steady.state, 8, steady.now);
     const r = ingestReading(cut, { gridAmps: 0, genAmps: 4.5 }, cfg, steady.now + PENDING_CUT_MS + 1);
     expect(r.events.some((e) => e.kind === "collapse")).toBe(true);
   });
 
   it("credit is spent once the meter has shown the cut, so a later trip latches", () => {
-    const steady = feedGen([14, 14.1, 13.9, 14]);
+    const steady = feedGen([14, 14.1, 13.9, 14, 14, 14.1, 13.9, 14]);
     const cut = noteCommandedCut(steady.state, 6, steady.now);
     // The cut arrives gradually and lands above the collapse floor: absorbed.
-    const settled = feedGen([8, 8, 8, 8], { state: cut, startAt: steady.now + 5_000 });
+    // A full window of the new level — absorption is read on the SMOOTHED
+    // meter, so the credit is only spent once the median has digested the fall.
+    const settled = feedGen(new Array(8).fill(8), { state: cut, startAt: steady.now + 5_000 });
     expect(pendingCutCredit(settled.state, settled.now)).toBe(0);
     const r = ingestReading(settled.state, { gridAmps: 0, genAmps: 1 }, cfg, settled.now + 5_000);
     expect(r.events.some((e) => e.kind === "collapse")).toBe(true);
   });
 
   it("absorption ratchets — a peer turning back on does not re-arm spent credit", () => {
-    const steady = feedGen([14, 14.1, 13.9, 14]);
+    const steady = feedGen([14, 14.1, 13.9, 14, 14, 14.1, 13.9, 14]);
     const cut = noteCommandedCut(steady.state, 6, steady.now);
     // Partial arrival of the cut, then a peer's start lifts the house again.
-    const dipped = feedGen([10, 10], { state: cut, startAt: steady.now + 5_000 });
+    // Half a window of the new level, so the median has moved partway and the
+    // credit is partly — but only partly — spent.
+    const dipped = feedGen([10, 10, 10, 10], { state: cut, startAt: steady.now + 5_000 });
     const spent = pendingCutCredit(dipped.state, dipped.now);
     expect(spent).toBeLessThan(6);
     const lifted = feedGen([14, 14, 14], { state: dipped.state, startAt: dipped.now + 5_000 });
@@ -656,7 +672,7 @@ describe("commanded-cut credit (self-inflicted collapse suppression)", () => {
   });
 
   it("a cut commanded on the old line credits nothing after a changeover", () => {
-    const steady = feedGen([11.5, 11.6, 11.4, 11.5]);
+    const steady = feedGen([11.5, 11.6, 11.4, 11.5, 11.5, 11.6, 11.4, 11.5]);
     const cut = noteCommandedCut(steady.state, 6, steady.now);
     const swapped = ingestReading(cut, { gridAmps: 12, genAmps: 0 }, cfg, steady.now + 5_000);
     expect(swapped.state.pendingCut).toBeNull();
@@ -747,10 +763,12 @@ describe("calm tracking & view", () => {
     expect(meterView(state, now + 20_000).source).toBe("none");
   });
 
-  it("smoothing is the median of the last 4 readings", () => {
-    const { state, now } = feedGen([10, 11, 12, 13, 100]);
-    // window = [11,12,13,100] → median 12.5
-    expect(meterView(state, now).smoothedAmps).toBe(12.5);
+  it("smoothing is the median of the last 8 readings", () => {
+    const { state, now } = feedGen([10, 11, 12, 13, 14, 15, 16, 17, 100]);
+    // window = [11,12,13,14,15,16,17,100] → median (14+15)/2 = 14.5. The oldest
+    // reading has aged out and the lone 100A spike moves it not at all — which
+    // is the whole point of widening the window (2026-08-05).
+    expect(meterView(state, now).smoothedAmps).toBe(14.5);
   });
 });
 
@@ -853,8 +871,10 @@ describe("calm refill timing", () => {
 // limit the hot breaker was no longer holding.
 describe("post-collapse limit derate", () => {
   const collapseThen = (after: number[], opts: { state?: MeterState; startAt?: number } = {}) =>
-    // 4 readings to seat the smoothing window, then the collapse, then `after`.
-    feedGen([14, 14, 14, 14, 3, ...after], opts);
+    // 8 readings to seat the smoothing window (SMOOTH_WINDOW, 2026-08-05 — the
+    // collapse baseline is null until the window is full), then the collapse,
+    // then `after`.
+    feedGen([14, 14, 14, 14, 14, 14, 14, 14, 3, ...after], opts);
 
   it("a collapse derates the limit for its window, then releases it", () => {
     const { state, now } = collapseThen([]);
@@ -917,7 +937,7 @@ describe("collapse latched on entry", () => {
   it("stacks on a rung still standing, exactly like a repeat trip", () => {
     // Invariant 15: a trip part-way up the recovery ladder escalates from where
     // the line actually was, and an entry latch is not a lesser event.
-    const { state, now } = feedGen([14, 14, 14, 14, 3, 13, 13, 13, 13]);
+    const { state, now } = feedGen([14, 14, 14, 14, 14, 14, 14, 14, 3, 13, 13, 13, 13]);
     expect(meterView(state, now).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
     const latched = latchCollapse(state, { source: "gen", now: now + 5_000, preMedianAmps: 14 });
     expect(meterView(latched, now + 5_000).derateAmps).toBe(2 * COLLAPSE_DERATE_AMPS);
@@ -1051,7 +1071,7 @@ describe("generator strain derate", () => {
   it("adds to a collapse derate rather than replacing it — every consumer sees the sum", () => {
     // A generator that tripped AND has been browning out is holding less than
     // either fact alone says. The two records decay independently.
-    const tripped = feedGen([14, 14, 14, 14, 3, 13, 13, 13, 13]);
+    const tripped = feedGen([14, 14, 14, 14, 14, 14, 14, 14, 3, 13, 13, 13, 13]);
     expect(meterView(tripped.state, tripped.now).derateAmps).toBe(COLLAPSE_DERATE_AMPS);
     const first = withGap([14.6, 14.6, 14.6], 14.6, { state: tripped.state, startAt: tripped.now + 5_000 });
     const second = withGap([14.6, 14.6, 14.6], 14.6, {

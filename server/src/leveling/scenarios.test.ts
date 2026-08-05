@@ -435,11 +435,16 @@ describe("gen entry floors (changeover AND cold start) then meter-confirmed one-
         .map((c) => c.cmd.deviceId),
     );
     expect([...floored].sort()).toEqual(["abdu", "abdullah"]);
-    // No raise before confirm (10s) + ramp (30s) + calm (30s):
+    // No raise before confirm (10s) + the ramp WINDOW + calm (30s). The window
+    // is `AC_RAMP_MS` (240s), not the sim's 30s compressor curve — the harness
+    // conflated the two until 2026-08-05 (see scenario.ts AC_RAMP_MS). Nothing
+    // absorbs here either: a changeover FLOORS every room, so the meter falls
+    // instead of rising and each ramp stays charged its whole modeled draw for
+    // the full window, exactly as it does in production.
     s.advance(30);
     expect(setLevels(s, flip + 10_000).filter((c) => c.cmd.level > 1)).toHaveLength(0);
     // The climb resumes — one raise command per batch on gen, spaced by settle.
-    s.advance(180);
+    s.advance(330);
     const raises = setLevels(s, flip + 40_000).filter((c) => c.cmd.level > 1);
     expect(raises.length).toBeGreaterThanOrEqual(1);
     // Never two upward levels in the same batch (the 07-23 double-raise → 16.6A):
@@ -516,7 +521,13 @@ describe("power collapse (external trip — the dominant real-world event)", () 
 
   it("a real trip while a shed is in flight still latches — the credit is not a blank cheque", () => {
     const s = new Scenario(cfg, PINNED_HOT, { nonAcAmps: 4.3, source: "gen" });
-    s.advance(15); // one shed sent (≈5.9A priced), nowhere near landed
+    // One shed sent (≈5.9A priced, at 10s) and nowhere near landed — its
+    // `offLagMs` is a full minute. The 45s is the SMOOTHING WINDOW seating, not
+    // the shed: the collapse baseline is the prior median and there is no prior
+    // median until the window is full, which at SMOOTH_WINDOW 8 takes eight
+    // readings (2026-08-05; it was four). A session younger than that has no
+    // fall to judge — which is exactly the hole `entryCollapseEvidence` covers.
+    s.advance(45);
     // The breaker goes while that off is still travelling: far more load
     // vanishes than anything we commanded, so the remainder is unexplained.
     s.trip();

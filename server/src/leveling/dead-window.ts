@@ -119,7 +119,7 @@ export const RAMP_RELEASE_FRACTION = 0.4;
  * What it is compared against: `AcView.rampAbsorbedAmps`, the ratcheted peak
  * rise of the SMOOTHED meter since the ramp armed. Largest single increment
  * that can consume 1.0 A of it without a compressor starting: supply flicker,
- * which `flickerAmps()` caps at 1.5 A on RAW readings — but the 4-wide median
+ * which `flickerAmps()` caps at 1.5 A on RAW readings — but the 8-wide median
  * this is measured on removes single-reading spikes, so the smoothed excursion
  * is a fraction of that. And the failure direction is benign either way: a
  * premature release restores exactly the pre-2026-08-04 behaviour (expire on
@@ -174,10 +174,11 @@ export function houseIsDead(gapAmps: number): boolean {
  * house sample is taken.
  *
  * "The meter is the house" is only true while the meter is not moving. When a
- * compressor finally engages, the raw reading jumps at once and the 4-wide
- * median follows over the next readings — so for two or three ticks the
- * smoothed value is a BLEND of house and compressor while the whole-house gap
- * has not yet fallen under `DEAD_WINDOW_GAP_AMPS`. The acceptance run booked a
+ * compressor finally engages, the raw reading jumps at once and the 8-wide
+ * median follows over the next readings — so for four or five ticks (it was two
+ * or three before the 2026-08-05 widening, which makes this guard MORE
+ * load-bearing, not less) the smoothed value is a BLEND of house and compressor
+ * while the whole-house gap has not yet fallen under `DEAD_WINDOW_GAP_AMPS`. The acceptance run booked a
  * 6.5A "house" on the tick the median was halfway up from a real 2.0A, and that
  * peak then refused every raise for the next fifteen minutes.
  *

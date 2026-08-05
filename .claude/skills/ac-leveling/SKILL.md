@@ -96,6 +96,24 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     `AcView.unmeteredJumpAmps` (priced jump, absorbed-ratcheted, `AC_RAMP_MS`) which `rampDebitAmps`
     charges to the next spender — the 2026-07-26 back-to-back-raise trip shape. Not double-charged
     for a ramping AC. Consequence: a fan restore waits behind a fresh raise (deliberate).
+    **The absorption that retires these debits is ONE SHARED POOL (2026-08-05,
+    `absorbedSharesAmps`), never the whole rise per room.** A compressor's arrival
+    is a whole-house delta; reading it per AC and summing the leftovers spends the
+    same amps against every debit at once — live, a 5.82 A rise cancelled 4.1 A of
+    one room AND 4.5 A of another, reporting 8.6 A of committed compressor as fully
+    absorbed, and a restore went into that hole. ⚠️ The old comment called this
+    "counted twice … errs toward not spending" and **had the sign backwards for
+    months**: crediting one rise to every ramp does not raise the debit, it SINKS
+    it — the trip direction, and this invariant's own premise inverted. The house
+    rose once, so it can only pay once. Per-AC cap = its own ratcheted rise; total
+    ≤ the max of those (the whole episode's rise, monotone so a dip cannot
+    un-absorb); apportioned proportional to each ramp's priced commitment (`AcView`
+    has baselines but not arm times, so "oldest first" would have to infer order
+    from a baseline VALUE — true only while the meter rises); leftover NOT
+    redistributed, because under-crediting only makes a spender wait.
+    ⚠️ STILL OPEN: `unmeteredJumpAmps` and the fan debit reach the pure layer
+    PRE-NETTED by the shell, so two settled rooms with live jump debits still each
+    credit the same rise. Needs the gross debit + baseline on `AcView`.
 
 **Added 2026-07-30 after a room turned on at L3 on a 15 A gen, and two gen trips 26 min apart:**
 13. **A gen turn-on is not an admission.** The TCL restores the level it was last left at, and since
@@ -239,7 +257,8 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     with `pressure.ts`. ⚠️ The smoothed overshoot is NEVER discounted — that is
     what keeps a real overload's latency unchanged. A load step-up still breaks
     calm immediately via `rawIsSupplyNoise` (it reads as low flicker), so the
-    median's 2-reading lag cannot refill the bucket it just drained.
+    median's lag — 2 readings then, 4 since `SMOOTH_WINDOW` widened to 8 on
+    2026-08-05 — cannot refill the bucket it just drained.
 25. **A comfort floor is a preference; being switched off is worse than any
     level.** The ladder gained a rung: levels → floor → fans → **sub-floor
     levels (to L1, never 0)** → off, priced by `w.subFloorStep` (40, between fan
@@ -316,9 +335,13 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     `creditRoomOff` on the dashboard tap AND on the observed shadow flip
     (automation, remote, schedule). Ours are already credited via
     `Plan.commandedCutAmps` and must not be credited twice. Also: the latch
-    window used to be two readings wide and did not know it (the 4-median flips
-    on the third post-cliff reading) — `cliffAnchor` holds the pre-fall mean for
-    `CLIFF_ANCHOR_MS` (30 s).
+    window used to be two readings wide and did not know it (at the then 4-wide
+    `SMOOTH_WINDOW` the median flipped on the third post-cliff reading) —
+    `cliffAnchor` holds the pre-fall mean for `CLIFF_ANCHOR_MS` (30 s). At
+    `SMOOTH_WINDOW` 8 (2026-08-05) the same arithmetic runs slower and in the SAFE
+    direction: fully pre-fall for three post-cliff readings, halfway on the fourth,
+    flipped on the fifth — 12–20 s, inside the 30 s hold with room to spare. A
+    wider window makes the anchor needed LESS often, never later.
 32. **A trough you cannot explain is not headroom.** A ≥ `POWER_COLLAPSE_DROP_AMPS`
     fall that is neither credit-explained nor floor-deep emits `unexplained_fall`
     and stands calm down for `UNEXPLAINED_FALL_CALM_HOLD_MS` (120 s). This is the
@@ -379,6 +402,29 @@ the TCL shadow, which the harness can only mirror), the **outdoor feed** and the
 (invariant 55, which lives in the grading shell). Mirrored the same day: the
 dead-window hold, the entry-collapse state machine, the recovery admission, the
 per-room shed bar, and `compressorOffLikely`.
+
+**2026-08-05 — one mirror repaid, two debts still open.** Mirrored: `isRamping`
+now expires at a mirrored **`AC_RAMP_MS`** (240 s), not at the sim's physical
+`rampSeconds` (60 s). The two are different things — the shell's window is an
+UPPER BOUND that *absorption* retires — and the harness conflated them. It was
+invisible until `SMOOTH_WINDOW` widened: production's window is 6–10× its
+smoothing settle time, the harness's was **1.5×**, so a wider median pushed the
+settle past the window and manufactured a **phantom regression** (a restore into
+a 2.3 A median lag) that the shell cannot exhibit. A harness constant that merely
+RESEMBLES a shell constant is worse than no mirror at all. `absorbedSharesAmps`
+was mirrored the same day (`projectedExtraAmps`). Still open:
+- **The dead-window fixture family is still scaled to `rampSeconds`**
+  (`holdPowerEventRamps`). Not a clock change: those fixtures express restart
+  protection as a MULTIPLE of that boundary (`DEAD_MS` 150 s against a 60 s
+  window, inside the 3-window cap), so moving it to 240 s makes the dead window
+  unreachable in simulation — the very debt `restartDelayMs` was added to repay.
+  Five scenarios go red and three assert what happens BEFORE the compressors
+  engage, i.e. a *different window* after a rescale, not a later clock. Needs the
+  family rescaled together with each assertion re-derived.
+- **Shell-side, not harness:** `unmeteredJumpAmps` and the fan debit are netted in
+  `controller.ts` before the view is built, so the shared absorption pool cannot
+  reach them (invariant 12's open ⚠). Fixing it moves the netting into the pure
+  layer, which is where the harness can finally see it.
 
 **Added 2026-08-03 (midday) after the top-priority room sat 20 min at a level its compressor will not run at:**
 36. **A level that does not cool is an off — in BOTH directions.** A comfort

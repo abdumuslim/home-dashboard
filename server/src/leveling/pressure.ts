@@ -79,7 +79,7 @@ export function requiredSavingsAmps(view: MeterView, limit: number, marginAmps: 
   const severe = over.filter(isSevere);
   // The newest readings, not merely the count: two spikes minutes apart in an
   // 8-deep ring are still two spikes, and the question this answers is whether
-  // the line is severe NOW, before the 4-wide median has caught up with it.
+  // the line is severe NOW, before the 8-wide median has caught up with it.
   const streak = over.length >= SEVERE_STREAK_READINGS && over.slice(-SEVERE_STREAK_READINGS).every(isSevere);
   const overshoot = streak
     ? Math.min(...severe) - limit

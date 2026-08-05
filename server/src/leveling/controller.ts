@@ -111,6 +111,7 @@ import {
   type LevelHold,
 } from "./level-hold.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
+import { absorbedSharesAmps } from "./raise.js";
 import { fanTrimSavings, modelCutAmps, raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, turnOnAmps, updateCost, type CostBook } from "./costs.js";
 import { LevelingStore } from "./store.js";
 import type { AcView, Command, MeterState, Mode, PowerSource } from "./types.js";
@@ -1936,19 +1937,29 @@ export class LevelingControllerV2 {
           (a.startBaselineAmps != null || this.freshlyOn.includes(a.deviceId)),
       );
       if (starting.length > 0) {
-        projectedExtraAmps = starting.reduce((sum, ac) => {
+        const committed = starting.map((ac) => {
           const ours = attemptedWithin(this.pacing, ac.deviceId, "restore", GRADE_TURN_ON_MS, now);
-          const committed = ours
+          return ours
             ? restoreCostAmps(this.book, this.config, ac.deviceId, source, floorOf(ac), ac.maxLevel, now, {
                 gentle: this.fanHolds[ac.deviceId]?.gentle === true,
               }).amps
             : turnOnAmps(this.book, this.config, ac.deviceId, source, ac.envelopeLevel, ac.maxLevel, now).amps;
-          const absorbed =
-            ac.rampBaselineAmps == null
-              ? 0
-              : Math.max(0, view.smoothedAmps - ac.rampBaselineAmps, ac.rampAbsorbedAmps ?? 0);
-          return sum + Math.max(0, committed - absorbed);
-        }, 0);
+        });
+        // ONE shared absorption pool, the same definition the raise path spends
+        // against (2026-08-05). Two rooms starting together — the ordinary
+        // changeover and the ordinary collapse recovery — used to cancel their
+        // projections against the SAME whole-house rise independently, which on
+        // this side under-states the projected overload and lets the reducer sit
+        // still. Same amps, same physics, so it must be the same arithmetic.
+        const absorbed = absorbedSharesAmps(
+          starting.map((ac, i) => ({
+            committedAmps: committed[i],
+            baselineAmps: ac.rampBaselineAmps,
+            ratchetAmps: ac.rampAbsorbedAmps,
+          })),
+          view.smoothedAmps,
+        );
+        projectedExtraAmps = committed.reduce((sum, c, i) => sum + Math.max(0, c - absorbed[i]), 0);
       }
     }
 

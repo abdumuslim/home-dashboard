@@ -52,6 +52,71 @@ export function envelopeTotalAmps(
   );
 }
 
+/** One ramping commitment, as the absorption pool needs to see it. */
+export interface AbsorptionEntry {
+  /** Modeled amps this ramp has committed and is still owed. */
+  committedAmps: number;
+  /** The smoothed meter when this ramp armed, or null (unmeasurable). */
+  baselineAmps: number | null;
+  /** The largest rise above that baseline the meter has ever shown for it. */
+  ratchetAmps: number | null;
+}
+
+/**
+ * How much of each ramping commitment the meter has demonstrably absorbed, out
+ * of ONE shared pool (2026-08-05).
+ *
+ * The rise a compressor's arrival puts on the meter is a WHOLE-HOUSE delta.
+ * Every consumer of it used to read it per AC — `max(0, smoothed − its own
+ * baseline)` — and then SUM the leftovers, so with two rooms ramping the same
+ * amps were spent against both debits at once. Live 2026-08-04 recovery, and
+ * uncovered when the smoothing window widened on 2026-08-05: both rooms armed
+ * at a 5.05A baseline, the meter reached 10.87A, and the 5.82A rise cancelled
+ * Abdullah's 4.1A and Abdu's 4.5A independently — 8.6A of committed compressor
+ * reported as fully absorbed by 5.8A of measured rise. A restore was admitted
+ * into that hole and a peer's level had to be cut 40s later to pay for it.
+ *
+ * Two bounds, both load-bearing:
+ *
+ *  - **Per AC**, absorption cannot exceed what the meter has risen since THAT
+ *    ramp armed (ratcheted — see `rampDebitAmps`; a peer's departure must not
+ *    un-prove amps that arrived). A room whose baseline postdates part of the
+ *    rise did not cause that part and may not claim it.
+ *  - **In total**, absorption cannot exceed the rise the house has actually
+ *    shown. That figure is `max` over the per-AC ratcheted rises: the largest
+ *    is measured from the earliest-armed (lowest) baseline, which is exactly
+ *    the whole episode's rise, and taking it from the per-AC ratchets keeps the
+ *    pool monotone for free — a smoothed dip can never un-absorb.
+ *
+ * Apportioned **proportionally to each ramp's own priced commitment**, rather
+ * than oldest-baseline-first: `AcView` carries baselines but not arm times, so
+ * "oldest" would have to be inferred from the baseline VALUE, which is only
+ * true while the meter is rising monotonically — and it is a falling meter
+ * (invariant 27's landing cut, invariant 20's wind-down) that this code is most
+ * often asked about. Proportional needs no ordering, is stable under a
+ * reordered array, and splits a shared rise the way the physics does: the
+ * bigger compressor is most of the rise it caused.
+ *
+ * Leftover pool is deliberately NOT redistributed to ramps that are still under
+ * their cap. That under-credits (a spender waits a little longer), which is the
+ * safe direction; over-crediting is the direction that trips breakers.
+ */
+export function absorbedSharesAmps(
+  entries: readonly AbsorptionEntry[],
+  smoothedAmps: number,
+): number[] {
+  // No baseline, no credit — ratchet or not (see `rampDebitAmps`).
+  const caps = entries.map((e) =>
+    e.baselineAmps == null ? 0 : Math.max(0, smoothedAmps - e.baselineAmps, e.ratchetAmps ?? 0),
+  );
+  const poolAmps = caps.reduce((max, cap) => Math.max(max, cap), 0);
+  const totalCommitted = entries.reduce((sum, e) => sum + Math.max(0, e.committedAmps), 0);
+  if (!(poolAmps > 0) || !(totalCommitted > 0)) return entries.map(() => 0);
+  return entries.map((e, i) =>
+    Math.min(caps[i], (poolAmps * Math.max(0, e.committedAmps)) / totalCommitted),
+  );
+}
+
 /**
  * Amps that ramping ACs have already COMMITTED but the meter has not absorbed
  * yet — the budget the house owes but cannot see.
@@ -69,10 +134,9 @@ export function envelopeTotalAmps(
  *
  * Per AC: what the cap model says it will pull at its current level, minus what
  * the meter has actually risen since its compressor started. Deliberately
- * conservative in three ways — a null baseline charges the WHOLE draw (unknown
- * absorption is not evidence of absorption), level 0 charges the unrestricted
- * draw, and with two ACs ramping each measures the rise from its own baseline,
- * so shared rise is counted twice. All three err toward not spending.
+ * conservative in two ways — a null baseline charges the WHOLE draw (unknown
+ * absorption is not evidence of absorption), and level 0 charges the
+ * unrestricted draw. Both err toward not spending.
  *
  * Absorption RATCHETS (2026-07-27). The live rise is only half the story: it is
  * a whole-house delta, so any load that leaves after the ramp armed masks it.
@@ -85,6 +149,15 @@ export function envelopeTotalAmps(
  * a one-way fact, and a peer's departure cannot un-prove amps the meter saw
  * arrive. Still bounded by the baseline — no baseline, no credit, ratchet or not.
  *
+ * Absorption is also POOLED (2026-08-05, `absorbedSharesAmps`). It used to be
+ * per-AC, and this comment used to call the shared rise "counted twice … errs
+ * toward not spending" — which had the sign backwards and stood for months.
+ * Crediting the same amps to every ramping AC does not raise the debit, it
+ * SINKS it: with two rooms ramping from one baseline, a 5.8A rise cancelled
+ * 4.1A of Abdullah AND 4.5A of Abdu, and the whole 8.6A of committed load
+ * reported as fully absorbed. That is the trip direction, and it is invariant
+ * 12's own premise inverted — the house rose once, so it can only pay once.
+ *
  * SPENDING SIDE ONLY. This must never inflate the reducer's savings target: a
  * ramping AC's inrush is transient and the 2026-07-25 storm proved that acting
  * on it sheds rooms for load that decays on its own (see pipeline.ts inrush
@@ -96,21 +169,36 @@ export function rampDebitAmps(
   config: LevelingConfigV2,
   source: Exclude<PowerSource, "none">,
 ): number {
-  return acs.reduce((sum, ac) => {
-    if (!ac.on || !ac.managed || ac.shed) return sum;
-    if (!ac.ramping) {
-      // Not starting, but a recent level raise may still be arriving. Charged
-      // only here: a RAMPING AC is already charged its whole steady draw at its
-      // current (raised) level below, which subsumes the jump.
-      return sum + Math.max(0, ac.unmeteredJumpAmps);
-    }
-    const committed = steadyDraw(ac.currentLevel, ac.maxLevel, modelFor(config, ac.deviceId, source));
-    const absorbed =
-      ac.rampBaselineAmps == null
-        ? 0
-        : Math.max(0, smoothedAmps - ac.rampBaselineAmps, ac.rampAbsorbedAmps ?? 0);
-    return sum + Math.max(0, committed - absorbed);
-  }, 0);
+  const live = acs.filter((ac) => ac.on && ac.managed && !ac.shed);
+  const ramping = live.filter((ac) => ac.ramping);
+  const committed = ramping.map((ac) =>
+    steadyDraw(ac.currentLevel, ac.maxLevel, modelFor(config, ac.deviceId, source)),
+  );
+  const absorbed = absorbedSharesAmps(
+    ramping.map((ac, i) => ({
+      committedAmps: committed[i],
+      baselineAmps: ac.rampBaselineAmps,
+      ratchetAmps: ac.rampAbsorbedAmps,
+    })),
+    smoothedAmps,
+  );
+  const rampOwed = committed.reduce((sum, c, i) => sum + Math.max(0, c - absorbed[i]), 0);
+  // Not starting, but a recent level raise (or fan restore) may still be
+  // arriving. Charged only for a settled AC: a RAMPING one is already charged
+  // its whole steady draw at its current (raised) level above, which subsumes
+  // the jump.
+  //
+  // ⚠ These arrive PRE-NETTED (`controller.unmeteredJumpAmps` subtracts each
+  // debit's own absorbed peak before the view is built), so the pool cannot
+  // reach them and two rooms with live jump debits still credit the same rise
+  // twice. Same bug class as the one fixed above, same invariants (12 and 18) —
+  // closing it needs the GROSS debit and its baseline on `AcView` so the
+  // netting happens here, in the pure layer, alongside the ramps.
+  const jumpOwed = live.reduce(
+    (sum, ac) => (ac.ramping ? sum : sum + Math.max(0, ac.unmeteredJumpAmps)),
+    0,
+  );
+  return rampOwed + jumpOwed;
 }
 
 /**

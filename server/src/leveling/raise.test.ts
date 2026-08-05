@@ -1102,6 +1102,92 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
     expect(rampDebitAmps(acs, 99, liveCfg, "gen")).toBeCloseTo(2.3, 5);
   });
 
+  // 2026-08-05. Absorption was read per AC — `max(0, smoothed − its own
+  // baseline)` — and the leftovers summed, so two rooms ramping from one
+  // baseline spent the SAME whole-house rise against both debits. Live during
+  // the 2026-08-04 trip-on-entry recovery: both armed at 5.05A, the meter
+  // reached 10.87A, and that 5.82A of rise cancelled Abdullah's 4.1A and Abdu's
+  // 4.5A independently — 8.6A of committed compressor reported fully absorbed.
+  // A restore was admitted into the hole and a peer's level paid for it 40s
+  // later. The comment above this function called the double-count conservative;
+  // it is the trip direction. The house rose once, so it can only pay once.
+  describe("shared absorption pool (2026-08-05)", () => {
+    it("two ramping rooms split ONE rise — sum(jumps) − rise, not sum(jumps) − 2×rise", () => {
+      const acs = [
+        ac("abdu", { currentLevel: 1, ramping: true, rampBaselineAmps: 5.05 }),
+        ac("najat", { currentLevel: 1, ramping: true, rampBaselineAmps: 5.05 }),
+      ];
+      // Committed: Abdu 4.3 + Najat 2.3 = 6.6. The meter has risen 5.82A.
+      const rise = 10.87 - 5.05;
+      expect(rampDebitAmps(acs, 10.87, liveCfg, "gen")).toBeCloseTo(6.6 - rise, 5);
+      // The pre-fix arithmetic — each cancelling the whole rise — reported zero.
+      expect(rampDebitAmps(acs, 10.87, liveCfg, "gen")).toBeGreaterThan(0);
+    });
+
+    it("a single ramping room is unchanged — the pool is its own rise", () => {
+      const acs = [ac("abdu", { currentLevel: 1, ramping: true, rampBaselineAmps: 10.5 })];
+      expect(rampDebitAmps(acs, 10.5, liveCfg, "gen")).toBeCloseTo(4.3, 5);
+      expect(rampDebitAmps(acs, 12.5, liveCfg, "gen")).toBeCloseTo(2.3, 5);
+      expect(rampDebitAmps(acs, 14.8, liveCfg, "gen")).toBe(0);
+    });
+
+    it("stays monotonic when the meter dips — a peer leaving cannot un-absorb", () => {
+      // Both ratcheted 2.0A each while the meter was up; the reducer then cuts a
+      // peer and the house falls BELOW both baselines. The pool is taken from
+      // the per-AC ratchets, so it survives the dip exactly as invariant
+      // 2026-07-27 requires — and it is still ONE pool, not two.
+      const acs = [
+        ac("abdu", { currentLevel: 1, ramping: true, rampBaselineAmps: 14.3, rampAbsorbedAmps: 2.0 }),
+        ac("najat", { currentLevel: 1, ramping: true, rampBaselineAmps: 14.3, rampAbsorbedAmps: 2.0 }),
+      ];
+      const dipped = rampDebitAmps(acs, 12.8, liveCfg, "gen");
+      expect(dipped).toBeCloseTo(6.6 - 2.0, 5);
+      // …and it never rises as the meter falls further.
+      expect(rampDebitAmps(acs, 10.0, liveCfg, "gen")).toBeCloseTo(dipped, 5);
+    });
+
+    it("a ramp whose baseline postdates part of the rise claims only its own share", () => {
+      // Abdu armed at 5.0 and Najat at 8.0 — by the time Najat started, 3.0A of
+      // the rise had already happened and it was not hers. At a 10.0A meter the
+      // pool is 5.0 (measured from the earliest baseline) but Najat's own cap is
+      // 2.0, so she may credit at most that.
+      const acs = [
+        ac("abdu", { currentLevel: 1, ramping: true, rampBaselineAmps: 5.0 }),
+        ac("najat", { currentLevel: 1, ramping: true, rampBaselineAmps: 8.0 }),
+      ];
+      // Shares of the 5.0 pool: Abdu 5×4.3/6.6 = 3.257, Najat 5×2.3/6.6 = 1.742
+      // — under her 2.0 cap, so nobody is clamped and the pool is fully spent.
+      expect(rampDebitAmps(acs, 10.0, liveCfg, "gen")).toBeCloseTo(6.6 - 5.0, 5);
+      // Push the meter to 9.0: the pool is 4.0, Najat's own cap is 1.0, and her
+      // proportional share (1.394) exceeds it — so she is clamped and the
+      // leftover is deliberately NOT handed to Abdu (under-crediting is safe).
+      const clamped = rampDebitAmps(acs, 9.0, liveCfg, "gen");
+      expect(clamped).toBeCloseTo(6.6 - (4.0 * 4.3) / 6.6 - 1.0, 5);
+      expect(clamped).toBeGreaterThan(6.6 - 4.0);
+    });
+
+    it("total absorption never exceeds the rise the house actually showed", () => {
+      // The property the whole fix exists to hold, over the shapes above.
+      const cases: Array<[number | null, number | null, number]> = [
+        [5.05, 5.05, 10.87],
+        [5.0, 8.0, 10.0],
+        [14.3, 14.3, 12.8],
+        [null, 10.5, 12.5],
+      ];
+      for (const [b1, b2, smoothed] of cases) {
+        const acs = [
+          ac("abdu", { currentLevel: 1, ramping: true, rampBaselineAmps: b1 }),
+          ac("najat", { currentLevel: 1, ramping: true, rampBaselineAmps: b2 }),
+        ];
+        const rise = Math.max(
+          0,
+          ...[b1, b2].filter((b): b is number => b != null).map((b) => smoothed - b),
+        );
+        expect(rampDebitAmps(acs, smoothed, liveCfg, "gen")).toBeGreaterThanOrEqual(6.6 - rise - 1e-9);
+      }
+    });
+  });
+
   it("a shed restore is charged the debit too, and says so", () => {
     const acs = [
       ac("abdu", { currentLevel: 1, needDelta: 1, ramping: true, rampBaselineAmps: 10.5 }),

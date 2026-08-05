@@ -65,10 +65,18 @@ export const POWER_COLLAPSE_FLOOR_FRACTION = 0.5;
  * How long the pre-fall mean stays available as the collapse baseline.
  *
  * The latch had a two-reading window and did not know it: with `SMOOTH_WINDOW`
- * 4, the median flips on the third post-cliff reading (two low + two high
- * averages one of each), so a 9.8A measured drop reads as 5.2A and fails the
+ * 4, the median flipped on the third post-cliff reading (two low + two high
+ * averages one of each), so a 9.8A measured drop read as 5.2A and failed the
  * test it passed twice. A fall that is still arriving must be judged against
  * where it started.
+ *
+ * At `SMOOTH_WINDOW` 8 (2026-08-05) the same arithmetic runs slower, and in the
+ * safe direction: the median is still fully pre-fall for THREE post-cliff
+ * readings, halfway on the fourth (four low + four high averages one of each),
+ * and fully post-fall on the fifth — 12–20 s after the cliff at the 3–5 s
+ * cadence, inside this 30 s hold with room to spare. The anchor is armed on the
+ * first reading that qualifies as a fall, so a wider window makes it needed
+ * LESS often (the prior median stays honest longer), never later.
  */
 export const CLIFF_ANCHOR_MS = 30_000;
 /**
@@ -144,9 +152,43 @@ export const ESP_GAP_EVENT_MS = 20_000;
 
 /** Sustained calm required to refill the bucket and close an over-limit episode. */
 export const CALM_REFILL_MS = 30_000;
-/** Smoothing window (median) size. */
-const SMOOTH_WINDOW = 4;
-/** Bounded ring of recent measured readings (trend + collapse baseline). */
+/**
+ * Smoothing window (median) size — how many readings the "mean" is taken over.
+ *
+ * Widened 4 → 8 on 2026-08-05 at the user's request. The smoothed meter is the
+ * controller's statement about LOAD (invariant 24: a generator is not a stable
+ * line, so the mean is the truth and a raw spike is not), and at four readings
+ * — ~12–20 s at the 2.7–5 s ESP cadence — it still partially TRACKED the slow
+ * wobble it exists to remove: a genset governor hunting, and two compressors
+ * cycling against each other on a period of tens of seconds. Eight readings is
+ * ~25–40 s, comfortably longer than that wobble, so the mean irons it out
+ * instead of following it.
+ *
+ * What it costs, stated plainly so the next forensic session does not have to
+ * rediscover it: everything judged on the SMOOTHED meter moves about two
+ * readings (~6–10 s) later. A genuine load step reaches the median on the fifth
+ * post-step reading instead of the third, so `smoothedOverSince` — and with it
+ * SUSTAINED_OVER_SEVERE_MS and SUSTAINED_OVER_EXTREME_MS — starts that much
+ * later, and a commanded cut's absorption is credited that much more slowly.
+ *
+ * The fast paths are deliberately untouched, and that is what makes the trade
+ * affordable: the leaky bucket drains on RAW readings and calm breaks on a raw
+ * reading past the live flicker (`rawIsSupplyNoise`). Both were put on the raw
+ * yardstick precisely so a real breach never has to wait for the median.
+ */
+const SMOOTH_WINDOW = 8;
+/**
+ * Bounded ring of recent measured readings (trend + collapse baseline).
+ *
+ * Deliberately EQUAL to `SMOOTH_WINDOW` since 2026-08-05, not an accident of
+ * the widening: nothing in this file reads a ring entry OLDER than the
+ * smoothing window, so a wider ring would buy nothing — and it would silently
+ * widen two other things that are bounded by it. `flickerSamples` caps at
+ * RECENT_RING, so the flicker estimator would look further back than the ~8
+ * readings its thresholds were measured against; and `overLimitReadings` banks
+ * `slice(-RECENT_RING)`, so the deficit sizing would draw on older evidence
+ * about a house that has since moved. Widen it only with both of those in hand.
+ */
 const RECENT_RING = 8;
 /**
  * Frozen-meter detection (2026-07-23 incident: ESP hung showing ~14.8A for
@@ -327,7 +369,7 @@ export const STRAIN_DERATE_MAX_AMPS = 1.5;
  * Compared against `effectiveLimit − smoothedAmps(pre-gap)`. The largest single
  * increment that can consume it is supply flicker, capped at
  * `FLICKER_MAX_AMPS` (1.5) on RAW readings — but this is measured on the
- * SMOOTHED mean, where a 4-wide median has already removed the single-reading
+ * SMOOTHED mean, where the 8-wide median has already removed the single-reading
  * spikes, so a mean this close to the limit is genuine load. Live evidence:
  * 14.3–14.8A against a 15A limit is 0.2–0.7A of margin, comfortably inside;
  * an ESP dropout at a 9A house is 6A out and must do nothing.
@@ -592,7 +634,7 @@ export function median(values: readonly number[]): number {
   return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-/** Median of the newest `SMOOTH_WINDOW` readings. */
+/** Median of the newest `SMOOTH_WINDOW` (8) readings — ~25–40s at the ESP cadence. */
 export function smoothedAmps(state: MeterState): number {
   return median(state.recent.slice(-SMOOTH_WINDOW));
 }
@@ -699,6 +741,14 @@ export function ingestReading(
       collapse = null;
     }
   }
+  // Still a PRIOR value with `SMOOTH_WINDOW === RECENT_RING` (2026-08-05): the
+  // ring is updated further down, so this median spans the readings BEFORE this
+  // one whether it covers part of the ring or all of it. What the widening does
+  // cost is seating time — the baseline now needs eight readings on the current
+  // source (~25–40 s) rather than four, so a fall inside the first half-minute
+  // of a changeover has no baseline to be judged against. That hole is what
+  // `entryCollapseEvidence` (dead-window.ts, invariant 45) exists to cover: a
+  // session that begins dead never had a cliff for this path to see either.
   const priorMedian = state.recent.length >= SMOOTH_WINDOW ? smoothedAmps(state) : null;
   // A fall still arriving is judged from where it STARTED, not from a median
   // that has already swallowed half of it (see CLIFF_ANCHOR_MS).
@@ -931,7 +981,7 @@ export function ingestReading(
       // the controller shell coalesces urgent evaluations.
       // The raw path keeps its own discount (`isSevereOverReading`) rather than
       // a mean-is-over gate: a genuine step-up must still be able to classify
-      // severe before the 4-wide median has caught up with it, which is the
+      // severe before the 8-wide median has caught up with it, which is the
       // whole reason the bucket reads raw readings at all.
       const severe =
         smoothedOver > OVER_LIMIT_SEVERE_AMPS ||

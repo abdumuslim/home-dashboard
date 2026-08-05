@@ -17,6 +17,92 @@ timestamp: 2026-07-28
 
 A ground-up rewrite lives in **`server/src/leveling/`** (21 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
+### 2026-08-05 (evening) — an 8-wide median, ONE shared absorption pool, and a harness window that lied
+
+**The incident (18:13:22 Baghdad / 15:13:22Z).** Najat was shed on `over_mild required 0.7 A` while
+the SMOOTHED mean sat at **14.9 A against a 15.0 A limit** — under the limit, and a room went off.
+Slow wobble (a genset governor hunting; two compressors cycling against each other on a period of
+tens of seconds) poked raw readings to ~15.6 A. `flickerAmps()` reported **±0.0**: its evidence is an
+excursion that REVERTS within `FLICKER_REVERT_WINDOW` (2) readings, and wobble slower than that is
+invisible to it by construction. So the raw overshoot was discounted by nothing, the bucket drained,
+and the deficit was sized off the raw median. Invariant 24 made the MEAN the truth about load; this
+was the mean being right and the machinery around it not believing it.
+
+**(a) `SMOOTH_WINDOW` 4 → 8** (`sensing.ts`, user request). Four readings is ~12–20 s at the ESP
+cadence — shorter than the wobble, so the median partially TRACKED the thing it exists to remove.
+Eight is ~25–40 s, comfortably longer, and irons it out instead. **The cost, stated in the constant's
+own comment so no future forensic session has to rediscover it:** everything judged on the smoothed
+meter moves about two readings (~6–10 s) later — a genuine load step reaches the median on the fifth
+post-step reading instead of the third, so `smoothedOverSince` (and with it invariant 33's
+sustained-over clocks) starts that much later and a commanded cut's absorption is credited that much
+more slowly. The **raw yardstick fast paths are untouched** — the leaky bucket still drains on raw
+readings, calm still breaks on a raw reading past the live flicker (`rawIsSupplyNoise`), and
+`isSevereOverReading` is unchanged — which is exactly what makes the trade affordable: both were put
+on the raw yardstick so a real breach never has to wait for the median. Two knock-ons, both checked
+before shipping rather than after:
+
+- **`RECENT_RING` stays 8**, now *deliberately* equal to the window rather than accidentally larger.
+  Widening it would silently stretch the flicker estimator's evidence window and the deficit sizing's
+  banked readings (see the constants table).
+- **Cliff-anchor arithmetic (invariant 31)** runs slower, in the safe direction: the median is fully
+  pre-fall for THREE post-cliff readings, halfway on the fourth, flipped on the fifth — 12–20 s after
+  the cliff, still inside `CLIFF_ANCHOR_MS` (30 s) with room to spare. The anchor arms on the first
+  reading that qualifies as a fall, so a wider window makes it needed LESS often, never later.
+- **The collapse baseline now needs eight readings to seat** (`priorMedian`), so a source session
+  opens with a ~25–40 s window in which a fall has no baseline to be judged against. That is the same
+  shape `entryCollapseEvidence` already covers (invariant 45): a session that begins dead never had a
+  cliff for this path to see either.
+
+**(b) ONE shared absorption pool** (`raise.ts` `absorbedSharesAmps`, consumed by `rampDebitAmps` and
+by `controller.ts` `projectedExtraAmps`, mirrored in `scenario.ts`). A months-old double-credit in
+invariant 12's mechanics, uncovered by (a). The rise a compressor's arrival puts on the meter is a
+**whole-house delta**, and every consumer read it PER AC — `max(0, smoothed − its own baseline)` —
+then summed the leftovers, so the same amps were spent against every ramping debit at once. Live
+2026-08-04 recovery: both rooms armed at a **5.05 A** baseline, the meter reached **10.87 A**, and
+that single **5.82 A** rise cancelled Abdullah's 4.1 A and Abdu's 4.5 A independently — **8.6 A of
+committed compressor reported as fully absorbed by 5.8 A of measured rise**. A restore was admitted
+into that hole and a peer's level had to be cut 40 s later to pay for it. The old comment called this
+"counted twice … errs toward not spending", which had **the sign backwards** and stood for months:
+crediting the same amps to every ramping AC does not raise the debit, it SINKS it. Now:
+
+| Rule | Why |
+|---|---|
+| Per AC, absorption ≤ what the meter has risen since THAT ramp armed (ratcheted) | A room whose baseline postdates part of the rise did not cause that part and may not claim it. Ratcheted since 2026-07-27 — a peer's departure must not un-prove amps that arrived |
+| In total, absorption ≤ `max` over the per-AC ratcheted rises | The largest is measured from the earliest-armed (lowest) baseline, which IS the whole episode's rise — and taking it from the per-AC ratchets keeps the pool monotone for free, so a smoothed dip can never un-absorb |
+| Apportioned **proportional to each ramp's priced commitment**, not oldest-baseline-first | `AcView` carries baselines but not arm times, so "oldest" would be inferred from the baseline VALUE — true only while the meter rises monotonically, and it is a FALLING meter (a landing cut, a wind-down) this code is most often asked about. Proportional needs no ordering and splits a shared rise the way the physics does |
+| Leftover pool **not** redistributed to ramps still under their cap | Under-crediting makes a spender wait a little longer; over-crediting trips breakers |
+
+Five tests in `raise.test.ts` under "shared absorption pool (2026-08-05)".
+
+**(c) Harness parity — the phantom regression (`scenario.ts`).** Widening the median turned a
+scenario red, and the bug was in the harness. Its `isRamping` expired at the sim's **physical**
+`rampSeconds` (60 s) while the shell's ramp WINDOW is `AC_RAMP_MS` (240 s) — where the window is an
+upper bound and *absorption* is what actually retires the charge. Production's window is **6–10× its
+smoothing settle time**; the harness's was **1.5×** (60 s against ~40 s at the 5 s step). Widening the
+median pushed the settle time past the harness's own window, so for ~15 s the view reported "settled"
+while the meter was still 2.3 A behind a load that had fully arrived, and a shed room was restored
+into that gap. The shell cannot exhibit that shape at all. `isRamping` now keys off a mirrored
+`AC_RAMP_MS`; `rampSeconds` remains what it always was, the physical draw curve. Two scenario
+expectations moved with it (the post-changeover climb now waits out the real window; the collapse
+test's 15 s pre-roll became 45 s, which is the smoothing window SEATING, not the shed). **This is the
+mirror rule the SKILL states** — a harness constant that merely *resembles* a shell constant is worse
+than no mirror at all, because every scenario then quietly tests a guard production does not have.
+
+**Still open (both flagged in ⚠ comments at the code, deliberately not smuggled in here):**
+
+1. **`unmeteredJumpAmps` and the fan debit arrive PRE-NETTED** from the shell (`controller.ts`
+   subtracts each debit's own absorbed peak before the view is built), so the pool cannot reach them
+   and two settled rooms with live jump debits still credit the same rise twice. Same bug class as
+   (b), same invariants (12 and 18). Closing it needs the GROSS debit plus its baseline on `AcView`
+   so the netting happens in the pure layer alongside the ramps.
+2. **The dead-window fixture family is still scaled to `rampSeconds`** (`holdPowerEventRamps`).
+   Aligning it is not a clock change: those fixtures express restart protection as a MULTIPLE of that
+   boundary (`DEAD_MS` 150 s against a 60 s window, inside the 3-window cap), so moving the boundary
+   to 240 s makes the dead window unreachable in simulation — the very debt `restartDelayMs` was
+   added to repay. Five scenarios go red and three of them assert what happens BEFORE the compressors
+   engage, which is a *different window* after a rescale, not a later clock. It needs the whole family
+   rescaled together with each assertion re-derived — its own task.
+
 ### 2026-08-05 — per-AC need override (`needOverrides`) + fan-restore cooldown 180→120 s
 
 Two user requests, no incident. **(a) `needOverrides`** (config row 1, per device id):
@@ -159,7 +245,7 @@ together at 17:44:27 (15.28 → 16.76 A) and the line went down again at 17:45:3
 
 | Live evidence (UTC) | Cause | Fix |
 |---|---|---|
-| 15.99 A → **5.88 A**, and 16.76 A → **5.76 A**, neither latched | `POWER_COLLAPSE_FLOOR_AMPS` (5) is absolute; the residual is the HOUSE and the house drew 5.76–6.2 A | Floor is `max(5, 0.5 × pre-fall mean)`; `cliffAnchor` holds the pre-fall mean 30 s so the 4-median flip cannot close the window |
+| 15.99 A → **5.88 A**, and 16.76 A → **5.76 A**, neither latched | `POWER_COLLAPSE_FLOOR_AMPS` (5) is absolute; the residual is the HOUSE and the house drew 5.76–6.2 A | Floor is `max(5, 0.5 × pre-fall mean)`; `cliffAnchor` holds the pre-fall mean 30 s so the median flip cannot close the window (then 4 readings wide; 8 since 2026-08-05, which flips on the fifth — still inside the hold) |
 | The same floor cannot tell a trip from switching off the 2-ton room | That room IS most of the load — meter shape alone cannot separate them (hard rule 5b) | `creditRoomOff` prices EVERY off we can know about: dashboard tap, automation, remote (observed flip). Only the unexplained remainder latches |
 | Three raises into a dead line at `pre ≈ 6.4 A` | A post-trip trough is textbook "calm": mean far under the limit, raw readings quiet | `unexplained_fall` event + `UNEXPLAINED_FALL_CALM_HOLD_MS` (120 s); an empty bucket with no evidence returns `hold`, never `calm` |
 | Two minutes at 15.6–16.0 A classified `mild` throughout | Severity was magnitude-only; mild's repertoire winds down over minutes | `smoothedOverMs` clock: 45 s ⇒ severe, 120 s ⇒ extreme (ONE room, `required > 0` after credit) — **user-approved 2026-08-03** |
@@ -309,8 +395,11 @@ calm, headroom, envelope and one-step pacing. `ceilOf` is never below `floorOf`,
 restores it as soon as it is affordable.
 
 **Harness:** `scenario.ts` gained a seeded LCG, `setFlicker({baseAmps, spikeAmps, spikeEveryN})` with
-a **deterministic spike cadence** (a random one clusters — three spikes in one 4-wide window lift the
-median over the limit, which is a real excursion, not noise), and `externalTurnOn(id, shadowLagMs)`
+a **deterministic spike cadence** (a random one clusters, and enough spikes inside one median window
+— more than half of it — genuinely lift the median over the limit, which is a real excursion, not
+noise; at the 8-wide window of 2026-08-05 the deterministic cadence is MORE forgiving, since a 1-in-4
+duty puts two spikes in eight readings and the median needs five to move), and
+`externalTurnOn(id, shadowLagMs)`
 which splits physical draw from shadow state. Acceptance test: the live trio {Abdullah L2, Abdu L1,
 Najat L1} + ~4 A house on a 14.9 A gen holds **30 sim-minutes of flicker with zero sheds and zero
 churn**.
@@ -574,7 +663,10 @@ Two independent controller bugs plus one wrong assumption:
    the meter has actually absorbed. Charged against the raise budget, the restore admission
    (`committedAmps`) and the fan-restore headroom in `pipeline.ts`. Conservative by construction: a
    null baseline charges the whole draw, level 0 charges the unrestricted draw, and two simultaneous
-   ramps each measure rise from their own baseline (shared rise counted twice). **Spending side
+   ramps each measure rise from their own baseline (shared rise counted twice). ⚠️ **That last one was
+   never conservatism — the sign was backwards, and it stood until 2026-08-05**: crediting one rise to
+   every ramp SINKS the debit rather than raising it. Absorption is pooled since then
+   (`absorbedSharesAmps`) — see the 2026-08-05 (evening) record. **Spending side
    only** — it must never inflate the reducer's target, or it re-creates the 2026-07-25 storm.
    `AcView.rampBaselineAmps` is armed by `rearmRamp()` at EVERY arming point (user/automation
    turn-on, restore, changeover, collapse recovery) and, unlike `startBaselineAmps`, is never
@@ -630,7 +722,9 @@ refreshed on the **ESP cadence** (~5s, not the tick — a rise between ticks is 
 skipped while the meter is stale/frozen/collapsed, and cleared exactly where `rampBaseline` is
 (re-arm, power-off, source change) since the two are only meaningful together. Every other
 conservatism is untouched: no baseline → no credit ratchet or not, level 0 still charges the
-unrestricted draw, two simultaneous ramps still each measure from their own baseline, and it stays
+unrestricted draw, two simultaneous ramps still each measure from their own baseline (**pooled since
+2026-08-05** — that one was a double-CREDIT, not a conservatism; the ratchet survives inside the pool
+as each entry's per-AC cap), and it stays
 **spending-side only**.
 
 Tests: `raise.test.ts` ratchet suite (3 — masked absorption, live rise still winning while it
@@ -1776,6 +1870,8 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
 | `FAN_RESTORE_AFTER_CUT_MS` (v2 `fan-trim.ts`) | 120 s (2026-08-05, user request; was 180 from 2026-07-31) | Quiet time owed after the last CUT before that fan may climb. `FAN_RESTORE_CALM_MS` alone never covered it: a fan-only batch does not rewind the shared calm clock, so a cut came all the way back 80 s later. Gentle-restore holds are exempt (`FanHold.fromCut`) |
 | `OVER_LIMIT_MODERATE_AMPS` / `OVER_LIMIT_DRAIN_MODERATE` (v2 `sensing.ts`) | 0.5A / 2 points (2026-07-31) | Middle drain rung. The binary 3-or-1 drain stepped at a full amp over, so 15.93A on a 15A gen took five readings (**52 s**) to reach the first act |
 | `OVER_LIMIT_BUDGET_AFTER_ACT` (v2 `sensing.ts`) | `OVER_LIMIT_DRAIN_SEVERE + 1` = **4** of 5 (2026-07-31) | Bucket level after an over-limit act. A FULL refill made an under-sized reduction wait out another five readings (**38 s** live). **Must stay above `OVER_LIMIT_DRAIN_SEVERE`** — shipped at 2 and double-shed within 20 minutes (see the incident section) |
+| `SMOOTH_WINDOW` (v2 `sensing.ts`) | **8** readings ≈ 25–40 s (2026-08-05, user request; was 4 since the v2 build) | Size of the median the "mean" is taken over — the controller's statement about LOAD (invariant 24). At 4 (~12–20 s) it still partially TRACKED the slow wobble it exists to remove: a genset governor hunting, and two compressors cycling against each other on a period of tens of seconds. Costs ~2 readings (~6–10 s) on everything judged on the SMOOTHED meter — `smoothedOverSince` and with it `SUSTAINED_OVER_SEVERE_MS`/`_EXTREME_MS`, and a commanded cut's absorption credit. The RAW fast paths are deliberately untouched (bucket drain, calm break via `rawIsSupplyNoise`, `isSevereOverReading`), which is what makes the trade affordable |
+| `RECENT_RING` (v2 `sensing.ts`) | 8 readings — deliberately **equal** to `SMOOTH_WINDOW` since 2026-08-05 | Bounded ring of recent measured readings (trend + collapse baseline). Nothing in `sensing.ts` reads an entry OLDER than the smoothing window, so a wider ring buys nothing — and it would silently widen two things bounded by it: `flickerSamples` (the estimator would look past the ~8 readings its thresholds were measured against) and `overLimitReadings` (`slice(-RECENT_RING)`, so deficit sizing would draw on evidence about a house that has since moved). Widen only with both of those in hand |
 | Source detection threshold | 0.1A | Line counts as active above this; larger line wins |
 | `AC_RAMP_MS` | **240s** (was 30s → 90s 2026-06-07 → 240s 2026-06-09) | Turn-on/changeover compressor ramp window; ramping AC's estimate not subtracted from measured |
 | `SETTLE_MS` | 30s | Post-command settle window for level/power batches; raises blocked inside it (unchanged 2026-06-09 — growing it would freeze the loop) |

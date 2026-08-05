@@ -101,9 +101,11 @@ export interface MeterState {
   calmHoldUntil: number;
   /**
    * The mean just before a still-developing fall, held briefly so the latch
-   * survives the smoothing window. The 4-wide median flips on the THIRD
-   * post-cliff reading, which collapsed the measured drop from 9.8A to 5.2A and
-   * closed the latch window before the fall had finished arriving.
+   * survives the smoothing window. The 4-wide median this was written against
+   * flipped on the THIRD post-cliff reading, which collapsed the measured drop
+   * from 9.8A to 5.2A and closed the latch window before the fall had finished
+   * arriving. At the 8-wide window (2026-08-05) it flips on the FIFTH instead,
+   * so the anchor is needed later and less often — never sooner.
    */
   cliffAnchor: { medianAmps: number; at: number } | null;
   /**
@@ -172,7 +174,7 @@ export interface MeterState {
 /** What the decision pipeline needs to know about the meter, per evaluation. */
 export interface MeterView {
   source: PowerSource;
-  /** Median-smoothed measured amps (last 4 readings). */
+  /** Median-smoothed measured amps (last 8 readings — `SMOOTH_WINDOW`). */
   smoothedAmps: number;
   /** Latest raw reading on the active source. */
   latestAmps: number;

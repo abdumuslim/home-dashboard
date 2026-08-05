@@ -47,6 +47,7 @@ import type { CostBook } from "./costs.js";
 import { fanTrimSavings, raiseJumpAmps, restoreCostAmps, turnOnAmps } from "./costs.js";
 import { ceilOf, floorOf, nextSubFloorWatch, type SubFloorWatch, worstCaseLevel } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
+import { absorbedSharesAmps } from "./raise.js";
 import {
   EXTERNAL_ON_VOID_MS,
   HOUSE_SAMPLE_COOLDOWN_MS,
@@ -197,8 +198,35 @@ interface SimAc {
 }
 
 const STEP_MS = 5_000;
-/** Mirrors the controller shell's grid full-start window (AC_RAMP_MS). */
-const GRID_START_MS = 240_000;
+/**
+ * Mirrors the controller shell's `AC_RAMP_MS` — the ramp WINDOW, which is a
+ * different thing from how long a simulated compressor takes to reach its
+ * steady draw (`SimAcSetup.rampSeconds`, the physical curve).
+ *
+ * The harness used to conflate them: `isRamping` expired at `rampSeconds`, so
+ * the window closed the instant the sim's compressor finished. That is not what
+ * the shell does — there the window is an UPPER BOUND and *absorption* is what
+ * actually retires the charge (`rampDebitAmps`), so a compressor that lands
+ * early stops being charged the moment the meter shows it, and a slow one stays
+ * charged for the full four minutes.
+ *
+ * The difference was invisible until 2026-08-05, when `SMOOTH_WINDOW` widened
+ * 4 → 8. Production's ramp window is 6–10× its smoothing settle time (240 s
+ * against 25–40 s at the ESP cadence); the harness's was **1.5×** (60 s against
+ * 40 s at this 5 s step). Widening the median pushed the settle time past the
+ * harness's own window, so for the ~15 s in between the view reported "settled"
+ * while the meter was still 2.3 A behind a load that had fully arrived — and a
+ * shed room was restored into that gap. The shell cannot exhibit that shape at
+ * all; it was a phantom regression manufactured by the scaling.
+ *
+ * ⚠ This is the SKILL's mirror rule — *"`scenario.ts` mirrors the shell …
+ * anything you change in one, change in the other"*. A harness constant that
+ * merely resembles a shell constant is worse than no mirror at all, because
+ * every scenario then quietly tests a guard production does not have.
+ */
+const AC_RAMP_MS = 240_000;
+/** Mirrors the controller shell's grid full-start window (`START_WINDOW_MS`). */
+const GRID_START_MS = AC_RAMP_MS;
 /** Mirrors the controller shell's FAN_DEBIT_MS. */
 const FAN_DEBIT_MS = 60_000;
 /** Mirrors the controller shell's FUNDING_COOLDOWN_MS. */
@@ -368,7 +396,9 @@ export class Scenario {
 
   private isRamping(ac: SimAc): boolean {
     if (!ac.on) return false;
-    if (ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < ac.setup.rampSeconds * 1000) return true;
+    // The WINDOW, not the sim's physical ramp — see AC_RAMP_MS. Absorption is
+    // what retires the debit inside it, exactly as in the shell.
+    if (ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < AC_RAMP_MS) return true;
     return ac.rampHeldUntil > this.now;
   }
 
@@ -408,6 +438,27 @@ export class Scenario {
     );
     for (const ac of this.acs) {
       if (!ac.powerEventRamp) continue;
+      // ⚠ DELIBERATELY still scaled to the sim's `rampSeconds`, and NOT to
+      // `AC_RAMP_MS` the way `isRamping` now is (2026-08-05). Do not "finish the
+      // job" here without reading this: aligning it was tried, and it does not
+      // translate as a clock.
+      //
+      // The dead-window fixtures express restart protection as a MULTIPLE of
+      // this boundary — `DEAD_MS = 150_000` against a 60s window, "the same
+      // shape at test speed … still inside the 3-window cap". Move the boundary
+      // to 240s and 150s of restart protection is shorter than a single window,
+      // so the hold can never arm at all and the dead window becomes unreachable
+      // in simulation — exactly the harness debt `restartDelayMs` was added to
+      // repay. Five scenarios go red, and three of them (R11b's entry admission,
+      // the direct house sample of invariant 44) assert what happens BEFORE the
+      // compressors engage, which is a different window after the rescale, not
+      // merely a later clock.
+      //
+      // Closing it properly means rescaling the whole dead-window fixture family
+      // together — restart protection, the dwell, the 3-window cap — and
+      // re-deriving each assertion's window. Worth doing; too big to smuggle in.
+      // The shell's own boundary is `ramp.armedAt + AC_RAMP_MS` with a
+      // `3 * AC_RAMP_MS` cap (controller.ts).
       const rampMs = ac.setup.rampSeconds * 1000;
       // Shell parity: judge only at the boundary. Inside the ordinary window the
       // timer is in charge and the smoothed meter is still draining the other
@@ -561,9 +612,11 @@ export class Scenario {
 
   /**
    * Generator flicker: the shape `setNoise` cannot make. That one alternates
-   * ±amplitude every reading, so a 4-wide median lands exactly on the truth
-   * every time — pathologically well-behaved, and useless for testing a rule
-   * about spikes. Real gen flicker is asymmetric and bursty: a mostly-quiet
+   * ±amplitude every reading, so an EVEN median window lands exactly on the
+   * truth every time (half the samples high, half low, averaged) — true at the
+   * old 4-wide window and equally true at today's 8. Pathologically
+   * well-behaved, and useless for testing a rule about spikes. Real gen flicker
+   * is asymmetric and bursty: a mostly-quiet
    * line with occasional single readings a full amp high, which is what drains
    * the leaky bucket and breaks calm while the MEAN sits comfortably under the
    * limit (live 2026-08-02).
@@ -907,19 +960,25 @@ export class Scenario {
         (v.startBaselineAmps != null || this.freshlyOn.includes(v.deviceId)),
     );
     if (starting.length === 0) return undefined;
-    return starting.reduce((sum, v) => {
+    const committed = starting.map((v) => {
       const ours = attemptedWithin(this.pacing, v.deviceId, "restore", GRADE_TURN_ON_MS, this.now);
-      const committed = ours
+      return ours
         ? restoreCostAmps(this.book, this.cfg, v.deviceId, source, floorOf(v), v.maxLevel, this.now, {
             gentle: this.fanHolds[v.deviceId]?.gentle === true,
           }).amps
         : turnOnAmps(this.book, this.cfg, v.deviceId, source, v.envelopeLevel, v.maxLevel, this.now).amps;
-      const absorbed =
-        v.rampBaselineAmps == null
-          ? 0
-          : Math.max(0, view.smoothedAmps - v.rampBaselineAmps, v.rampAbsorbedAmps ?? 0);
-      return sum + Math.max(0, committed - absorbed);
-    }, 0);
+    });
+    // Shell parity (controller.projectedExtraAmps): ONE shared absorption pool
+    // across everything that is starting, never the whole rise per room.
+    const absorbed = absorbedSharesAmps(
+      starting.map((v, i) => ({
+        committedAmps: committed[i],
+        baselineAmps: v.rampBaselineAmps,
+        ratchetAmps: v.rampAbsorbedAmps,
+      })),
+      view.smoothedAmps,
+    );
+    return committed.reduce((sum, c, i) => sum + Math.max(0, c - absorbed[i]), 0);
   }
 
   private execute(out: PlanOutput): void {
@@ -1044,10 +1103,13 @@ export class Scenario {
           ? // Mostly-quiet line, with a periodic reading a full amp high. The
             // spike CADENCE is deterministic and only its amplitude varies:
             // supply ripple recurs, it does not arrive in random bursts — and a
-            // random one clusters, where three spikes inside one 4-wide median
-            // window genuinely lift the SMOOTHED meter over the limit. That is
-            // a real excursion the controller should answer, not the
-            // single-reading supply noise this is here to model.
+            // random one clusters, where enough spikes inside one median window
+            // (more than half of it) genuinely lift the SMOOTHED meter over the
+            // limit. That is a real excursion the controller should answer, not
+            // the single-reading supply noise this is here to model. The 8-wide
+            // window makes the deterministic cadence MORE forgiving, not less:
+            // a 1-in-4 duty puts two spikes in eight readings, and the median
+            // needs five to move.
             (this.nextRandom() * 2 - 1) * this.flicker.baseAmps +
             (this.flickerTick++ % Math.max(1, this.flicker.spikeEveryN) === 0
               ? this.flicker.spikeAmps * (0.8 + 0.4 * this.nextRandom())
