@@ -1,9 +1,10 @@
 // Pure power-source session/stats logic — no I/O, no Date.now(), fully unit-testable.
 // Everything downstream (24h grid hours, daily averages, session duration,
-// time-remaining prediction, per-day history breakdown) is DERIVED from the
-// power_readings minute stream. There is no stored source/session/event table;
-// a minute is classified grid/gen/none by the same rule the AC leveler and the
-// power card use (determineSource). Missing minutes = blackout ("none").
+// per-day history breakdown) is DERIVED from the power_readings minute stream.
+// There is no stored source/session/event table; a minute is classified
+// grid/gen/none by the same rule the AC leveler and the power card use
+// (determineSource). Missing minutes = blackout ("none"). The sessions built
+// here are also what the next-switch predictor (power-predict.ts) learns from.
 //
 // The stateful wrapper (power-stats-service.ts) supplies the DB rows and "now".
 
@@ -13,11 +14,6 @@ export const BAGHDAD_UTC_OFFSET_MS = 3 * 3_600_000; // Iraq: permanent UTC+3, no
 export const MINUTE_MS = 60_000;
 export const DAY_MS = 24 * 60 * MINUTE_MS;
 export const FLICKER_MAX_MINUTES = 2;
-export const PREDICTION_LOOKBACK_DAYS = 14;
-export const PREDICTION_MIN_SAMPLES = 2;
-export const PREDICTION_MAX_MINUTES = 24 * 60;
-export const TEMP_KERNEL_SIGMA_C = 4;
-export const MISSING_TEMP_WEIGHT = 0.25;
 
 export interface PowerMinuteRow {
   ts: Date;
@@ -38,11 +34,6 @@ export interface DayBreakdownEntry {
   genHours: number;
   offHours: number;
   partial: boolean;
-}
-
-export interface PredictionResult {
-  remainingMinutes: number;
-  sampleDays: number;
 }
 
 /** The one and only classification path — mirrors the power card / leveler. */
@@ -150,10 +141,6 @@ export function baghdadDateKey(ms: number): string {
   return new Date(ms + BAGHDAD_UTC_OFFSET_MS).toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
-export function baghdadHourKey(ms: number): string {
-  return new Date(ms + BAGHDAD_UTC_OFFSET_MS).toISOString().slice(0, 13); // YYYY-MM-DDTHH
-}
-
 /**
  * Average duration of a single grid/gen stretch — the typical "time between
  * switches" — over sessions that ended within [windowStartMs, now). The final
@@ -188,49 +175,6 @@ export function weightedMedian(samples: { value: number; weight: number }[]): nu
     if (cum >= total / 2) return s.value;
   }
   return sorted[sorted.length - 1].value;
-}
-
-/**
- * Predict how many more minutes the current source will last, learning from the
- * previous `lookbackDays` days at the same Baghdad wall-clock time, weighted by
- * outdoor-temperature similarity (Gaussian kernel). Returns null when there is
- * not enough usable history (client hides the estimate).
- */
-export function predictRemainingMinutes(args: {
-  sessions: Session[];
-  nowMs: number;
-  liveSource: PowerSource;
-  hourlyTempByKey: Map<string, number>;
-  nowTempC: number | null;
-  lookbackDays?: number;
-}): PredictionResult | null {
-  const { sessions, nowMs, liveSource, hourlyTempByKey, nowTempC } = args;
-  const lookbackDays = args.lookbackDays ?? PREDICTION_LOOKBACK_DAYS;
-  const lastSession = sessions.length > 0 ? sessions[sessions.length - 1] : null;
-  const samples: { value: number; weight: number }[] = [];
-
-  for (let d = 1; d <= lookbackDays; d++) {
-    const sampleMs = nowMs - d * DAY_MS; // exact 24h steps preserve Baghdad wall-clock
-    const s = sessions.find((x) => x.startMs <= sampleMs && sampleMs < x.endMs);
-    if (!s) continue;
-    if (s.source !== liveSource) continue;
-    // Censoring: the final session's endMs is the data edge, not a real ending.
-    // Only the last session can be right-censored, so this identity check is complete.
-    if (s === lastSession) continue;
-
-    const value = (s.endMs - sampleMs) / MINUTE_MS;
-    let weight = 1;
-    if (nowTempC != null) {
-      const histTemp = hourlyTempByKey.get(baghdadHourKey(sampleMs));
-      if (histTemp == null) weight = MISSING_TEMP_WEIGHT;
-      else weight = Math.exp(-(((histTemp - nowTempC) / TEMP_KERNEL_SIGMA_C) ** 2));
-    }
-    samples.push({ value, weight });
-  }
-
-  if (samples.length < PREDICTION_MIN_SAMPLES) return null;
-  const remainingMinutes = Math.min(PREDICTION_MAX_MINUTES, Math.max(0, Math.round(weightedMedian(samples))));
-  return { remainingMinutes, sampleDays: samples.length };
 }
 
 /**

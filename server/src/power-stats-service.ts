@@ -1,7 +1,7 @@
 // Stateful wrapper around the pure power-stats logic: pulls the raw minute
-// stream + outdoor temps from Postgres, assembles the card payload and the
-// history breakdown, and caches each for 60s. Card stats also invalidate early
-// when the live source flips, so a grid<->gen changeover is reflected at once.
+// stream from Postgres, assembles the card payload and the history breakdown,
+// and caches each for 60s. Card stats also invalidate early when the live source
+// flips, so a grid<->gen changeover is reflected at once.
 
 import pg from "pg";
 import { childLogger } from "./logger.js";
@@ -13,17 +13,17 @@ import {
   resolveCurrentSession,
   gridMinutesInWindow,
   averageSessionHours,
-  predictRemainingMinutes,
   dayBreakdownForWindow,
   MINUTE_MS,
   DAY_MS,
   type PowerMinuteRow,
   type DayBreakdownEntry,
 } from "./power-stats.js";
+import { predictNextSwitch } from "./power-predict.js";
 
 const log = childLogger("power-stats");
 
-const STATS_LOOKBACK_DAYS = 15; // 14-day prediction lookback + 1-day margin
+const STATS_LOOKBACK_DAYS = 15; // learning window for the slot/survival predictor
 const CACHE_TTL_MS = 60_000;
 
 export interface PowerStatsPayload {
@@ -32,7 +32,10 @@ export interface PowerStatsPayload {
   sessionStartTs: string | null;
   sessionMinutes: number;
   expectedRemainingMinutes: number | null;
+  /** Events backing the prediction (switches, or survival samples) — name kept for payload stability. */
   predictionSampleDays: number;
+  /** Which path produced the estimate; diagnostics only, the card does not show it. */
+  predictionMethod: "slot" | "survival" | null;
   gridHours24h: number;
   avgGridSessionHours: number | null; // avg length of one grid stretch (time between switches), 7d
   avgGenSessionHours: number | null;
@@ -84,11 +87,7 @@ export class PowerStatsService {
       return cached.payload;
     }
 
-    const [rows, hourlyTempByKey, nowTempC] = await Promise.all([
-      this.fetchMinuteRows(`${STATS_LOOKBACK_DAYS} days`),
-      this.fetchHourlyTemps(),
-      this.fetchLatestTemp(),
-    ]);
+    const rows = await this.fetchMinuteRows(`${STATS_LOOKBACK_DAYS} days`);
 
     const nowMs = Date.now();
     const startMs = Math.floor((nowMs - STATS_LOOKBACK_DAYS * DAY_MS) / MINUTE_MS) * MINUTE_MS;
@@ -96,7 +95,7 @@ export class PowerStatsService {
     const sessions = buildSessions(series, startMs);
 
     const cur = resolveCurrentSession(sessions, source, nowMs);
-    const pred = predictRemainingMinutes({ sessions, nowMs, liveSource: source, hourlyTempByKey, nowTempC });
+    const pred = predictNextSwitch({ sessions, nowMs, liveSource: source });
     const gridHours24h = round1(gridMinutesInWindow(series, startMs, nowMs - DAY_MS, nowMs) / 60);
     const { avgGridSessionHours, avgGenSessionHours } = averageSessionHours(sessions, nowMs - 7 * DAY_MS);
 
@@ -106,7 +105,8 @@ export class PowerStatsService {
       sessionStartTs: new Date(cur.startMs).toISOString(),
       sessionMinutes: cur.minutes,
       expectedRemainingMinutes: pred?.remainingMinutes ?? null,
-      predictionSampleDays: pred?.sampleDays ?? 0,
+      predictionSampleDays: pred?.sampleCount ?? 0,
+      predictionMethod: pred?.method ?? null,
       gridHours24h,
       avgGridSessionHours,
       avgGenSessionHours,
@@ -132,27 +132,6 @@ export class PowerStatsService {
     return payload;
   }
 
-  private async fetchHourlyTemps(): Promise<Map<string, number>> {
-    // to_char TEXT key is deliberate: node-pg parses a tz-less timestamp as
-    // process-local time, so we format the Baghdad hour key in SQL instead.
-    const result = await this.pool.query<{ hour_key: string; temp_c: number }>(
-      `SELECT to_char(date_trunc('hour', ts AT TIME ZONE 'Asia/Baghdad'), 'YYYY-MM-DD"T"HH24') AS hour_key,
-              AVG(temp_c)::real AS temp_c
-       FROM weather_readings
-       WHERE ts >= NOW() - INTERVAL '${STATS_LOOKBACK_DAYS} days' AND temp_c IS NOT NULL
-       GROUP BY hour_key`,
-    );
-    const map = new Map<string, number>();
-    for (const row of result.rows) map.set(row.hour_key, row.temp_c);
-    return map;
-  }
-
-  private async fetchLatestTemp(): Promise<number | null> {
-    const result = await this.pool.query<{ temp_c: number }>(
-      `SELECT temp_c FROM weather_readings WHERE temp_c IS NOT NULL ORDER BY ts DESC LIMIT 1`,
-    );
-    return result.rows[0]?.temp_c ?? null;
-  }
 }
 
 /** Convert a whitelisted RANGE_MAP interval string (e.g. "24 hours", "7 days") to ms. */

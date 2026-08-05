@@ -66,7 +66,10 @@ export interface PowerStats {
   sessionStartTs: string | null;
   sessionMinutes: number;
   expectedRemainingMinutes: number | null;
+  /** Events backing the prediction (switches, or survival samples) — legacy name, kept stable. */
   predictionSampleDays: number;
+  /** Server-side diagnostics only — not rendered. */
+  predictionMethod?: "slot" | "survival" | null;
   gridHours24h: number;
   avgGridSessionHours: number | null;
   avgGenSessionHours: number | null;

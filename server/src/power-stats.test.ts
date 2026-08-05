@@ -8,14 +8,10 @@ import {
   resolveCurrentSession,
   gridMinutesInWindow,
   baghdadDateKey,
-  baghdadHourKey,
   averageSessionHours,
   weightedMedian,
-  predictRemainingMinutes,
   dayBreakdownForWindow,
   MINUTE_MS,
-  DAY_MS,
-  MISSING_TEMP_WEIGHT,
   type Session,
   type PowerMinuteRow,
 } from "./power-stats.js";
@@ -153,17 +149,13 @@ describe("resolveCurrentSession", () => {
   });
 });
 
-describe("baghdadDateKey / baghdadHourKey", () => {
-  it("20:30Z is the same Baghdad day, hour 23", () => {
-    const ms = Date.UTC(2026, 6, 1, 20, 30);
-    expect(baghdadDateKey(ms)).toBe("2026-07-01");
-    expect(baghdadHourKey(ms)).toBe("2026-07-01T23");
+describe("baghdadDateKey", () => {
+  it("20:30Z is the same Baghdad day", () => {
+    expect(baghdadDateKey(Date.UTC(2026, 6, 1, 20, 30))).toBe("2026-07-01");
   });
 
-  it("21:30Z rolls into the next Baghdad day, hour 00", () => {
-    const ms = Date.UTC(2026, 6, 1, 21, 30);
-    expect(baghdadDateKey(ms)).toBe("2026-07-02");
-    expect(baghdadHourKey(ms)).toBe("2026-07-02T00");
+  it("21:30Z rolls into the next Baghdad day", () => {
+    expect(baghdadDateKey(Date.UTC(2026, 6, 1, 21, 30))).toBe("2026-07-02");
   });
 });
 
@@ -234,77 +226,6 @@ describe("weightedMedian", () => {
 
   it("single sample", () => {
     expect(weightedMedian([{ value: 42, weight: 1 }])).toBe(42);
-  });
-});
-
-describe("predictRemainingMinutes", () => {
-  const now = Date.UTC(2026, 6, 15, 12, 0, 0);
-  const emptyTemps = new Map<string, number>();
-
-  function daySess(source: PowerSource, d: number, remainingMin: number): Session {
-    const sampleMs = now - d * DAY_MS;
-    return sess(source, sampleMs - 30 * MINUTE_MS, sampleMs + remainingMin * MINUTE_MS);
-  }
-  const current = sess("grid", now - 10 * MINUTE_MS, now); // always the last session
-
-  it("returns the weighted median of remaining minutes (no temp weighting)", () => {
-    const sessions = [daySess("grid", 3, 90), daySess("grid", 2, 60), daySess("grid", 1, 30), current];
-    const r = predictRemainingMinutes({ sessions, nowMs: now, liveSource: "grid", hourlyTempByKey: emptyTemps, nowTempC: null });
-    expect(r).toEqual({ remainingMinutes: 60, sampleDays: 3 });
-  });
-
-  it("temperature kernel: one similar-temp day outweighs two dissimilar ones", () => {
-    const sessions = [daySess("grid", 2, 30), daySess("grid", 3, 30), daySess("grid", 1, 120), current];
-    const temps = new Map<string, number>();
-    temps.set(baghdadHourKey(now - 1 * DAY_MS), 40); // hot day matches now
-    temps.set(baghdadHourKey(now - 2 * DAY_MS), 28); // cool
-    temps.set(baghdadHourKey(now - 3 * DAY_MS), 28); // cool
-    const r = predictRemainingMinutes({ sessions, nowMs: now, liveSource: "grid", hourlyTempByKey: temps, nowTempC: 40 });
-    expect(r?.remainingMinutes).toBe(120);
-    expect(r?.sampleDays).toBe(3);
-  });
-
-  it("a missing historical temp is down-weighted (not dropped)", () => {
-    // Near day (value 20) has a MISSING temp -> weight 0.25; far day (value 200)
-    // matches -> weight 1. Weighted median therefore lands on 200, not 20.
-    const sessions = [daySess("grid", 2, 200), daySess("grid", 1, 20), current];
-    const temps = new Map<string, number>();
-    temps.set(baghdadHourKey(now - 2 * DAY_MS), 35); // day 1 (near) intentionally absent
-    const r = predictRemainingMinutes({ sessions, nowMs: now, liveSource: "grid", hourlyTempByKey: temps, nowTempC: 35 });
-    expect(r?.sampleDays).toBe(2);
-    expect(r?.remainingMinutes).toBe(200);
-    expect(MISSING_TEMP_WEIGHT).toBe(0.25);
-  });
-
-  it("skips days on a different source", () => {
-    const sessions = [daySess("gen", 2, 60), daySess("grid", 1, 45), current];
-    const r = predictRemainingMinutes({ sessions, nowMs: now, liveSource: "grid", hourlyTempByKey: emptyTemps, nowTempC: null });
-    expect(r).toBeNull(); // only 1 usable sample
-  });
-
-  it("returns null with fewer than 2 usable samples", () => {
-    const sessions = [daySess("grid", 1, 45), current];
-    expect(predictRemainingMinutes({ sessions, nowMs: now, liveSource: "grid", hourlyTempByKey: emptyTemps, nowTempC: null })).toBeNull();
-  });
-
-  it("censors the final (right-censored) session", () => {
-    // A long final grid session spans the d=1 sample instant; it must be skipped.
-    const finalGrid = sess("grid", now - Math.floor(1.5 * DAY_MS), now);
-    const sessions = [daySess("grid", 3, 40), daySess("grid", 2, 40), finalGrid];
-    const r = predictRemainingMinutes({ sessions, nowMs: now, liveSource: "grid", hourlyTempByKey: emptyTemps, nowTempC: null });
-    expect(r?.sampleDays).toBe(2); // d=1 censored; d=2 and d=3 remain
-  });
-
-  it("clamps to 24h", () => {
-    const sessions = [daySess("grid", 2, 3001), daySess("grid", 1, 3000), current];
-    const r = predictRemainingMinutes({ sessions, nowMs: now, liveSource: "grid", hourlyTempByKey: emptyTemps, nowTempC: null });
-    expect(r?.remainingMinutes).toBe(24 * 60);
-  });
-
-  it("predicts blackout-end for liveSource none", () => {
-    const sessions = [daySess("none", 2, 45), daySess("none", 1, 45), sess("none", now - 5 * MINUTE_MS, now)];
-    const r = predictRemainingMinutes({ sessions, nowMs: now, liveSource: "none", hourlyTempByKey: emptyTemps, nowTempC: null });
-    expect(r?.remainingMinutes).toBe(45);
   });
 });
 

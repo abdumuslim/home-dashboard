@@ -15,17 +15,11 @@ const TEST_CONFIG: Config = {
   observedOffLocks: true,
 };
 
-/** Fake pool answering the three power-stats queries by SQL substring. */
+/** Fake pool answering the power-stats minute-stream query by SQL substring. */
 function createPowerPool() {
   const now = Date.now();
   return {
     query: async (sql: string) => {
-      if (sql.includes("hour_key")) {
-        return { rows: [{ hour_key: "2026-07-09T12", temp_c: 41.2 }], rowCount: 1 };
-      }
-      if (sql.includes("ORDER BY ts DESC LIMIT 1")) {
-        return { rows: [{ temp_c: 42.5 }], rowCount: 1 };
-      }
       if (sql.includes("FROM power_readings")) {
         // pg returns ts as a Date — the fixture must too.
         return {
@@ -79,6 +73,7 @@ describe("GET /api/power/stats", () => {
     expect(body).toHaveProperty("sessionStartTs");
     expect(body).toHaveProperty("expectedRemainingMinutes");
     expect(typeof body.predictionSampleDays).toBe("number");
+    expect(body).toHaveProperty("predictionMethod"); // null under the fake pool's 3-minute window
     expect(body).toHaveProperty("avgGridSessionHours");
     expect(body).toHaveProperty("avgGenSessionHours");
   });
