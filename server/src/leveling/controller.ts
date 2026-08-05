@@ -10,7 +10,7 @@
 import pg from "pg";
 import { childLogger } from "../logger.js";
 import type { LevelerDeviceContext, LevelingDeps, LevelingStatusV2 } from "./api.js";
-import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, effectiveLimit, limitFor, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
+import { DEFAULT_LEVELING_CONFIG_V2, mergeLevelingConfigV2, effectiveLimit, limitFor, type AcNeedOverride, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
 import {
   clearCollapse,
   derateFor,
@@ -711,6 +711,15 @@ export class LevelingControllerV2 {
 
   getComfortTarget(): number {
     return this.config.comfortTargetC;
+  }
+
+  /**
+   * This room's need corrections (thermometer calibration, own-setpoint target),
+   * or null when the room has none. Read by `collector.computeAcNeed` — the
+   * need itself is computed there, not here.
+   */
+  getNeedOverride(deviceId: string): AcNeedOverride | null {
+    return this.config.needOverrides[deviceId] ?? null;
   }
 
   getLimits(): { gridLimitAmps: number; genLimitAmps: number; marginAmps: number } {
@@ -2269,7 +2278,20 @@ export class LevelingControllerV2 {
       // this room comfortable?" and a useless one to "which room is cooler?".
       // Dead thermometer (the 86f8696 rule: absent or ≤0 is not a reading) →
       // fall back to `needDelta`, which is exactly the old ordering.
-      const roomTempC = device.currentTemp != null && device.currentTemp > 0 ? device.currentTemp : null;
+      //
+      // The per-AC `tempOffsetC` IS applied here: it is a calibration of that
+      // room's SENSOR, so a room whose thermometer reads 1°C high is 1°C cooler
+      // in every room-vs-room comparison too, and leaving it out would rank the
+      // rooms on readings taken with differently-biased instruments. The other
+      // half of the override — `targetFromSetpoint` — is deliberately NOT read
+      // here: which room is cooler is not that room's own business (R13/50), so
+      // the rank must keep asking every room the one shared question, its own
+      // thermometer against `comfortTargetC`. A per-room setpoint preference
+      // belongs to that room's absolute need (`computeAcNeed`), never to the
+      // ordering that decides whose amps get taken.
+      const rawTempC = device.currentTemp != null && device.currentTemp > 0 ? device.currentTemp : null;
+      const roomTempC =
+        rawTempC == null ? null : rawTempC + (this.config.needOverrides[device.id]?.tempOffsetC ?? 0);
       const rankNeedDelta =
         roomTempC == null
           ? needDelta

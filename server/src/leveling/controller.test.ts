@@ -301,6 +301,43 @@ describe("shed ranking on real temperature (2026-08-04)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Per-AC need override (user, 2026-08-05: "consider the room temp is what we
+// get from the AC − 1°C, and the target is what is set"). The SENSOR
+// calibration belongs in every room-vs-room comparison — otherwise the rooms
+// are ranked on readings taken with differently-biased instruments — while the
+// per-room SETPOINT preference must stay out of it (R13/50: which room is
+// cooler is not that room's own business). `buildViews` is in the zone the
+// scenario harness cannot see, so this file is the only net.
+// ---------------------------------------------------------------------------
+describe("per-AC need override in buildViews (2026-08-05)", () => {
+  it("calibrates roomTempC by tempOffsetC and leaves the rank on the SHARED target", async () => {
+    const mock = createGradePool({
+      comfortTargetC: 25,
+      needOverrides: { abdullah: { tempOffsetC: -1, targetFromSetpoint: true } },
+    });
+    const controller = new LevelingControllerV2(mock.pool, createDeps());
+    await controller.ensureLoaded();
+
+    const device = { ...(acDevice("abdullah", true, 1) as object), currentTemp: 35, targetTemp: 27 };
+    const views = (
+      controller as unknown as {
+        buildViews: (
+          ctx: unknown[],
+          outdoorTempC: number | null,
+          now: number,
+        ) => Array<{ deviceId: string; roomTempC: number | null; rankNeedDelta: number }>;
+      }
+    ).buildViews([{ device, managed: true, needTier: "full", needDelta: 7, slotGenCap: null }], 40, Date.now());
+
+    expect(views[0].roomTempC).toBe(34);
+    // 34 − 25, the shared comfort target. Had `targetFromSetpoint` leaked into
+    // the ranking this would read 7 (34 − 27) and a room would be ordering the
+    // house on its own occupant's preference.
+    expect(views[0].rankNeedDelta).toBe(9);
+  });
+});
+
 describe("LevelingControllerV2 — grade queue", () => {
   it("a bounced attempt keeps its ladder position — a stale grade must not mark it a success", async () => {
     vi.useFakeTimers();

@@ -17,6 +17,20 @@ export interface AcLevelBoost {
   outdoorAtLeastC: number;
 }
 
+/**
+ * Per-AC correction to how a room's need is computed (thermometer calibration,
+ * own-setpoint target). Declared here rather than imported from
+ * `leveling/config.ts` for the same reason AcAmpModel and AcLevelBoost are:
+ * this module is the dependency-free allocator and the v2 config module owns
+ * the parsing. The two shapes are structurally identical on purpose.
+ */
+export interface AcNeedOverride {
+  /** Calibration added to the AC's internal thermometer (e.g. -1). */
+  tempOffsetC?: number;
+  /** Use the device's live setpoint as this room's need target instead of comfortTargetC. */
+  targetFromSetpoint?: boolean;
+}
+
 export interface AcLevelingConfig {
   enabled: boolean;
   gridLimitAmps: number;
@@ -51,6 +65,13 @@ export interface AcLevelingConfig {
   /** Optional per-AC draw model on generator — lower, fluctuating voltage means more amps. */
   genAmpModels?: Record<string, AcAmpModel>;
   levelBoosts: Record<string, AcLevelBoost>;
+  /**
+   * Per-AC need corrections, keyed by device id (2026-08-05). v2 owns this
+   * field — v1 only carries it so a rollback keeps reading the same row 1 value
+   * the acting controller wrote, and so the REST validator has one type to
+   * check against. Optional: rows written before it existed have no key.
+   */
+  needOverrides?: Record<string, AcNeedOverride>;
   /**
    * Max levels an AC may be raised in ONE allocation batch, per source. A gen/
    * grid level is a CAP, not a setpoint: releasing it surges a hot/pinned

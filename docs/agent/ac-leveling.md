@@ -17,6 +17,29 @@ timestamp: 2026-07-28
 
 A ground-up rewrite lives in **`server/src/leveling/`** (21 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
+### 2026-08-05 — per-AC need override (`needOverrides`) + fan-restore cooldown 180→120 s
+
+Two user requests, no incident. **(a) `needOverrides`** (config row 1, per device id):
+`{ tempOffsetC?: number, targetFromSetpoint?: boolean }` — born from "for Abdullah AC, consider the
+room temp is what we get from the AC − 1 °C, and the target is what is set (currently 27)". The
+OFFSET is a thermometer calibration and applies everywhere leveling reads that room's sensor —
+`computeAcNeed`'s comfort fallback (collector.ts) AND `buildViews`' `roomTempC`, so `rankNeedDelta`
+ranks on the corrected reading too. The SETPOINT target applies ONLY to that room's own
+`needDelta`/tier — deliberately never to `rankNeedDelta`, which must keep asking every room the one
+shared question (invariant 50) — and falls back to `comfortTargetC` when the setpoint is missing or
+≤ 0. Both dead-sensor guards still read RAW (absent or ≤ 0 → the delta-1 sentinel, `roomTempC`
+null): an offset must not invent a reading. A matching metric range rule bypasses the override
+entirely — that branch reads a weather/air metric against the slot's own limits, never the AC
+sensor. Sanitized in `config.ts` (offset clamped ±5 °C, entries carrying neither field dropped); the
+PUT route rejects an out-of-range offset and forwards the key **only when present**, so a dashboard
+save that does not know the field cannot erase it (no UI editor yet — set via the API). v1 reads the
+same row-1 value (`getNeedOverride`) so a rollback keeps honouring it, but a v1 config save replaces
+row 1 wholesale and drops it (invariant 37's known v1 flaw). Live:
+`{ Cy3aihFAAAE: { tempOffsetC: -1, targetFromSetpoint: true } }`, verified needDelta 5 =
+(33 − 1) − 27 on deploy. **(b)** `FAN_RESTORE_AFTER_CUT_MS` 180 s → **120 s** (user: "is it possible
+to reduce from 180 to 120?") — still double the 60 s first-gear calm gate, and a fresh cut restarts
+it, so the anti-bounce argument is unchanged; the episode tail is a minute shorter.
+
 ### 2026-08-04 — two breaker trips before lunch, and the day the ladder learned to read the meter
 
 Nineteen commits, all deployed. **SKILL invariants 44–55 are the normative list**; this is the
@@ -1142,8 +1165,9 @@ nonetheless found room for a level, twice:
    (priced at exactly what `planFanRestore` admitted, absorbed-ratcheted, `FAN_DEBIT_MS` 60s), calm
    reset on a fan RESTORE but never on a fan CUT (a cut frees amps — stalling the reducer behind its
    own cut is how episodes drag), `FAN_RESTORE_MAX_STEP` 2 gears per step, and
-   `FAN_RESTORE_AFTER_CUT_MS` 180s measured from `FanHold.lastCutAt`. Gentle-restore holds are exempt
-   from the cut cooldown (`FanHold.fromCut: false`) — nothing was taken away there.
+   `FAN_RESTORE_AFTER_CUT_MS` 180s measured from `FanHold.lastCutAt` (**120s since 2026-08-05**,
+   user request). Gentle-restore holds are exempt from the cut cooldown (`FanHold.fromCut: false`) —
+   nothing was taken away there.
 4. **The reducer answered a real overload with a token fan, then waited out a full bucket.** 15.93A
    is 0.93A over and `OVER_LIMIT_SEVERE_AMPS` is 1.0, so it classified mild and drained 1 point per
    reading: **52s to the first act**. That act was a 0.4A fan trim on Abdu while Abdullah sat at L3
@@ -1738,6 +1762,7 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
 | `marginAmps` (config) | user-set (live ≈ 0.1A) | Safety margin under the limit; reduce side fires at the raw limit |
 | `raiseBufferAmps` (config) | 1A default (0–10 validated) | Raise-side hysteresis deadband; fills/restores use `budget − buffer`; clamps negative to 0 |
 | `comfortTargetC` (config) | 26°C default | Need target for ACs without an automation |
+| `needOverrides` (config, per device id) | `{}` default (2026-08-05) | Per-AC need corrections: `tempOffsetC` (±5 clamp) calibrates the AC's thermometer everywhere leveling reads it, incl. `rankNeedDelta`; `targetFromSetpoint` moves that room's OWN need target to its live setpoint (→ `comfortTargetC` when missing/≤0; never the rank — invariant 50). Set via `PUT /api/ac/leveling`; dashboard saves that omit the key preserve it. Live: Abdullah −1°C + setpoint |
 | `nearTargetBandC` (config) | 0.5°C default (0–5 validated) | Near-target band: needDelta ≤ band → hard L1 cap; above → budget decides (no mild cap) |
 | `DEMOTE_HYSTERESIS_C` (v2 `demote.ts`) | 0.2°C | Demote fires at `needDelta ≤ nearTargetBandC − this`; the gap to the band is the anti-bounce dead zone (2 sensor LSBs) |
 | `DEMOTE_DWELL_MS` (v2 `demote.ts`) | 120 s | How long satisfaction must hold CONTINUOUSLY before a level is reclaimed |
@@ -1748,7 +1773,7 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
 | `HOUSE_LOAD_WINDOW_MS` (v2 `house-load.ts`) | 15 min (2026-07-31) | How far back the non-AC PEAK looks. Long enough to span a compressor duty cycle, so a satisfied trough can't make the raise envelope permissive. Samples are per-source and tagged with the running-AC set |
 | `FAN_DEBIT_MS` (v2 `controller.ts`) | 60 s (2026-07-31) | How long a fan RESTORE's amps stay charged as committed-but-unmetered. A gear changes almost instantly, unlike a compressor, so this only has to outlive the ESP cadence plus a tick; the absorption ratchet retires it sooner |
 | `FAN_RESTORE_MAX_STEP` (v2 `fan-trim.ts`) | 2 gears (2026-07-31) | Ceiling on ONE restore step. The unbounded "sweet spot" search always reached the original — a 6-gear swing prices at only ~0.9A — which is how Abdu ran 7→5→3→1→7→1→7→4 in nine minutes |
-| `FAN_RESTORE_AFTER_CUT_MS` (v2 `fan-trim.ts`) | 180 s (2026-07-31) | Quiet time owed after the last CUT before that fan may climb. `FAN_RESTORE_CALM_MS` alone never covered it: a fan-only batch does not rewind the shared calm clock, so a cut came all the way back 80 s later. Gentle-restore holds are exempt (`FanHold.fromCut`) |
+| `FAN_RESTORE_AFTER_CUT_MS` (v2 `fan-trim.ts`) | 120 s (2026-08-05, user request; was 180 from 2026-07-31) | Quiet time owed after the last CUT before that fan may climb. `FAN_RESTORE_CALM_MS` alone never covered it: a fan-only batch does not rewind the shared calm clock, so a cut came all the way back 80 s later. Gentle-restore holds are exempt (`FanHold.fromCut`) |
 | `OVER_LIMIT_MODERATE_AMPS` / `OVER_LIMIT_DRAIN_MODERATE` (v2 `sensing.ts`) | 0.5A / 2 points (2026-07-31) | Middle drain rung. The binary 3-or-1 drain stepped at a full amp over, so 15.93A on a 15A gen took five readings (**52 s**) to reach the first act |
 | `OVER_LIMIT_BUDGET_AFTER_ACT` (v2 `sensing.ts`) | `OVER_LIMIT_DRAIN_SEVERE + 1` = **4** of 5 (2026-07-31) | Bucket level after an over-limit act. A FULL refill made an under-sized reduction wait out another five readings (**38 s** live). **Must stay above `OVER_LIMIT_DRAIN_SEVERE`** — shipped at 2 and double-shed within 20 minutes (see the incident section) |
 | Source detection threshold | 0.1A | Line counts as active above this; larger line wins |

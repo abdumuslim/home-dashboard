@@ -8,7 +8,7 @@ import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud } from "./tcl-cloud.js";
 import { MAX_GENERATOR_LEVEL } from "./tcl-cloud.js";
 import type { ForecastResponse } from "./forecast.js";
-import type { AcLevelingConfig, AcAmpModel, AcLevelBoost } from "./ac-leveling.js";
+import type { AcLevelingConfig, AcAmpModel, AcLevelBoost, AcNeedOverride } from "./ac-leveling.js";
 import type { AcLevelingStatus } from "./ac-leveler.js";
 import type { AcCalibrationStatus, CalibrationResultRow, CalibrationFit } from "./ac-calibration.js";
 import { PowerStatsService } from "./power-stats-service.js";
@@ -1384,6 +1384,14 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         if (!num(boost.outdoorAtLeastC) || boost.outdoorAtLeastC < 25 || boost.outdoorAtLeastC > 55) return "boost outdoor temp must be 25–55";
       }
     }
+    if (b.needOverrides != null) {
+      if (typeof b.needOverrides !== "object" || Array.isArray(b.needOverrides)) return "needOverrides must be an object";
+      for (const o of Object.values(b.needOverrides as Record<string, AcNeedOverride>)) {
+        if (!o || typeof o !== "object") return "needOverride must be an object";
+        if (o.tempOffsetC != null && (!num(o.tempOffsetC) || o.tempOffsetC < -5 || o.tempOffsetC > 5)) return "needOverride tempOffsetC must be -5–5";
+        if (o.targetFromSetpoint != null && typeof o.targetFromSetpoint !== "boolean") return "needOverride targetFromSetpoint must be boolean";
+      }
+    }
     return null;
   }
 
@@ -1415,6 +1423,12 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         ampModels: body.ampModels as Record<string, AcAmpModel>,
         genAmpModels: (body.genAmpModels as Record<string, AcAmpModel>) ?? {},
         levelBoosts: (body.levelBoosts as Record<string, AcLevelBoost>) ?? {},
+        // Forwarded ONLY when the body carries it — deliberately NOT the `?? {}`
+        // its neighbours use. The dashboard UI does not know this field, so a
+        // default of `{}` would make every ordinary UI save erase the stored
+        // override: the save path merges the given keys over row 1, which
+        // preserves an omitted key and overwrites an explicit empty one.
+        ...(body.needOverrides != null ? { needOverrides: body.needOverrides } : {}),
         maxRaiseStepGrid: (body.maxRaiseStepGrid as number) ?? 1,
         maxRaiseStepGen: (body.maxRaiseStepGen as number) ?? 1,
       });

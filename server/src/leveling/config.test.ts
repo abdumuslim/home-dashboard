@@ -49,6 +49,40 @@ describe("mergeLevelingConfigV2", () => {
     expect(merged.priority).toEqual(["a", "b"]);
   });
 
+  it("defaults needOverrides to an empty map — no room is special until configured", () => {
+    expect(mergeLevelingConfigV2({}).needOverrides).toEqual({});
+    expect(DEFAULT_LEVELING_CONFIG_V2.needOverrides).toEqual({});
+  });
+
+  it("round-trips a valid need override", () => {
+    const merged = mergeLevelingConfigV2({
+      needOverrides: { abdullah: { tempOffsetC: -1, targetFromSetpoint: true } },
+    } as unknown as Record<string, unknown>);
+    expect(merged.needOverrides.abdullah).toEqual({ tempOffsetC: -1, targetFromSetpoint: true });
+  });
+
+  it("drops junk need-override entries and fields, and clamps the offset to ±5", () => {
+    const merged = mergeLevelingConfigV2({
+      needOverrides: {
+        notObject: 7,
+        nulled: null,
+        badFields: { tempOffsetC: "x", targetFromSetpoint: "yes" },
+        empty: {},
+        tooCold: { tempOffsetC: -12 },
+        tooHot: { tempOffsetC: 12 },
+        offsetOnly: { tempOffsetC: -1 },
+        flagOnly: { targetFromSetpoint: false },
+      },
+    } as unknown as Record<string, unknown>);
+    // `badFields` keeps neither field, so it drops out with the junk entries —
+    // an override that changes nothing must not read as "this room is special".
+    expect(Object.keys(merged.needOverrides).sort()).toEqual(["flagOnly", "offsetOnly", "tooCold", "tooHot"]);
+    expect(merged.needOverrides.tooCold).toEqual({ tempOffsetC: -5 });
+    expect(merged.needOverrides.tooHot).toEqual({ tempOffsetC: 5 });
+    expect(merged.needOverrides.offsetOnly).toEqual({ tempOffsetC: -1 });
+    expect(merged.needOverrides.flagOnly).toEqual({ targetFromSetpoint: false });
+  });
+
   it("clamps calm seconds to sane minimums", () => {
     expect(mergeLevelingConfigV2({ raiseCalmSeconds: 1 }).raiseCalmSeconds).toBe(5);
     expect(mergeLevelingConfigV2({ restoreCalmSeconds: 0 }).restoreCalmSeconds).toBe(5);

@@ -142,7 +142,8 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     `planFanRestore` admitted, absorbed-ratcheted, `FAN_DEBIT_MS` 60 s) **and** reset calm; cuts still
     do neither (a cut frees amps — stalling the reducer behind its own cut is how episodes drag).
     The climb is bounded to `FAN_RESTORE_MAX_STEP` (2 gears) and owes `FAN_RESTORE_AFTER_CUT_MS`
-    (180 s) since the last cut; gentle-restore holds are exempt via `FanHold.fromCut: false`.
+    (**120 s** since 2026-08-05, user request; was 180 s) since the last cut; gentle-restore holds
+    are exempt via `FanHold.fromCut: false`.
     The old "sweet spot" search always reached the original — a 6-gear swing prices at ~0.9 A.
     Since 2026-08-03 only the FIRST gear pays the 60 s anti-bounce window; the rest of the same climb
     pays `FAN_RESTORE_CONTINUE_CALM_MS` (20 s), tracked by `FanHold.climbStartedAt` and cleared by any
@@ -619,10 +620,12 @@ per-room shed bar, and `compressorOffLikely`.
     alone could make a milder room outrank a hotter one and take its amps.
     `AcView.rankNeedDelta` asks ONE question of every room (its own thermometer
     against the shared comfort target, inverted in heat mode exactly as
-    `computeAcNeed` does it), and every room-vs-room use moves onto it: shed
-    selection and `SHED_NEED_GAP_C`, the reduction cost weights, the sub-floor
-    protection term, restore/yield precedence, the rebalance donor gap, the
-    recovery admission. Per-room ABSOLUTE logic keeps `needDelta` and its
+    `computeAcNeed` does it; a configured per-AC `tempOffsetC` calibrates that
+    thermometer here too — a biased instrument is not a different question),
+    and every room-vs-room use moves onto it: shed selection and
+    `SHED_NEED_GAP_C`, the reduction cost weights, the sub-floor protection
+    term, restore/yield precedence, the rebalance donor gap, the recovery
+    admission. Per-room ABSOLUTE logic keeps `needDelta` and its
     configured metric — whether a room is comfortable is that room's own
     business. A dead thermometer falls back to `needDelta`, which is precisely
     the old ordering, so the change can never be worse than what it replaces;
@@ -781,6 +784,16 @@ still cut below an active boost floor**, and `invariantCorrections` deliberately
 back (that re-assertion was the 08-02 limit cycle), so only the raise path can — which is why
 **invariant 36** prices that cut as an off on the reduction side and gives the stranded room
 precedence over a less-needy shed restore on the recovery side.
+
+**Abdullah's thermometer reads ~1 °C high, and his comfort target is his own setpoint** (user,
+2026-08-05: "consider the room temp is what we get from the AC − 1 °C, and the target is what is
+set, currently 27"). Expressed as config, never code: `needOverrides` in the leveling config —
+`{ Cy3aihFAAAE: { tempOffsetC: -1, targetFromSetpoint: true } }`. The offset is a sensor calibration
+and applies everywhere leveling reads his thermometer, **including `rankNeedDelta`**; the setpoint
+target moves only his OWN `needDelta`/tier — never the rank, which keeps asking every room the one
+shared question (invariant 50). Setpoint missing or ≤ 0 → falls back to `comfortTargetC`; a matching
+metric range rule bypasses the override entirely (none active on deploy). Set via
+`PUT /api/ac/leveling`; a dashboard save that omits the key preserves it.
 
 **Measured gen draw** (`GET /api/ac/calibration`, 2026-06-11, 12–14 samples each): Abdullah
 2.08 / 3.81 / 4.32 · Abdu 4.08 / 5.66 / 6.21 · Najat's gen run failed (0 A). ⚠️ Each step was sampled

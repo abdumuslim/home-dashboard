@@ -43,6 +43,7 @@ import {
   DEFAULT_LEVELING_CONFIG,
   type AcAmpModel,
   type AcLevelingConfig,
+  type AcNeedOverride,
   type AllocationResult,
   type AllocatorInput,
   type LevelerAcSnapshot,
@@ -493,6 +494,17 @@ export class AcLeveler {
 
   getComfortTarget(): number {
     return this.config.comfortTargetC;
+  }
+
+  /**
+   * This room's need corrections, or null when it has none. v2 owns the field;
+   * v1 reads it straight off the stored row, which survives `ensureLoaded`'s
+   * defaults-then-stored spread — so a rollback keeps honouring an override the
+   * acting controller wrote. A v1 config SAVE still replaces row 1 wholesale
+   * and would drop it (invariant 37's known v1 flaw, unchanged here).
+   */
+  getNeedOverride(deviceId: string): AcNeedOverride | null {
+    return this.config.needOverrides?.[deviceId] ?? null;
   }
 
   /** Source limits for other components (e.g. the calibration safety check). */

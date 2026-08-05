@@ -4364,3 +4364,65 @@ describe("raise-hold meter-anchored release (P6, 2026-07-06)", () => {
     expect(collector.acLeveler.getStatus().raiseHoldRemainingMs).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-AC need override (user, 2026-08-05: "consider the room temp is what we
+// get from the AC − 1°C, and the target is what is set"). Config-driven, keyed
+// by device id in the stored row — never hardcoded here. These run with v1 as
+// the acting controller (row 1 is the only config row this harness serves), so
+// they exercise `AcLeveler.getNeedOverride`'s read straight off the stored row.
+// ---------------------------------------------------------------------------
+describe("computeAcNeed — per-AC need override", () => {
+  function computeAcNeed(collector: Collector, deviceId: string, device: Record<string, unknown>) {
+    return (
+      collector as never as {
+        computeAcNeed: (id: string, d: unknown) => { tier: string; delta: number; slotGenCap: number | null };
+      }
+    ).computeAcNeed(deviceId, device);
+  }
+
+  async function withOverride(override: Record<string, unknown> | null) {
+    const { collector, setLevelingConfig } = createCollector();
+    setLevelingConfig({
+      ...LEVELING_CONFIG,
+      comfortTargetC: 25,
+      ...(override ? { needOverrides: { ac1: override } } : {}),
+    });
+    await collector.acLeveler.ensureLoaded();
+    return collector;
+  }
+
+  it("corrects the thermometer and targets the AC's own setpoint", async () => {
+    const collector = await withOverride({ tempOffsetC: -1, targetFromSetpoint: true });
+    // 35 read, 34 real, against HIS setpoint of 27 — not the shared 25.
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 35, targetTemp: 27, mode: 1 }).delta).toBe(7);
+  });
+
+  it("falls back to the shared comfort target when the setpoint is missing or zero", async () => {
+    const collector = await withOverride({ tempOffsetC: -1, targetFromSetpoint: true });
+    // A setpoint of 0 is not a setpoint — using it would declare the room 34°C
+    // too hot and hand it every spare amp in the house.
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 35, targetTemp: 0, mode: 1 }).delta).toBe(9);
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 35, mode: 1 }).delta).toBe(9);
+  });
+
+  it("inverts in heat mode, on the corrected temperature and the same target", async () => {
+    const collector = await withOverride({ tempOffsetC: -1, targetFromSetpoint: true });
+    // mode 4 = heat: need is how far the room sits BELOW target (27 − 19).
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 20, targetTemp: 27, mode: 4 }).delta).toBe(8);
+  });
+
+  it("leaves an AC with no override on the shared target and its raw reading", async () => {
+    const collector = await withOverride(null);
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 35, targetTemp: 27, mode: 1 }).delta).toBe(10);
+  });
+
+  it("keeps the dead-sensor sentinel — an offset must not invent a reading", async () => {
+    const collector = await withOverride({ tempOffsetC: -1, targetFromSetpoint: true });
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 0, targetTemp: 27, mode: 1 })).toEqual({
+      tier: "mild",
+      delta: 1,
+      slotGenCap: null,
+    });
+  });
+});

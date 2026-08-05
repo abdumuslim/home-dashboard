@@ -12,6 +12,18 @@ export interface AcLevelBoost {
   outdoorAtLeastC: number;
 }
 
+/**
+ * Per-AC correction to how this room's NEED is computed. Both fields describe
+ * one room's own comfort question, never the house's — see the rank comment in
+ * `controller.buildViews`.
+ */
+export interface AcNeedOverride {
+  /** Calibration added to the AC's internal thermometer (e.g. -1). */
+  tempOffsetC?: number;
+  /** Use the device's live setpoint as this room's need target instead of comfortTargetC. */
+  targetFromSetpoint?: boolean;
+}
+
 export type ControllerFlavor = "v1" | "shadow" | "v2";
 
 export interface LevelingConfigV2 {
@@ -43,6 +55,14 @@ export interface LevelingConfigV2 {
   ampModels: Record<string, AcAmpModel>;
   genAmpModels: Record<string, AcAmpModel>;
   levelBoosts: Record<string, AcLevelBoost>;
+  /**
+   * Per-AC need corrections, keyed by device id. An AC whose internal
+   * thermometer reads high, or whose occupant's comfort target is his own
+   * setpoint rather than the shared one, is described HERE — never hardcoded
+   * against a device id (user request, 2026-08-05: Abdullah's AC reads ~1°C
+   * high and his target is the AC's own setpoint).
+   */
+  needOverrides: Record<string, AcNeedOverride>;
 }
 
 export const DEFAULT_LEVELING_CONFIG_V2: LevelingConfigV2 = {
@@ -61,6 +81,7 @@ export const DEFAULT_LEVELING_CONFIG_V2: LevelingConfigV2 = {
   ampModels: {},
   genAmpModels: {},
   levelBoosts: {},
+  needOverrides: {},
 };
 
 /**
@@ -94,6 +115,7 @@ export function mergeLevelingConfigV2(stored: Record<string, unknown> | null | u
     ampModels: sanitizeModels(s.ampModels),
     genAmpModels: sanitizeModels(s.genAmpModels),
     levelBoosts: sanitizeBoosts(s.levelBoosts),
+    needOverrides: sanitizeNeedOverrides(s.needOverrides),
   };
 }
 
@@ -121,6 +143,30 @@ function sanitizeBoosts(raw: unknown): Record<string, AcLevelBoost> {
     if (typeof min === "number" && min >= 1 && typeof at === "number" && Number.isFinite(at)) {
       out[id] = { minLevel: Math.round(min), outdoorAtLeastC: at };
     }
+  }
+  return out;
+}
+
+/**
+ * Keep only the fields that are actually usable, and drop an entry that carries
+ * none of them — an override present but empty would read as "this room is
+ * special" everywhere it is consulted while changing nothing. The offset is
+ * clamped to ±5°C: a thermometer calibration, not a way to fake a room's
+ * temperature into a different house.
+ */
+function sanitizeNeedOverrides(raw: unknown): Record<string, AcNeedOverride> {
+  if (raw == null || typeof raw !== "object") return {};
+  const out: Record<string, AcNeedOverride> = {};
+  for (const [id, o] of Object.entries(raw as Record<string, unknown>)) {
+    if (o == null || typeof o !== "object") continue;
+    const offset = (o as AcNeedOverride).tempOffsetC;
+    const fromSetpoint = (o as AcNeedOverride).targetFromSetpoint;
+    const entry: AcNeedOverride = {};
+    if (typeof offset === "number" && Number.isFinite(offset)) {
+      entry.tempOffsetC = Math.min(5, Math.max(-5, offset));
+    }
+    if (typeof fromSetpoint === "boolean") entry.targetFromSetpoint = fromSetpoint;
+    if (entry.tempOffsetC != null || entry.targetFromSetpoint != null) out[id] = entry;
   }
   return out;
 }

@@ -1982,6 +1982,10 @@ export class Collector {
       if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
       if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
       if (!rule.metric) continue;
+      // A matching metric rule bypasses the per-AC need override entirely: this
+      // branch reads a WEATHER/AIR metric against the slot's own limits, never
+      // the AC's internal thermometer, so neither the sensor calibration nor
+      // the own-setpoint target has anything to correct here.
       const slot = findActiveRangeSlot(
         rule.range_slots ?? getLegacyRangeSlots(rule.threshold_low, rule.threshold),
         getBaghdadMinutes(),
@@ -2007,18 +2011,30 @@ export class Collector {
       };
     }
     if (!device.currentTemp || device.currentTemp <= 0) return { tier: "mild", delta: 1, slotGenCap: null };
-    const target = this.leveling().getComfortTarget();
+    // Per-AC corrections to this room's OWN comfort question (config-driven, no
+    // device ids in code). `tempOffsetC` calibrates a thermometer that reads
+    // high or low; `targetFromSetpoint` says this occupant's target is what he
+    // set on the AC, not the shared household one (user, 2026-08-05: "consider
+    // the room temp is what we get from the AC − 1°C, and the target is what is
+    // set"). A setpoint of 0 is not a setpoint — fall back to the shared target
+    // rather than declaring the room 27°C too hot.
+    const override = this.leveling().getNeedOverride(deviceId);
+    const roomTemp = device.currentTemp + (override?.tempOffsetC ?? 0);
+    const target =
+      override?.targetFromSetpoint && device.targetTemp != null && device.targetTemp > 0
+        ? device.targetTemp
+        : this.leveling().getComfortTarget();
     if (device.mode === 4) {
       // Heat mode: deviation is how far the room is below the comfort target
       return {
-        tier: computeNeedTier({ kind: "comfort", currentTemp: 2 * target - device.currentTemp, target }),
-        delta: target - device.currentTemp,
+        tier: computeNeedTier({ kind: "comfort", currentTemp: 2 * target - roomTemp, target }),
+        delta: target - roomTemp,
         slotGenCap: null,
       };
     }
     return {
-      tier: computeNeedTier({ kind: "comfort", currentTemp: device.currentTemp, target }),
-      delta: device.currentTemp - target,
+      tier: computeNeedTier({ kind: "comfort", currentTemp: roomTemp, target }),
+      delta: roomTemp - target,
       slotGenCap: null,
     };
   }

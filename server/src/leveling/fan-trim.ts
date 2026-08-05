@@ -52,8 +52,13 @@ export const FAN_RESTORE_MAX_STEP = 2;
  * climb at all. `FAN_RESTORE_CALM_MS` alone never covered this: a fan-only
  * batch does not rewind the shared calm clock, so a fan cut at 17:30:24 was
  * fully restored 80s later — v1's 61s bounce median, reproduced in v2.
+ *
+ * 180s → 120s on 2026-08-05 (user request, watching his fans sit at 1 after an
+ * episode ended). Still comfortably past the 60s first-gear calm gate plus the
+ * meter's smoothing window, and a fresh cut restarts it — the anti-bounce
+ * argument is unchanged, the episode tail is a minute shorter.
  */
-export const FAN_RESTORE_AFTER_CUT_MS = 180_000;
+export const FAN_RESTORE_AFTER_CUT_MS = 120_000;
 
 export interface FanHold {
   deviceId: string;
