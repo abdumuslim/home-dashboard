@@ -250,6 +250,34 @@ describe("AC control attribution (2026-07-24 'Najat keeps turning back on')", ()
     expect(locks.notified).toEqual([{ deviceId: "DHihohFAAAE", authKind: "agent", ip: "9.9.9.9" }]);
   });
 
+  it("claims the release before the send, so the shadow echo can't steal it (2026-08-05)", async () => {
+    const tcl = createTclMock();
+    const locks = createLockHandlers(["DHihohFAAAE"]);
+    // The real send runs restoreLastState, whose ~1s timer lets the TCL shadow
+    // read ON before this handler returns — the device poll's observed-ON
+    // reconcile then wins the atomic release and the actor-carrying push is
+    // lost (live 00:42:34: "lock cleared" 455ms BEFORE "Restored last state").
+    const send = tcl.cloud.sendControlVerified;
+    tcl.cloud.sendControlVerified = async (deviceId: string, command: string, value: unknown) => {
+      if (command === "set_power" && value === 1) await locks.handlers.clear(deviceId);
+      await send(deviceId, command, value);
+    };
+    const { server, url } = await startServer({ tcl: tcl.cloud, locks: locks.handlers });
+    servers.push(server);
+
+    const resp = await control(
+      url,
+      { Cookie: agentCookie(), "cf-connecting-ip": "9.9.9.9", "x-forwarded-for": "9.9.9.9, 162.158.1.1" },
+      "set_power",
+      1,
+    );
+
+    expect(resp.status).toBe(200);
+    expect(tcl.sent).toHaveLength(1);
+    expect(locks.cleared).toEqual(["DHihohFAAAE"]); // only one caller can claim it
+    expect(locks.notified).toEqual([{ deviceId: "DHihohFAAAE", authKind: "agent", ip: "9.9.9.9" }]);
+  });
+
   it("does not push when the AC was not manual-off locked", async () => {
     const tcl = createTclMock();
     const locks = createLockHandlers();

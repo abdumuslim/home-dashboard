@@ -1274,6 +1274,21 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       auditAcControl(req, id, command, value);
       // A user touching any AC mid-calibration aborts the run — their intent wins
       acCalibration?.requestAbort("user_control");
+      // Releasing a manual-off lock is the one command that undoes the user's
+      // sacred off — notify so an ON nobody at home made surfaces within
+      // seconds instead of being found in rotated logs. The release is reported
+      // by clear() itself, so two concurrent turn-ons can't both claim it and
+      // double-push. Claimed BEFORE the send (same reason the OFF branch records
+      // first): the send's restoreLastState lets the TCL shadow echo our own ON
+      // ~1s later, and the device poll's observed-ON reconcile then wins the
+      // atomic release and clears it silently — this call site is the only one
+      // that knows the actor, so its push is lost (2026-08-05 00:42:34). If the
+      // send then throws, the lock stays released: the user's latest intent was
+      // ON, and the 500 tells them the command itself failed.
+      const releasedLock = command === "set_power" && value === 1
+        ? await acManualOffLocks?.clear(id)
+        : false;
+      if (releasedLock) acManualOffLocks?.notifyLockCleared?.(id, req.authKind ?? "user", clientIp(req));
       // Verified send: the firmware (Najat especially) sometimes accepts a
       // command without applying it — the shadow is re-checked every 5s and
       // the command re-sent up to 3 times (gen level/beep/fan-auto excluded).
@@ -1284,14 +1299,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
           await acManualOffLocks?.record(id, "ui");
           await acLeveling?.onUserPowerOff(id);
         } else if (value === 1) {
-          // Releasing a manual-off lock is the one command that undoes the
-          // user's sacred off — notify so an ON nobody at home made surfaces
-          // within seconds instead of being found in rotated logs. The release
-          // is reported by clear() itself, so two concurrent turn-ons can't both
-          // claim it and double-push.
-          const released = await acManualOffLocks?.clear(id);
           await acLeveling?.onUserPowerOn(id);
-          if (released) acManualOffLocks?.notifyLockCleared?.(id, req.authKind ?? "user", clientIp(req));
         }
       } else if (command === "set_generator_mode" && typeof value === "number") {
         const result = await acLeveling?.onUserGenLevel(id, value);

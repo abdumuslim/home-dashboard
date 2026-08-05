@@ -389,6 +389,23 @@ export class Collector {
     });
   }
 
+  /**
+   * An OBSERVED (un-commanded) ON released a manual-off lock — announced too,
+   * because a release nobody can attribute is exactly the one the user needs to
+   * see. Deliberately NOT called from `clearAcManualOff()`: the `set_power=1`
+   * route pushes its own richer, actor-carrying message and the two would
+   * double-push (2026-08-05).
+   */
+  private notifyObservedAcLockCleared(deviceId: string): void {
+    const name = this.tclCloud?.getDevices().find((d) => d.id === deviceId)?.name ?? deviceId;
+    log.info(`[collector] AC ${deviceId}: manual-off lock released by an observed ON (no command of ours)`);
+    void this.broadcastPush({
+      title: "AC manual-off released",
+      body: `${name} was turned back on physically (remote / app / panel) — the manual-off lock is cleared and automations resume.`,
+      type: "leveling",
+    });
+  }
+
   async getAcManualOffLockedIds(deviceIds?: string[]): Promise<Set<string>> {
     await this.ensureAcManualOffLocksLoaded();
     if (!deviceIds) return new Set(this.acManualOffLocks);
@@ -494,7 +511,7 @@ export class Collector {
       if (!this.acManualOffLocks.has(dev.id)) continue;
       this.noteAcObservedPower(dev.id, dev.power ? "on" : "off");
       if (dev.power && this.canClearAcManualOff(dev.id)) {
-        await this.clearAcManualOff(dev.id);
+        if (await this.clearAcManualOff(dev.id)) this.notifyObservedAcLockCleared(dev.id);
       }
     }
     return this.getAcManualOffLockedIds(devices.map((dev) => dev.id));
@@ -1267,7 +1284,7 @@ export class Collector {
       this.noteAcObservedPower(deviceId, power);
       if (power === "on") {
         if (this.canClearAcManualOff(deviceId)) {
-          await this.clearAcManualOff(deviceId);
+          if (await this.clearAcManualOff(deviceId)) this.notifyObservedAcLockCleared(deviceId);
         }
         await this.leveling().reconcileObservedOn(deviceId);
       }

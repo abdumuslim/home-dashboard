@@ -281,6 +281,39 @@ describe("AC manual-off locks", () => {
     expect(actions).toEqual([{ deviceId: "ac1", action: { temperature: 23 } }]);
   });
 
+  it("announces an observed-ON release (remote/app/panel), so a silent unlock can't happen", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", name: "Mom" }]);
+    const pushes: { title?: string; body?: string }[] = [];
+    (collector as never as { broadcastPush: (p: { title?: string; body?: string }) => Promise<void> }).broadcastPush =
+      async (p) => { pushes.push(p); };
+    await collector.recordAcManualOff("ac1", "test");
+    (collector as never as { acManualOffLockTimes: Map<string, number> }).acManualOffLockTimes.set("ac1", Date.now() - 20_000);
+
+    // The off propagates to the shadow (lock holds), then the AC is seen back ON.
+    await collector.reconcileAcManualOffLocks([{ id: "ac1", power: false }]);
+    const locked = await collector.reconcileAcManualOffLocks([{ id: "ac1", power: true }]);
+
+    expect(locked.has("ac1")).toBe(false);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0].title).toBe("AC manual-off released");
+    expect(pushes[0].body).toContain("Mom");
+  });
+
+  it("stays silent when the dashboard turn-on already released the lock (that path pushes its own)", async () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", name: "Mom" }]);
+    const pushes: { title?: string }[] = [];
+    (collector as never as { broadcastPush: (p: { title?: string }) => Promise<void> }).broadcastPush =
+      async (p) => { pushes.push(p); };
+    await collector.recordAcManualOff("ac1", "ui");
+    await collector.clearAcManualOff("ac1"); // the set_power=1 handler claimed the release
+
+    await collector.reconcileAcManualOffLocks([{ id: "ac1", power: true }]);
+
+    expect(pushes).toEqual([]);
+  });
+
   it("does not clear a manual-off lock from an on-read when the off was never observed (stale/flappy shadow, 32A grid incident)", async () => {
     const { collector, tclCloud, actions } = createCollector();
     await (collector as never as { recordAcManualOff: (id: string, reason: string) => Promise<void> }).recordAcManualOff("ac1", "test");
