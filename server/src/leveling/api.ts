@@ -55,8 +55,14 @@ export interface LevelingAcStatusV2 {
   /**
    * How long this room has sat below its comfort floor WITHOUT getting cooler
    * (0 when at/above it, or whenever it last made progress). The raw clock
-   * behind `coolingState: "stalled"` — surfaced so the diagnosis can be checked
+   * behind `coolingState: "stalled"` — surfaced so the report can be checked
    * rather than taken on faith.
+   *
+   * ⚠ REPORT-ONLY since 2026-08-06. Nothing in the ladder reads it: a stalled
+   * thermometer stopped being evidence of a dead compressor (user: "it is so
+   * normal that we see no cooling progress in all rooms for a long time, even
+   * with L3"). It is also what the "pinned below the comfort floor and not
+   * cooling" report is built from, which was always its report-only half.
    */
   subFloorStalledMs?: number;
   /**
@@ -65,9 +71,14 @@ export interface LevelingAcStatusV2 {
    *  - `off`             not on, or shed by the leveler.
    *  - `compressor_off`  the METER says its compressor is not running — a graded
    *                      lone off that moved about a fan, or a dead window
-   *                      nothing has absorbed (R6).
-   *  - `stalled`         the THERMOMETER says so: below its comfort floor with
-   *                      no cooling progress for `SUBFLOOR_WATCH_MS`.
+   *                      nothing has absorbed (R6). This is the only one the
+   *                      ladder ACTS on. (A lone RAISE's rise is journalled as
+   *                      `compressor_report` and never reaches this field: it
+   *                      measures the whole house, not the room.)
+   *  - `stalled`         the THERMOMETER has not moved: below its comfort floor
+   *                      with no cooling progress for `SUBFLOOR_WATCH_MS`.
+   *                      Report-only since 2026-08-06 — informative, not a
+   *                      diagnosis (see `subFloorStalledMs`).
    *  - `cooling`         nothing to report.
    *
    * A diagnostic, not an alarm: a room can sit at a perfectly healthy-looking

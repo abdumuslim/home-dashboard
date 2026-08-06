@@ -14,9 +14,9 @@ import { effectiveLimit } from "./config.js";
 import type { CostBook } from "./costs.js";
 import { commandedCutAmpsOf, modelFor, steadyDraw } from "./costs.js";
 import { assessPressure } from "./pressure.js";
-import { cutTrendOf } from "./sensing.js";
+import { cutTrendOf, OVER_LIMIT_BUDGET } from "./sensing.js";
 import { planReduction, SHED_NEED_GAP_C } from "./reduce.js";
-import { invariantCorrections, planRaise, rampDebitAmps } from "./raise.js";
+import { invariantCorrections, planRaise, rampDebitAmps, type SwapDecision } from "./raise.js";
 import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
 import { ceilOf, floorOf } from "./needs.js";
 import { planIdleDemotes } from "./demote.js";
@@ -77,6 +77,19 @@ export interface PlanInput {
    * `RaiseInput.shedBarAmps`. Defaults to "no bar" (the pre-R9 admission).
    */
   shedBarAmps?: (deviceId: string) => number;
+  /**
+   * The gated proactive shed already in flight house-wide (donor → receiver),
+   * or null. ONE at a time; the shell owns the record and clears it when the
+   * receiver comes back. Defaults to "none in flight".
+   */
+  swapInFlight?: SwapDecision | null;
+  /**
+   * The ladder shipped an over-limit batch within `SWAP_QUIET_AFTER_OVER_MS`.
+   * The meter gates below all read the CURRENT tick and none of them remembers
+   * an episode the house is still digesting — see the constant. Defaults to
+   * "nothing recent", which is what an un-wired caller had before this existed.
+   */
+  overLimitActedRecently?: boolean;
 }
 
 export interface PlanOutput extends Plan {
@@ -93,6 +106,11 @@ export interface PlanOutput extends Plan {
   fundingDonors?: string[];
   /** Devices the reducer took a level from — the shell stamps their cooldown. */
   reductionVictims?: string[];
+  /**
+   * The gated proactive shed this plan armed (donor → receiver), or null/absent.
+   * The shell records it once the donor's `power_off` has actually shipped.
+   */
+  swap?: SwapDecision | null;
 }
 
 /**
@@ -579,6 +597,50 @@ export function plan(input: PlanInput): PlanOutput {
       // heading" (invariant 41): the trough a room's own shed digs outlives the
       // commanded-cut credit, so the bar does too (R9).
       shedBarAmps: input.shedBarAmps,
+      // The SITUATIONAL half of the proactive-shed gate. The arithmetic half
+      // lives in `swapDonorFor`; this is the "is the house quiet enough to be
+      // rearranging rooms at all" half, and it is deliberately strict — a swap
+      // is a comfort optimisation, never an emergency tool:
+      //
+      //  - NORMAL only. FLOORS/GRID_FULL/SETTLING/COLLAPSED all return above,
+      //    so reaching here already implies it; asserted anyway so a future
+      //    branch cannot silently inherit the permission.
+      //  - GEN only. On grid the entry policy is "start everything full" and
+      //    the reducer is the safety (see GRID_FULL), so trading one room off
+      //    for another is not the grid contract — and grid is not
+      //    envelope-guarded, which is half of what makes the trade honest.
+      //  - No derate (collapse OR strain): a line that has just proved it
+      //    cannot hold its rating is not a line to spend a room's comfort on.
+      //  - Nothing frozen, no over-limit episode in flight (mean over the
+      //    limit, a drained bucket, or a cut still landing). `pressure.kind`
+      //    being `calm` is not enough on its own — the bucket can still be
+      //    refilling from an episode seconds old, which is exactly the 02:32
+      //    storm this feature must stand down for.
+      //  - …and none of those remembers an episode the meter has already
+      //    absorbed. `overLimitActedRecently` is the memory; without it the
+      //    acceptance replay traded a room away 50 s after a level cut.
+      //  - …and NOTHING ELSE MAY SHIP THIS TICK. `invariantCorrections` are
+      //    merged into the same batch below, so a tick that carries one would
+      //    put the donor's `power_off` in a 2-command batch — and the grading
+      //    shell only grades `meterCmds.length === 1`. The trade would then
+      //    lose the free `on@L` sample AND the off-drop compressor evidence
+      //    (invariant 55) the design counts on, while the SKILL's "ships ALONE"
+      //    quietly stopped being true. Standing down costs one tick: corrections
+      //    are one-shot clamps, and the swap re-arms on the next calm tick with
+      //    every other gate re-evaluated.
+      swapAllowed:
+        mode === "NORMAL" &&
+        source === "gen" &&
+        corrections.commands.length === 0 &&
+        !meter.frozen &&
+        !meter.collapsed &&
+        meter.derateAmps <= 0 &&
+        meter.smoothedOverMs === 0 &&
+        meter.overLimitBudget >= OVER_LIMIT_BUDGET &&
+        meter.commandedCutCreditAmps <= 0 &&
+        meter.commandedCutTotalAmps <= 0 &&
+        input.overLimitActedRecently !== true,
+      swapInFlight: input.swapInFlight ?? null,
     });
     if (raisePlan.commands.length > 0 || corrections.commands.length > 0) {
       // A gentle restore (power_on carrying a pinned fan) records a fan hold so
@@ -604,13 +666,16 @@ export function plan(input: PlanInput): PlanOutput {
         commandedCutAmps: commandedCutAmpsOf(raiseCommands, acs, config, source, book, now),
         compareAfter: now + (raisePlan.isTurnOn ? GRADE_TURN_ON_MS : GRADE_LEVEL_MS),
         decisions: [...corrections.decisions, ...raisePlan.decisions],
-        reason: raisePlan.isTurnOn ? "restore" : "raise",
+        // A proactive shed is its own reason in the journal — the user reads
+        // this, and "raise" on a batch that switched a room OFF would be a lie.
+        reason: raisePlan.swap != null ? "proactive_shed" : raisePlan.isTurnOn ? "restore" : "raise",
         severity: null,
         requiredAmps: null,
         fanHolds,
         attempts: raisePlan.attempts,
         fanOnly: false,
         fundingDonors: raisePlan.fundingDonors,
+        swap: raisePlan.swap,
       };
     }
     // Nothing to raise — walk any SATISFIED room parked above its need ceiling

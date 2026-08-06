@@ -1,5 +1,17 @@
 import { describe, it, expect } from "vitest";
-import { envelopeTotalAmps, invariantCorrections, planRaise, rampDebitAmps, type RaiseInput } from "./raise.js";
+import {
+  envelopeTotalAmps,
+  invariantCorrections,
+  planRaise,
+  rampDebitAmps,
+  REBALANCE_NEED_GAP_C,
+  swapDonorFor,
+  SWAP_NEED_GAP_C,
+  SWAP_QUIET_AFTER_OVER_MS,
+  type RaiseInput,
+} from "./raise.js";
+import { SHED_NEED_GAP_C } from "./reduce.js";
+import { PENDING_CUT_MS } from "./sensing.js";
 import { initialPacingState, noteAttempt, noteFailure } from "./pacing.js";
 import { updateCost } from "./costs.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
@@ -1550,5 +1562,295 @@ describe("house load in the raise envelope (2026-07-31 gen trip)", () => {
     expect(p.commands).toContainEqual(
       expect.objectContaining({ deviceId: "abdullah", kind: "power_on", reason: "restore" }),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The gated proactive shed (the swap) — un-parked 2026-08-06 on the user's own
+// ask after the 02:21–02:49 heater episode: "after Najat on and be stable,
+// there was enough budget to turn off Najat and bring Abdu back on."
+// ---------------------------------------------------------------------------
+
+describe("gated proactive shed: swapping a cool room's amps to a hot one", () => {
+  // Ids stay a/b/c/d so the declared base-2/step-2 models apply (⇒ L1 = 2A,
+  // L2 = 4A, L3 = 6A); the NAMES are what the journal prints.
+  const swapCfg: LevelingConfigV2 = {
+    ...cfg,
+    ampModels: { ...cfg.ampModels, d: { baseAmps: 2, stepAmps: 2 } },
+  };
+  //  - `hot`  is the shed room we want back (rank 3.0), restore cost 2A at L1.
+  //  - `cool` is the donor: running at ITS FLOOR (so no floor-down is available
+  //    and `atFloors` cannot rescue the restore), 1.5°C milder than `hot`.
+  //  - `mid`  keeps a second room running, so the donor is never the last one.
+  const hot = (o: Partial<AcView> = {}): AcView =>
+    ac("a", { name: "hot", on: false, shed: true, needDelta: 3, rankNeedDelta: 3.0, roomTempC: 28.0, ...o });
+  const mid = (o: Partial<AcView> = {}): AcView =>
+    ac("b", { name: "mid", currentLevel: 1, needDelta: 2.5, rankNeedDelta: 2.5, roomTempC: 27.0, ...o });
+  const cool = (o: Partial<AcView> = {}): AcView =>
+    ac("c", { name: "cool", currentLevel: 1, needDelta: 1.5, rankNeedDelta: 1.5, roomTempC: 26.5, ...o });
+  const swapScene = (donorOverrides: Partial<AcView> = {}): AcView[] => [
+    hot(),
+    mid(),
+    cool(donorOverrides),
+  ];
+  // 13.5 committed: `hot` needs 2A and the ceiling is 14.9, so plain (15.5A)
+  // and at-floors (both peers already at their floor ⇒ nothing to give) both
+  // refuse. Switching `cool` off frees 2A ⇒ 13.5 − 2 + 2 = 13.5, a full amp
+  // inside the 0.5A funding margin.
+  const swapRaise = (acs: AcView[], overrides: Partial<RaiseInput> = {}) =>
+    raise(acs, {
+      config: swapCfg,
+      smoothedAmps: 13.5,
+      headroomAmps: 1.2,
+      swapAllowed: true,
+      ...overrides,
+    });
+
+  it("sheds the coolest eligible donor ALONE and reserves the receiver's amps", () => {
+    const p = swapRaise(swapScene());
+    // Invariant 9: the off ships by itself. A power_on in the same batch would
+    // commit a whole compressor against a saving that has not landed.
+    expect(p.commands).toEqual([{ deviceId: "c", kind: "power_off", reason: "shed" }]);
+    expect(p.swap).toEqual({ donorId: "c", receiverId: "a" });
+    expect(p.reservedAmps).toBeGreaterThan(0);
+    // The donor gave a whole room — invariant 30's cooldown applies to it.
+    expect(p.fundingDonors).toEqual(["c"]);
+    // Priced for the collapse detector at the model steady draw (invariant 11).
+    expect(p.cutAmps).toBeCloseTo(2, 5);
+  });
+
+  it("journals the trade loudly, naming both rooms and both thermometers", () => {
+    const d = swapRaise(swapScene()).decisions.find((x) => x.action === "proactive shed");
+    expect(d?.deviceId).toBe("c");
+    expect(d?.detail).toContain("cool → hot");
+    expect(d?.detail).toContain("1.5°C real");
+    expect(d?.detail).toContain("room 26.5°C");
+    expect(d?.detail).toContain("3.0°C real");
+    expect(d?.detail).toContain("room 28.0°C");
+  });
+
+  it("picks the COOLEST eligible donor, not the biggest saving", () => {
+    // `mid` would free 4A at its L2 floor and `cool` only 2A — but 2A is
+    // enough, and the thermometer decides who loses their room (2026-08-04).
+    const p = swapRaise([
+      hot(),
+      mid({ currentLevel: 2, minLevel: 2, needDelta: 1.9, rankNeedDelta: 1.9 }),
+      cool(),
+    ]);
+    expect(p.swap).toEqual({ donorId: "c", receiverId: "a" });
+  });
+
+  it("does NOT fire when the donor is inside the need gap (26.0 vs 25.3 rooms)", () => {
+    // 0.7°C apart — the rebalance gap, deliberately NOT enough to take a whole
+    // room away. Nothing happens; the shed room waits for honest headroom.
+    const p = swapRaise([
+      hot(),
+      mid({ needDelta: 2.8, rankNeedDelta: 2.8 }),
+      cool({ needDelta: 2.3, rankNeedDelta: 2.3 }),
+    ]);
+    expect(p.commands).toEqual([]);
+    expect(p.swap).toBeNull();
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", blockedBy: "no headroom" }),
+    );
+  });
+
+  it("never touches a PINNED donor (manual wins), in either form", () => {
+    expect(swapRaise(swapScene({ manualTarget: 1 })).swap).toBeNull();
+    expect(swapRaise(swapScene({ manualCap: 1 })).swap).toBeNull();
+  });
+
+  it("never touches a RAMPING donor — its amps are not knowable yet", () => {
+    expect(swapRaise(swapScene({ ramping: true })).swap).toBeNull();
+  });
+
+  it("never touches a donor serving a funding or victim cooldown", () => {
+    expect(swapRaise(swapScene(), { fundingCooldown: (id) => id === "c" }).swap).toBeNull();
+    expect(swapRaise(swapScene(), { victimCooldown: (id) => id === "c" }).swap).toBeNull();
+  });
+
+  it("never leaves the house with nothing running", () => {
+    // Only `cool` is on. A swap re-arranges cooling; it may not empty the house
+    // on the way through.
+    const p = swapRaise([hot(), cool()]);
+    expect(p.swap).toBeNull();
+    expect(p.commands).toEqual([]);
+  });
+
+  it("refuses a trade that does not actually CLOSE the gap", () => {
+    // 14.5 committed: freeing 2A and spending 2A leaves 14.5, and the 0.5A
+    // funding margin puts it over the 14.9 ceiling. Spending a room's comfort
+    // on a restore that would still be refused is the worst of both.
+    const p = swapRaise(swapScene(), { smoothedAmps: 14.5, headroomAmps: 0.2 });
+    expect(p.swap).toBeNull();
+  });
+
+  it("refuses a trade the PHYSICS ENVELOPE rejects even when the meter allows it", () => {
+    // `mid` sits at its L3 boost floor (6A) and `hot` returns at 2A ⇒ an 8A
+    // end-state against a 7.8A ceiling, while the meter (5.0A) says yes.
+    const p = swapRaise([hot(), mid({ currentLevel: 3, minLevel: 3 }), cool()], {
+      limitAmps: 7.9,
+      smoothedAmps: 5.0,
+      headroomAmps: 2.6,
+    });
+    expect(p.swap).toBeNull();
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", blockedBy: "physics envelope" }),
+    );
+  });
+
+  it("stands down entirely when the caller has not allowed it (the situational gate)", () => {
+    expect(swapRaise(swapScene(), { swapAllowed: false }).swap).toBeNull();
+    // …and the default is OFF: a caller that never thought about it never
+    // trades a room away.
+    expect(
+      raise(swapScene(), { config: swapCfg, smoothedAmps: 13.5, headroomAmps: 1.2 }).swap,
+    ).toBeNull();
+  });
+
+  it("waits for the same calm the restore it funds must clear", () => {
+    expect(swapRaise(swapScene(), { calmMs: 1_000 }).swap).toBeNull();
+  });
+
+  it("allows only ONE swap in flight house-wide", () => {
+    const p = swapRaise(swapScene(), { swapInFlight: { donorId: "x", receiverId: "y" } });
+    expect(p.swap).toBeNull();
+    expect(p.commands).toEqual([]);
+  });
+
+  it("only the HOTTEST shed room may buy itself back", () => {
+    // `hotter` heads the queue and is waiting out a restore backoff, so no swap
+    // may be armed FOR it (shedding a room to fund a restore that cannot ship
+    // is pure loss). `hot` is second in the queue and must not reach for a
+    // donor on its own behalf either: the gap that makes a trade honest is
+    // measured from the top of the queue, and trading rooms sideways is not
+    // what the user asked for. Both refusals, one scene.
+    let pacing = initialPacingState("gen");
+    pacing = noteAttempt(pacing, "d", "restore", T - 1_000);
+    pacing = noteFailure(pacing, "d", "restore", T - 1_000);
+    const p = swapRaise(
+      [ac("d", { name: "hotter", on: false, shed: true, needDelta: 5, rankNeedDelta: 5.0 }), hot(), mid(), cool()],
+      { pacing },
+    );
+    expect(p.swap).toBeNull();
+    expect(p.commands).toEqual([]);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", action: "restore", blockedBy: "no headroom" }),
+    );
+  });
+
+  it("RESERVES the receiver's amps across later ticks while the trade lands", () => {
+    // The donor is already off; the meter has not shown the saving yet, so the
+    // restore still does not fit. Nothing else may spend those amps.
+    const p = swapRaise([hot(), mid(), cool({ on: false, shed: true })], {
+      swapInFlight: { donorId: "c", receiverId: "a" },
+    });
+    expect(p.commands).toEqual([]);
+    expect(p.reservedAmps).toBeCloseTo(2, 5);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", blockedBy: "swap landing" }),
+    );
+    // The raise phase is parked behind the reservation.
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ action: "raises", blockedBy: "restore reservation" }),
+    );
+  });
+
+  it("bars the DONOR from taking its donation back and RESERVES for the live trade", () => {
+    // `cool` is shed and is the cheapest thing on the board — but it was
+    // switched off to fund `hot`, which is still waiting for the saving to
+    // reach the meter. Its amps are reserved, not spent (invariant 30, one rung
+    // down).
+    const p = swapRaise([hot(), cool({ on: false, shed: true }), mid()], {
+      fundingCooldown: (id) => id === "c",
+      swapInFlight: { donorId: "c", receiverId: "a" },
+    });
+    expect(p.commands).toEqual([]);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "c", blockedBy: "donation cooldown" }),
+    );
+    expect(p.reservedAmps).toBeGreaterThan(0);
+  });
+
+  it("REGRESSION 2026-08-06 (review): a LEVEL-funding donor's shed must not park the house", () => {
+    // Same predicate, different donation. `cool` gave up a LEVEL to fund a peer
+    // (invariant 30 proper) and was then shed for an unrelated overload — no
+    // trade is waiting on its amps. It is still barred from restoring, but a
+    // reservation would park the raise phase AND the fan restore house-wide for
+    // two minutes over a claim nobody made: `mid` may still take its step.
+    const p = swapRaise([cool({ on: false, shed: true }), mid()], {
+      smoothedAmps: 8.0,
+      headroomAmps: 6.7,
+      fundingCooldown: (id) => id === "c",
+      swapInFlight: null,
+    });
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "c", blockedBy: "donation cooldown" }),
+    );
+    // The bar holds — the donor itself is not restored…
+    expect(p.commands.some((c) => c.deviceId === "c")).toBe(false);
+    // …and nothing is held back from everyone else.
+    expect(p.reservedAmps).toBe(0);
+    expect(p.decisions).not.toContainEqual(
+      expect.objectContaining({ action: "raises", blockedBy: "restore reservation" }),
+    );
+  });
+});
+
+describe("swapDonorFor: the gap constants must outrank each other (2026-07-31 lesson)", () => {
+  it("a whole ROOM costs at least what a LEVEL costs", () => {
+    // A swap takes a room away; a rebalance takes one level. The bar for the
+    // bigger loss may never be the lower one.
+    expect(SWAP_NEED_GAP_C).toBeGreaterThan(REBALANCE_NEED_GAP_C);
+    // …and it IS the shed-side gap, the user's own calibration — not a copy of
+    // its current value that could drift away from it.
+    expect(SWAP_NEED_GAP_C).toBe(SHED_NEED_GAP_C);
+  });
+
+  it("the ladder's quiet window outlasts the credit that hides an episode", () => {
+    // Every other swap gate reads the CURRENT tick, and the last of them to go
+    // quiet is the commanded-cut credit — which the meter can absorb in well
+    // under a minute. A quiet window shorter than the credit's own life would
+    // let a trade fire inside an episode nothing else remembers.
+    expect(SWAP_QUIET_AFTER_OVER_MS).toBeGreaterThanOrEqual(PENDING_CUT_MS);
+  });
+
+  it("the reverse trade needs the rooms to genuinely CROSS (anti-oscillation)", () => {
+    const donor = ac("c", { currentLevel: 1, rankNeedDelta: 1.5 });
+    const receiver = ac("a", { on: false, shed: true, rankNeedDelta: 3.0 });
+    const bystander = ac("b", { rankNeedDelta: 2.5 });
+    const args = {
+      receiverCostAmps: 2,
+      committedAmps: 13.5,
+      ceilingAmps: 14.9,
+      donorSavingsAmps: () => 2,
+      envelopeAfter: null,
+      blocked: () => false,
+    };
+    // Forward: the hot room may take the cool room's amps.
+    expect(
+      swapDonorFor({ ...args, receiver, running: [donor, bystander] })?.donor.deviceId,
+    ).toBe("c");
+    // Reverse, with the rooms as they stand right after the trade: the ex-donor
+    // is 1.5°C cooler, so it needs ~2 × the gap of real thermometer movement to
+    // win the room back. Noise cannot do it.
+    expect(
+      swapDonorFor({
+        ...args,
+        receiver: { ...donor, on: false, shed: true },
+        running: [{ ...receiver, on: true, shed: false }, bystander],
+      }),
+    ).toBeNull();
+    // Only once they have actually crossed by the full gap does it flip.
+    expect(
+      swapDonorFor({
+        ...args,
+        receiver: { ...donor, on: false, shed: true, rankNeedDelta: 3.6 },
+        running: [
+          { ...receiver, on: true, shed: false, rankNeedDelta: 2.5 },
+          { ...bystander, rankNeedDelta: 2.9 },
+        ],
+      })?.donor.deviceId,
+    ).toBe("a");
   });
 });

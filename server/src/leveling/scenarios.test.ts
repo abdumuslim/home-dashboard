@@ -1915,3 +1915,179 @@ describe("trip on entry, and the surge that follows (2026-08-04)", () => {
     expect(off).not.toContain("najat");
   });
 });
+
+describe("the 2026-08-06 heater episode — the gated proactive shed", () => {
+  // 02:21Z grid→gen on a 15A generator. A heater put the non-AC house at 7.4A;
+  // the extreme/severe rungs shed Najat and Abdu at 02:32. Najat's cheaper
+  // 3.35A restore fitted at 02:33 and took the headroom — and Abdu, the HOTTER
+  // room at 4.3A, then did not fit until 02:49, when the heater cycled off on
+  // its own. Seventeen minutes with the amps sitting in a cooler room.
+  //
+  // The user's ask, verbatim: "after Najat on and be stable, there was enough
+  // budget to turn off Najat and bring Abdu back on."
+  const HOUSE_WITH_HEATER = 7.4;
+  const HOUSE_HEATER_OFF = 4.0;
+  // comfortTargetC is 26, so the room temperatures ARE the ranks: Abdullah 3.0,
+  // Abdu 2.0, Najat 0.5. Abdu is 1.5°C hotter than Najat — clear of the 1.0°C
+  // shed-side gap; Abdullah is hotter than both and can never be the donor.
+  const scene = (): SimAcSetup[] => [
+    { ...ABDULLAH, level: 1, demandAmps: 3.5, needDelta: 3, roomTempC: 29.0 },
+    { ...NAJAT, level: 1, demandAmps: 3.0, needDelta: 0.5, roomTempC: 26.5 },
+    { ...ABDU, level: 1, shed: true, demandAmps: 6.0, needDelta: 2, roomTempC: 28.0 },
+  ];
+
+  it("switches the COOLER running room off, alone, and gives its amps to the hotter shed room", () => {
+    const s = new Scenario(cfg, scene(), { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" });
+    const t0 = s.now;
+    // ~11.8A on the meter (7.4 house + two 1-ton floors). Abdu's 4.5A modeled
+    // return is 16.3A against a 14.8A ceiling, and both peers are already at
+    // their floors, so at-floors cannot rescue it either.
+    s.advance(60);
+    const offs = s.commandsSince(t0, "power_off");
+    expect(offs).toHaveLength(1);
+    expect(offs[0].cmd.deviceId).toBe("najat");
+    // Invariant 9: the off ships in a batch of its own. The receiver's whole
+    // compressor may not be committed against a saving that has not landed.
+    const swapBatch = s.plans.find((p) => p.reason === "proactive_shed");
+    expect(swapBatch?.commands).toEqual([
+      { deviceId: "najat", kind: "power_off", reason: "shed" },
+    ]);
+    expect(swapBatch?.swap).toEqual({ donorId: "najat", receiverId: "abdu" });
+    // …and it says so, in the journal the user reads.
+    expect(swapBatch?.decisions).toContainEqual(
+      expect.objectContaining({
+        deviceId: "najat",
+        action: "proactive shed",
+        detail: expect.stringContaining("najat → abdu"),
+      }),
+    );
+  });
+
+  it("brings the hot room back within a few minutes, once the saving is on the meter", () => {
+    const s = new Scenario(cfg, scene(), { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" });
+    const t0 = s.now;
+    s.advance(5 * 60);
+    const ons = s.commandsSince(t0, "power_on");
+    expect(ons).toHaveLength(1);
+    expect(ons[0].cmd.deviceId).toBe("abdu");
+    const off = s.commandsSince(t0, "power_off")[0];
+    // Minutes, not the seventeen the live house waited — and never in the same
+    // batch as the off.
+    expect(ons[0].at).toBeGreaterThan(off.at);
+    expect(ons[0].at - off.at).toBeLessThan(3 * 60_000);
+  });
+
+  it("reserves the freed amps — no peer raise steals them between the off and the restore", () => {
+    const s = new Scenario(cfg, scene(), { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" });
+    const t0 = s.now;
+    s.advance(5 * 60);
+    const off = s.commandsSince(t0, "power_off")[0];
+    const on = s.commandsSince(t0, "power_on")[0];
+    // Abdullah is the HOTTEST room in the house and would happily take 1.6A of
+    // the trade. Nothing moves a level in the window the reservation covers.
+    const between = setLevels(s, off.at).filter((e) => e.at <= on.at);
+    expect(between).toEqual([]);
+    expect(
+      s.plans.some((p) =>
+        p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "swap landing"),
+      ),
+    ).toBe(true);
+  });
+
+  it("holds the donor off until the heater releases — then restores it, with no oscillation", () => {
+    const s = new Scenario(cfg, scene(), { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" });
+    const t0 = s.now;
+    // Fifteen minutes of the heater still running: Najat stays off, because the
+    // house genuinely cannot carry her on top of the room she paid for.
+    s.advance(15 * 60);
+    expect(s.commandsSince(t0, "power_on").map((e) => e.cmd.deviceId)).toEqual(["abdu"]);
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(1);
+    // The heater cycles off — the real 02:49 event, this time with the hot room
+    // already running.
+    const t1 = s.now;
+    s.setNonAc(HOUSE_HEATER_OFF);
+    s.advance(15 * 60);
+    expect(s.commandsSince(t1, "power_on").map((e) => e.cmd.deviceId)).toEqual(["najat"]);
+    // Thirty minutes, three power commands, and nobody switched off twice. A
+    // limit cycle here is a bug by the user's own definition.
+    expect(s.commandsSince(t1, "power_off")).toEqual([]);
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(1);
+    expect(s.commandsSince(t0, "power_on")).toHaveLength(2);
+  });
+
+  it("…and does the same under ±0.5A meter noise (the churn gate)", () => {
+    // testing.md's standing rule: every new path that SPENDS or TRADES amps is
+    // run under the noise scene before it ships. It is what caught both
+    // load-bearing guards of the comparative-need rebalance — a deficit judged
+    // off one noisy reading armed a trade on every dip, and the freed amps then
+    // fit the DONOR's cheaper re-raise but not the receiver's, giving a 35s
+    // donor↔receiver limit cycle while every targeted test stayed green. A trade
+    // that costs a room its compressor has to be quieter than that, not louder.
+    const s = new Scenario(cfg, scene(), { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" });
+    s.setNoise(0.5);
+    const t0 = s.now;
+    s.advance(15 * 60);
+    // Exactly the same trade the quiet run makes — once.
+    expect(s.commandsSince(t0, "power_off").map((e) => e.cmd.deviceId)).toEqual(["najat"]);
+    expect(s.commandsSince(t0, "power_on").map((e) => e.cmd.deviceId)).toEqual(["abdu"]);
+
+    const t1 = s.now;
+    s.setNonAc(HOUSE_HEATER_OFF);
+    s.advance(15 * 60);
+    expect(s.commandsSince(t1, "power_on").map((e) => e.cmd.deviceId)).toEqual(["najat"]);
+
+    // Thirty noisy minutes, three power commands, and no room switched off
+    // twice: no shed→restore→shed of the same room, in either direction.
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(1);
+    expect(s.commandsSince(t0, "power_on")).toHaveLength(2);
+    expect(s.plans.filter((p) => p.reason === "proactive_shed")).toHaveLength(1);
+  });
+
+  it("does NOT fire when the two rooms are inside the gap (26.0 vs 25.3)", () => {
+    // The same house, the same arithmetic, one difference: the running room is
+    // only 0.7°C cooler than the shed one. That is the rebalance gap, not the
+    // shed gap — a whole room is not traded on it. The shed room simply waits.
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDULLAH, level: 1, demandAmps: 3.5, needDelta: 3, roomTempC: 29.0 },
+        { ...NAJAT, level: 1, demandAmps: 3.0, needDelta: 0.5, roomTempC: 25.3 },
+        { ...ABDU, level: 1, shed: true, demandAmps: 6.0, needDelta: 2, roomTempC: 26.0 },
+      ],
+      { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" },
+    );
+    const t0 = s.now;
+    s.advance(30 * 60);
+    expect(s.commandsSince(t0, "power_off")).toEqual([]);
+    expect(s.plans.some((p) => p.reason === "proactive_shed")).toBe(false);
+  });
+
+  it("stands down through the over-limit episode itself (02:32) — it is not an emergency tool", () => {
+    // Both rooms at L2 with the heater on: ~15.2A on a 14.9A line. The reducer
+    // cuts levels, the meter falls to ~11.8A, and the trade's arithmetic then
+    // closes perfectly — Abdu is 2.5°C hotter than Najat, and her off buys his
+    // return. It must NOT fire: a room is not traded away while a cut we
+    // commanded is still landing and the bucket is still refilling. The
+    // situational gate is what stops it, and it is load-bearing — forcing
+    // `swapAllowed` true makes this scenario shed Najat inside the episode.
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDULLAH, level: 2, demandAmps: 3.9, needDelta: 3, roomTempC: 28.0 },
+        { ...NAJAT, level: 2, demandAmps: 3.9, needDelta: 2, roomTempC: 27.0 },
+        { ...ABDU, level: 1, shed: true, demandAmps: 6.0, needDelta: 3, roomTempC: 29.5 },
+      ],
+      { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" },
+    );
+    const t0 = s.now;
+    s.advance(2 * 60);
+    // The ladder did its job…
+    expect(s.plans.some((p) => p.reason.startsWith("over_"))).toBe(true);
+    // …and the comfort trade stayed out of it.
+    expect(s.plans.some((p) => p.reason === "proactive_shed")).toBe(false);
+    for (const e of s.commandsSince(t0, "power_off")) {
+      const batch = s.plans.find((p) => p.commands.includes(e.cmd));
+      expect(batch?.reason).toMatch(/^over_/);
+    }
+  });
+});

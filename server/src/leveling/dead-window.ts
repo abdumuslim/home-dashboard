@@ -261,6 +261,106 @@ export function offDropSaysCompressorOn(dropAmps: number): boolean {
   return dropAmps >= COMPRESSOR_ON_DROP_AMPS;
 }
 
+/**
+ * How far ABOVE its priced step a lone raise OFF L1 must rise before the only
+ * physical explanation left is a compressor that was not running at L1
+ * (2026-08-06).
+ *
+ * This is the RISE-side twin of the off-drop above, and it exists because the
+ * off-drop only speaks when a room is going off anyway. A raise off L1 happens
+ * on the way UP, minutes earlier, and it measures the same thing from the other
+ * end: if the compressor was already running, the meter moves by the level step
+ * (a duty/cap change); if it was not, the meter moves by the whole compressor
+ * starting — the step PLUS everything L1 was supposed to be drawing and wasn't.
+ *
+ * Largest single increment that can consume it (hard rule 5c): the error in the
+ * priced step it is added to. `pricedStepAmps` is `raiseJumpAmps`, i.e.
+ * max(model, learned), so an over-priced step only makes this test HARDER — the
+ * dangerous direction is a step priced too LOW, and the worst such error this
+ * house has produced is ~1.0 A (Abdullah's gen step model sat at 2.5 A against a
+ * measured ~1.5 A until 2026-08-03). On top of that the sample is a ratcheted
+ * peak off the smoothed meter, which a supply excursion can inflate by the live
+ * flicker. Two amps covers both — and it is deliberately the SAME quantity as
+ * `COMPRESSOR_ON_DROP_AMPS`/`DEAD_WINDOW_GAP_AMPS`, "the smallest whole
+ * compressor this house has", so all three compressor-evidence bars agree about
+ * what a compressor is worth.
+ *
+ * ⚠ Accepted, and deliberate: this is a HIGH bar and it will miss genuine
+ * cases. A 1-ton starting from fan-only into L2 rises about `steadyDraw(2)`
+ * minus its fan ≈ 3.4 A against a bar of 1.5 + 2.0 = 3.5 A. The failure
+ * direction is chosen: under-arming costs a hold that arms later (the off-drop
+ * and the user's own hand raise still catch it), while over-arming spends a
+ * hotter room's amps for six hours on fiction — which is exactly what the
+ * temperature watch this replaced did on 2026-08-06.
+ *
+ * ⚠ REPORT-ONLY since 2026-08-06 (review, same day it shipped). The bar above
+ * is honest about the *step price*, and dishonest about everything else on the
+ * line: the rise it is compared to is `PendingGrade.peakDeltaAmps`, a ratcheted
+ * WHOLE-HOUSE smoothed delta over the 240 s grading window, and nothing
+ * subtracts non-AC load. This house's own water heater is a 3.4 A step. Switch
+ * it on ninety seconds into the window and a perfectly ordinary 1.5 A level
+ * step measures 4.9 A against a 3.5 A bar — a false hold, six hours, spending
+ * the hottest room's amps, which is the exact failure class invariant 56 was
+ * written to kill. The off-drop (55) does not have this problem: it is a FALL,
+ * and a coincident household fall is both rarer and self-limiting.
+ *
+ * So the verdict is emitted and never acted on: `compressorOffLikely` is not
+ * set and no level hold is armed. The armers stay the three that measure only
+ * what they can attribute — the graded off-drop, the dead window, and the
+ * user's own hand raise. Closing this properly needs the rise measured net of
+ * `houseLoadAmps` at both ends of the window, which is its own investigation.
+ */
+export const COMPRESSOR_START_RISE_MARGIN_AMPS = COMPRESSOR_ON_DROP_AMPS;
+
+/**
+ * Did this lone raise measure a compressor STARTING rather than a level step?
+ * `riseAmps` is the graded window's ratcheted peak rise; `pricedStepAmps` is
+ * what admission charged for the same move.
+ *
+ * ⚠ REPORT-ONLY — see the margin's own note. A `true` here is journalled and
+ * logged; it arms nothing.
+ */
+export function raiseRiseSaysCompressorWasOff(riseAmps: number, pricedStepAmps: number): boolean {
+  return riseAmps >= Math.max(0, pricedStepAmps) + COMPRESSOR_START_RISE_MARGIN_AMPS;
+}
+
+/**
+ * May this raise's rise be read as compressor evidence at all? Decided at the
+ * moment the command is SENT, because every exclusion is a statement about the
+ * state we commanded it from.
+ *
+ * The question the measurement answers is "did this level step start a
+ * compressor that L1 was not running?", and it only has that answer when the
+ * compressor had no OTHER reason to start:
+ *
+ *  - `fromLevel === 1` — the evidence is about L1 and nothing else. A big rise
+ *    off L2 says the room was working harder, not that L2 was dead.
+ *  - not in FLOORS — the recovery admission commands a whole house back to its
+ *    floors at once, so no single command owns the meter, and it does so exactly
+ *    when every compressor is restarting anyway.
+ *  - not in a start window — the room has just been switched on; its compressor
+ *    is starting because it was OFF, which is not news about L1.
+ *  - not inside a power-event ramp — the dead window after a changeover, where
+ *    TCL restart protection holds the compressors off for minutes. A raise there
+ *    ALWAYS engages the compressor, because that is restart protection ending.
+ *    Without this exclusion every gen changeover of the day would mint a hold.
+ *
+ * Contamination and settle are deliberately NOT here: the grading pipeline
+ * already refuses a window born beside another batch (invariant 23) and one
+ * whose compressor has not settled (invariant 29), and the evidence is read at
+ * `learnAfter` — behind exactly that certification.
+ */
+export function loneRaiseIsAttributable(input: {
+  fromLevel: number;
+  floorsMode: boolean;
+  inStartWindow: boolean;
+  inPowerEventRamp: boolean;
+}): boolean {
+  return (
+    input.fromLevel === 1 && !input.floorsMode && !input.inStartWindow && !input.inPowerEventRamp
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Trip on ENTRY (2026-08-04, user-confirmed: the breaker physically tripped
 // this morning and he reset it by hand).

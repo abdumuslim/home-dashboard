@@ -168,10 +168,10 @@ describe("a level that does not cool is an off (user rule, 2026-08-03 evening)",
     expect(isNonCooling(ac({ minLevel: 1, needDelta: 9 }), 1)).toBe(false);
   });
 
-  it("takes the METER's word too — a fan-sized off-drop beats the three-minute clock (R6)", () => {
-    // Same physical state the watch detects, arriving minutes sooner: a graded
-    // lone off that moved about a fan, or a dead window nothing has absorbed.
-    // It must reach the SAME consumers, not a parallel set.
+  it("takes the METER's word — an attributable amp verdict is the evidence (R6)", () => {
+    // A graded lone off that moved about a fan, a graded lone raise off L1 that
+    // rose by a whole compressor more than its step, or a dead window nothing
+    // has absorbed. Since 2026-08-06 this is the ONLY automatic evidence.
     const measured = boosted({ needDelta: 0.4, subFloorStalledMs: 0, compressorOffLikely: true });
     expect(isNonCooling(measured, 1)).toBe(true);
     // …and it still says nothing at or above the floor: the evidence is about
@@ -179,14 +179,23 @@ describe("a level that does not cool is an off (user rule, 2026-08-03 evening)",
     expect(isNonCooling(measured, 2)).toBe(false);
   });
 
-  it("WATCHES inside the band: no cooling for the watch window is an off too", () => {
-    // The band is a prediction; this is the check on it ("at the 2 degrees the
-    // system should watch it if the compressor fall"). A room that is not
-    // getting cooler is not being cooled, however close to target it looks.
-    const stalled = boosted({ needDelta: 1.0, subFloorStalledMs: SUBFLOOR_WATCH_MS });
-    expect(isNonCooling(stalled, 1)).toBe(true);
-    const progressing = boosted({ needDelta: 1.0, subFloorStalledMs: SUBFLOOR_WATCH_MS - 1 });
-    expect(isNonCooling(progressing, 1)).toBe(false);
+  it("REGRESSION 2026-08-06: a stalled thermometer is NOT evidence of a dead compressor", () => {
+    // User's decision, verbatim: "it is so normal that we see no cooling
+    // progress in all rooms for a long time, even with L3, so this should not
+    // be considered. However, we have to depend on Amps."
+    //
+    // The shape that forced it — 02:12:20 Abdullah was demoted to L1 FOR being
+    // satisfied twenty minutes, and at 02:15:29 the watch called that same
+    // room non-cooling. A room at target cannot show 0.2°C more cooling, so the
+    // verdict was true by construction of the state that produced it.
+    const satisfiedAtL1 = boosted({ needDelta: 0.2, subFloorStalledMs: SUBFLOOR_WATCH_MS * 4 });
+    expect(isNonCooling(satisfiedAtL1, 1)).toBe(false);
+    // …and not for a merely-warm room either: inside the 2°C band the clock
+    // says nothing at all now, however long it has run.
+    expect(isNonCooling(boosted({ needDelta: 1.0, subFloorStalledMs: SUBFLOOR_WATCH_MS }), 1)).toBe(false);
+    // The two surviving grounds are untouched by the removal.
+    expect(isNonCooling(boosted({ needDelta: 2.5, subFloorStalledMs: 0 }), 1)).toBe(true);
+    expect(isNonCooling(boosted({ needDelta: 1.0, compressorOffLikely: true }), 1)).toBe(true);
   });
 });
 

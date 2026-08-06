@@ -399,7 +399,18 @@ guards, because `scenarios.test.ts` cannot see them. Added to that list
 2026-08-04: **device LIVENESS** (invariant 45 reads `isOnline`/`lastSeenAt` off
 the TCL shadow, which the harness can only mirror), the **outdoor feed** and the
 **learned hold's persistence** (invariant 52), and the **graded off-drop**
-(invariant 55, which lives in the grading shell). Mirrored the same day: the
+(invariant 55, which lives in the grading shell). Added 2026-08-06: the
+**graded lone-raise rise, its arm-time exclusions and its report** (invariant
+56 — same grading shell, so it lives entirely on `controller.test.ts` guards),
+and note that a scenario can no longer stage a non-cooling room by starving it
+of temperature progress (40 is report-only) — state `compressorOffLikely`
+instead. Also unmirrored: the shell's **`swap` record itself** — `scenario.ts`
+keeps its own copy, so a divergence between the two (the source-change clear was
+one, fixed 2026-08-06) is invisible to `scenarios.test.ts` by construction and
+needs a `controller.test.ts` guard reading the record directly. Every OUTWARD
+effect of a stale swap is masked on the far side of a changeover, so a decisions
+assertion is not enough.
+Mirrored the same day: the
 dead-window hold, the entry-collapse state machine, the recovery admission, the
 per-room shed bar, and `compressorOffLikely`.
 
@@ -499,17 +510,20 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     post-shed meter looks affordable. **Prerequisite for the unconditional form:
     a restore-bounce backoff** (a restore re-shed within N minutes must slow the
     ladder), without which there is nowhere stable to land.
-40. **Inside the band, WATCH it** (user: "at the 2 degrees the system should
-    watch it if the compressor fall"). The band is a prediction; the thermometer
-    is the check. `AcView.subFloorStalledMs` counts how long a room has sat
+40. ⚠️ **SUPERSEDED 2026-08-06 by 56 — REPORT-ONLY.** *Was:* "Inside the band,
+    WATCH it" (user: "at the 2 degrees the system should watch it if the
+    compressor fall"). `AcView.subFloorStalledMs` counts how long a room has sat
     below its floor **without getting cooler** — any progress of
     `SUBFLOOR_PROGRESS_C` (0.2°C, two sensor LSBs) re-bases the clock — and
-    `SUBFLOOR_WATCH_MS` (10 min) of no progress makes it non-cooling whatever
-    its need. ⚠️ Room TEMPERATURE, never the amp residual: `smoothed − modelled`
-    moves when a room under-draws its model, so reading it to decide whether a
-    room is under-drawing is circular. That reasoning already produced one wrong
-    diagnosis, which the user corrected. Mirrored in `scenario.ts`
-    (`trackSubFloor`) — do not let that drift.
+    `SUBFLOOR_WATCH_MS` (**3 min** since 2026-08-04, not the 10 min this shipped
+    with) of no progress made it non-cooling whatever its need. It no longer
+    does: the clock still runs and is still reported (`coolingState: "stalled"`,
+    the pinned-below-floor report) but nothing enforces or spends on it. Its
+    ⚠️ still stands and is now the whole rule — never the amp RESIDUAL
+    (`smoothed − modelled` moves when a room under-draws its model, so reading
+    it to decide whether a room is under-drawing is circular); only
+    ATTRIBUTABLE amps (55, 56). Still computed in `scenario.ts`
+    (`trackSubFloor`) for parity with the status surface only.
 41. **A restore is judged on where the meter is HEADING, not where it sits.**
     Live: Najat shed and restored FOUR times in 23 min, every restore admitted
     at a 9.5–12.5A meter while the settled three-room draw was ~15A — her draw
@@ -543,10 +557,12 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     alternative. Live 20:24:50: a **0.3 A** overshoot shed the user's own 33 °C
     room (need 4.2) while a 28.2 °C room (need 2.5) kept running — and shedding
     the milder one covered that deficit many times over. A plan that sheds ONLY
-    rooms at least `SHED_NEED_GAP_C` (1.5 °C) milder than the causer no longer
-    counts as exporting; it competes normally on `shedNeed`. Inside the gap the
-    original rule stands, and it should: flipping your AC on must not switch off
-    a comparably warm room instead.
+    rooms at least `SHED_NEED_GAP_C` (**1.0 °C** — cut from 1.5 by the user on
+    2026-08-04, *"1 c is enough to switch between acs"*; `reduce.ts`, and the
+    same constant invariant 57's swap gap is defined as) milder than the causer
+    no longer counts as exporting; it competes normally on `shedNeed`. Inside
+    the gap the original rule stands, and it should: flipping your AC on must
+    not switch off a comparably warm room instead.
 
 **Added 2026-08-04 after TWO real breaker trips before lunch, neither of which the controller saw:**
 44. **A timer is not a compressor.** A grid→gen changeover power-cycles every AC
@@ -692,9 +708,10 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     files — Abdullah's configured 39 °C: **< 36** nothing special · **36–39
     `watch`** L1 is still his legitimate floor and he is WATCHED there
     (`subFloorStalledMs` measures against the boost minimum, `BOOST_WATCH_BELOW_C`
-    = 3 °C early, which is the only window in which the evidence can be gathered
-    BEFORE the heat that makes it matter, and the RAISE path is what lifts him
-    on it) · **39–41 `flex`** the floor binds raises and entry clamps as always
+    = 3 °C early — ⚠️ **the ARMING half is superseded 2026-08-06 by 56:** that
+    watch is report-only now, so the zone gathers no evidence and lifts nobody;
+    the zone BOUNDARIES and the floor behaviour below are unchanged) ·
+    **39–41 `flex`** the floor binds raises and entry clamps as always
     and the sub-floor rung may STILL use L1, because at ~39 °C on 2026-08-03 he
     was genuinely cooling there (`BOOST_FLOOR_FLEX_C` = 2) · **> 41 `hard`** not
     a legal automatic target, no evidence needed. Every boundary carries the
@@ -711,8 +728,15 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     system records its own bar (user: "when the system observe that abdullah is
     not working on l1, by own observation or manual raise, it should state the
     outside temp, so it will never reduce the level to l1 untill it drop below
-    that temp or after 6 h"). Armed by the sub-floor watch stalling at L1, by
-    R6's fan-sized off-drop (55), or by a hand raise OFF L1 — recorded BEFORE
+    that temp or after 6 h"). Armed by exactly THREE attributable things: R6's
+    fan-sized off-drop (55), the dead window (44), or a hand raise OFF L1
+    — ⚠️ **two candidate armers were removed on 2026-08-06.** The sub-floor
+    watch stalling at L1 (56: it fired on a room demoted for being *satisfied*,
+    which cannot show progress, and the hold's raise then cost the hottest room
+    its restore for 17 min), and the graded lone-raise RISE built to replace it
+    (56 again, on review: its rise is a whole-house delta, so a household step
+    inside the window mints the same false hold from the amps side) — recorded
+    BEFORE
     the breaker check that may revert it, because whether we can AFFORD the
     level he asked for says nothing about whether the level he is leaving cools
     his room. Keyed on the outdoor temperature of the observation, so the LOWER
@@ -770,16 +794,19 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     frees real headroom, the raise path is entitled to it, and the line goes
     over again. Closing it needs a shed that does not hand its amps straight
     back (the user's parked "gated proactive shed").
-55. **Ask the METER whether the compressor ran.** The sub-floor watch answers it
-    from the thermometer and needs three minutes; a lone shed's off-drop answers
-    it in one grading window, and the shed was going to happen anyway (user's own
-    experiment: "an off with 1 amp or less of drop means the compressor was not
-    running"). `AcView.compressorOffLikely` carries the verdict from two
-    ATTRIBUTABLE sources — a graded LONE off whose drop was ≤
+55. **Ask the METER whether the compressor ran.** The sub-floor watch answered it
+    from the thermometer and needed three minutes (⚠️ and answered it WRONG —
+    see 56, which made this the only automatic answer); a lone shed's off-drop
+    answers it in one grading window, and the shed was going to happen anyway
+    (user's own experiment: "an off with 1 amp or less of drop means the
+    compressor was not running"). `AcView.compressorOffLikely` carries the
+    verdict from ATTRIBUTABLE sources — a graded LONE off whose drop was ≤
     `COMPRESSOR_OFF_DROP_AMPS` (1.2) while the model claimed ≥
     `COMPRESSOR_OFF_MODEL_AMPS` (2.0), retained per device+LEVEL and per source
     until `COMPRESSOR_ON_DROP_AMPS` of graded fall or an amp of ramp absorption
-    retires it; and the dead window of 44. It feeds `isNonCooling` (so both
+    retires it; and the dead window of 44. (The lone-raise RISE of 56 was going
+    to be the third and is not — it is report-only; see 56.) It feeds
+    `isNonCooling` (so both
     ladder directions treat it exactly as they treat a stalled room), arms 52's
     learned hold, and surfaces as `coolingState` per AC. ⚠️ Never from the
     standing residual — `smoothed − modelled` moves when a room under-draws its
@@ -789,6 +816,100 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     has already certified uncontaminated (23) and settled (29). Read BEFORE the
     0.2 A learn threshold, because a room that dropped almost nothing is exactly
     the case this is about and exactly the case that gate discards.
+
+**Added 2026-08-06 after a bogus "L1 not cooling" verdict cost the hottest room 17 minutes:**
+56. **A stalled thermometer is not evidence; only ATTRIBUTABLE amps are.** User,
+    verbatim: *"it is so normal that we see no cooling progress in all rooms for
+    a long time, even with L3, so this should not be considered. However, we
+    have to depend on Amps — if it draws only about 1 amp, only the fan is
+    working, no compressor."* The 02:15:29 misfire is the proof it could not be
+    otherwise: Abdullah was demoted to L1 at 02:12:20 **for being satisfied 20
+    min**, and a room at target can never show the `SUBFLOOR_PROGRESS_C` that
+    re-bases the watch — the verdict was true by construction of the state that
+    armed it (invariant 40's own circularity ⚠️, arriving from the thermometer
+    side). The 6 h hold raised him L1→L2 at 02:36:42 on a 15 A gen, and those
+    1.5–1.9 A are why the hotter 4.3 A room stayed shed until 02:49. So:
+    `isNonCooling` keeps only the >`NON_COOLING_NEED_C` ground and
+    `compressorOffLikely`; `subFloorStalledMs` is report-only everywhere (40,
+    51's watch zone, 52's armer). **Rise-side observation, REPORT-ONLY:** a LONE
+    `set_level` raise off L1, graded over the full ramp, whose ratcheted rise is
+    ≥ its priced step (`raiseJumpAmps`) +
+    `COMPRESSOR_START_RISE_MARGIN_AMPS` (2.0 — deliberately the same "smallest
+    whole compressor" quantity as
+    `COMPRESSOR_ON_DROP_AMPS`/`DEAD_WINDOW_GAP_AMPS`) is journalled
+    (`reason: "compressor_report"`) and logged, and **arms nothing**.
+    ⚠️ It was built to set `compressorOffLikely` and arm 52's hold, and was
+    demoted on review the same day, before it ever ran on the house: the rise it
+    measures is `PendingGrade.peakDeltaAmps`, a ratcheted **whole-house**
+    smoothed delta over the 240 s window with **no non-AC load subtracted**.
+    This house's own water heater is a 3.4 A step — switch it on ninety seconds
+    into the window and an ordinary 1.5 A level step measures 4.9 A against a
+    3.5 A bar, minting a 6 h L1 hold that spends the hottest room's amps on a
+    kettle. That is this very invariant's failure class arriving from the amps
+    side instead of the thermometer side, and 5c again: a bar sized against the
+    step price alone while the quantity it is compared to contains the whole
+    house. The off-drop (55) does not share it — a coincident household step
+    DOWN is rarer, and its bar is a ceiling on a fall rather than a floor under
+    a rise. Closing it for real needs the rise taken net of `houseLoadAmps` at
+    both ends of the window; that is its own piece of work, not a threshold
+    tweak. **So the armers of 52's hold are three, all attributable: the graded
+    off-drop (55), the dead window (44), and the user's own hand raise off L1.**
+    The detection, its arm-time exclusions (`loneRaiseIsAttributable`: start
+    window, power-event ramp, FLOORS, `fromLevel === 1`) and
+    `raiseRiseSaysCompressorWasOff` all remain — as observability, and as the
+    scaffolding a net-of-house version would reuse.
+
+**Added 2026-08-06, the user's own approval of the parked proposal, from the same morning:**
+57. **A shed room may be bought back by switching a CLEARLY COOLER one off —
+    the gated proactive shed.** User: *"after Najat on and be stable, there was
+    enough budget to turn off Najat and bring Abdu back on."* Live: after the
+    02:32 storm, Najat's cheaper 3.35 A restore fitted first and took the
+    headroom; Abdu — 1.5 °C hotter, 4.3 A — stayed shed until 02:49, when the
+    heater cycled off on its own. `swapDonorFor` (raise.ts) picks the COOLEST
+    donor that is `SWAP_NEED_GAP_C` milder (= `SHED_NEED_GAP_C` 1.0, the
+    shed-side gap the user calibrated — a whole room costs at least what a level
+    costs, so never `REBALANCE_NEED_GAP_C` 0.7), unpinned, unramping, not in a
+    funding/victim cooldown, and never the last room running. Any AC may donate,
+    top-priority included (2026-08-04: the thermometer decides). The trade must
+    CLOSE the gap — the receiver fits after the donor's off at the PLAIN learned
+    price (never the probe, invariant 3) with `REBALANCE_FUND_MARGIN_AMPS` to
+    spare, on the meter AND on the envelope.
+    ⚠️ Execution is invariant 9 verbatim: the donor's `power_off` ships **ALONE**
+    (credited via `commandedCutAmps`, so its cliff cannot latch a phantom
+    collapse — 11/31), the receiver's amps are **RESERVED across ticks**
+    (`controller.swap`, mirrored in `scenario.ts` — **including the
+    source-change clear**, added on review 2026-08-06: a trade reserved amps on
+    a budget the changeover deleted, and the entry mode re-decides who runs from
+    scratch), released when the receiver returns or at `SWAP_RESERVATION_MS` =
+    `ATTEMPT_BLAME_WINDOW_MS`; and the restore is admitted on a LATER tick
+    against the committed meter (41/54).
+    ONE swap in flight house-wide, only the HOTTEST shed room may arm one.
+    ⚠️ **"ALONE" is enforced at the ARM, not hoped for:** `plan()` merges
+    `invariantCorrections` into the same batch, and the grading shell only
+    grades `meterCmds.length === 1` — so a tick carrying a correction would ship
+    the trade in a 2-command batch and silently forfeit BOTH the free `on@L`
+    sample and the off-drop compressor evidence (55) it was designed to harvest.
+    `swapAllowed` therefore requires `corrections.commands.length === 0`
+    (review, 2026-08-06; the trade stands down and re-arms next tick).
+    ⚠️ The donor gets an ordinary shed row (so it auto-restores when budget
+    genuinely allows) but is barred from restoring for `FUNDING_COOLDOWN_MS` —
+    invariant 30 one rung down, and a `power_off` now stamps that cooldown, not
+    only a `set_level`. **The bar and the RESERVATION are separate rungs**
+    (review, 2026-08-06): every funding-cooldown donor is barred, but only the
+    LIVE trade's donor reserves its restore cost, because a reservation parks
+    the raise phase *and* the fan restore house-wide and only a named receiver
+    can claim that. Keyed on `fundingCooldown` alone, a room that gave up one
+    LEVEL and was then shed for an unrelated overload froze the whole house for
+    two minutes. The need gap IS the anti-oscillation hysteresis: the
+    reverse trade needs the rooms to CROSS by the same margin (~2 × gap).
+    ⚠️ It is a COMFORT optimisation, never an emergency tool: NORMAL + gen +
+    calm only, and it stands down on any derate/collapse/frozen meter, a mean
+    over the limit, a drained bucket, a live cut credit, a bar-blocked receiver
+    (54) — and for `SWAP_QUIET_AFTER_OVER_MS` (= `PENDING_CUT_MS`) after ANY
+    over-limit batch. That last one is not redundant: every other gate reads the
+    CURRENT tick, and the acceptance replay traded a room away **50 s** after a
+    level cut with all of them satisfied. Journalled as `proactive_shed`, with a
+    push naming donor → receiver (a shed must be LOUD).
 
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
@@ -850,7 +971,13 @@ L3 at 7.3 A — above the 2-ton's measured L3). **Abdu (4.3/2.5 ⇒ 9.3 A at L3)
 6.3 A at L3) are still over-priced against the same evidence** — not yet corrected.
 ⚠ Do NOT diagnose this from the house-load figure: the residual is `smoothed − modeled draw`, so a
 room drawing less than its model inflates "house" by construction and the reasoning is circular. The
-honest signal is the room TEMPERATURE failing to fall while the level is held.
+honest signal is the ATTRIBUTABLE one — a graded lone off's DROP against what the model priced (55).
+A graded lone raise's RISE reads well but is not attributable (56): the rise is a whole-house delta
+with no non-AC load subtracted, so it is journalled and never acted on. ⚠️ The room TEMPERATURE
+failing to fall is NOT one of them
+(superseded 2026-08-06, invariant 56): a working compressor routinely shows no progress for a long
+time on a Baghdad afternoon, and a room parked at a level *because it is satisfied* cannot show
+progress at all.
 
 ## Navigating the doc
 

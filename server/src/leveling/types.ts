@@ -408,17 +408,22 @@ export interface AcView {
   /**
    * How long this room has sat BELOW its comfort floor without getting any
    * cooler (0 when at/above the floor, or whenever the room last made progress).
-   * The watch behind `isNonCooling` — inside the 2°C band a sub-floor level is
-   * assumed to cool, and this is what tests that assumption against the
-   * thermometer rather than trusting it (user, 2026-08-03).
+   *
+   * ⚠ REPORT-ONLY since 2026-08-06 — it feeds `coolingState: "stalled"` on the
+   * status card and nothing else. It used to be the watch behind `isNonCooling`
+   * (user, 2026-08-03), and it was wrong twice over: a working compressor
+   * routinely shows no progress for a long time in this heat, and a room parked
+   * at a level BECAUSE it is satisfied cannot show progress at all — which is
+   * how it armed a six-hour hold on a healthy room at 02:15:29. Amps are the
+   * evidence now; see `compressorOffLikely`.
    */
   subFloorStalledMs: number;
   /**
    * This room's compressor is probably not running RIGHT NOW, on evidence from
    * the METER rather than from the thermometer (R6, user 2026-08-04 — his own
    * experiment: "an off with 1 amp or less of drop means the compressor was not
-   * running"). Two attributable sources, both one-off measurements rather than
-   * standing residuals:
+   * running"). Attributable sources only — one-off measurements over a graded
+   * window, never standing residuals:
    *
    *  - a graded LONE off/shed whose measured drop was ≤ `COMPRESSOR_OFF_DROP_AMPS`
    *    while the model claimed ≥ `COMPRESSOR_OFF_MODEL_AMPS` at that level;
@@ -427,10 +432,16 @@ export interface AcView {
    *  - the changeover DEAD WINDOW — a power-event ramp held open past its timer
    *    because nothing has been absorbed and the whole house agrees.
    *
-   * The third way a room can be non-cooling — the sub-floor thermometer watch —
-   * is carried by `subFloorStalledMs` and consumed by the same `isNonCooling`,
-   * so it is deliberately NOT folded in here: keeping them separate is what lets
-   * the status card say "compressor off" and "stalled" as different words.
+   * ⚠ A graded LONE RAISE off L1 was written as a third source (2026-08-06, the
+   * same experiment from the other end) and does NOT set this: its rise is a
+   * whole-house delta with no non-AC load subtracted, so a household step inside
+   * the grading window reads as a compressor. It reports only — see
+   * `noteLoneRaiseRise`.
+   *
+   * Since 2026-08-06 this is the ONLY automatic evidence `isNonCooling` reads
+   * besides the room being >2°C from target. The old thermometer watch
+   * (`subFloorStalledMs`) is report-only, and the status card still says
+   * "compressor off" and "stalled" as different words.
    *
    * ⚠ Never from the standing residual (`smoothed − modelled`): a room drawing
    * under its model moves that number by construction, so reading it to decide

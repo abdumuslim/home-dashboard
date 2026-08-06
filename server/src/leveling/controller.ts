@@ -60,14 +60,17 @@ import {
   type HouseLoadState,
 } from "./house-load.js";
 import {
+  COMPRESSOR_START_RISE_MARGIN_AMPS,
   ENTRY_COLLAPSE_DWELL_MS,
   entryCollapseEvidence,
   type RoomLiveness,
   houseIsDead,
+  loneRaiseIsAttributable,
   meterIsSteady,
   modeledGapAmps,
   offDropSaysCompressorOff,
   offDropSaysCompressorOn,
+  raiseRiseSaysCompressorWasOff,
   rampAbsorptionLanded,
   RAMP_RELEASE_MAX_AMPS,
   type ModeledAc,
@@ -111,7 +114,7 @@ import {
   type LevelHold,
 } from "./level-hold.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
-import { absorbedSharesAmps } from "./raise.js";
+import { absorbedSharesAmps, SWAP_QUIET_AFTER_OVER_MS } from "./raise.js";
 import { fanTrimSavings, modelCutAmps, raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, turnOnAmps, updateCost, type CostBook } from "./costs.js";
 import { LevelingStore } from "./store.js";
 import type { AcView, Command, MeterState, Mode, PowerSource } from "./types.js";
@@ -204,6 +207,18 @@ const OUTDOOR_FRESH_MS = 10 * 60_000;
  * deliberately: it is the same wind-down being waited out.
  */
 const VICTIM_COOLDOWN_MS = 120_000;
+/**
+ * How long a gated proactive shed (the swap) may hold its receiver's amps
+ * reserved before the record is dropped.
+ *
+ * Deliberately `ATTEMPT_BLAME_WINDOW_MS`, not a new constant: the trade IS the
+ * receiver's restore attempt, one window early. If the donor's off has not
+ * bought the room back inside the window we would already be blaming that shed
+ * for, the trade has failed on its own terms and the ordinary queue takes over
+ * — the donor is a normal shed row and restores when budget genuinely allows.
+ * Nothing may reserve amps unboundedly (invariant 22's spirit).
+ */
+const SWAP_RESERVATION_MS = ATTEMPT_BLAME_WINDOW_MS;
 /**
  * How long a shed room must keep reporting ON after a boot before its shed
  * record is cleared. The boot shadow can be up to 13 minutes stale, so one
@@ -304,6 +319,25 @@ interface PendingGrade {
   contaminated: boolean;
   /** Which direction of later batch can corrupt this window's measurement. */
   direction: "up" | "down";
+  /**
+   * May this window's rise be read as COMPRESSOR evidence (2026-08-06)? Set
+   * only for a lone `set_level` raise off L1 that was commanded outside every
+   * state in which a compressor engages for a reason of its own:
+   *
+   *  - a start window (the room has just been switched on),
+   *  - a power-event ramp — the dead window / TCL restart protection after a
+   *    changeover. A raise right after a power cycle ALWAYS engages the
+   *    compressor, because that is restart protection ENDING, not L1 failing.
+   *    This is the exclusion that would otherwise mint a hold on every gen
+   *    changeover of the day.
+   *  - FLOORS (the recovery admission is commanding a whole house back, so no
+   *    single command owns the meter).
+   *
+   * Contamination and settle are NOT re-checked here — `learnGrade` is already
+   * reached only for an uncontaminated window past `learnAfter` (invariants
+   * 23/29), which is the same certification the cost learner requires.
+   */
+  riseEvidence: boolean;
 }
 
 /** Whether a batch adds load, removes it, or both (contamination direction). */
@@ -387,6 +421,17 @@ export class LevelingControllerV2 {
    * a restore was admitted 31 s after the shed that caused it (R9, invariant 41).
    */
   private shedBar = new Map<string, { amps: number; at: number }>();
+  /**
+   * The ONE gated proactive shed in flight house-wide: the room we switched off
+   * and the shed room its amps are reserved for (2026-08-06). Cleared when the
+   * receiver comes back, on a source change, or at `SWAP_RESERVATION_MS`.
+   */
+  private swap: { donorId: string; receiverId: string; at: number } | null = null;
+  /**
+   * When the ladder last shipped an over-limit batch — the memory the
+   * meter-level swap gates do not have (see `SWAP_QUIET_AFTER_OVER_MS`).
+   */
+  private lastOverLimitActAt: number | null = null;
   /** Last fan TRIM actually sent per device — the fan half of send dedupe. */
   private lastFanSent = new Map<string, { fan: number; at: number }>();
   /** Last shed actually sent per device — the power_off half of send dedupe. */
@@ -891,6 +936,10 @@ export class LevelingControllerV2 {
           // all; found reviewing the 2026-08-02 funding-cycle fix.)
           this.fundingDemotedAt.clear();
           this.reducedAt.clear();
+          // …and so is a trade in flight: it reserved amps on a budget that no
+          // longer exists, and the entry mode (FLOORS / GRID_FULL) re-decides
+          // who runs from scratch. The donor keeps its ordinary shed row.
+          this.swap = null;
           if (event.to === "grid") {
             this.manualCap.clear();
             this.manualTarget.clear();
@@ -1865,14 +1914,10 @@ export class LevelingControllerV2 {
     // even one evaluation (R14, level-hold.ts).
     if (this.acts()) await this.sweepLevelHolds(outdoorTempC, now);
 
-    // Build views.
+    // Build views. (Nothing arms a learned hold here any more — the sub-floor
+    // watch stopped being evidence on 2026-08-06; the amp-side armers all live
+    // in the grading shell, which runs a full compressor ramp behind this.)
     const acs = this.buildViews(ctx, outdoorTempC, now);
-    // …and arm a hold from our OWN evidence, now that the watch clocks for this
-    // tick exist. Deliberately AFTER the views: the hold changes the floor, and
-    // a floor that moves mid-evaluation would price this tick's plan against
-    // one picture and execute it against another. It takes effect next tick,
-    // which is the same lag every other observation in this shell carries.
-    if (this.acts()) await this.noteLevelHoldEvidence(acs, outdoorTempC, now);
     const onManaged = acs.filter((a) => a.on && a.managed && !a.shed);
     this.modeState = clearFloorsIfDone(this.modeState, {
       allConfirmedAtFloor: onManaged.every((a) => a.currentLevel > 0 && a.currentLevel <= floorOf(a)),
@@ -2033,6 +2078,12 @@ export class LevelingControllerV2 {
       // against the meter BEFORE that hole, for as long as the shed can still
       // be blamed for a bounce (R9).
       shedBarAmps: (deviceId) => this.shedBarFor(deviceId, now),
+      // The one proactive shed in flight house-wide — its receiver's amps stay
+      // reserved until the restore lands (invariant 9).
+      swapInFlight: this.swapInFlightFor(acs, now),
+      // …and the ladder's own recent history, which no meter field carries.
+      overLimitActedRecently:
+        this.lastOverLimitActAt != null && now - this.lastOverLimitActAt < SWAP_QUIET_AFTER_OVER_MS,
     });
     this.fanHolds = out.fanHolds;
 
@@ -2130,6 +2181,39 @@ export class LevelingControllerV2 {
    * closing — live 2026-08-03, four restores of one room in 23 minutes, every
    * one admitted at a 9.5–12.5 A meter whose settled value was ~15 A.
    */
+  /**
+   * The proactive-shed trade still in flight, or null — and the place it is
+   * retired.
+   *
+   * Two ways it ends, and only one of them is a clock: the receiver is BACK
+   * (the trade did what it was for), or `SWAP_RESERVATION_MS` has passed
+   * without it (the trade failed, and holding amps for a room that cannot take
+   * them is the strand every reservation in this file is bounded against). A
+   * source change clears it separately — see `clearOnSourceChange`.
+   */
+  private swapInFlightFor(acs: AcView[], now: number): { donorId: string; receiverId: string } | null {
+    const swap = this.swap;
+    if (swap == null) return null;
+    const receiver = acs.find((a) => a.deviceId === swap.receiverId);
+    if (receiver != null && receiver.on && !receiver.shed) {
+      log.info(
+        `[leveler2] Proactive shed complete: ${this.deviceNames.get(swap.receiverId) ?? swap.receiverId} ` +
+          `is back on the amps ${this.deviceNames.get(swap.donorId) ?? swap.donorId} gave up`,
+      );
+      this.swap = null;
+      return null;
+    }
+    if (now - swap.at > SWAP_RESERVATION_MS) {
+      log.warn(
+        `[leveler2] Proactive shed expired: ${this.deviceNames.get(swap.receiverId) ?? swap.receiverId} ` +
+          `never fitted in ${(SWAP_RESERVATION_MS / 1000).toFixed(0)}s — reservation released`,
+      );
+      this.swap = null;
+      return null;
+    }
+    return { donorId: swap.donorId, receiverId: swap.receiverId };
+  }
+
   private shedBarFor(deviceId: string, now: number): number {
     const bar = this.shedBar.get(deviceId);
     if (bar == null) return 0;
@@ -2210,31 +2294,29 @@ export class LevelingControllerV2 {
     }
   }
 
-  /**
-   * Arm the learned hold from the system's OWN evidence: a room sitting at a
-   * level with the sub-floor watch already stalled there (`SUBFLOOR_WATCH_MS` of
-   * no cooling progress — needs.ts). The watch arms `BOOST_WATCH_BELOW_C`
-   * before the comfort floor does, which is precisely the window in which this
-   * evidence can be gathered BEFORE the heat that makes it matter.
-   *
-   * Scoped to L1, which is the only level either of the user's triggers names:
-   * the hold's whole job is to stop the ladder ending at a level that draws a
-   * fan and cools nothing, and L1 is the level his ACs do that at.
-   */
-  private async noteLevelHoldEvidence(acs: AcView[], outdoorTempC: number | null, now: number): Promise<void> {
-    for (const ac of acs) {
-      if (!ac.on || !ac.managed || ac.shed) continue;
-      if (ac.currentLevel !== 1) continue;
-      if (ac.subFloorStalledMs < SUBFLOOR_WATCH_MS) continue;
-      await this.noteLevelHold(
-        ac.deviceId,
-        1,
-        outdoorTempC,
-        now,
-        `no cooling progress in ${Math.round(ac.subFloorStalledMs / 60_000)} min at L1`,
-      );
-    }
-  }
+  // ⚠ REMOVED 2026-08-06: `noteLevelHoldEvidence`, which armed the learned L1
+  // hold from the sub-floor WATCH (`SUBFLOOR_WATCH_MS` of no cooling progress).
+  // The user's decision, verbatim: "it is so normal that we see no cooling
+  // progress in all rooms for a long time, even with L3, so this should not be
+  // considered. However, we have to depend on Amps — if it draws only about 1
+  // amp, only the fan is working, no compressor."
+  //
+  // Live 2026-08-06 02:15:29, the shape that killed it: Abdullah had been
+  // demoted to L1 at 02:12:20 *for being satisfied for twenty minutes*, and a
+  // room at target can never show the 0.2°C of further cooling that re-bases the
+  // watch — so the verdict was true by construction of the state that produced
+  // it. The hold armed, re-armed at 02:35:21, and raised him L1→L2 at 02:36:42
+  // during a 15 A generator episode; those 1.5–1.9 A are what made restoring the
+  // hotter room (4.3 A) infeasible until 02:49.
+  //
+  // The remaining armers are all ATTRIBUTABLE: the graded lone off-drop
+  // (`noteOffDrop`), the dead window, and a manual raise off L1 (dashboard
+  // `onUserGenLevel`, or observed externally). Any NEW call site must be
+  // attributable in the same sense — which is the bar the graded lone RAISE
+  // (`noteLoneRaiseRise`) failed on review the day it was written: its rise is a
+  // whole-house delta with no non-AC load subtracted, so a household step inside
+  // the window is indistinguishable from a compressor. It reports and arms
+  // nothing.
 
   /** Live turn-on start baseline for a device, or null once the window closed. */
   private startBaselineFor(deviceId: string, on: boolean, now: number): number | null {
@@ -2555,13 +2637,27 @@ export class LevelingControllerV2 {
             this.lastOffSentAt.set(cmd.deviceId, now);
             // Whatever ON we were still waiting to confirm is now overtaken.
             this.pendingOn.delete(cmd.deviceId);
+            // A shed must be LOUD (hard rule 2's spirit), and a PROACTIVE shed
+            // must additionally say who it was for — the user reads this push
+            // and this journal, and "to protect the breaker" would be a lie
+            // about a room switched off while the line was calm.
+            const forReceiver = out.swap?.donorId === cmd.deviceId ? out.swap.receiverId : null;
+            const receiverName =
+              forReceiver == null ? null : (this.deviceNames.get(forReceiver) ?? forReceiver);
             await this.recordShed(
               cmd.deviceId,
-              `over ${effectiveLimit(this.config, view.source === "none" ? "gen" : view.source, view.derateAmps)}A on ${view.source}`,
+              receiverName != null
+                ? `swapped off on ${view.source} so ${receiverName} could run`
+                : `over ${effectiveLimit(this.config, view.source === "none" ? "gen" : view.source, view.derateAmps)}A on ${view.source}`,
             );
             await this.releaseHold(cmd.deviceId, "shed");
             this.deps.setDevicePowerCache(cmd.deviceId, "off");
-            await this.pushNotice(`AC ${name} turned off to protect the ${view.source} breaker`, true);
+            await this.pushNotice(
+              receiverName != null
+                ? `AC ${name} turned off so the hotter room (${receiverName}) can run`
+                : `AC ${name} turned off to protect the ${view.source} breaker`,
+              true,
+            );
             log.warn(`[leveler2] Shed AC ${name} (${out.reason})`);
             fanOnly = false;
             break;
@@ -2670,6 +2766,9 @@ export class LevelingControllerV2 {
       this.meterState = refillBucket(this.meterState);
     }
     if (out.reason.startsWith("over")) {
+      // The ladder acted: the comfort trade owes the house a quiet window that
+      // outlives every meter-level signal of this episode.
+      this.lastOverLimitActAt = now;
       // PARTIAL — see OVER_LIMIT_BUDGET_AFTER_ACT. A reduction that did not go
       // deep enough must be allowed to escalate in seconds, not in another
       // five readings.
@@ -2727,10 +2826,28 @@ export class LevelingControllerV2 {
     // A room that just paid for a peer's raise may not take the level straight
     // back — see FUNDING_COOLDOWN_MS. Stamped only for donors whose demote was
     // actually SENT (the filtered `commands`, not the plan's wish list).
+    //
+    // `power_off` counts since 2026-08-06: a proactive-shed donor gave up its
+    // WHOLE room, which is the same donation one rung down, and its restore is
+    // the thing that would undo the trade (the "donation cooldown" branch in
+    // raise.ts spends this stamp).
     for (const deviceId of out.fundingDonors ?? []) {
-      if (commands.some((c) => c.deviceId === deviceId && c.kind === "set_level")) {
+      if (
+        commands.some(
+          (c) => c.deviceId === deviceId && (c.kind === "set_level" || c.kind === "power_off"),
+        )
+      ) {
         this.fundingDemotedAt.set(deviceId, now);
       }
+    }
+    // Record the trade only once its donor's off has actually SHIPPED — the
+    // receiver's reservation is a claim about amps that are really leaving.
+    if (out.swap != null && commands.some((c) => c.deviceId === out.swap?.donorId && c.kind === "power_off")) {
+      this.swap = { donorId: out.swap.donorId, receiverId: out.swap.receiverId, at: now };
+      log.warn(
+        `[leveler2] Proactive shed: ${this.deviceNames.get(out.swap.donorId) ?? out.swap.donorId} off to fund ` +
+          `${this.deviceNames.get(out.swap.receiverId) ?? out.swap.receiverId}`,
+      );
     }
     // …and a room the reducer took a level from may not climb back into the
     // overload before its own cut has reached the meter (VICTIM_COOLDOWN_MS).
@@ -2747,12 +2864,24 @@ export class LevelingControllerV2 {
     // threshold would swallow a ~0.1A fan step — so fan costs stay seed-only).
     const meterCmds = commands.filter((c) => c.kind !== "set_fan");
     let single: PendingGrade["single"] = null;
+    let riseEvidence = false;
     if (meterCmds.length === 1 && view.source !== "none") {
       const cmd = meterCmds[0];
       if (cmd.kind === "set_level") {
         const from = this.recon[cmd.deviceId]?.confirmedLevel;
         if (from != null && from >= 1 && cmd.level > from) {
           single = { deviceId: cmd.deviceId, transition: `level:${from}>${cmd.level}` };
+          // …and a lone raise OFF L1 is also the rise-side OBSERVATION (R6b):
+          // how far the meter moves hints at whether anything but the fan was
+          // running down there. Judged HERE, at the send, because every
+          // exclusion is a statement about the state we commanded it from.
+          // Report-only — see `noteLoneRaiseRise` for why it may not arm a hold.
+          riseEvidence = loneRaiseIsAttributable({
+            fromLevel: from,
+            floorsMode: mode === "FLOORS",
+            inStartWindow: acs.find((a) => a.deviceId === cmd.deviceId)?.startBaselineAmps != null,
+            inPowerEventRamp: this.powerEventRamp.has(cmd.deviceId),
+          });
         }
       } else if (cmd.kind === "power_on") {
         single = { deviceId: cmd.deviceId, transition: `on@L${cmd.level}` };
@@ -2822,6 +2951,7 @@ export class LevelingControllerV2 {
       attempts: out.attempts,
       contaminated: bornContaminated,
       direction: single?.negate === true ? "down" : "up",
+      riseEvidence,
     });
     if (this.pendingGrades.length > MAX_PENDING_GRADES) {
       this.pendingGrades = this.pendingGrades.slice(-MAX_PENDING_GRADES);
@@ -2908,6 +3038,10 @@ export class LevelingControllerV2 {
     // threshold below: a room that dropped almost nothing is exactly the case
     // this is about, and that is the case the threshold discards.
     if (grade.single.negate === true) this.noteOffDrop(grade, learnSample, now);
+    // …and the rise-side observation (R6b), REPORT-ONLY. Same placement and the
+    // same reason: read BEFORE the 0.2A learn threshold, so what gets reported
+    // never depends on what the cost book happens to accept.
+    else if (grade.riseEvidence) await this.noteLoneRaiseRise(grade, learnSample, now);
     if (!(learnSample > 0.2)) return;
     this.book = updateCost(
       this.book,
@@ -2960,11 +3094,79 @@ export class LevelingControllerV2 {
       `[leveler2] ${name}: switching off at L${level} moved the meter ${dropAmps.toFixed(1)}A against a ` +
         `${modeled.toFixed(1)}A model — its compressor was not running at that level`,
     );
-    // …and that is one of R14's two triggers, arriving minutes before the
-    // thermometer watch could have said the same thing.
+    // …and that is one of R14's triggers — and since 2026-08-06 one of only
+    // three, the thermometer watch having stopped being evidence at all.
     if (level === 1) {
       void this.noteLevelHold(deviceId, 1, this.freshOutdoorC(now), now, `off-drop of only ${dropAmps.toFixed(1)}A at L1`);
     }
+  }
+
+  /**
+   * What one graded LONE RAISE off L1 SUGGESTS about that room's compressor —
+   * REPORT-ONLY (2026-08-06; built as the rise-side twin of `noteOffDrop` and
+   * demoted the same day, on review, before it ever ran on the house).
+   *
+   * The measurement still happens and is still worth reading: a raise off L1
+   * that moves the meter by a whole compressor MORE than its own step price
+   * looks like a compressor STARTING, i.e. one that was not running at L1.
+   *
+   * ⚠ But it may not ARM anything, because the quantity it measures is not the
+   * room. `riseAmps` is `PendingGrade.peakDeltaAmps` — a ratcheted WHOLE-HOUSE
+   * smoothed delta over the 240 s window — and nothing subtracts non-AC load.
+   * This house's own water heater is a 3.4 A step; switched on inside the
+   * window it turns an ordinary 1.5 A level step into a 4.9 A "rise" against a
+   * 3.5 A bar, and the 6 h L1 hold that used to follow would spend the hottest
+   * room's amps on a kettle. That is precisely the false-evidence class
+   * invariant 56 exists to kill, arriving from the amps side instead of the
+   * thermometer side. `noteOffDrop` does not share the flaw: a household step
+   * DOWN coincident with our own off is both rarer and self-limiting, and the
+   * off-drop bar is a ceiling on a fall rather than a floor under a rise.
+   *
+   * So this journals and logs, and the three armers of the learned hold stay
+   * the ones that measure only what they can attribute: the graded off-drop
+   * (55), the dead window (44), and the user's own hand raise. Closing it for
+   * real needs the rise taken net of `houseLoadAmps` at both ends of the
+   * window — its own piece of work, not a threshold tweak.
+   *
+   * The window has already been certified uncontaminated (23) and settled (29)
+   * by `gradePending`; the commanded-state exclusions were stamped at arm time
+   * (`riseEvidence`). Nothing here touches the cost book either — the same
+   * sample goes on to `updateCost` exactly as before.
+   */
+  private async noteLoneRaiseRise(grade: PendingGrade, riseAmps: number, now: number): Promise<void> {
+    if (grade.single == null || grade.source === "none") return;
+    const to = Number(/^level:1>(\d+)$/.exec(grade.single.transition)?.[1] ?? NaN);
+    if (!Number.isFinite(to) || to <= 1) return;
+    const deviceId = grade.single.deviceId;
+    const maxLevel = this.deviceMaxLevel.get(deviceId) ?? 3;
+    // Priced with the SAME function admission uses (max of model and learned),
+    // read before this window's own sample is folded in — so the bar is what we
+    // thought the step was worth when we bought it.
+    const priced = raiseJumpAmps(this.book, this.config, deviceId, grade.source, 1, to, maxLevel, now).amps;
+    if (!raiseRiseSaysCompressorWasOff(riseAmps, priced)) return;
+    const name = this.deviceNames.get(deviceId) ?? deviceId;
+    const detail =
+      `lone L1→L${to} raise rose ${riseAmps.toFixed(1)}A ` +
+      `(≥ bar ${(priced + COMPRESSOR_START_RISE_MARGIN_AMPS).toFixed(1)}A) — compressor may not have been ` +
+      `running at L1 (report-only)`;
+    log.warn(`[leveler2] ${name}: ${detail}`);
+    // Journalled so the observation is durable and greppable next to the batch
+    // that produced it — docker logs rotate in ~1.5 days, the journal does not.
+    await this.store
+      .insertJournal({
+        at: now,
+        source: grade.source,
+        mode: deriveMode(this.modeState, now),
+        severity: null,
+        reason: "compressor_report",
+        requiredAmps: null,
+        preAmps: grade.preAmps,
+        commands: [],
+        decisions: [{ at: now, deviceId, action: "compressor report", detail }],
+        expectedDelta: null,
+        executed: false,
+      })
+      .catch(() => undefined);
   }
 
   private async persistFanHold(deviceId: string): Promise<void> {

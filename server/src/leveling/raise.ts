@@ -16,6 +16,7 @@ import { levelCutSavings, modelCutAmps, modelFor, raiseJumpAmps, restoreCostAmps
 import type { LevelingConfigV2 } from "./config.js";
 import { ceilCapOf, ceilOf, floorOf, isNonCooling } from "./needs.js";
 import { SHED_NEED_GAP_C } from "./reduce.js";
+import { PENDING_CUT_MS } from "./sensing.js";
 import {
   attemptedWithin,
   canAttempt,
@@ -255,6 +256,156 @@ export const REBALANCE_NEED_GAP_C = 0.7;
  */
 export const REBALANCE_FUND_MARGIN_AMPS = 0.5;
 
+/**
+ * How much HOTTER a shed room must be than a RUNNING peer before that peer's
+ * WHOLE ROOM is traded for it — the gated proactive shed (user, 2026-08-06,
+ * after the 02:21–02:49 heater episode: *"after Najat on and be stable, there
+ * was enough budget to turn off Najat and bring Abdu back on"*).
+ *
+ * Deliberately `SHED_NEED_GAP_C` and NOT `REBALANCE_NEED_GAP_C` (0.7). The
+ * rebalance trades ONE LEVEL between two running rooms; this trades a whole
+ * room's cooling, which is the shed-side question — "who may be switched off so
+ * another room keeps running?" — and the user calibrated that constant himself
+ * on 2026-08-04 ("1 c is enough to switch between acs"). One gap rule for every
+ * decision about who loses their room, not a second constant to drift from it.
+ *
+ * It is also the anti-oscillation hysteresis, and the asymmetry is the whole of
+ * it: the donor leaves the trade `SWAP_NEED_GAP_C` cooler than the receiver, so
+ * for the donor to win the room back the two rooms must genuinely CROSS by the
+ * same margin — ~2 × gap of real thermometer movement. Sensor noise (0.1 °C
+ * LSB) cannot ping-pong a swap, and the reverse swap is structurally impossible
+ * until the rooms have actually swapped places.
+ */
+export const SWAP_NEED_GAP_C = SHED_NEED_GAP_C;
+
+/**
+ * Quiet the gated proactive shed owes the LADDER after any over-limit batch.
+ *
+ * The meter-level gates (`swapAllowed`) all read the CURRENT tick: bucket full,
+ * mean under the limit, no credit outstanding. None of them remembers that the
+ * reducer was working a minute ago — and 50 s after a level cut the acceptance
+ * replay showed exactly that: meter settled, calm re-established, credit
+ * absorbed, arithmetic closing, and a room switched off inside an episode the
+ * house had not finished digesting. A comfort optimisation has nothing to lose
+ * by waiting and a room to lose by not.
+ *
+ * `PENDING_CUT_MS` by DERIVATION, not by value: it is this controller's own
+ * standing answer to "how long may a cut we commanded still be landing?"
+ * (invariants 5 and 48). One number, so the two cannot drift apart.
+ */
+export const SWAP_QUIET_AFTER_OVER_MS = PENDING_CUT_MS;
+
+/** A proactive-shed trade: switch `donorId` off so `receiverId` can come back. */
+export interface SwapDecision {
+  donorId: string;
+  receiverId: string;
+}
+
+export interface SwapDonorInput {
+  /** The shed room we want back — the hottest shed candidate, and only it. */
+  receiver: AcView;
+  /** Every ON, managed, un-shed AC (the pool donors are drawn from). */
+  running: readonly AcView[];
+  /**
+   * What the receiver's return costs at the PLAIN learned price. NEVER the
+   * gentle probe price: the fan pin does not shrink a compressor (invariant 3),
+   * and a swap spends a whole room's comfort — it may not be armed on the one
+   * price the house has already proved optimistic.
+   */
+  receiverCostAmps: number;
+  /**
+   * The committed meter the receiver's restore is judged against — bar-aware
+   * (invariant 54) and ramp-debited, exactly the figure the ordinary admission
+   * used to refuse it.
+   */
+  committedAmps: number;
+  /** The restore ceiling (limit − margin). */
+  ceilingAmps: number;
+  /**
+   * Model-priced steady draw a donor's `power_off` frees. Model, not
+   * max(model, learned): this is the SAME number `commandedCutAmpsOf` will
+   * credit the collapse detector with (invariant 11), and a swap must never
+   * admit more amps than the credit it arms.
+   */
+  donorSavingsAmps: (donor: AcView) => number;
+  /**
+   * Worst-case cap-model envelope of the end-state after `donor` goes off and
+   * the receiver returns at its floor; null when the source is not
+   * envelope-guarded. The meter is not the only judge of a commanded end-state
+   * (invariant 16 / hard rule 5c).
+   */
+  envelopeAfter: ((donor: AcView) => number) | null;
+  /** Donor is serving a funding/victim cooldown and may not be touched. */
+  blocked: (deviceId: string) => boolean;
+}
+
+/**
+ * Pick the one room to switch OFF so a hotter shed room can come back — the
+ * gated proactive shed, un-parked 2026-08-06 (reduce.ts's invariant-39 note
+ * named it as the missing piece; the 02:21 incident is its confirming case).
+ *
+ * The whole shape of this morning: a heater put the non-AC house at 7.4 A on a
+ * 15 A generator, the reducer shed Najat (26.5 °C) and Abdu (28 °C), Najat's
+ * cheaper 3.35 A restore fitted first and took the headroom, and Abdu's 4.3 A
+ * then did not fit for SEVENTEEN MINUTES — until the heater cycled off on its
+ * own. The house had the amps for the hotter room the entire time; what it did
+ * not have was a way to spend a cool room's amps on a hot one.
+ *
+ * Every gate below is load-bearing, and each fails CLOSED (no swap):
+ *
+ *  - **Need gap** (`SWAP_NEED_GAP_C`) — the donor must be meaningfully cooler.
+ *    Ranked on `rankNeedDelta`, the one question asked of every room in the
+ *    same unit (invariant 50): a feels-like metric must never decide which room
+ *    loses its compressor.
+ *  - **Unpinned** — a `manualTarget`/`manualCap` is user intent, and manual
+ *    always wins. Configured PRIORITY is deliberately NOT a shield: the user's
+ *    2026-08-04 policy is that the thermometer decides and the coolest room
+ *    goes off, top-priority included.
+ *  - **Not ramping** — a compressor mid-start has not shown its amps yet, so
+ *    neither its saving nor the meter it would leave behind is knowable.
+ *  - **Not cooling down** — a room inside a funding or victim cooldown is
+ *    already paying for something (invariants 30 and 35).
+ *  - **Not the last room running** — a swap re-arranges cooling; it may not
+ *    empty the house on the way through.
+ *  - **It must actually CLOSE the gap** — the receiver has to fit AFTER the
+ *    donor's off lands, with `REBALANCE_FUND_MARGIN_AMPS` to spare, on BOTH the
+ *    meter and the physics envelope. A trade that leaves the receiver still
+ *    refused has spent a room's comfort for nothing.
+ *
+ * Coolest eligible donor first, and the FIRST one whose off makes the receiver
+ * fit wins — never the biggest saving, which would trade a warm room's whole
+ * compressor when a cooler one covered the gap.
+ */
+export function swapDonorFor(input: SwapDonorInput): { donor: AcView; freedAmps: number } | null {
+  const { receiver, running } = input;
+  // A swap re-arranges cooling between rooms; with one room running there is
+  // nothing to re-arrange, only a house to empty.
+  if (running.length < 2) return null;
+  const eligible = running
+    .filter(
+      (a) =>
+        a.deviceId !== receiver.deviceId &&
+        a.on &&
+        a.managed &&
+        !a.shed &&
+        !a.ramping &&
+        a.manualTarget == null &&
+        a.manualCap == null &&
+        !input.blocked(a.deviceId) &&
+        a.rankNeedDelta + SWAP_NEED_GAP_C <= receiver.rankNeedDelta,
+    )
+    .sort((x, y) => x.rankNeedDelta - y.rankNeedDelta);
+  for (const donor of eligible) {
+    const freedAmps = input.donorSavingsAmps(donor);
+    if (!(freedAmps > 0)) continue;
+    const after = input.committedAmps - freedAmps + input.receiverCostAmps;
+    if (after + REBALANCE_FUND_MARGIN_AMPS > input.ceilingAmps) continue;
+    if (input.envelopeAfter != null && input.envelopeAfter(donor) > input.ceilingAmps) continue;
+    return { donor, freedAmps };
+  }
+  return null;
+}
+
 export interface RaiseInput {
   /** ALL managed AC views (on and off/shed), pre-sorted by priority. */
   acs: AcView[];
@@ -322,6 +473,22 @@ export interface RaiseInput {
    * Defaults to "no bar", i.e. exactly the pre-R9 admission.
    */
   shedBarAmps?: (deviceId: string) => number;
+  /**
+   * The gated proactive shed may arm this tick — the SITUATIONAL half of its
+   * gate, owned by the caller (pipeline.ts): NORMAL mode, gen, no derate, no
+   * collapse, no over-limit episode in flight and nothing landing. It is a
+   * comfort optimisation, not an emergency tool, so it stands down whenever the
+   * house is busy. Defaults to OFF — a caller that has not thought about it
+   * never trades a room away.
+   */
+  swapAllowed?: boolean;
+  /**
+   * The proactive shed already in flight house-wide (donor → receiver), or null.
+   * ONE at a time: while it is set no new swap may arm, and the receiver's amps
+   * stay RESERVED across ticks until its restore lands (invariant 9 — the
+   * saving is spent only once the meter has shown it).
+   */
+  swapInFlight?: SwapDecision | null;
 }
 
 export interface RaisePlan {
@@ -355,6 +522,12 @@ export interface RaisePlan {
    * meter (see `RaiseInput.fundingCooldown`).
    */
   fundingDonors: string[];
+  /**
+   * The proactive shed this plan ARMED (donor → receiver), or null. The shell
+   * records it once the donor's `power_off` has actually shipped, so the
+   * receiver's amps stay reserved across ticks until its restore lands.
+   */
+  swap: SwapDecision | null;
 }
 
 /**
@@ -438,21 +611,28 @@ export function planRaise(input: RaiseInput): RaisePlan {
   // draw exceeds limit − margin, no matter how much room the meter shows.
   const envelopeCeiling = input.limitAmps - config.marginAmps;
   const envelopeGuard = source === "gen";
-  const envelopeWith = (overrides: Record<string, number>, extra?: { deviceId: string; level: number; maxLevel: number }): number =>
+  const envelopeWith = (
+    overrides: Record<string, number>,
+    extra?: { deviceId: string; level: number; maxLevel: number },
+    /** A room this batch is switching OFF — it draws nothing in the end-state. */
+    excludeId?: string,
+  ): number =>
     envelopeTotalAmps(
       [
-        ...onManaged.map((a) => ({
-          deviceId: a.deviceId,
-          // `envelopeLevel`, not `currentLevel`: the shadow confirms minutes
-          // late on some firmware, and a worst-case guard that prices a peer at
-          // a level we already commanded it away from is not a guard at all
-          // (2026-07-28 15:55:36 — Abdu L2→L3 admitted at a 13.6A envelope
-          // because Najat's L3, sent 16 min earlier, had not confirmed; the
-          // same end-state was vetoed at 15.6A once it did). An explicit
-          // override always wins — those are commanded end-states this batch.
-          level: overrides[a.deviceId] ?? a.envelopeLevel,
-          maxLevel: a.maxLevel,
-        })),
+        ...onManaged
+          .filter((a) => a.deviceId !== excludeId)
+          .map((a) => ({
+            deviceId: a.deviceId,
+            // `envelopeLevel`, not `currentLevel`: the shadow confirms minutes
+            // late on some firmware, and a worst-case guard that prices a peer
+            // at a level we already commanded it away from is not a guard at all
+            // (2026-07-28 15:55:36 — Abdu L2→L3 admitted at a 13.6A envelope
+            // because Najat's L3, sent 16 min earlier, had not confirmed; the
+            // same end-state was vetoed at 15.6A once it did). An explicit
+            // override always wins — those are commanded end-states this batch.
+            level: overrides[a.deviceId] ?? a.envelopeLevel,
+            maxLevel: a.maxLevel,
+          })),
         ...(extra != null ? [extra] : []),
       ],
       config,
@@ -573,7 +753,8 @@ export function planRaise(input: RaiseInput): RaisePlan {
     return step.amps <= input.headroomAmps - input.rampDebitAmps;
   };
 
-  for (const candidate of shedCandidates) {
+  const swapInFlight = input.swapInFlight ?? null;
+  for (const [candidateIndex, candidate] of shedCandidates.entries()) {
     // Candidates are most-needy-first, so a stranded room that outranks this
     // one outranks every candidate behind it: stand the whole phase down (no
     // reservation) and let the raise phase buy the floor back.
@@ -593,6 +774,45 @@ export function planRaise(input: RaiseInput): RaisePlan {
           `${needier.roomTempC != null ? `, room ${needier.roomTempC.toFixed(1)}°C` : ""})`,
       });
       break;
+    }
+    // A room that funded a peer may not take the donation straight back —
+    // invariant 30's rule, reaching the restore queue. Without it the donor is
+    // the cheapest thing on the board and simply undoes the trade before the
+    // receiver's compressor has even started.
+    //
+    // ⚠ Two tiers, and the split is the point (review, 2026-08-06). RESERVING
+    // amps is a claim that these specific amps are spoken for, and only the
+    // live trade can make it: `fundingCooldown` is ALSO stamped by an ordinary
+    // level-funding demote (invariant 30 proper), so keying the reservation on
+    // it alone let a room that gave up one LEVEL and was then shed for an
+    // unrelated overload park the raise phase AND the fan restore house-wide
+    // for two minutes. The BAR is right for both; the RESERVATION is right only
+    // for the swap donor, whose amps a named receiver is waiting on.
+    if (input.fundingCooldown?.(candidate.deviceId) === true) {
+      const isSwapDonor = swapInFlight != null && swapInFlight.donorId === candidate.deviceId;
+      const donated = restoreCostAmps(
+        book,
+        config,
+        candidate.deviceId,
+        source,
+        floorOf(candidate),
+        candidate.maxLevel,
+        now,
+        { gentle: false },
+      );
+      if (isSwapDonor) reservedAmps = Math.max(reservedAmps, donated.amps);
+      decisions.push({
+        at: now,
+        deviceId: candidate.deviceId,
+        action: "restore",
+        blockedBy: "donation cooldown",
+        detail: isSwapDonor
+          ? `it was switched off to fund ${swapInFlight?.receiverId} — reserved ${donated.amps.toFixed(1)}A ` +
+            `until that room is back`
+          : `it just funded a peer's raise — barred for the funding cooldown, but its ` +
+            `${donated.amps.toFixed(1)}A are not reserved (no trade is waiting on them)`,
+      });
+      continue;
     }
     const floor = floorOf(candidate);
     // What THIS room's return is judged against: the committed meter, never
@@ -738,6 +958,120 @@ export function planRaise(input: RaiseInput): RaisePlan {
       continue;
     }
 
+    // ---- GATED PROACTIVE SHED (the swap), 2026-08-06 ----
+    // The room does not fit plain and does not fit at floors. Before writing it
+    // off for another tick, ask the question this morning's journal asked for:
+    // is there a room RUNNING that is clearly cooler, whose off would buy this
+    // one back? (User: "after Najat on and be stable, there was enough budget to
+    // turn off Najat and bring Abdu back on.")
+    //
+    // Execution is invariant 9 verbatim — never spend a saving that has not
+    // landed. The donor's `power_off` ships ALONE (a reducing batch, credited
+    // via `commandedCutAmps` so its cliff cannot latch a phantom collapse —
+    // invariants 11/31), the receiver's amps are RESERVED, and the restore is
+    // admitted on a LATER tick once the committed meter shows the saving landed
+    // (invariant 41's bar arithmetic, which the same `candidateCommitted` above
+    // already applies). Shipping both in one batch would commit ~4 A of
+    // compressor on a 15 A line for however long the donor takes to wind down.
+    if (!fitsPlain && !fitsAtFloors && swapInFlight != null && swapInFlight.receiverId === candidate.deviceId) {
+      // Our own trade is still landing. These amps are SPOKEN FOR — reserve
+      // them (which parks the raise phase and the fan restore) so the swap
+      // cannot be robbed by a peer's cheaper step between the donor's off and
+      // this restore. This is the reservation surviving across ticks.
+      reservedAmps = Math.max(reservedAmps, plainCost.amps);
+      decisions.push({
+        at: now,
+        deviceId: candidate.deviceId,
+        action: "restore",
+        blockedBy: "swap landing",
+        detail:
+          `${swapInFlight.donorId} was switched off for this room — ` +
+          `reserved ${plainCost.amps.toFixed(1)}A until the saving reaches the meter ` +
+          `(committed ${candidateCommitted.toFixed(1)}A of ${restoreCeiling.toFixed(1)}A)`,
+      });
+      continue;
+    }
+    if (
+      !fitsPlain &&
+      !fitsAtFloors &&
+      input.swapAllowed === true &&
+      swapInFlight == null &&
+      // Only the HOTTEST shed room may be bought back this way. A cooler
+      // candidate reaching for a donor would be trading rooms sideways, and the
+      // gap that makes the trade honest is measured from the top of the queue.
+      candidateIndex === 0 &&
+      // Same calm the restore it funds must clear. A swap is a comfort
+      // optimisation; it waits for a quiet line like every other spend.
+      restoreCalmOk &&
+      canAttempt(pacing, candidate.deviceId, "restore", now) &&
+      !attemptedWithin(pacing, candidate.deviceId, "restore", RESTORE_CONFIRM_WAIT_MS, now)
+    ) {
+      const picked = swapDonorFor({
+        receiver: candidate,
+        running: onManaged,
+        // PLAIN price only (invariant 3) — the probe discount may not arm a
+        // trade that costs another room its compressor.
+        receiverCostAmps: plainCost.amps,
+        committedAmps: candidateCommitted,
+        ceilingAmps: restoreCeiling,
+        // `currentLevel`, deliberately — the SAME level `commandedCutAmpsOf`
+        // will price this `power_off` at when it credits the collapse detector.
+        // The worst-case `chargedLevelOf` would credit admission MORE than the
+        // batch is credited, i.e. admit a trade on a saving nothing else in the
+        // system believes in (and it is the permissive direction, which is the
+        // one that trips breakers).
+        donorSavingsAmps: (donor) =>
+          modelCutAmps(config, donor.deviceId, source, donor.currentLevel, null, donor.maxLevel),
+        envelopeAfter: envelopeGuard
+          ? (donor) => envelopeWith({}, candidateEntry, donor.deviceId)
+          : null,
+        blocked: (deviceId) =>
+          input.fundingCooldown?.(deviceId) === true || input.victimCooldown?.(deviceId) === true,
+      });
+      if (picked != null) {
+        const { donor, freedAmps } = picked;
+        commands.push({ deviceId: donor.deviceId, kind: "power_off", reason: "shed" });
+        cutAmps += freedAmps;
+        // The donor funded a peer with its whole room — invariant 30's cooldown
+        // applies to it exactly as it does to a level donor, which is what the
+        // "donation cooldown" branch above spends.
+        fundingDonors.push(donor.deviceId);
+        reservedAmps = Math.max(reservedAmps, plainCost.amps);
+        decisions.push({
+          at: now,
+          deviceId: donor.deviceId,
+          action: "proactive shed",
+          detail:
+            `${donor.name} → ${candidate.name}: switching ${donor.name} off ` +
+            `(${donor.rankNeedDelta.toFixed(1)}°C real` +
+            `${donor.roomTempC != null ? `, room ${donor.roomTempC.toFixed(1)}°C` : ""}) ` +
+            `to bring ${candidate.name} back ` +
+            `(${candidate.rankNeedDelta.toFixed(1)}°C real` +
+            `${candidate.roomTempC != null ? `, room ${candidate.roomTempC.toFixed(1)}°C` : ""}) — ` +
+            `frees ~${freedAmps.toFixed(1)}A, restore needs ${plainCost.amps.toFixed(1)}A ` +
+            `at ${candidateCommitted.toFixed(1)}A committed vs ${restoreCeiling.toFixed(1)}A`,
+        });
+        decisions.push({
+          at: now,
+          deviceId: candidate.deviceId,
+          action: "restore",
+          blockedBy: "swap landing",
+          detail: `reserved ${plainCost.amps.toFixed(1)}A — restores once the meter shows the saving`,
+        });
+        return {
+          commands,
+          decisions,
+          attempts,
+          isTurnOn: false,
+          reservedAmps,
+          probeRestoreIds: [],
+          cutAmps,
+          fundingDonors,
+          swap: { donorId: donor.deviceId, receiverId: candidate.deviceId },
+        };
+      }
+    }
+
     // Can't return this tick even with peer floor-downs → reserve NOTHING
     // (raises don't change floors math, so parking here would be a permanent
     // strand); the next-most-needy candidate may still fit.
@@ -821,7 +1155,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       commands.push(restoreCmd());
       attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: candidateCommitted });
       decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}`, detail: probeDetail });
-      return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors };
+      return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors, swap: null };
     }
     for (const a of onManaged) {
       const f = floorOf(a);
@@ -849,7 +1183,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       action: `restore @L${floor} with peer floor-downs`,
       detail: probeDetail,
     });
-    return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors };
+    return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors, swap: null };
   }
 
   // A feasible restore is reserved but gated (backoff/calm) — park the ENTIRE
@@ -866,7 +1200,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       blockedBy: "restore reservation",
       detail: `${reservedAmps.toFixed(1)}A reserved`,
     });
-    return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors };
+    return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors, swap: null };
   }
 
   // ---- Raise phase: one-step, meter-anchored, most-needy first ----
@@ -1224,5 +1558,5 @@ export function planRaise(input: RaiseInput): RaisePlan {
     if (source === "gen") break;
   }
 
-  return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors };
+  return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors, swap: null };
 }

@@ -451,11 +451,22 @@ export function planReduction(input: ReduceInput): ReducePlan {
         // genuine floor-down, so it fits at floors honestly. The loop is
         // structural — the shed frees headroom, the raise path is entitled to
         // it, and the line goes over again — and closing it means a shed that
-        // does not hand its amps straight back, which is the user's parked
-        // "gated proactive shed", deliberately not built this session.
+        // does not hand its amps straight back.
+        //
+        // ⚠ UPDATE 2026-08-06: that prerequisite now EXISTS. The user approved
+        // the parked "gated proactive shed" after the 02:21 heater episode, and
+        // it lives in `raise.ts` (`swapDonorFor` + the swap branch of the
+        // restore phase): a shed whose freed amps are RESERVED for a named
+        // hotter room, with the donor barred from taking them back. It is not,
+        // however, the same thing as flipping this term — it fires from the
+        // RECOVERY side, on a calm line, for a room that is already off. This
+        // term would still have to answer "shed a running room because a level
+        // is not cooling it", and the 41-commands-in-40-minutes evidence above
+        // is about THAT question.
         //
         // Left conditional, on evidence, for the second time. Do not flip it
-        // without re-running that scenario and reading the command list.
+        // without re-running that scenario and reading the command list — now
+        // with the swap live, which changes what the restore path does next.
         shedNeed: shedNeed + (sheds > 0 ? subFloorNeed : 0),
         feasible: savings >= requiredAmps - EPS && (!requireShed || sheds > 0),
         // "A bystander pays" — but only when the bystander is not obviously the

@@ -545,3 +545,56 @@ describe("raise cooldowns reach the planner", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// The gated proactive shed ships its donor's `power_off` ALONE (invariant 9,
+// restated by 57). `plan()` merges `invariantCorrections` into the same batch,
+// and the grading shell only grades a batch whose meter commands number exactly
+// one — so a tick that carries a correction would ship the trade in a 2-command
+// batch and silently lose BOTH the free `on@L` cost sample and the off-drop
+// compressor evidence (invariant 55) the trade was designed to harvest, while
+// the SKILL still claimed "ships ALONE". Found on review, 2026-08-06.
+// ---------------------------------------------------------------------------
+
+describe("proactive shed: the donor's power_off may not share a batch", () => {
+  // The scene has to be built so the correction does NOT rescue the restore on
+  // its own, or the swap never reaches its branch and the test proves nothing:
+  //  - `hot` is shed and needs 5.0A; committed 12.5A against a 14.9A ceiling,
+  //    so plain (17.5A) refuses;
+  //  - `mid` is inside its gen turn-on window at L2, so the gen start clamp
+  //    emits `set_level 1` for it — and that floor-down is worth only 2.0A,
+  //    leaving the at-floors fit at 15.5A, still refused;
+  //  - `cool` is at its floor and 2.0°C milder, and switching it off frees the
+  //    4.0A that closes the gap.
+  const swapCfg: LevelingConfigV2 = {
+    ...cfg,
+    ampModels: { a: { baseAmps: 5, stepAmps: 2 }, b: { baseAmps: 2, stepAmps: 2 }, c: { baseAmps: 4, stepAmps: 2 } },
+    genAmpModels: { a: { baseAmps: 5, stepAmps: 2 }, b: { baseAmps: 2, stepAmps: 2 }, c: { baseAmps: 4, stepAmps: 2 } },
+  };
+  const hot = () => ac("a", { name: "hot", on: false, shed: true, currentLevel: 1, needDelta: 3, rankNeedDelta: 3.0 });
+  const mid = (o: Partial<AcView> = {}) =>
+    ac("b", { name: "mid", currentLevel: 2, needDelta: 2.5, rankNeedDelta: 2.5, ...o });
+  const cool = () => ac("c", { name: "cool", currentLevel: 1, needDelta: 1.0, rankNeedDelta: 1.0 });
+  const calm = () => meter({ smoothedAmps: 12.5, calmMs: 300_000 });
+
+  it("arms the trade on a clean tick (the control)", () => {
+    const out = run([hot(), mid(), cool()], calm(), { config: swapCfg });
+    expect(out.swap).toEqual({ donorId: "c", receiverId: "a" });
+    // ALONE — this is the assertion the fix exists to keep true.
+    expect(out.commands).toEqual([{ deviceId: "c", kind: "power_off", reason: "shed" }]);
+  });
+
+  it("stands down on a tick where an invariant correction also ships", () => {
+    // `mid` is inside its gen start window, so the L2→L1 clamp owns this tick.
+    const out = run([hot(), mid({ startBaselineAmps: 5 }), cool()], calm(), { config: swapCfg });
+    expect(out.swap).toBeNull();
+    expect(out.commands.some((c) => c.kind === "power_off")).toBe(false);
+    // The correction still ships — standing down costs the trade one tick, not
+    // the hard invariant. It re-arms on the next calm tick.
+    expect(out.commands).toContainEqual({ deviceId: "b", kind: "set_level", level: 1 });
+    // ⚠ Deliberate and worth knowing: with no trade to reserve them, the freed
+    // amps go to the ordinary raise phase (`cool` L1→L2 here). The trade is a
+    // comfort optimisation and it waits; a batch that never grades would cost
+    // the cost book and the compressor evidence permanently.
+  });
+});

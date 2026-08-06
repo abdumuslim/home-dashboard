@@ -241,6 +241,21 @@ export class Collector {
   // A manual UI vertical-swing change suspends swing enforcement until the active
   // slot changes or the AC power-cycles (no shadow-drift detection — UI-driven only).
   private acSwingOverrides = new Map<string, AcSwingOverride>(); // key `${rule.id}:${deviceId}`
+  /**
+   * Last AC power cycle this process can ATTRIBUTE to something other than the
+   * rule that owns the device — a leveler shed/restore or a mains power event.
+   * Two jobs: it is the edge on which pre-cycle fan/swing intent is forgotten,
+   * and it is the window inside which a swing difference reads as a firmware
+   * reset rather than as somebody's remote (see `driftedRangeSwing`).
+   */
+  private acPowerCycleAt = new Map<string, number>();
+  private readonly AC_POWER_CYCLE_RESET_MS = 15 * 60_000;
+  /** Devices seen shed on the previous sweep — for leveler shed EDGE detection. */
+  private acShedSeen = new Set<string>();
+  // Fan/swing enforcement sweep (beep-style): per-device resend cooldown so a
+  // lagging shadow can never turn "re-assert once" into a command every tick.
+  private acEnforceLastSent = new Map<string, number>();
+  private readonly AC_ENFORCE_RESEND_COOLDOWN_MS = 30_000;
   // Last automation-sent power-off per device — the shadow can lag past the 5s power
   // cache TTL, so off branches re-firing inside this grace are duplicates, not state.
   private acRangeOffAt = new Map<string, number>();
@@ -436,7 +451,75 @@ export class Collector {
     // Shadows go stale across power events (ACs restart, firmware republishes
     // late) — force the next leveling tick to fetch live device state.
     this.lastLevelerDevicesFetch = 0;
+    // A changeover / collapse / blackout restarts the units themselves: the
+    // firmware resets the blower to built-in auto and re-reads swing. That is a
+    // power cycle for every managed AC, and none of it passes through a
+    // rule-owned clear site (2026-08-06).
+    for (const dev of this.tclCloud?.getDevices() ?? []) {
+      this.notePowerCycle(dev.id, `power event (${kind})`);
+    }
     log.info(`[collector] Power event (${kind}) — observed AC offs read as power-loss for the next 15 min`);
+  }
+
+  /**
+   * An AC power-cycled for a reason the rule that owns it never observed — a
+   * leveler shed/restore, or a mains power event. `clearAcFanEnforcement`'s
+   * contract has always been "any AC power cycle the rule owns", but only the
+   * five automation-driven cycles honored it: a leveler shed skips the
+   * observed-off branch outright (`isShed` → continue) and a leveler restore
+   * has no automation site at all. So `acFanEnforcement.manual` survived from
+   * BEFORE the cycle, `effectiveAcRangeProfile` deleted fan_speed/turbo from
+   * every enforced profile, and the AC sat on device-auto ('A') indefinitely —
+   * live 2026-08-06 02:32Z, Najat shed + restored across a grid→gen changeover.
+   *
+   * Only PRE-cycle intent is forgotten: this is edge-triggered, so a manual
+   * change made AFTER the cycle re-arms the override and still wins.
+   *
+   * The fan entry is released, NOT deleted — the five rule-owned sites can drop
+   * the whole entry because each one re-sends the full profile in the same
+   * breath and `noteAcFanCommanded` rebuilds it; nothing re-sends here, and the
+   * baseline (`lastCommandedFan`/`lastFanCommandAt`) is what `refreshAcFanBaseline`
+   * updates on every leveler fan command and what keeps a later drift check from
+   * misreading our own send as a manual change.
+   */
+  private notePowerCycle(deviceId: string, reason: string): void {
+    this.acPowerCycleAt.set(deviceId, Date.now());
+    let cleared = false;
+    for (const [key, entry] of this.acFanEnforcement) {
+      if (!key.endsWith(`:${deviceId}`) || !entry.manual) continue;
+      this.acFanEnforcement.set(key, { ...entry, manual: false });
+      cleared = true;
+    }
+    for (const key of this.acSwingOverrides.keys()) {
+      if (key.endsWith(`:${deviceId}`)) {
+        this.acSwingOverrides.delete(key);
+        cleared = true;
+      }
+    }
+    if (cleared) {
+      log.info(`[collector] AC ${deviceId}: ${reason} — dropping pre-cycle fan/swing intent, enforcement resumes`);
+    }
+  }
+
+  /**
+   * Leveler shed edges the `setDevicePowerCache` hook cannot see: a shed
+   * adopted from the DB at boot, a controller flip, or a shed cleared by
+   * another path. Only the false→true edge clears intent — a shed clears on the
+   * CONFIRMED shadow ON, which lags the restore command by 5.8s–13min
+   * (ac-leveling invariant 4), so treating the un-shed edge as the cycle would
+   * wipe a manual change the user made minutes after the room was already back.
+   */
+  private observeLevelerShedEdges(deviceIds: string[]): void {
+    const leveling = this.leveling();
+    for (const deviceId of deviceIds) {
+      if (!leveling.isShed(deviceId)) {
+        this.acShedSeen.delete(deviceId);
+        continue;
+      }
+      if (this.acShedSeen.has(deviceId)) continue;
+      this.acShedSeen.add(deviceId);
+      this.notePowerCycle(deviceId, "leveler shed");
+    }
   }
 
   /**
@@ -596,6 +679,10 @@ export class Collector {
       setDevicePowerCache: (deviceId: string, power: "on" | "off") => {
         this.devicePowerCache.set(deviceId, { power, ts: Date.now() });
         if (power === "on") this.noteServerAcOn(deviceId);
+        // The leveler touches this on its OWN shed and restore ONLY, so it is
+        // the exact edge of a leveler-driven power cycle — and neither edge
+        // reaches any rule-owned fan/swing clear site.
+        this.notePowerCycle(deviceId, power === "on" ? "leveler restore" : "leveler shed");
       },
       isManualOffLocked: (deviceId: string) => this.isAcManualOffLocked(deviceId),
       onLevelerFanCommand: (deviceId: string, fan: number) => this.refreshAcFanBaseline(deviceId, fan),
@@ -829,6 +916,13 @@ export class Collector {
       await this.runStep("beep", () => this.checkAcBeepEnforcement());
     } catch (err) {
       log.error("[collector] AC beep enforcement failed:", err);
+    }
+
+    try {
+      // After leveling, so fan holds and shed flags are this tick's truth.
+      await this.runStep("ac-enforce", () => this.checkAcRangeEnforcement());
+    } catch (err) {
+      log.error("[collector] AC fan/swing enforcement failed:", err);
     }
 
     // Retry TCL Cloud init if it failed previously (every 5 minutes)
@@ -1314,6 +1408,54 @@ export class Collector {
   }
 
   /**
+   * Is a manual fan override still describing the device? Manual wins over
+   * automation enforcement — but only while the AC still HAS the fan the user
+   * chose.
+   *
+   * An observed fan of 0 is the device's BUILT-IN auto, which nothing in this
+   * system can have asked for: range automations never command 0, and the
+   * dashboard's A button DELETES the override rather than marking it manual
+   * (`noteUserAcFanAuto`). So a `manual` flag sitting on an observed 0 is
+   * pre-power-cycle intent the firmware has already eaten — the documented
+   * "until the AC power cycles" release, read off the firmware's own
+   * fingerprint for the cycles no clear site witnessed. This is what lets a
+   * unit stuck on 'A' self-heal (live 2026-08-06: Najat, after a leveler shed +
+   * restore across a grid→gen changeover).
+   *
+   * ⚠ RELEASED, not deleted — `notePowerCycle`'s own rule, and for its own
+   * reason. This is a read-side predicate: nothing here re-sends the profile, so
+   * dropping the whole entry would throw away the baseline
+   * (`lastCommandedFan`/`lastFanCommandAt`) that `refreshAcFanBaseline` keeps
+   * current on every leveler fan command — and `driftedRangeFan` reads that
+   * entry for its `AC_FAN_SETTLE_MS` guard on the very next line, so deleting it
+   * here destroyed the settle window the caller was about to consult. The five
+   * rule-owned clear sites may delete because each re-sends the full profile in
+   * the same breath and `noteAcFanCommanded` rebuilds the entry.
+   */
+  private acFanOverrideActive(ruleId: number, deviceId: string): boolean {
+    const key = this.acFanKey(ruleId, deviceId);
+    const entry = this.acFanEnforcement.get(key);
+    if (!entry?.manual) return false;
+    if (this.tclCloud?.getDeviceState(deviceId)?.fan_speed !== 0) return true;
+    this.acFanEnforcement.set(key, { ...entry, manual: false });
+    log.info(`[collector] AC ${deviceId}: manual fan override released — the unit is on built-in auto (power-cycle reset), resuming enforcement`);
+    return false;
+  }
+
+  /**
+   * Is a manual swing override still live for this rule+device? The override is
+   * keyed to the slot it was taken under, so a slot change resumes enforcement.
+   */
+  private acSwingOverrideActive(ruleId: number, deviceId: string, slot: AutomationRangeSlot): boolean {
+    const key = this.acSwingKey(ruleId, deviceId);
+    const override = this.acSwingOverrides.get(key);
+    if (!override) return false;
+    if (override.slotId === slot.id) return true;
+    this.acSwingOverrides.delete(key); // active slot changed — resume swing enforcement
+    return false;
+  }
+
+  /**
    * The range fan is ALWAYS the delta-based smart level unless the active slot
    * explicitly fixes 1–7 (slot 0 or absent → smart auto). The preset's
    * fan_speed never drives range enforcement — presets still apply their fan
@@ -1356,19 +1498,13 @@ export class Collector {
     // enforcement until the active slot changes or the AC power-cycles — same
     // intent model as fan. The override is keyed to the slot it was made under,
     // so a slot change naturally resumes enforcement.
-    const swingKey = this.acSwingKey(rule.id, deviceId);
-    const swingOverride = this.acSwingOverrides.get(swingKey);
-    if (swingOverride && swingOverride.slotId !== slot.id) {
-      this.acSwingOverrides.delete(swingKey); // active slot changed — resume swing enforcement
-    }
-    if (this.acSwingOverrides.has(swingKey)) {
+    if (this.acSwingOverrideActive(rule.id, deviceId, slot)) {
       delete profile.vertical_swing; // user took manual swing control — leave it untouched
     } else if (slot.vertical_swing != null) {
       // 0 (Off) is a real value — overrides the preset's swing; absent falls through.
       profile.vertical_swing = slot.vertical_swing;
     }
-    const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, deviceId));
-    if (entry?.manual) {
+    if (this.acFanOverrideActive(rule.id, deviceId)) {
       // Non-Najat fan 7 == turbo — enforcing turbo would clobber a manual fan choice
       delete profile.fan_speed;
       delete profile.turbo;
@@ -1781,6 +1917,146 @@ export class Collector {
       conditionLostAt: null,
       canAutoTurnOn: state.canAutoTurnOn,
     });
+  }
+
+  /**
+   * Beep-style enforcement sweep for the two channels the diff path can lose:
+   * fan and vertical swing (added 2026-08-06).
+   *
+   * `checkAcRangeAutomation` only re-enforces along its own state machine — and
+   * a device it is skipping (shed, an off it never saw, a lagging shadow) is
+   * exactly the device whose fan came back as built-in auto. This sweep asks
+   * the same question `checkAcBeepEnforcement` asks about the buzzer, once a
+   * tick, independent of that state machine: does the shadow still carry what
+   * the active slot resolves to? It never fights the leveler (fan holds and
+   * sheds stand it down), never fights the user (a live manual override stands
+   * it down), and never fights itself (30s per-device cooldown + the 15s fan
+   * settle window).
+   */
+  private async checkAcRangeEnforcement(): Promise<void> {
+    if (!this.tclCloud || !this.tclCloud.isReady()) return;
+    if (this.acCalibrator.isActive()) return; // calibration owns the ACs
+    const now = Date.now();
+    const devices = this.tclCloud.getDevices();
+    this.observeLevelerShedEdges(devices.map((dev) => dev.id));
+    if (devices.length === 0) return;
+
+    for (const rule of this.automationRules) {
+      if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
+      if (!rule.metric) continue;
+      const def = ALERT_METRICS[rule.metric];
+      if (!def) continue;
+      // Same freshness bars the rule itself uses — a stale metric resolves a
+      // smart-auto fan from a temperature nobody can vouch for.
+      if (def.source === "weather" && (!this.latestWeatherTs || now - this.latestWeatherTs.getTime() > 300_000)) continue;
+      if (def.source === "air" && (!this.latestAirTs || now - this.latestAirTs.getTime() > 300_000)) continue;
+      if (def.source === "power" && (!this.latestPowerTs || now - this.latestPowerTs.getTime() > 60_000)) continue;
+      const value = getMetricValue(rule.metric, this.latestWeatherRow, this.latestAirRow, this.latestPowerRow);
+      if (value == null) continue;
+      const slot = findActiveRangeSlot(
+        rule.range_slots ?? getLegacyRangeSlots(rule.threshold_low, rule.threshold),
+        getBaghdadMinutes(),
+        (prayer, offset) => this.resolvePrayerMinutes(prayer, offset),
+      );
+      if (!slot) continue; // outside every window — this rule owes the device an OFF, not a fan
+      const isCool = (rule.action_on as Record<string, unknown>).mode === 1;
+      const shouldTurnOff = isCool ? value <= slot.threshold_low : value >= slot.threshold;
+      if (shouldTurnOff) continue; // ditto: don't dress a device the rule is about to switch off
+
+      for (const deviceId of rule.device_ids ?? [rule.device_id]) {
+        const dev = devices.find((d) => d.id === deviceId);
+        if (!dev) continue; // not in the shared cache — nothing observed to compare against
+        try {
+          await this.enforceAcFanSwing(rule, slot, dev, value, now);
+        } catch (err) {
+          log.warn(`[collector] AC range "${rule.name}": fan/swing enforcement failed for ${deviceId}: ${(err as Error).message}`);
+        }
+      }
+    }
+  }
+
+  /** One device of `checkAcRangeEnforcement` — gates, then at most one re-assert per channel. */
+  private async enforceAcFanSwing(
+    rule: AutomationRule,
+    slot: AutomationRangeSlot,
+    dev: AcDevice,
+    value: number,
+    now: number,
+  ): Promise<void> {
+    const deviceId = dev.id;
+    if (!dev.power) return; // off — the range/leveler paths own bringing it back
+    const leveling = this.leveling();
+    if (leveling.isShed(deviceId)) return; // leveler owns a shed device
+    if (leveling.hasFanHold(deviceId)) return; // leveler owns the fan channel while it holds it
+    // The rule's OWN cooldown, and it is not redundant with the per-device one
+    // below: manual-fan detection lives in `updateAcFanTracking`, which the
+    // rule's turn-on, locked-adopt and power-event re-turn-on paths all bypass —
+    // each stamps `lastToggle: now` and RETURNS before tracking runs. Inside
+    // `cooldown_secs` of one of those, no tick has yet had the chance to notice
+    // a remote/app fan change, so a sweep firing there reverts the user within
+    // 30 s and never records the override at all. Waiting out the rule's own
+    // cooldown guarantees manual detection gets a tick first. (Review,
+    // 2026-08-06; the sweep landed without any lastToggle gate.)
+    const ruleState = this.automationState.get(rule.id);
+    if (ruleState != null && now - ruleState.lastToggle < (rule.cooldown_secs ?? 5) * 1000) return;
+    // Our own commands still in flight: an off just sent, a turn-on still
+    // booting, or a previous sweep send inside its cooldown.
+    if (now - (this.acRangeOffAt.get(deviceId) ?? 0) < this.AC_OFF_REFIRE_GRACE_MS) return;
+    if (now - (this.lastServerAcOnAt.get(deviceId) ?? 0) < this.AC_FAN_SETTLE_MS) return;
+    if (now - (this.acEnforceLastSent.get(deviceId) ?? 0) < this.AC_ENFORCE_RESEND_COOLDOWN_MS) return;
+
+    const fan = this.driftedRangeFan(rule, slot, dev, value, now);
+    const swing = this.driftedRangeSwing(rule, slot, dev, now);
+    if (fan == null && swing == null) return;
+    this.acEnforceLastSent.set(deviceId, now);
+    // One property per send: on a TAC-12CHSD the fan block is silently dropped
+    // when it shares an update with anything else (tcl-ac.md, "the fan block
+    // must travel ALONE").
+    if (fan != null) {
+      log.info(`[collector] AC range "${rule.name}": ${deviceId} fan drifted to ${dev.fanSpeed}, re-asserting ${fan}`);
+      await this.tclCloud!.executeAcAction(deviceId, { fan_speed: fan });
+      this.noteAcFanCommanded(rule, slot, deviceId, { fan_speed: fan });
+    }
+    if (swing != null) {
+      log.info(`[collector] AC range "${rule.name}": ${deviceId} swing drifted to ${dev.verticalSwing} after a power cycle, re-asserting ${swing}`);
+      await this.tclCloud!.executeAcAction(deviceId, { vertical_swing: swing });
+    }
+  }
+
+  /** The slot's resolved fan when the shadow has drifted off it, else null. */
+  private driftedRangeFan(
+    rule: AutomationRule,
+    slot: AutomationRangeSlot,
+    dev: AcDevice,
+    value: number,
+    now: number,
+  ): number | null {
+    if (this.acFanOverrideActive(rule.id, dev.id)) return null; // manual wins
+    const entry = this.acFanEnforcement.get(this.acFanKey(rule.id, dev.id));
+    if (entry && now - entry.lastFanCommandAt < this.AC_FAN_SETTLE_MS) return null; // our own send, still landing
+    const desired = this.resolveRangeFan(rule, slot, dev.id, value);
+    return dev.fanSpeed === desired ? null : desired;
+  }
+
+  /**
+   * The slot's pinned swing when a POWER CYCLE has knocked the device off it.
+   *
+   * Swing deliberately has no drift detection (its power-loss reset value is
+   * unknown), so a mid-session difference stays what it has always been — the
+   * ordinary `computeAcDiff` re-enforcement's business, not this sweep's. Only
+   * inside the window after an attributable power cycle is a difference known
+   * to be a firmware reset, and only then does the sweep speak.
+   */
+  private driftedRangeSwing(
+    rule: AutomationRule,
+    slot: AutomationRangeSlot,
+    dev: AcDevice,
+    now: number,
+  ): number | null {
+    if (slot.vertical_swing == null) return null; // nothing pinned for this slot
+    if (this.acSwingOverrideActive(rule.id, dev.id, slot)) return null; // manual wins
+    if (now - (this.acPowerCycleAt.get(dev.id) ?? 0) > this.AC_POWER_CYCLE_RESET_MS) return null;
+    return dev.verticalSwing === slot.vertical_swing ? null : slot.vertical_swing;
   }
 
   private async checkScheduleAutomation(rule: AutomationRule): Promise<void> {

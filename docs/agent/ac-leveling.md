@@ -17,6 +17,253 @@ timestamp: 2026-07-28
 
 A ground-up rewrite lives in **`server/src/leveling/`** (21 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
+### 2026-08-06 — the gated proactive shed: a cool room's amps may be given to a hot one
+
+**The user's decision, verbatim (2026-08-06):**
+
+> *"after Najat on and be stable, there was enough budget to turn off Najat and bring Abdu back on."*
+
+**The incident is the same morning** (see the section above for the full 02:21–02:49 timeline). Once
+the 02:32 storm had shed both rooms, the restore queue did exactly what it was built to do and it was
+still the wrong answer: Najat's return cost 3.35 A and fitted at 02:33; Abdu's cost 4.3 A and never
+fitted, because Najat was now spending the amps. He sat off until 02:49, when the heater cycled off by
+itself — **seventeen minutes with a 28 °C room dark and a 26.5 °C room cooling.**
+
+Nothing in the ladder could fix that. The reducer only runs when the meter objects, and the meter did
+not: 11.8 A on a 15 A line is calm. The restore path only spends headroom that already exists. The
+one action that would have helped — *switch the cooler room off and give its amps to the hotter one* —
+had been proposed twice and parked twice (the invariant-39 note in `reduce.ts` named it as the missing
+prerequisite for making the non-cooling term unconditional). This session is the user's approval of it.
+
+#### What it does
+
+`swapDonorFor()` in `raise.ts`, consulted from the RESTORE phase when the hottest shed room fits
+neither plain nor at-floors. It picks the **coolest running room whose off buys that room back**, and
+every gate below is load-bearing:
+
+| Gate | Why |
+|---|---|
+| Donor is `SWAP_NEED_GAP_C` milder on `rankNeedDelta` | = `SHED_NEED_GAP_C` (1.0 °C), the shed-side gap the user calibrated on 2026-08-04. Never `REBALANCE_NEED_GAP_C` (0.7): that one buys a LEVEL, this one buys a ROOM. Ranked on real temperature (invariant 50) — a feels-like metric must never decide who loses a compressor. |
+| Donor unpinned (`manualTarget`/`manualCap`) | Manual always wins. Configured PRIORITY is deliberately *not* a shield — the user's 2026-08-04 policy is that the thermometer decides and the coolest room goes off, top-priority included. |
+| Donor not ramping | A compressor mid-start has not shown its amps; neither its saving nor the meter it leaves behind is knowable. |
+| Donor not in a funding/victim cooldown | It is already paying for something (invariants 30, 35). |
+| Not the last room running | A swap re-arranges cooling; it may not empty the house on the way through. |
+| The trade must CLOSE the gap | The receiver has to fit *after* the donor's off, with `REBALANCE_FUND_MARGIN_AMPS` (0.5 A) to spare, on the **meter** AND on the **physics envelope** (with the donor removed). Priced at the donor's MODEL steady draw — the same number `commandedCutAmpsOf` credits (invariant 11), so the trade can never admit more amps than the credit it arms — and at the receiver's **plain learned** on-cost, never the gentle probe price (invariant 3). |
+
+**Execution is invariant 9 verbatim — never spend a saving that has not landed:**
+
+1. The donor's `power_off` ships **ALONE**, in its own batch, journalled `proactive_shed`. It is a
+   reducing command, so `commandedCutAmps` credits it and its cliff cannot latch a phantom collapse
+   (invariants 11 and 31). Being a lone off it is also a clean grading window, so it feeds the
+   `on@L{n}` cost model and invariant 55's compressor evidence exactly like any other shed.
+
+   ⚠️ **"ALONE" is enforced at the ARM (added on review, 2026-08-06).** `plan()` merges
+   `invariantCorrections` into the same batch, and the grading shell only grades a batch whose meter
+   commands number exactly one — so a tick carrying a level-0 re-cap or a gen start clamp would have
+   shipped the trade in a **2-command batch**, forfeiting both the free `on@L` sample and the
+   off-drop compressor evidence the point above promises, while this doc still said "ALONE".
+   `swapAllowed` therefore also requires `corrections.commands.length === 0`; the trade stands down
+   and re-arms on the next calm tick. Deliberate consequence: with no trade to reserve them, that
+   tick's headroom goes to the ordinary raise phase. A comfort trade can wait; a batch that never
+   grades costs the cost book and the compressor evidence permanently.
+2. The freed amps are **RESERVED for the named receiver across ticks** — `controller.swap`
+   (mirrored in `scenario.ts`, **including the source-change clear**: a changeover deletes the budget
+   the trade was priced against and the entry mode re-decides who runs, so `clearOnSourceChange`
+   drops the record and `Scenario.setSource` now does the same. The mirror gap was found on review,
+   2026-08-06; because every outward effect of a stale swap is masked on the far side of a
+   changeover, its `controller.test.ts` guard reads the record directly). Released when the receiver
+   comes back or at `SWAP_RESERVATION_MS` (= `ATTEMPT_BLAME_WINDOW_MS`; a trade that has not paid off
+   inside the window we would blame that shed for has failed on its own terms). While it is live, the
+   receiver's restore reserves its cost, which parks the raise phase and the fan restore — nothing
+   may take the amps the donor gave up.
+3. The receiver's restore is admitted on a **LATER tick**, through the ordinary admission, against
+   the committed meter (invariants 41 and 54). No special case: if the saving does not land, the
+   restore does not ship.
+4. The donor gets an **ordinary shed row**, so it re-enters the restore queue and comes back when
+   budget genuinely allows — but not for `FUNDING_COOLDOWN_MS`, because a donor may not take its
+   donation back (invariant 30, one rung down; a `power_off` now stamps that cooldown, not only a
+   `set_level`). Its return is journalled `blockedBy: "donation cooldown"`.
+
+   ⚠️ **The bar and the reservation are separate rungs (review, 2026-08-06).** Every
+   funding-cooldown donor is barred from restoring; only the **live trade's donor** additionally
+   RESERVES its restore cost. A reservation parks the raise phase *and* the fan restore house-wide,
+   which is a claim that specific amps are spoken for — and only a named receiver can make it. Keyed
+   on `fundingCooldown` alone (as it first shipped), a room that gave up one LEVEL to fund a peer
+   under invariant 30 proper and was then shed for an unrelated overload froze the whole house for
+   two minutes over a claim nobody had made.
+5. A shed is **LOUD**: the push names donor → receiver ("AC Najat turned off so the hotter room
+   (Abdu) can run") and the `ac_leveling_shed` row records the same, instead of the ladder's
+   "to protect the breaker" — which would be a lie about a calm line.
+
+#### Anti-oscillation
+
+The asymmetric need gap *is* the hysteresis. The donor leaves the trade `SWAP_NEED_GAP_C` cooler than
+the receiver, so for the donor to win the room back the two thermometers must genuinely **cross** by
+the same margin — ~2 × the gap of real movement. Sensor noise (0.1 °C LSB) cannot do it, and the
+reverse trade is structurally impossible until the rooms have actually swapped places. Pinned by a
+unit test that runs `swapDonorFor` forwards, backwards (null), and after a real crossing.
+
+#### When it never fires
+
+It is a **comfort optimisation, never an emergency tool**. `swapAllowed` (pipeline.ts) requires:
+NORMAL mode, GEN (grid enters FULL by directive and is not envelope-guarded), an unfrozen meter, no
+collapse, **no derate** (collapse or strain), the smoothed mean not over the limit, a FULL leaky
+bucket, no live commanded-cut credit or total — and `SWAP_QUIET_AFTER_OVER_MS` (= `PENDING_CUT_MS`,
+180 s) since the ladder last shipped an over-limit batch. Inside `planRaise` it additionally needs the
+restore calm window, an un-backed-off receiver, ONE swap in flight house-wide, and the receiver must be
+the HOTTEST shed room (a cooler one trading rooms sideways is not what was asked for) and must not be
+blocked by its own shed-trough bar (invariant 54 — a bar-blocked room already reserves, and the swap
+would spend the very trough the bar disbelieves).
+
+⚠️ **The quiet window is not redundant with the meter gates.** Every other one reads the CURRENT tick,
+and the acceptance replay traded a room away **50 seconds** after a level cut with all of them
+satisfied: the meter had settled, calm was re-established, the credit was absorbed and the bucket was
+full. The ladder's own recent history is the only thing that remembers, so the shell carries
+`lastOverLimitActAt` (mirrored in `scenario.ts`). Verified by re-breaking: with that one term forced
+true, the 02:32 stand-down scenario sheds a room inside the episode.
+
+#### Tests
+
+- `raise.test.ts` — `swapDonorFor` gate by gate (need gap, pin in both forms, ramping, cooldowns, last
+  room, fit-with-margin, envelope), the ALONE emission, the loud journal line, the cross-tick
+  reservation, the donation cooldown in BOTH tiers (the live trade's donor reserves; a
+  level-funding donor is barred without reserving — *"REGRESSION 2026-08-06 (review): a LEVEL-funding
+  donor's shed must not park the house"*), hottest-room-only, and the constant relations
+  (`SWAP_NEED_GAP_C > REBALANCE_NEED_GAP_C`, `=== SHED_NEED_GAP_C`,
+  `SWAP_QUIET_AFTER_OVER_MS >= PENDING_CUT_MS` — the 2026-07-31 "no test compared the two constants"
+  lesson).
+- `pipeline.test.ts` — *"the donor's power_off may not share a batch"*: the control (a clean tick
+  emits exactly one command) and the stand-down (a tick carrying a gen start clamp arms no trade).
+  The scene is built so the correction's own floor-down does NOT rescue the restore, or the swap
+  would never reach its branch and the test would prove nothing.
+- `scenarios.test.ts` — *"the 2026-08-06 heater episode"*: the whole-house replay. The trade fires, the
+  receiver returns in minutes instead of seventeen, no peer level moves in between, the donor comes
+  back only when the heater releases, and **30 minutes produce three power commands and no cycle** —
+  plus the same replay again under **±0.5 A meter noise** (testing.md's churn gate for any path that
+  spends or trades amps), asserting the identical end-state and no room switched off twice. Plus the
+  two negatives: rooms 0.7 °C apart never trade, and nothing trades during the over-limit episode.
+- `controller.test.ts` — the shell-only halves the harness cannot see: the shed ROW and the PUSH naming
+  the receiver, the journal reason, the reservation surviving ticks, a `power_off` stamping the
+  funding cooldown, and the **source-change clear** (reading `controller.swap` directly — every
+  outward effect of a stale trade is masked on the far side of a changeover).
+
+**Re-break verification** (project discipline): `SWAP_NEED_GAP_C` raised to 2.0 fails the acceptance
+replay (9 tests); lowered to 0.5 fails the negative-gap scenario; the quiet window disabled fails the
+stand-down scenario. All three reverted.
+
+### 2026-08-06 — amps are the only evidence: the temperature watch stops deciding anything
+
+**The user's decision, verbatim (2026-08-06):**
+
+> *"it is so normal that we see no cooling progress in all rooms for a long time, even with L3, so
+> this should not be considered. However, we have to depend on Amps — if it draws only about 1 amp,
+> only the fan is working, no compressor."*
+
+**The incident (all UTC).** 02:21 grid→gen, limit 15 A. A heater lifted the non-AC house to 7.4 A by
+02:31. The extreme/severe rungs shed Najat and Abdu and cut Abdullah L2→L1 at 02:32. Najat came back
+at 02:33 (3.35 A fit); Abdu — hotter, and 4.3 A — was refused every attempt until the heater cycled
+off at **02:49**. Seventeen minutes with the hottest room off.
+
+The amps that made it infeasible were not the heater's. At **02:12:20** Abdullah had been demoted to
+L1 *for being satisfied for twenty minutes*. At **02:15:29** the sub-floor watch declared "no cooling
+progress at L1" and armed a six-hour learned hold; it re-armed at 02:35:21 and the hold raised him
+L1→L2 at **02:36:42**, taking the 1.5–1.9 A that Abdu's restore and every swap needed.
+
+**Why the verdict was guaranteed.** The watch (invariant 40) makes a room non-cooling after
+`SUBFLOOR_WATCH_MS` below its floor without `SUBFLOOR_PROGRESS_C` (0.2 °C) of cooling. A room that is
+demoted *because it is at target* cannot show 0.2 °C more cooling — there is nothing left to cool. So
+the state that produced the demote is the state that guarantees the stall, and the verdict is true by
+construction rather than by observation. It is the same family as invariants 5b/20/23/40's own
+warning: a signal read out of the very quantity it is supposed to judge. Invariant 40 banned the
+circular *amp* residual and moved to the thermometer; this is the thermometer's own circularity,
+arriving from the other side.
+
+The user's ruling settles it more broadly than the demote case: on a Baghdad afternoon a working
+compressor at L3 routinely shows no progress for a long time, so a stalled thermometer carries no
+information about whether the compressor is running.
+
+**What changed.**
+
+- **`isNonCooling` (needs.ts) lost the watch ground.** Two grounds remain: the room more than
+  `NON_COOLING_NEED_C` (2 °C) from target below an active floor — a different rule, and untouched —
+  and `compressorOffLikely`, the METER's verdict from an ATTRIBUTABLE window.
+- **The watch-stall armer of the learned L1 hold is gone** (`controller.noteLevelHoldEvidence`,
+  deleted). Remaining armers, all attributable: the graded lone off-drop (55), the dead window (44),
+  and a manual raise off L1 — dashboard or observed. (The graded lone RAISE below was built as a
+  fourth and demoted to report-only on review the same day; it arms nothing.)
+- **`subFloorStalledMs` is REPORT-ONLY.** The clock still runs, still feeds `coolingState: "stalled"`
+  on the status card and the "pinned below the comfort floor and not cooling" report (`api.ts`). No
+  decision path reads it; `scenario.ts` keeps computing it for parity with that surface only.
+- **NEW — the lone-raise experiment (R6b), REPORT-ONLY.** The off-drop of invariant 55 only speaks
+  when a room is going off anyway. A raise OFF L1 measures the same thing from the other end, on a
+  batch the house was going to send regardless: if the compressor was already running, the meter
+  moves by the level step; if it was not, it moves by the whole compressor starting. So a LONE
+  `set_level` raise from L1 whose graded ratcheted rise is ≥ its priced step +
+  `COMPRESSOR_START_RISE_MARGIN_AMPS` (2.0 A) is journalled (`reason: "compressor_report"`) and
+  logged at warn. It is **evidence, not a price** — nothing touches the cost book; the same sample
+  goes on to `updateCost` exactly as before.
+
+  ⚠️ **And it may not arm anything either — demoted on review, 2026-08-06, before it ever ran on the
+  house.** It was written to set `compressorOffLikely` and arm the six-hour hold, and that is a
+  repeat of this very section's bug from the amps side. `riseAmps` is `PendingGrade.peakDeltaAmps`,
+  a ratcheted **whole-house** smoothed delta over the 240 s window, and **nothing subtracts non-AC
+  load** — the same house whose heater is the villain of the incident above. Switch that 3.4 A heater
+  on ninety seconds into the window and an ordinary, correctly-priced 1.5 A level step measures 4.9 A
+  against a 3.5 A bar: a false verdict, a six-hour L1 hold, and the hottest room's amps spent on a
+  kettle. Hard rule 5c again — the margin is sized against the error in the *step price*, while the
+  quantity it is compared to contains the entire house.
+
+  The off-drop does not share the flaw: a household step DOWN coincident with our own off is rarer,
+  and its bar is a **ceiling on a fall** (a small drop proves absence) rather than a floor under a
+  rise (a large rise must be proven to belong to us). Closing the rise side for real needs the rise
+  taken **net of `houseLoadAmps` at both ends of the window** — its own piece of work, not a
+  threshold tweak. Until then the detection, the exclusions and the constant all stay as
+  observability and as the scaffolding that version would reuse.
+
+**Why 2.0 A (hard rule 5c).** The largest single increment that can consume the margin is the error
+in the priced step it is added to. `pricedStepAmps` is `raiseJumpAmps` = max(model, learned), so an
+over-priced step only makes the test harder; the dangerous direction is a step priced too LOW, and
+the worst such error this house has produced is ~1.0 A (Abdullah's gen step model sat at 2.5 A
+against a measured ~1.5 A until 2026-08-03). The sample is a ratcheted peak off the smoothed meter,
+which a supply excursion can inflate by the live flicker on top of that. Two amps covers both, and it
+is deliberately the SAME quantity as `COMPRESSOR_ON_DROP_AMPS`/`DEAD_WINDOW_GAP_AMPS` — "the smallest
+whole compressor this house has" — so all three compressor-evidence bars agree about what a
+compressor is worth (asserted as a relation in `dead-window.test.ts`, per the 2026-07-31 lesson).
+
+⚠️ **Accepted false negatives, deliberately.** This is a high bar and it will miss real cases: a
+1-ton starting from fan-only into L2 rises about `steadyDraw(2)` minus its fan ≈ 3.4 A against a bar
+of 1.5 + 2.0 = 3.5 A. The failure direction is chosen — under-arming costs a hold that arms later
+(the off-drop and the user's own hand raise still catch it), while over-arming spends a hotter room's
+amps for six hours on fiction, which is exactly what this morning cost. (Since the demotion above,
+both directions cost only a journal line — but the reasoning is preserved because a net-of-house
+version would keep exactly this bar.)
+
+**Exclusions (`loneRaiseIsAttributable`, dead-window.ts).** Each is a state in which a compressor
+engages for a reason of its own, so the measurement has no answer in it: a **start window** (the room
+was just switched on), a **power-event ramp** — the dead window / TCL restart protection after a
+changeover, where a raise ALWAYS engages the compressor because that is restart protection *ending*
+— and **FLOORS**, where the recovery admission is commanding a whole house back at once. Judged at
+the SEND, because each is a statement about the state we commanded from. Contamination and settle are
+not re-checked: the evidence is read at `learnAfter`, behind the same certification the cost learner
+requires (invariants 23/29), so a contaminated or unsettled window never reaches it.
+
+**Tests.** `needs.test.ts` "REGRESSION 2026-08-06: a stalled thermometer is NOT evidence of a dead
+compressor" (and the two surviving grounds still fire) · `controller.test.ts` "REGRESSION 2026-08-06
+02:15:29: a satisfied room stalled at L1 arms NOTHING" — asserts the clock still reports `stalled`
+while arming no hold and moving no level · a `R6b` describe covering the REPORT (emitted, and no hold
+/ no `compressorOffLikely` behind it), the ordinary-step silence (the 02:36:42 shape), a raise not off
+L1, a two-room batch, and **"REGRESSION 2026-08-06 (review): a heater step inside the grading window
+must not mint a hold"** — a real 1.5 A step plus a 3.4 A household load 90 s in · `dead-window.test.ts`
+for the predicate, every exclusion, and the constant relations. Each fix was verified by re-breaking
+the single line it hinges on: restoring the watch armer fails the shell regression with 1 hold
+instead of 0, a zero margin fails the ordinary-step regression the same way, and re-adding the hold
+arm to `noteLoneRaiseRise` fails exactly the two new report-only guards and nothing else.
+
+**Harness debt (unchanged, and now larger).** The whole grading shell — `pendingGrades`,
+`bornContaminated`, the arm-time exclusions — is still invisible to `scenario.ts`, so R6b lives
+entirely on `controller.test.ts` guards. `scenario.ts` also can no longer stage a non-cooling room by
+starving it of progress; state the amp evidence (`compressorOffLikely`) instead.
+
 ### 2026-08-05 (evening) — an 8-wide median, ONE shared absorption pool, and a harness window that lied
 
 **The incident (18:13:22 Baghdad / 15:13:22Z).** Najat was shed on `over_mild required 0.7 A` while
@@ -180,16 +427,19 @@ ceiling (**49**).
   ceiling stops at two, which is what makes "the hottest room always survives" true with three rooms
   and no cap at all with two (**50**).
 - *"1 c is enough to switch between acs"* — `SHED_NEED_GAP_C` 1.5 → 1.0.
-- *"no need for 10 min, 3 min is enough"* — `SUBFLOOR_WATCH_MS` 10 → 3 min.
+- *"no need for 10 min, 3 min is enough"* — `SUBFLOOR_WATCH_MS` 10 → 3 min. (⚠️ Superseded
+  2026-08-06: the window is still 3 min but the clock decides nothing — report-only.)
 - *"it is already 47 outside (8 c above what specifyed for abdullah lowest level temp) that should
   never put it at l1"* (~17:35), refined twice more into the whole gradient: `< 36` nothing special ·
   `36–39` watched at L1 · `39–41` the floor binds but the sub-floor rung may still use L1 · `> 41`
   never L1. One function, `boostZoneOf`, because four conditionals in four files is how a per-room
-  rule drifts (**51**).
+  rule drifts (**51**). (⚠️ The `watch` zone's WATCH is report-only since 2026-08-06 — the zone
+  boundaries and the floor behaviour are unchanged.)
 - *"when the system observe that abdullah is not working on l1 (by own observation or manual raise),
   it should state the outside temp, so it will never reduce the level to l1 untill it drop below that
   temp or after [6] h"* (~13:2x, TTL revised down from 12 h that afternoon). The LEARNED hold,
-  persisted in `ac_leveling_level_hold` (**52**).
+  persisted in `ac_leveling_level_hold` (**52**). (⚠️ Its watch-stall armer was removed 2026-08-06;
+  the hold and its other armers are unchanged.)
 - *"an off with 1 amp or less of drop means the compressor was not running"* — his own experiment,
   now a signal: `compressorOffLikely` from a graded lone off's drop, feeding `isNonCooling`, arming
   the learned hold, and surfaced as `coolingState` per AC (**55**).
@@ -348,9 +598,16 @@ nothing was drawing, in a room that had climbed 30 → 34 °C against a setpoint
 
 Shipped as invariants 39–41. `isNonCooling()` in `needs.ts` is now the single definition of "this
 level is an off", consulted by the reducer and by the recovery ranking; the 0.5 °C gate invariant 36
-shipped with is replaced by his 2 °C; and `subFloorStalledMs` is the watch inside the band — 10 min
-below the floor with no cooling progress is an off however close to target the room looks, judged on
-the thermometer because the amp residual is circular here.
+shipped with is replaced by his 2 °C; and `subFloorStalledMs` is the watch inside the band —
+`SUBFLOOR_WATCH_MS` below the floor with no cooling progress is an off however close to target the
+room looks, judged on the thermometer because the amp residual is circular here.
+
+> ⚠️ **Superseded 2026-08-06 — the WATCH half only.** The window is 3 min (user, 2026-08-04), and the
+> clock is now **report-only**: a stalled thermometer no longer makes a room non-cooling and no
+> longer arms the learned hold. The user's ruling — "it is so normal that we see no cooling progress
+> in all rooms for a long time, even with L3" — plus a false positive that was true by construction
+> (a room demoted *for being satisfied* cannot show 0.2 °C more cooling). The 2 °C ground below an
+> active floor is untouched. See the 2026-08-06 section.
 
 **What was held back, and why.** "Should not happen" argues for counting a non-cooling sub-floor cut
 unconditionally in the protection term. That was built, and the acceptance scenario rejected it: on a
@@ -1970,6 +2227,41 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
   the envelope more permissive at the same moment the house term makes it stricter, and two errors
   moving at once cannot be attributed. Revisit after one clean gen session.
   (See "2026-07-31 gen trip — a raise on a trough, a fan bounce, and a 90-second escalation".)
+- **2026-08-06 (amps are the only evidence of a dead compressor):** user, verbatim — *"it is so
+  normal that we see no cooling progress in all rooms for a long time, even with L3, so this should
+  not be considered. However, we have to depend on Amps — if it draws only about 1 amp, only the fan
+  is working, no compressor."* Given after a bogus "L1 not cooling" verdict armed a 6 h hold on
+  Abdullah at 02:15:29 — three minutes after he was demoted to L1 **for being satisfied**, a state in
+  which the watch cannot fail to stall — and the hold's L1→L2 raise at 02:36:42 took the 1.5–1.9 A
+  that made restoring the hotter room infeasible for seventeen minutes. Decisions applied: the
+  temperature watch is **report-only** (it keeps its 3-min window and its status card line, and
+  decides nothing — `isNonCooling` lost that ground and the learned hold lost that armer); the only
+  automatic evidence is the METER's, and only from an **attributable** window (invariants 23/29) —
+  which on review the same day left exactly one automatic armer, the lone **off-drop**. A lone
+  **raise** off L1 was built as a second such window (rise ≥ its priced step + 2.0 A) and demoted to
+  **report-only** before it ran: its rise is a whole-house delta with no non-AC load subtracted, so
+  the house's own 3.4 A heater inside the 240 s window mints the same false 6 h hold the user's
+  ruling was given to stop. Deliberately conservative in both directions: a missed hold arms later
+  from the off-drop or his own hand raise, a false hold spends a hotter room's amps for six hours.
+  (See "2026-08-06 — amps are the only evidence".)
+- **2026-08-06 (the gated proactive shed, UN-PARKED):** user, verbatim — *"after Najat on and be
+  stable, there was enough budget to turn off Najat and bring Abdu back on."* The confirming incident
+  is the same morning: after the 02:32 storm shed both rooms, Najat's cheaper 3.35 A restore fitted
+  first and took the headroom, and Abdu — 1.5 °C hotter and 4.3 A — stayed off until 02:49, when the
+  heater cycled off by itself. The proposal had been parked twice (see the invariant-39 note in
+  `reduce.ts`, which named it as the missing prerequisite for the unconditional non-cooling term);
+  this is the approval. Decisions applied: **the shed-side gap governs the trade**
+  (`SWAP_NEED_GAP_C` = `SHED_NEED_GAP_C` 1.0, the constant the user calibrated on 2026-08-04, not the
+  0.7 rebalance gap — a whole room costs at least what a level costs); **any AC may donate**,
+  top-priority included, per his 2026-08-04 policy that the thermometer decides; **the donor's off
+  ships alone and its amps are RESERVED** for the named receiver until the meter shows the saving
+  (invariant 9 — and "alone" is enforced at the arm, by standing the trade down on any tick that also
+  carries an invariant correction); **the donor may not take the donation back** for
+  `FUNDING_COOLDOWN_MS` (invariant 30, one rung down — barred always, but only the live trade's donor
+  RESERVES, since a reservation parks the whole house); and **it is a comfort optimisation, never an
+  emergency tool** — it stands down for any derate, collapse, over-limit episode, changeover, or
+  bar-blocked receiver, including for a full `PENDING_CUT_MS` after the ladder last acted.
+  (See "2026-08-06 — the gated proactive shed".)
 
 ## Gotchas & test notes
 

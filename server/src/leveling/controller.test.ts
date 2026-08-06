@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { LevelingControllerV2, batchLoadDirections } from "./controller.js";
 import type { LevelingDeps } from "./api.js";
+import { SUBFLOOR_WATCH_MS } from "./needs.js";
 
 // Minimal in-memory mock of the Postgres pool the controller talks to. Only the
 // tables the flavor re-sync touches are backed by mutable state; everything else
@@ -155,7 +156,13 @@ function createGradePool(
 ) {
   const journal: Array<Record<string, unknown>> = [];
   const costs: Array<{ deviceId: string; transition: string; ewma: number }> = [];
+  /** Reasons written to `ac_leveling_shed` — a shed's own record of WHY. */
+  const shedReasons: string[] = [];
   const query = vi.fn(async (sql: string, params: unknown[] = []) => {
+    if (sql.includes("INSERT INTO ac_leveling_shed")) {
+      shedReasons.push(String(params[1]));
+      return { rows: [], rowCount: 1 };
+    }
     // The learned non-cooling hold table — write-through, because a 6-hour hold
     // a deploy erases is not a hold (R14).
     if (sql.includes("INSERT INTO ac_leveling_level_hold")) {
@@ -221,7 +228,7 @@ function createGradePool(
     if (sql.includes("COUNT(*)") && sql.includes("ac_leveling_costs")) return { rows: [{ n: 7 }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   });
-  return { pool: { query } as never, journal, costs, levelHolds };
+  return { pool: { query } as never, journal, costs, levelHolds, shedReasons };
 }
 
 function acDevice(id: string, power: boolean, generatorMode: number) {
@@ -1654,28 +1661,42 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
     }
   });
 
-  it("arms from the system's OWN evidence — the watch zone, three degrees before the floor", async () => {
+  it("REGRESSION 2026-08-06 02:15:29: a satisfied room stalled at L1 arms NOTHING", async () => {
     vi.useFakeTimers();
     try {
-      vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
-      // 37°C: inside Abdullah's watch zone (39 − 3) and BELOW his configured
-      // floor, so the boost has not armed — this is exactly the window in which
-      // the evidence can be gathered before the heat that makes it matter.
+      vi.setSystemTime(new Date("2026-08-06T02:12:00Z"));
+      // The live shape. 37°C is inside Abdullah's watch zone (39 − 3) and below
+      // his configured floor, so the boost has not armed and the sub-floor watch
+      // is running at L1 — which is where the old armer lived.
+      //
+      // The room was demoted to L1 at 02:12:20 FOR BEING SATISFIED for twenty
+      // minutes (need 0.2, inside nearTargetBandC), and an at-target room can
+      // never show the 0.2°C of further cooling that re-bases the watch. So the
+      // watch was guaranteed to stall, and its verdict was true by construction
+      // of the state that produced it. It armed a six-hour hold at 02:15:29,
+      // re-armed at 02:35:21, and raised him L1→L2 at 02:36:42 — the 1.5–1.9A
+      // that made restoring the hotter 4.3A room infeasible until 02:49.
       const { mock, controller, run } = setup({
         hotLevel: 1,
+        hotNeed: 0.2,
         levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 39 } },
       });
       await controller.ensureLoaded();
 
-      // 3 min of no cooling progress at L1 (SUBFLOOR_WATCH_MS) at a fixed need,
-      // riding near the limit so the raise path cannot lift the room out of the
-      // very level the evidence is about.
+      // Nearly four minutes — well past SUBFLOOR_WATCH_MS (3 min) — with the
+      // need pinned, i.e. no cooling progress at all.
       await run(14.6, 45, 37);
 
-      expect(mock.levelHolds.get(HOT)).toMatchObject({ level: 1, outdoorC: 37 });
-      // …and the hold now extends the hard floor BELOW the configured 39°C bar,
-      // which is the whole point of learning it.
-      expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.minLevel).toBe(2);
+      const status = controller.getStatus().acs.find((a) => a.deviceId === HOT);
+      // No hold, no floor: amps are the only evidence now (user, 2026-08-06).
+      expect(mock.levelHolds.size).toBe(0);
+      expect(status?.levelHold ?? null).toBeNull();
+      expect(status?.minLevel).toBe(1);
+      expect(status?.level).toBe(1); // …so nothing raised him off L1 either
+      // The clock itself is untouched and still REPORTED — it just decides
+      // nothing. That is the whole of the change: an observation, not a verdict.
+      expect(status?.subFloorStalledMs ?? 0).toBeGreaterThanOrEqual(SUBFLOOR_WATCH_MS);
+      expect(status?.coolingState).toBe("stalled");
     } finally {
       vi.useRealTimers();
     }
@@ -1685,12 +1706,15 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
-      const { mock, controller, run } = setup({
-        hotLevel: 1,
-        levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 39 } },
-      });
+      // Exercised through the MANUAL raise now that the watch no longer arms
+      // anything: the guard belongs to `noteLevelHold`, so any armer proves it.
+      const { mock, controller, run } = setup({ hotLevel: 1 });
       await controller.ensureLoaded();
-      await run(14.6, 45, null);
+      await run(14.6, 6, null);
+
+      await controller.onUserGenLevel(HOT, 2);
+      await run(14.6, 1, null);
+
       expect(mock.levelHolds.size).toBe(0);
     } finally {
       vi.useRealTimers();
@@ -1892,6 +1916,419 @@ describe("LevelingControllerV2 — a fan-sized off-drop says the compressor was 
       await run(13.0, 16); // ~2.5A gone: the compressor was there
 
       expect(mock.levelHolds.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R6b (2026-08-06) — the RISE side of the same experiment, REPORT-ONLY. The
+// off-drop above only speaks when a room is going off anyway; a lone raise off
+// L1 speaks on the way UP, on a batch the house was going to send regardless.
+//
+// ⚠ It observes and arms NOTHING (demoted on review the day it was written).
+// The rise it measures is a whole-house smoothed delta with no non-AC load
+// subtracted, so any household step inside the 240 s window reads as a
+// compressor — see the heater regression at the bottom of this block. Every
+// test here therefore asserts the REPORT, and that no hold and no
+// `compressorOffLikely` follow it.
+//
+// SHELL tests, and they have to be: the whole mechanism lives in the grading
+// shell (`pendingGrades`, the arm-time exclusions, `learnAfter`,
+// `bornContaminated`) which `scenario.ts` does not model at all — the standing
+// harness debt recorded in the SKILL. The arithmetic and the exclusion rule have
+// their own pure guards in dead-window.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — a lone raise off L1 REPORTS on the compressor (R6b)", () => {
+  /** One 1-ton room on gen: 2.3A at L1, so a level:1>2 step is priced 1.5A. */
+  function setup(
+    opts: {
+      level?: number;
+      maxLevel?: number;
+      peers?: boolean;
+      levelBoosts?: Record<string, { minLevel: number; outdoorAtLeastC: number }>;
+    } = {},
+  ) {
+    const models = { a: { baseAmps: 2.3, stepAmps: 1.5 }, b: { baseAmps: 2.3, stepAmps: 1.5 } };
+    const mock = createGradePool({
+      genLimitAmps: 15,
+      priority: ["a", "b"],
+      genAmpModels: models,
+      ...(opts.levelBoosts != null ? { levelBoosts: opts.levelBoosts } : {}),
+    });
+    const make = (id: string) => ({
+      id,
+      name: id,
+      power: true,
+      generatorMode: opts.level ?? 1,
+      maxGeneratorLevel: opts.maxLevel ?? 2,
+      fanSpeed: 1,
+      currentTemp: 32,
+    });
+    const devices = opts.peers === true ? [make("a"), make("b")] : [make("a")];
+    const deps: LevelingDeps = {
+      ...createDeps(),
+      getTclCloud: () =>
+        ({
+          sendControl: async (id: string, cmd: string, value: number) => {
+            if (cmd !== "set_generator_mode") return;
+            const d = devices.find((x) => x.id === id);
+            if (d != null) d.generatorMode = value;
+          },
+          executeAcAction: async () => undefined,
+        }) as never,
+    };
+    const controller = new LevelingControllerV2(mock.pool, deps);
+    const ctx = devices.map((device) => ({
+      device: device as never,
+      managed: true,
+      needTier: "full" as const,
+      needDelta: 3,
+      slotGenCap: null,
+    }));
+    let flip = 1;
+    const run = async (genAmps: number, steps: number, outdoorC: number | null = 44) => {
+      for (let i = 0; i < steps; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx as never, outdoorC);
+      }
+    };
+    return { mock, controller, devices, run };
+  }
+
+  it("REPORTS — but arms nothing — when the rise is a whole compressor above its step", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T05:00:00Z"));
+      const { mock, controller, devices, run } = setup();
+      await controller.ensureLoaded();
+
+      await run(8.0, 8); // calm ≥ raiseCalmSeconds → the lone L1→L2 raise ships
+      expect(devices[0].generatorMode).toBe(2);
+      // …and the meter rises 3.7A for a step priced at 1.5A. A level step does
+      // not do that; a compressor starting from a fan does — OR the house did
+      // something we cannot see, which is why this only reports. Held past
+      // AC_RAMP_MS so the sample is the settled peak, not a slice of ramp.
+      await run(11.7, 60);
+
+      // The observation IS emitted, and it is durable (docker logs rotate).
+      const report = mock.journal.find((j) => j.reason === "compressor_report");
+      expect(report).toBeDefined();
+      expect(String(report?.decisions)).toContain("report-only");
+      expect(String(report?.decisions)).toContain("compressor may not have been running at L1");
+
+      // …and it changes NOTHING. No 6h hold, no ladder clamp, no non-cooling
+      // verdict — those cost the hottest room its amps, and this measurement is
+      // not attributable enough to spend them (review, 2026-08-06).
+      expect(mock.levelHolds.size).toBe(0);
+      const status = controller.getStatus().acs.find((s) => s.deviceId === "a");
+      expect(status?.minLevel).toBe(1);
+      expect(status?.levelHold ?? null).toBeNull();
+      expect(status?.coolingState).not.toBe("compressor_off");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("REGRESSION 2026-08-06 (review): a heater step inside the grading window must not mint a hold", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T05:00:00Z"));
+      const { mock, controller, devices, run } = setup();
+      await controller.ensureLoaded();
+
+      await run(8.0, 8); // the lone L1→L2 raise ships
+      expect(devices[0].generatorMode).toBe(2);
+      // The step is REAL and ordinary: 1.5A, exactly what it was priced at.
+      await run(9.5, 18);
+      // …and ninety seconds into the 240s window this house's own water heater
+      // (3.4A) switches on. `peakDeltaAmps` is a whole-house ratcheted delta
+      // with no non-AC load subtracted, so the window now measures 4.9A against
+      // a 3.5A bar and the detector fires on a kettle.
+      await run(12.9, 45);
+
+      // It may say so out loud…
+      expect(mock.journal.some((j) => j.reason === "compressor_report")).toBe(true);
+      // …but a 6-hour L1 hold armed on a household appliance is the exact
+      // failure invariant 56 was written to kill, arriving from the amps side.
+      expect(mock.levelHolds.size).toBe(0);
+      const status = controller.getStatus().acs.find((s) => s.deviceId === "a");
+      expect(status?.minLevel).toBe(1);
+      expect(status?.levelHold ?? null).toBeNull();
+      expect(status?.coolingState).not.toBe("compressor_off");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("REGRESSION 2026-08-06 02:36:42: an ordinary step reports nothing", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T05:00:00Z"));
+      const { mock, controller, devices, run } = setup();
+      await controller.ensureLoaded();
+
+      await run(8.0, 8);
+      expect(devices[0].generatorMode).toBe(2);
+      // 1.5A — exactly the step price, which is what the live L1→L2 raise
+      // measured that morning (1.5–1.9A). Nothing anomalous happened, and the
+      // detector must not manufacture evidence out of a normal raise.
+      await run(9.5, 60);
+
+      // Nothing to report and — as always now — nothing armed. The report is
+      // what these tests pin since the demotion: a hold assertion alone would
+      // pass trivially and stop guarding the detector at all.
+      expect(mock.journal.some((j) => j.reason === "compressor_report")).toBe(false);
+      expect(mock.levelHolds.size).toBe(0);
+      expect(controller.getStatus().acs.find((s) => s.deviceId === "a")?.minLevel).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says nothing about a raise that is not off L1", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T05:00:00Z"));
+      // Starts at L2 with L3 available: the same anomalous rise, one level up.
+      // The L2 comfort floor is what lets the gen-entry clamp (invariant 13)
+      // leave the room where it is, so the raise under test really is L2→L3.
+      const { mock, controller, devices, run } = setup({
+        level: 2,
+        maxLevel: 3,
+        levelBoosts: { a: { minLevel: 2, outdoorAtLeastC: 40 } },
+      });
+      await controller.ensureLoaded();
+
+      await run(8.0, 8);
+      expect(devices[0].generatorMode).toBe(3);
+      await run(11.7, 60);
+
+      // The observation is about L1. A room that drew a lot more at L3 than its
+      // model said was simply working harder — nothing says L2 was dead.
+      expect(mock.journal.some((j) => j.reason === "compressor_report")).toBe(false);
+      expect(mock.levelHolds.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a second room moving inside the window voids the experiment (invariant 23)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T05:00:00Z"));
+      const { mock, controller, devices, run } = setup({ peers: true });
+      await controller.ensureLoaded();
+
+      await run(8.0, 30); // both rooms climb off L1 over the calm windows
+      expect(devices.filter((d) => d.generatorMode === 2).length).toBe(2);
+      await run(13.5, 60); // a big house-wide rise — attributable to NEITHER
+
+      // One actuator is the whole premise. With two rooms moving, the rise
+      // cannot be assigned, so nothing is reported for either — the same
+      // certification the cost learner requires, reaching the report path.
+      expect(mock.journal.some((j) => j.reason === "compressor_report")).toBe(false);
+      expect(mock.levelHolds.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The gated proactive shed (the swap), 2026-08-06. The DECISION is pure and
+// pinned in raise.test.ts; the whole-house replay is in scenarios.test.ts.
+//
+// SHELL guards, for what neither of those can see: the shed ROW and the PUSH a
+// donor gets (both are I/O), and the fact that a `power_off` — not only a
+// `set_level` — stamps the funding cooldown that stops the donor undoing the
+// trade.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — a donor switched off for a hotter room (the swap)", () => {
+  function setup() {
+    const mock = createGradePool({
+      genLimitAmps: 15,
+      priority: ["mid", "cool", "hot"],
+      genAmpModels: {
+        hot: { baseAmps: 4.5, stepAmps: 2.4 },
+        mid: { baseAmps: 2.5, stepAmps: 1.6 },
+        cool: { baseAmps: 2.7, stepAmps: 1.6 },
+      },
+    }, ["hot"]);
+    const offs: string[] = [];
+    const ons: string[] = [];
+    const pushes: string[] = [];
+    const deps: LevelingDeps = {
+      ...createDeps(),
+      broadcast: async (payload: Record<string, unknown>) => {
+        pushes.push(String(payload.body ?? ""));
+      },
+      getTclCloud: () =>
+        ({
+          sendControl: async () => undefined,
+          executeAcAction: async (id: string, action: Record<string, unknown>) => {
+            if (action.power === 0) offs.push(id);
+            if (action.power === 1) ons.push(id);
+          },
+        }) as never,
+    };
+    const controller = new LevelingControllerV2(mock.pool, deps);
+    const power = new Map<string, boolean>([
+      ["hot", false],
+      ["mid", true],
+      ["cool", true],
+    ]);
+    // comfortTargetC is 26, so the thermometer IS the rank: mid 3.0, hot 2.0,
+    // cool 0.5. `hot` is 1.5°C hotter than `cool` — clear of the 1.0°C gap —
+    // and `mid` is hotter than both, so it can never be the donor.
+    const room = (id: string, temp: number, need: number) => ({
+      device: {
+        ...(acDevice(id, power.get(id) === true, 1) as object),
+        power: power.get(id) === true,
+        currentTemp: temp,
+      } as never,
+      managed: true,
+      needTier: "full" as const,
+      needDelta: need,
+      slotGenCap: null,
+    });
+    const ctxOf = () => [room("mid", 29, 3), room("cool", 26.5, 0.5), room("hot", 28, 2)] as never;
+    let flip = 1;
+    const run = async (amps: number, steps: number) => {
+      for (let i = 0; i < steps; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: amps + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctxOf(), 40);
+      }
+    };
+    /** Same cadence on the GRID channel — a real changeover, not a gap. */
+    const runGrid = async (amps: number, steps: number) => {
+      for (let i = 0; i < steps; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: amps + 0.01 * flip, current_2: 0 } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctxOf(), 40);
+      }
+    };
+    const decisionsOf = () =>
+      mock.journal.flatMap(
+        (r) => JSON.parse(String(r.decisions ?? "[]")) as Array<{ blockedBy?: string; action?: string; deviceId?: string }>,
+      );
+    const shedReasons = () => mock.shedReasons;
+    return { journal: mock.journal, controller, offs, ons, pushes, power, run, runGrid, decisionsOf, shedReasons };
+  }
+
+  it("records the shed row and the push naming the room the donation was FOR", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T02:40:00Z"));
+      const { controller, journal, offs, pushes, run, shedReasons } = setup();
+      await controller.ensureLoaded();
+
+      // 11.8A: `hot` needs 4.5A against a 14.9A ceiling and both running rooms
+      // are already at their floors, so nothing but a trade can bring it back.
+      await run(11.8, 12);
+
+      expect(offs).toEqual(["cool"]);
+      // It is the TRADE that switched the room off, not the ladder — the
+      // journal reason is what a forensic pass reads first.
+      expect(journal.some((r) => r.reason === "proactive_shed")).toBe(true);
+      // A shed must be LOUD, and a proactive one must say who it was for —
+      // "to protect the breaker" would be a lie about a calm line.
+      expect(shedReasons().some((r) => r.includes("so hot could run"))).toBe(true);
+      expect(pushes.some((b) => b.includes("cool") && b.includes("hot"))).toBe(true);
+      expect(pushes.some((b) => b.includes("protect the"))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("remembers the trade across ticks and hands the amps to its receiver", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T02:40:00Z"));
+      const { controller, offs, ons, power, run, decisionsOf } = setup();
+      await controller.ensureLoaded();
+      await run(11.8, 12);
+      expect(offs).toEqual(["cool"]);
+      power.set("cool", false);
+
+      // The off is sent; the compressor has not stopped yet, so the meter has
+      // not moved. The receiver's amps must stay reserved rather than be handed
+      // to `mid` — the hottest room in the house, and one step from L2.
+      await run(11.8, 6);
+      expect(ons).toHaveLength(0);
+      expect(decisionsOf().some((d) => d.deviceId === "hot" && d.blockedBy === "swap landing")).toBe(true);
+
+      // …and once the saving really lands, the room the trade was for comes back.
+      await run(9.1, 12);
+      expect(ons).toEqual(["hot"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bars the DONOR's own restore for the funding cooldown (a power_off stamps it)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T02:40:00Z"));
+      const { controller, offs, ons, power, run, decisionsOf } = setup();
+      await controller.ensureLoaded();
+      await run(11.8, 12);
+      expect(offs).toEqual(["cool"]);
+      power.set("cool", false);
+
+      // Now the line is roomy enough for BOTH rooms to return. The receiver goes
+      // first (it is the hotter one), and the donor may not take its donation
+      // back while the cooldown runs — without the `power_off` arm of the
+      // stamp it would simply be restored on the next calm window, undoing the
+      // trade it just paid for. (70 s of ticks, inside FUNDING_COOLDOWN_MS.)
+      await run(6.0, 8);
+      power.set("hot", true);
+      await run(6.0, 6);
+
+      expect(ons).toEqual(["hot"]);
+      expect(decisionsOf().some((d) => d.deviceId === "cool" && d.blockedBy === "donation cooldown")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a CHANGEOVER releases the reservation — the trade was priced on a budget that is gone", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T02:40:00Z"));
+      const { controller, offs, power, run, runGrid, decisionsOf } = setup();
+      await controller.ensureLoaded();
+      // The record itself, because that is the thing under test: every OUTWARD
+      // effect of a stale swap is masked on the far side of a changeover (the
+      // entry mode returns before `planRaise`, and GRID_FULL restores the
+      // receiver outright), so an assertion on decisions would pass with the
+      // clear deleted — it did, on the first draft of this test.
+      const shell = controller as unknown as { swap: { donorId: string; receiverId: string } | null };
+
+      await run(11.8, 12);
+      expect(offs).toEqual(["cool"]);
+      power.set("cool", false);
+
+      // The reservation is live: the receiver's amps are held across ticks.
+      await run(11.8, 4);
+      expect(decisionsOf().some((d) => d.deviceId === "hot" && d.blockedBy === "swap landing")).toBe(true);
+      expect(shell.swap).toMatchObject({ donorId: "cool", receiverId: "hot" });
+
+      // gen → grid. `clearOnSourceChange` drops the trade: it reserved amps on a
+      // budget that no longer exists, and GRID_FULL re-decides who runs from
+      // scratch. Carried over, it would park the next gen session's raise phase
+      // for the rest of SWAP_RESERVATION_MS and bar a fresh trade for the same
+      // window. (Mirrored in `scenario.ts` `setSource`.)
+      await runGrid(11.8, 2);
+      expect(shell.swap).toBeNull();
     } finally {
       vi.useRealTimers();
     }

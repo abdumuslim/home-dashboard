@@ -27,22 +27,29 @@ export const NON_COOLING_NEED_C = 2;
 
 /**
  * How long a room may sit below its comfort floor showing NO cooling progress
- * before it is declared non-cooling regardless of how close to target it is.
+ * before the status card says so.
  *
- * The 2°C band above is a prediction ("this close, L1 still works"); this is
- * the check on it (user, 2026-08-03: "at the 2 degrees, the system should watch
- * it if the compressor fall"). Long enough that a slow room on a hot afternoon
- * is not misjudged, short enough to catch a compressor that never engaged well
- * before the room drifts out of the band on its own.
+ * ⚠ REPORT-ONLY since 2026-08-06 (user's decision, verbatim): *"it is so normal
+ * that we see no cooling progress in all rooms for a long time, even with L3, so
+ * this should not be considered. However, we have to depend on Amps — if it
+ * draws only about 1 amp, only the fan is working, no compressor."* Nothing
+ * enforces or spends on this clock any more: it does not make a room
+ * `isNonCooling`, and it no longer arms the learned L1 hold. The only automatic
+ * evidence that a compressor is not running is the METER's, from an
+ * ATTRIBUTABLE window (`compressorOffLikely` — dead-window.ts).
  *
- * Shipped at 10 min; the user cut it to 3 after watching an afternoon of it
- * (2026-08-04: "no need for 10 min, 3 min is enough"). What consumes the window
- * is a working compressor's own duty cycle — it must be able to show
- * SUBFLOOR_PROGRESS_C (0.2°C, two sensor LSBs) inside it or a healthy room
- * reads as dead. A TCL cycles in ones of minutes and a room that IS cooling
- * moves 0.2°C well inside three; ten minutes was simply longer than the
- * evidence needed, and every minute of it is a minute the hottest room spends
- * at a level its compressor is not running at.
+ * What killed it was a false positive that could not have been anything else.
+ * 2026-08-06 02:12:20 Abdullah was demoted to L1 *for being satisfied for 20
+ * minutes*; at 02:15:29 the watch declared "no cooling progress at L1" and armed
+ * a six-hour hold. An at-target room can never show `SUBFLOOR_PROGRESS_C` more
+ * cooling — the verdict was true by construction of the state that produced it.
+ * The hold then raised him L1→L2 at 02:36:42 in the middle of a 15 A generator
+ * episode, and the 1.5–1.9 A it took is what made restoring the hotter room
+ * (4.3 A) infeasible for the next thirteen minutes.
+ *
+ * The window itself stays at the user's 3 min (2026-08-04: "no need for 10 min,
+ * 3 min is enough") because the report is still worth reading — a room that has
+ * not moved in three minutes is a fact, it is just not a diagnosis.
  */
 export const SUBFLOOR_WATCH_MS = 3 * 60 * 1000;
 
@@ -61,26 +68,22 @@ export interface SubFloorWatch {
  * scenario harness so the two can never drift (the mirror-drift trap that hid
  * bug 14 for five days).
  *
- * ⚠ The `tempKnown` gate is load-bearing, and it is where `satisfiedForMs`'s
- * no-stale-guard argument INVERTS. A dead room sensor maps to needDelta
- * EXACTLY 1 (computeAcNeed's sentinel) — inside the 2°C band and constant, so
- * it can never show the 0.2°C of progress that re-bases this clock; ten
- * minutes of dead sensor would read as "compressor never engaged" and the
- * recovery path would start SPENDING on a thermometer that is lying. For the
- * demote that failure mode was a harmless L1 cap; here it is a raise, so a
- * tick without a real reading reports 0 — acting always requires a live
- * thermometer. The record is kept, not reset: when the sensor returns, the two
- * REAL endpoint readings still answer "did this room get cooler" honestly.
+ * ⚠ The `tempKnown` gate is kept even though nothing spends on this clock any
+ * more (see SUBFLOOR_WATCH_MS). A dead room sensor maps to needDelta EXACTLY 1
+ * (computeAcNeed's sentinel) — inside the 2°C band and constant, so it can
+ * never show the 0.2°C of progress that re-bases the clock, and a stall it
+ * reports would be a statement about the thermometer rather than the room. It
+ * was load-bearing while the watch could arm a hold; it is now what keeps the
+ * REPORT honest, which is the only job the clock has left. The record is kept,
+ * not reset: when the sensor returns, the two REAL endpoint readings still
+ * answer "did this room get cooler" honestly.
  *
  * Known accepted edge: when an automation rule drives needDelta from a WEATHER
  * metric (e.g. the feels-like range rules), `tempKnown` reflects the AC's own
  * thermometer, not that feed — a frozen weather station freezes the delta and
  * the watch can accrue on it. Deliberately not plumbed (it needs a freshness
- * flag through LevelerDeviceContext): the worst outcome is one envelope-guarded
- * step up to the comfort floor, which is approximately what the floor asks for
- * absent better information — the same accepted-risk class as satisfiedForMs's
- * stale-but-plausible reading, with the same self-correction once the feed
- * recovers.
+ * flag through LevelerDeviceContext), and since 2026-08-06 the worst outcome is
+ * a wrong line on the status card.
  */
 export function nextSubFloorWatch(
   prev: SubFloorWatch | null,
@@ -103,18 +106,33 @@ export function nextSubFloorWatch(
  *  - the room is more than `NON_COOLING_NEED_C` from target, so the compressor
  *    will not engage at all (the user's rule, and his measurement: switching
  *    the AC off barely moved the meter); or
- *  - it IS within that band, but has sat there `SUBFLOOR_WATCH_MS` without the
- *    room getting any cooler — the prediction tested against the thermometer; or
  *  - the METER has already said so (`compressorOffLikely`, R6): a graded lone
- *    off that measured about a fan, or a dead window nothing has absorbed. The
- *    same physical state the watch detects, arriving minutes sooner — so it
- *    reaches the same consumers rather than a parallel set.
+ *    off that measured about a fan, or a dead window nothing has absorbed. A
+ *    lone RAISE off L1 that rose by a whole compressor more than its step LOOKS
+ *    like the same evidence and is not — its rise is a whole-house delta with
+ *    no non-AC load subtracted, so it reports and never reaches this predicate
+ *    (see `controller.noteLoneRaiseRise`).
  *
- * Room temperature is the signal on purpose. The tempting alternative — "it is
- * not drawing its modelled amps" — is circular here: the house residual is
- * `smoothed − modelled draw`, so a room under-drawing its model moves the very
- * number you would be reading. That reasoning already produced one wrong
- * diagnosis on 2026-08-03 and the user corrected it.
+ * ⚠ A THIRD ground was removed on 2026-08-06 — "it has sat below its floor for
+ * `SUBFLOOR_WATCH_MS` without getting cooler". The user's decision, verbatim:
+ * *"it is so normal that we see no cooling progress in all rooms for a long
+ * time, even with L3, so this should not be considered. However, we have to
+ * depend on Amps — if it draws only about 1 amp, only the fan is working, no
+ * compressor."* A stalled thermometer is ambiguous between a dead compressor
+ * and a hot afternoon a working one cannot win, and in its worst case it is
+ * circular in the other direction: a room demoted to L1 *for being satisfied*
+ * cannot show 0.2°C more cooling, so the watch is true by construction of the
+ * state that armed it (live 2026-08-06 02:15:29 — see SUBFLOOR_WATCH_MS). The
+ * clock still runs and is still REPORTED (`coolingState: "stalled"`); nothing
+ * enforces or spends on it.
+ *
+ * Amps are the signal now, but only ATTRIBUTABLE amps. The tempting shortcut —
+ * "it is not drawing its modelled amps" off the standing residual — stays
+ * banned: the house residual is `smoothed − modelled draw`, so a room
+ * under-drawing its model moves the very number you would be reading. That
+ * reasoning already produced one wrong diagnosis on 2026-08-03 and the user
+ * corrected it. `compressorOffLikely` is fed only from graded, uncontaminated,
+ * settled single-actuator windows (invariants 23/29) and the dead window.
  *
  * Both directions of the ladder consult this: the reducer prices such a move as
  * a room going out of service, and the recovery path ranks such a room
@@ -122,11 +140,7 @@ export function nextSubFloorWatch(
  */
 export function isNonCooling(ac: AcView, level: number): boolean {
   if (level >= floorOf(ac)) return false;
-  return (
-    ac.needDelta > NON_COOLING_NEED_C ||
-    ac.subFloorStalledMs >= SUBFLOOR_WATCH_MS ||
-    ac.compressorOffLikely
-  );
+  return ac.needDelta > NON_COOLING_NEED_C || ac.compressorOffLikely;
 }
 
 /**
@@ -145,8 +159,9 @@ export function isNonCooling(ac: AcView, level: number): boolean {
  * ever shed to recover a level the user chose to leave. The watch keeps
  * observing regardless — it keys off the boost minimum (`minLevel`), not this
  * — so `subFloorStalledMs` still accrues and can still say "you pinned this
- * room below its comfort floor and it has not cooled in ten minutes". Reported,
- * never enforced: that is what "manual wins" has to mean to be worth anything.
+ * room below its comfort floor and it has not cooled in three minutes".
+ * Reported, never enforced: that is what "manual wins" has to mean to be worth
+ * anything, and since 2026-08-06 it is what the watch is for everywhere.
  */
 export function floorOf(ac: AcView): number {
   let floor = Math.max(1, Math.min(ac.minLevel, ac.maxLevel));

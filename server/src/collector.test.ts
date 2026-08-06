@@ -3648,6 +3648,390 @@ describe("AC beep-off enforcement", () => {
   });
 });
 
+async function checkAcEnforce(collector: Collector) {
+  await (collector as never as { checkAcRangeEnforcement: () => Promise<void> }).checkAcRangeEnforcement();
+}
+
+function getSwingOverrides(collector: Collector) {
+  return (collector as never as { acSwingOverrides: Map<string, { slotId: string }> }).acSwingOverrides;
+}
+
+/**
+ * Fan/swing enforcement sweep + the power-cycle clear sites the rule-owned ones
+ * never covered (2026-08-06 — Najat stuck on device-auto 'A' after a leveler
+ * shed + restore across a grid→gen changeover).
+ */
+describe("AC fan/swing enforcement sweep (2026-08-06)", () => {
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T04:30:00.000Z")); // 07:30 Baghdad — morning slot active
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Najat's live shape: one slot pinning a fixed fan (and optionally a swing). */
+  function enforceRule(slotFan: number, slotSwing?: number) {
+    return {
+      ...acRangeRule(),
+      action_on: { power: 1, mode: 1, temperature: 23, fan_speed: 7 },
+      range_slots: [
+        {
+          id: "morning", type: "window",
+          start_mode: "exact", start_time: "06:00",
+          end_mode: "exact", end_time: "10:00",
+          threshold_low: 22, threshold: 25,
+          fan_speed: slotFan,
+          ...(slotSwing != null ? { vertical_swing: slotSwing } : {}),
+        },
+      ] satisfies AutomationRangeSlot[],
+    };
+  }
+
+  function enforceSetup(devOverrides: Record<string, unknown> = {}, slotFan = 7, slotSwing?: number) {
+    const ctx = createCollector();
+    const rule = enforceRule(slotFan, slotSwing);
+    (ctx.collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    const devices = [{
+      id: "ac1", name: "Najat", power: true, fanSpeed: 7, verticalSwing: 9,
+      generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1,
+      ...devOverrides,
+    }];
+    ctx.tclCloud.getDevices.mockReturnValue(devices);
+    ctx.tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+    ctx.tclCloud.getDeviceState.mockReturnValue({ fan_speed: devices[0].fanSpeed as number });
+    return { ...ctx, rule, devices };
+  }
+
+  it("regression: Najat fan stuck at device-auto after a leveler shed/restore across a changeover self-heals", async () => {
+    const { collector, tclCloud, actions, devices, shed, setLevelingConfig } =
+      enforceSetup({ power: false, fanSpeed: 0 });
+    setLevelingConfig(LEVELING_CONFIG);
+    shed.add("ac1");
+    await collector.acLeveler.ensureLoaded();
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 0 });
+    await setWeatherValue(collector, 24);
+
+    // A manual fan change from BEFORE the incident is still on the books.
+    collector.noteUserAcFanChange("ac1");
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+
+    // The shed is a power cycle no rule-owned clear site sees — the range
+    // automation's observed-off branch skips shed devices outright.
+    await checkAcEnforce(collector);
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(false);
+    expect(actions).toEqual([]); // shed → the leveler owns it, nothing enforced
+
+    // Headroom returns and the leveler restores her; the firmware brings the
+    // blower back on built-in auto ('A' = fanSpeed 0).
+    genReadings(collector, 4, 6);
+    await checkAcLeveling(collector);
+    expect(shed.has("ac1")).toBe(false);
+    devices[0].power = true;
+    actions.length = 0;
+
+    vi.advanceTimersByTime(31_000); // past the turn-on settle + the sweep cooldown
+    await setWeatherValue(collector, 24);
+    await checkAcEnforce(collector);
+
+    expect(actions).toEqual([{ deviceId: "ac1", action: { fan_speed: 7 } }]);
+  });
+
+  it("a leveler restore releases pre-cycle intent on its own (no rule-owned site sees a restore)", async () => {
+    const { collector, actions, devices, shed, setLevelingConfig } =
+      enforceSetup({ power: false, fanSpeed: 3 });
+    setLevelingConfig(LEVELING_CONFIG);
+    shed.add("ac1");
+    await collector.acLeveler.ensureLoaded();
+    await setWeatherValue(collector, 24);
+    collector.noteUserAcFanChange("ac1");
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+
+    // Isolated to the restore hook: already ON gen (no source-change power
+    // event), no sweep has run (so the shed EDGE was never observed), and she
+    // comes back on fan 3 — not the built-in auto the staleness heal reads.
+    primeGenSource(collector);
+    genReadings(collector, 4, 6);
+    await checkAcLeveling(collector);
+    expect(shed.has("ac1")).toBe(false);
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(false);
+
+    devices[0].power = true;
+    actions.length = 0;
+    vi.advanceTimersByTime(31_000);
+    await setWeatherValue(collector, 24);
+    await checkAcEnforce(collector);
+
+    expect(actions).toEqual([{ deviceId: "ac1", action: { fan_speed: 7 } }]);
+  });
+
+  it("a power event releases pre-cycle fan and swing intent for every cached AC", async () => {
+    const { collector } = enforceSetup({}, 7, 9);
+    collector.noteUserAcFanChange("ac1");
+    collector.noteUserAcSwingChange("ac1");
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+    expect(getSwingOverrides(collector).has("1:ac1")).toBe(true);
+
+    collector.notePowerEvent("source grid → gen");
+
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(false);
+    expect(getSwingOverrides(collector).has("1:ac1")).toBe(false);
+  });
+
+  it("releases the manual flag but KEEPS the baseline the leveler re-stamps", async () => {
+    const { collector } = enforceSetup();
+    getFanEnforcement(collector).set("1:ac1", {
+      slotId: "morning", lastCommandedFan: 5, lastFanCommandAt: 1234, manual: true,
+    } as never);
+
+    collector.notePowerEvent("source grid → gen");
+
+    // Deleting the entry would strand `refreshAcFanBaseline` (it only updates
+    // entries that exist) and lose the settle window that stops a later drift
+    // check misreading our own send as a manual change.
+    expect(getFanEnforcement(collector).get("1:ac1")).toMatchObject({
+      lastCommandedFan: 5, lastFanCommandAt: 1234, manual: false,
+    });
+  });
+
+  it("a manual fan change AFTER the cycle still wins — the clear only forgets pre-cycle intent", async () => {
+    const { collector, actions } = enforceSetup({ fanSpeed: 3 });
+    await setWeatherValue(collector, 24);
+
+    collector.notePowerEvent("source grid → gen");
+    collector.noteUserAcFanChange("ac1"); // the user picks a fan AFTER the changeover
+
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+  });
+
+  it("does not treat the un-shed edge as the cycle (a shed clears on the confirmed ON, minutes later)", async () => {
+    const { collector, shed, setLevelingConfig } = enforceSetup({ fanSpeed: 3 });
+    setLevelingConfig(LEVELING_CONFIG);
+    shed.add("ac1");
+    await collector.acLeveler.ensureLoaded();
+    await setWeatherValue(collector, 24);
+
+    await checkAcEnforce(collector); // the shed edge — pre-cycle intent released
+    collector.noteUserAcFanChange("ac1"); // the room is back and the user picks a fan
+    await collector.acLeveler.clearShed("ac1", "confirmed_on"); // shadow confirms, minutes on
+
+    await checkAcEnforce(collector);
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+  });
+
+  it("re-asserts a drifted slot fan, then honours the 30s per-device cooldown", async () => {
+    const { collector, actions } = enforceSetup({ fanSpeed: 0 });
+    await setWeatherValue(collector, 24);
+
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([{ deviceId: "ac1", action: { fan_speed: 7 } }]);
+
+    await checkAcEnforce(collector); // shadow still lagging — one command, not one per tick
+    expect(actions).toHaveLength(1);
+
+    vi.advanceTimersByTime(31_000); // still on 'A' after the cooldown → re-assert
+    await checkAcEnforce(collector);
+    expect(actions).toHaveLength(2);
+  });
+
+  it("stands down while the leveler holds the fan (the leveler owns that channel)", async () => {
+    const { collector, actions, fanHolds, setLevelingConfig } = enforceSetup({ fanSpeed: 0 });
+    setLevelingConfig(LEVELING_CONFIG);
+    fanHolds.set("ac1", { original_fan: 0, last_set_fan: 1 });
+    await collector.acLeveler.ensureLoaded();
+    await setWeatherValue(collector, 24);
+
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+  });
+
+  it("stands down for a shed device", async () => {
+    const { collector, actions, shed, setLevelingConfig } = enforceSetup({ fanSpeed: 0 });
+    setLevelingConfig(LEVELING_CONFIG);
+    shed.add("ac1");
+    await collector.acLeveler.ensureLoaded();
+    await setWeatherValue(collector, 24);
+
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+  });
+
+  it("stands down while calibration is active", async () => {
+    const { collector, actions } = enforceSetup({ fanSpeed: 0 });
+    vi.spyOn(collector.acCalibrator, "isActive").mockReturnValue(true);
+    await setWeatherValue(collector, 24);
+
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+  });
+
+  it("leaves a live manual fan override alone — manual wins over enforcement", async () => {
+    const { collector, actions } = enforceSetup({ fanSpeed: 3 });
+    await setWeatherValue(collector, 24);
+    collector.noteUserAcFanChange("ac1");
+
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+  });
+
+  it("stays silent for an AC that is off, and for one the rule is about to switch off", async () => {
+    const off = enforceSetup({ power: false, fanSpeed: 0 });
+    await setWeatherValue(off.collector, 24);
+    await checkAcEnforce(off.collector);
+    expect(off.actions).toEqual([]);
+
+    const cooled = enforceSetup({ fanSpeed: 0 });
+    await setWeatherValue(cooled.collector, 21); // ≤ the slot's low limit → an OFF is owed, not a fan
+    await checkAcEnforce(cooled.collector);
+    expect(cooled.actions).toEqual([]);
+  });
+
+  it("stays silent when the metric is stale (a smart-auto fan needs a temperature to resolve)", async () => {
+    const { collector, actions } = enforceSetup({ fanSpeed: 0 }, 0); // slot fan Auto → smart auto
+    await setWeatherValue(collector, 24);
+    (collector as never as { latestWeatherTs: Date }).latestWeatherTs = new Date(Date.now() - 400_000);
+
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+  });
+
+  it("heals a manual override the firmware already ate, even when no clear site saw the cycle", async () => {
+    // The belt to the clear sites' braces: a restart, or a cold device cache at
+    // power-event time, leaves the override in place. Observed fan 0 is the
+    // device's BUILT-IN auto, which nothing here commands and which the
+    // dashboard's A button expresses by DELETING the override — so a manual
+    // flag on an observed 0 is pre-cycle intent the unit has forgotten.
+    const { collector, actions } = enforceSetup({ fanSpeed: 0 });
+    await setWeatherValue(collector, 24);
+    getFanEnforcement(collector).set("1:ac1", {
+      slotId: "morning", lastCommandedFan: 5, lastFanCommandAt: 0, manual: true,
+    } as never);
+
+    await checkAcEnforce(collector);
+
+    expect(actions).toEqual([{ deviceId: "ac1", action: { fan_speed: 7 } }]);
+  });
+
+  it("REGRESSION 2026-08-06 (review): the heal RELEASES the entry, it does not delete it", async () => {
+    // Same stale override, but our own fan command is still in flight. The heal
+    // is a read-side predicate — `driftedRangeFan` consults the very entry it
+    // touches, one line later, for the AC_FAN_SETTLE_MS guard. Deleting the
+    // entry destroyed that guard and re-asserted on top of a send the shadow had
+    // not reported yet; it also stranded `refreshAcFanBaseline`, which only
+    // updates entries that exist. Release-don't-delete is notePowerCycle's own
+    // documented rule and it applies here for the same reason.
+    const { collector, actions } = enforceSetup({ fanSpeed: 0 });
+    await setWeatherValue(collector, 24);
+    getFanEnforcement(collector).set("1:ac1", {
+      slotId: "morning", lastCommandedFan: 7, lastFanCommandAt: Date.now(), manual: true,
+    } as never);
+
+    await checkAcEnforce(collector);
+
+    // The manual flag is gone (enforcement resumes)…
+    expect(getFanEnforcement(collector).get("1:ac1")).toMatchObject({
+      lastCommandedFan: 7, manual: false,
+    });
+    // …but the settle window survives with it, so nothing is re-sent yet.
+    expect(actions).toEqual([]);
+
+    // Past the settle window, the same sweep heals it for real.
+    vi.advanceTimersByTime(31_000);
+    await setWeatherValue(collector, 24);
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([{ deviceId: "ac1", action: { fan_speed: 7 } }]);
+  });
+
+  it("heals the same stale override through the ordinary diff re-enforcement too", async () => {
+    const { collector, tclCloud } = enforceSetup({ fanSpeed: 0 });
+    await setWeatherValue(collector, 24);
+    getFanEnforcement(collector).set("1:ac1", {
+      slotId: "morning", lastCommandedFan: 5, lastFanCommandAt: 0, manual: true,
+    } as never);
+
+    setTriggered(collector, 1);
+    await checkAcRangeAutomation(collector, enforceRule(7));
+
+    // Not `{ mode, temperature }` with the fan deleted — the profile carries it.
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 7 });
+  });
+
+  it("REGRESSION 2026-08-06 (review): waits out the rule's own cooldown, so manual detection gets a tick", async () => {
+    // The rule's turn-on, locked-adopt and power-event re-turn-on paths all
+    // stamp `lastToggle: now` and RETURN before `updateAcFanTracking` — which is
+    // the only place a remote/app fan change is ever noticed. The sweep runs on
+    // its own 30 s clock and had no lastToggle gate, so a user reaching for the
+    // remote inside `cooldown_secs` of a power-event restart was reverted before
+    // any tick could record his choice as manual: enforcement then "won" a
+    // contest the user never got to enter.
+    const { collector, tclCloud, actions, devices } = enforceSetup({ power: false, fanSpeed: 0 });
+    const rule = { ...enforceRule(7), cooldown_secs: 60 };
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    await setWeatherValue(collector, 24);
+    setTriggered(collector, 1);
+
+    // A mains event, then the rule's power-event re-turn-on path — which stamps
+    // `lastToggle` and returns without running fan tracking.
+    collector.notePowerEvent("source grid → gen");
+    await checkAcRangeAutomation(collector, rule as never);
+    expect(actions.some((a) => (a.action as Record<string, unknown>).power === 1)).toBe(true);
+
+    // The room is back and the user picks fan 3 on the remote. Nothing in the
+    // system has observed it yet.
+    devices[0].power = true;
+    devices[0].fanSpeed = 3;
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 3 });
+    actions.length = 0;
+
+    // 20 s later: past the turn-on settle window, still inside the rule's own
+    // 60 s cooldown. The sweep must hold its tongue.
+    vi.advanceTimersByTime(20_000);
+    await setWeatherValue(collector, 24);
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+
+    // Past the cooldown the rule ticks, `updateAcFanTracking` sees fan 3 against
+    // a commanded 7 and records the override — and the sweep now stands down for
+    // the RIGHT reason (manual wins), permanently.
+    vi.advanceTimersByTime(45_000);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule as never);
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+    actions.length = 0;
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+  });
+
+  it("re-asserts a drifted slot swing only inside the post-power-cycle window", async () => {
+    const { collector, actions } = enforceSetup({ verticalSwing: 1 }, 7, 9);
+    await setWeatherValue(collector, 24);
+
+    // Mid-session drift with no power event: swing has no drift detection by
+    // design, so this sweep leaves it to the ordinary diff re-enforcement.
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+
+    // After a changeover the same difference IS a firmware reset.
+    collector.notePowerEvent("source grid → gen");
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([{ deviceId: "ac1", action: { vertical_swing: 9 } }]);
+  });
+
+  it("does not re-assert swing a user took by hand after the power cycle", async () => {
+    const { collector, actions } = enforceSetup({ verticalSwing: 1 }, 7, 9);
+    await setWeatherValue(collector, 24);
+
+    collector.notePowerEvent("source grid → gen");
+    collector.noteUserAcSwingChange("ac1"); // the user aimed it himself afterwards
+
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]);
+  });
+});
+
 describe("Smart AC leveling — emergency reduction fast path", () => {
   beforeEach(() => {
     acTimers.clear();
@@ -4258,7 +4642,10 @@ describe("collector loop watchdog + step deadlines (2026-07-06 stall)", () => {
     c.collectAmbientWeather = async () => {};
     c.collectQingping = async () => {};
     c.checkAlerts = () => new Promise<void>(() => {}); // hangs forever (the stall)
-    c.acCalibrator = { tick: async () => {} };
+    // `isActive` too: the ac-enforce step added 2026-08-06 calls it, and a stub
+    // without it threw a TypeError that the step's own try/catch swallowed —
+    // the test still passed while silently exercising nothing.
+    c.acCalibrator = { tick: async () => {}, isActive: () => false };
     c.checkAutomations = async () => {};
     let timersRan = false;
     c.checkAcTimers = async () => { timersRan = true; };

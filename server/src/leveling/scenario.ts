@@ -47,7 +47,7 @@ import type { CostBook } from "./costs.js";
 import { fanTrimSavings, raiseJumpAmps, restoreCostAmps, turnOnAmps } from "./costs.js";
 import { ceilOf, floorOf, nextSubFloorWatch, type SubFloorWatch, worstCaseLevel } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
-import { absorbedSharesAmps } from "./raise.js";
+import { absorbedSharesAmps, SWAP_QUIET_AFTER_OVER_MS } from "./raise.js";
 import {
   EXTERNAL_ON_VOID_MS,
   HOUSE_SAMPLE_COOLDOWN_MS,
@@ -233,6 +233,13 @@ const FAN_DEBIT_MS = 60_000;
 const FUNDING_COOLDOWN_MS = 120_000;
 /** Mirrors the controller shell's VICTIM_COOLDOWN_MS. */
 const VICTIM_COOLDOWN_MS = 120_000;
+/**
+ * Mirrors the controller shell's SWAP_RESERVATION_MS by its DERIVATION, not by
+ * its value: the shell defines it AS the blame window, so the mirror does too.
+ * A harness constant that merely resembles a shell constant is worse than no
+ * mirror at all (2026-08-05, the phantom `rampSeconds` regression).
+ */
+const SWAP_RESERVATION_MS = ATTEMPT_BLAME_WINDOW_MS;
 
 export class Scenario {
   now = 1_000_000_000;
@@ -293,6 +300,15 @@ export class Scenario {
    * A restore is judged against that, not against the trough its shed dug.
    */
   private shedBar = new Map<string, { amps: number; at: number }>();
+  /**
+   * Shell parity (`controller.swap`): the ONE gated proactive shed in flight
+   * house-wide. Mirrored because the receiver's reservation must survive across
+   * ticks — a harness that forgot the trade every step could never show the
+   * donor's amps actually reaching the room they were taken for.
+   */
+  private swap: { donorId: string; receiverId: string; at: number } | null = null;
+  /** Shell parity (`controller.lastOverLimitActAt`): when the ladder last acted. */
+  private lastOverLimitActAt: number | null = null;
   private attempts: Array<{ deviceId: string; kind: AttemptKind; at: number }> = [];
 
   constructor(
@@ -523,6 +539,15 @@ export class Scenario {
     for (const ac of this.acs) ac.unansweredSince = 0;
     this.entryCollapseSince = null;
     this.entryCollapseLatched = false;
+    // Shell parity (`clearOnSourceChange`): a trade in flight reserved amps on a
+    // budget that no longer exists, and the entry mode (FLOORS / GRID_FULL)
+    // re-decides who runs from scratch. The donor keeps its ordinary shed row.
+    // Missing here, the harness would carry a receiver's reservation across a
+    // changeover and park the new line's raise phase for `SWAP_RESERVATION_MS`
+    // — a divergence the shell cannot exhibit, i.e. exactly the mirror class the
+    // SKILL warns about ("a harness constant that merely RESEMBLES a shell
+    // constant is worse than no mirror at all").
+    this.swap = null;
     // Shell parity (R11b): a changeover power-cycles every compressor exactly
     // as a collapse recovery does, so the gen-entry floor set is admitted
     // against the envelope on EVERY gen entry — not only after a latched
@@ -767,7 +792,17 @@ export class Scenario {
     return since == null ? 0 : this.now - since;
   }
 
-  /** Shell parity for the sub-floor watch — SAME implementation, not a mirror. */
+  /**
+   * Shell parity for the sub-floor watch — SAME implementation, not a mirror.
+   *
+   * ⚠ REPORT-ONLY on both sides since 2026-08-06: `isNonCooling` no longer reads
+   * this clock and no hold is armed from it, so a scenario cannot stage a
+   * non-cooling room by starving it of progress. State
+   * `SimAcSetup.compressorOffLikely`'s physical cause instead (a held
+   * power-event ramp), which is the amp evidence the ladder now runs on.
+   * Kept computed because the shell still computes it for the status card, and
+   * a harness that stopped would be free to drift from a live surface.
+   */
   private subFloorStalledMs(ac: SimAc, observedLevel: number): number {
     const floor = ac.setup.minLevel ?? 1;
     const r = nextSubFloorWatch(this.subFloorSince.get(ac.setup.deviceId) ?? null, {
@@ -1257,6 +1292,27 @@ export class Scenario {
         }
         return Math.max(0, bar.amps);
       },
+      // Shell parity (`controller.swapInFlightFor`): the trade ends when the
+      // receiver is back, or at SWAP_RESERVATION_MS — never on a bare clock
+      // while the room it is holding amps for is still off.
+      swapInFlight: (() => {
+        if (this.swap == null) return null;
+        const receiver = views.find((a) => a.deviceId === this.swap?.receiverId);
+        if (receiver != null && receiver.on && !receiver.shed) {
+          this.swap = null;
+          return null;
+        }
+        if (this.now - this.swap.at > SWAP_RESERVATION_MS) {
+          this.swap = null;
+          return null;
+        }
+        return { donorId: this.swap.donorId, receiverId: this.swap.receiverId };
+      })(),
+      // Shell parity: the comfort trade owes the ladder a quiet window that
+      // outlives every meter-level signal of the episode.
+      overLimitActedRecently:
+        this.lastOverLimitActAt != null &&
+        this.now - this.lastOverLimitActAt < SWAP_QUIET_AFTER_OVER_MS,
     });
     this.freshlyOn = [];
     this.plans.push(out);
@@ -1265,10 +1321,23 @@ export class Scenario {
     if (out.commands.length > 0) {
       // Shell parity: stamp the funding donors before executing, from the same
       // command list that ships.
+      // Shell parity: a proactive-shed donor gave up its whole ROOM, so a
+      // `power_off` stamps the same cooldown a `set_level` demote does.
       for (const deviceId of out.fundingDonors ?? []) {
-        if (out.commands.some((c) => c.deviceId === deviceId && c.kind === "set_level")) {
+        if (
+          out.commands.some(
+            (c) => c.deviceId === deviceId && (c.kind === "set_level" || c.kind === "power_off"),
+          )
+        ) {
           this.fundingDemotedAt.set(deviceId, this.now);
         }
+      }
+      // Shell parity: record the trade once its donor's off has shipped.
+      if (
+        out.swap != null &&
+        out.commands.some((c) => c.deviceId === out.swap?.donorId && c.kind === "power_off")
+      ) {
+        this.swap = { donorId: out.swap.donorId, receiverId: out.swap.receiverId, at: this.now };
       }
       for (const deviceId of out.reductionVictims ?? []) {
         if (out.commands.some((c) => c.deviceId === deviceId && c.kind === "set_level")) {
@@ -1293,6 +1362,8 @@ export class Scenario {
         this.meterState = refillBucket(this.meterState);
       }
       if (out.reason.startsWith("over")) {
+        // Shell parity: the ladder acted — the comfort trade stands down.
+        this.lastOverLimitActAt = this.now;
         // Shell parity: PARTIAL after an over-limit act, so an under-sized
         // reduction can escalate in seconds rather than another five readings.
         this.meterState = refillBucket(this.meterState, OVER_LIMIT_BUDGET_AFTER_ACT);

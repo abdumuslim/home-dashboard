@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
   COMPRESSOR_OFF_DROP_AMPS,
+  COMPRESSOR_OFF_MODEL_AMPS,
   COMPRESSOR_ON_DROP_AMPS,
+  COMPRESSOR_START_RISE_MARGIN_AMPS,
   offDropSaysCompressorOff,
   offDropSaysCompressorOn,
+  raiseRiseSaysCompressorWasOff,
   DEAD_WINDOW_GAP_AMPS,
   ENTRY_COLLAPSE_DWELL_MS,
   ENTRY_COLLAPSE_STALE_MS,
@@ -12,6 +15,7 @@ import {
   roomIsDark,
   type RoomLiveness,
   houseIsDead,
+  loneRaiseIsAttributable,
   meterIsSteady,
   modeledGapAmps,
   modeledRunningAmps,
@@ -251,5 +255,74 @@ describe("what a lone off's measured drop says about the compressor", () => {
     expect(offDropSaysCompressorOn(1.9)).toBe(false);
     // The two verdicts can never both hold — the bars do not overlap.
     expect(offDropSaysCompressorOff(2.5, 4.1) && offDropSaysCompressorOn(2.5)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R6b (2026-08-06) — the RISE side of the same question, because the off-drop
+// only speaks when a room is going off anyway. A lone raise off L1 that moves
+// the meter by a whole compressor more than its step price is a compressor
+// STARTING, which means it was not running at L1.
+// ---------------------------------------------------------------------------
+
+describe("what a lone raise off L1 says about the compressor", () => {
+  it("calls an anomalously large rise a compressor start", () => {
+    // Abdullah's real gen step is ~1.5A. A rise of 3.5A+ is that step plus a
+    // whole compressor that was not there before.
+    expect(raiseRiseSaysCompressorWasOff(3.5, 1.5)).toBe(true);
+    expect(raiseRiseSaysCompressorWasOff(4.2, 1.5)).toBe(true);
+  });
+
+  it("says nothing about an ordinary step, including the 02:36:42 one", () => {
+    // Live 2026-08-06: the bogus hold raised Abdullah L1→L2 and the meter moved
+    // 1.5–1.9A — his step price exactly. Nothing anomalous happened, and the
+    // detector must not manufacture evidence out of a normal raise.
+    expect(raiseRiseSaysCompressorWasOff(1.5, 1.5)).toBe(false);
+    expect(raiseRiseSaysCompressorWasOff(1.9, 1.5)).toBe(false);
+    // …nor at the bar itself minus a hair.
+    expect(raiseRiseSaysCompressorWasOff(1.5 + COMPRESSOR_START_RISE_MARGIN_AMPS - 0.01, 1.5)).toBe(false);
+    expect(raiseRiseSaysCompressorWasOff(1.5 + COMPRESSOR_START_RISE_MARGIN_AMPS, 1.5)).toBe(true);
+  });
+
+  it("scales with the price, so an expensive room needs a bigger anomaly", () => {
+    // Abdu's learned gen level:1>2 is 3.8A. A 4.5A rise there is ordinary; the
+    // same 4.5A on a 1.5A-priced room is a compressor.
+    expect(raiseRiseSaysCompressorWasOff(4.5, 3.8)).toBe(false);
+    expect(raiseRiseSaysCompressorWasOff(4.5, 1.5)).toBe(true);
+  });
+
+  it("a negative or zero price cannot lower the bar below the margin", () => {
+    expect(raiseRiseSaysCompressorWasOff(COMPRESSOR_START_RISE_MARGIN_AMPS - 0.01, -5)).toBe(false);
+    expect(raiseRiseSaysCompressorWasOff(COMPRESSOR_START_RISE_MARGIN_AMPS, 0)).toBe(true);
+  });
+
+  it("only reads a raise off L1 — a big rise off L2 is a room working harder", () => {
+    const attributable = { fromLevel: 1, floorsMode: false, inStartWindow: false, inPowerEventRamp: false };
+    expect(loneRaiseIsAttributable(attributable)).toBe(true);
+    expect(loneRaiseIsAttributable({ ...attributable, fromLevel: 2 })).toBe(false);
+  });
+
+  it("excludes every state in which a compressor starts for its own reasons", () => {
+    const attributable = { fromLevel: 1, floorsMode: false, inStartWindow: false, inPowerEventRamp: false };
+    // FLOORS: the recovery admission is commanding a whole house back at once.
+    expect(loneRaiseIsAttributable({ ...attributable, floorsMode: true })).toBe(false);
+    // Start window: the room was OFF, so of course its compressor engages.
+    expect(loneRaiseIsAttributable({ ...attributable, inStartWindow: true })).toBe(false);
+    // Power-event ramp: a raise right after a changeover ALWAYS engages the
+    // compressor — that is TCL restart protection ending, not L1 failing. This
+    // is the exclusion that would otherwise mint a hold on every changeover.
+    expect(loneRaiseIsAttributable({ ...attributable, inPowerEventRamp: true })).toBe(false);
+  });
+
+  it("agrees with the other two compressor bars about what a compressor is worth", () => {
+    // The relationship, not the literal value (2026-07-31's lesson: the
+    // constant nobody related to another constant is the one that broke). All
+    // three bars answer "how many amps is a whole compressor", so a change to
+    // one that does not move the others is a bug.
+    expect(COMPRESSOR_START_RISE_MARGIN_AMPS).toBe(COMPRESSOR_ON_DROP_AMPS);
+    expect(COMPRESSOR_START_RISE_MARGIN_AMPS).toBe(COMPRESSOR_OFF_MODEL_AMPS);
+    // …and it must outrank the fan-sized drop, or "the compressor started" and
+    // "nothing but the fan was running" could be claimed of the same amps.
+    expect(COMPRESSOR_START_RISE_MARGIN_AMPS).toBeGreaterThan(COMPRESSOR_OFF_DROP_AMPS);
   });
 });
