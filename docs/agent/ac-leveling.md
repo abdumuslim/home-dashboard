@@ -17,6 +17,69 @@ timestamp: 2026-07-28
 
 A ground-up rewrite lives in **`server/src/leveling/`** (21 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
+### 2026-08-06 (07:01Z) — a TCL that blinks restores its level, and that is not a hand on the remote
+
+**The incident (all UTC).** 07:00:49 and 07:01:23 the generator brownout-blinked: two ESP gaps, 25 s
+and 28 s. The collector logged *"Power event (ESP gap 25s) — observed AC offs read as power-loss for
+the next 15 min"* and the leveler armed a strain derate (invariant 47) off the second one. Then at
+**07:01:52 — 29 seconds after the second gap** — the device-poll reconciler saw Abdu's shadow at a
+level above his confirmed L1 with no send of ours to explain it, called it an external manual raise,
+and armed the six-hour learned L1 hold (invariant 52) through the *"raised off L1 externally"* armer
+(`controller.ts`, the `result.kind === "manual" && intent === "target"` branch).
+
+Nobody touched that AC. **A TCL that power-cycles restores the level it was last left at** — the same
+firmware behaviour invariant 34 already relies on for envelope pricing — and in the cloud shadow that
+restore is *character-for-character* the observation a hand raise makes: an un-commanded level,
+above the confirmed one. The bogus hold put Abdu's restore floor at L2 (6.5 A instead of 4.3 A) and
+stranded the hottest room off at 43 °C outdoor. User-confirmed misclassification.
+
+**Why it was a hole and not a surprise.** The OBSERVED-OFF side has had exactly this guard since
+2026-07-06: `collector.classifyObservedAcOff` refuses to mint a sacred manual-off lock within
+`AC_POWER_EVENT_GRACE_MS` (15 min) of a power event, because an un-commanded off near a blackout is a
+power-loss off. The observed-RAISE armer, added 2026-08-04 for invariant 52, was never given the
+matching guard — the same question on the other edge, answered only on one of them. Hard rule 5b's
+spirit: **never infer a HUMAN event from device or meter shape near a power event.**
+
+**What changed.**
+
+- **`controller.notePowerEvent(kind, now)`** is now the single door for every power event. It stamps
+  a leveler-side **`lastPowerEventAt`** and then calls `deps.onPowerEvent` exactly as before, so the
+  collector's window and the leveler's window are the same clock by construction. The five call sites
+  are unchanged in meaning and are exactly the set the collector already trusts: source change
+  (changeover), collapse, ESP gap, frozen meter, dead circuit (entry collapse) — every one of them a
+  power cycle for the units.
+- **The external armer is guarded** by `inPowerEventWindow(now)` /
+  **`POWER_EVENT_LEVEL_JUMP_GRACE_MS` (15 min)**. Inside the window the jump is journal-free and logs
+  at info: *"level jump off L1 within 15min of a power event (Ns) — firmware restore, not a human
+  raise; no hold"*. Outside it, R14 learns exactly as before.
+- **The dashboard path (`onUserGenLevel`) is deliberately untouched.** An authenticated REST command
+  has a person behind it and is attributable no matter what the line is doing; guarding it would
+  throw away the *most* reliable armer the rule has.
+
+**Why 15 min (hard rule 5c).** The largest single increment that can consume the window is the **TCL
+send-to-confirm lag**, documented at 5.8 s–13 min (invariant 4) with one 15.8-min outlier
+(invariant 7): the shadow can report the firmware's restored level that long after the blink that
+caused it, so a window shorter than the lag would guard only the fast half of the failure. Fifteen
+minutes covers the documented range and is **deliberately the same number as the collector's
+`AC_POWER_EVENT_GRACE_MS`** — two windows answering one question would drift. The failure direction
+makes generosity cheap: a skipped arm loses one *observation* (the room proves it again the next time
+it genuinely fails to cool, and the two attributable armers — the graded off-drop (55) and the dead
+window (44) — are untouched), while a false arm spends the hottest room's amps for six hours.
+
+⚠️ **Scope note, checked and left alone.** The same branch also records `manualTarget`, and that is
+NOT a floor: `floorOf` takes the **min** of `minLevel` and the pin, so a bogus target can only lower
+the floor, never raise it. It does raise `ceilOf` (manual bypasses the need cap), so a firmware
+restore can still let the raise path *choose* that level — a comfort question, not the strand this
+incident was, and out of scope here. The strand was entirely the hold's `minLevel`.
+
+**Tests.** `controller.test.ts`, the R14 describe: **"REGRESSION 2026-08-06 07:01:52: a level jump off
+L1 near a power event is firmware restore, not a human raise"** — 17 min of clean readings first (so
+the boot source-change is stale and the *blink* is the only thing that can explain the skip), then a
+25 s ESP gap, then the shadow jumps L1→L2 with no send of ours → no hold, no `minLevel` change — plus
+the positive control **"still arms from the same jump when no power event is anywhere near it"**,
+which is the identical sequence without the gap and still learns. Re-broken to verify: with the guard
+removed, the regression is the only failing test in the suite.
+
 ### 2026-08-06 — the gated proactive shed: a cool room's amps may be given to a hot one
 
 **The user's decision, verbatim (2026-08-06):**
@@ -190,7 +253,10 @@ information about whether the compressor is running.
 - **The watch-stall armer of the learned L1 hold is gone** (`controller.noteLevelHoldEvidence`,
   deleted). Remaining armers, all attributable: the graded lone off-drop (55), the dead window (44),
   and a manual raise off L1 — dashboard or observed. (The graded lone RAISE below was built as a
-  fourth and demoted to report-only on review the same day; it arms nothing.)
+  fourth and demoted to report-only on review the same day; it arms nothing.) ⚠️ The **observed**
+  half of that last armer is power-event-guarded since 07:01Z the same morning — a TCL restores its
+  last level after a blink, which the shadow cannot tell from a hand raise. See the 07:01Z section
+  above.
 - **`subFloorStalledMs` is REPORT-ONLY.** The clock still runs, still feeds `coolingState: "stalled"`
   on the status card and the "pinned below the comfort floor and not cooling" report (`api.ts`). No
   decision path reads it; `scenario.ts` keeps computing it for parity with that surface only.
@@ -438,8 +504,9 @@ ceiling (**49**).
 - *"when the system observe that abdullah is not working on l1 (by own observation or manual raise),
   it should state the outside temp, so it will never reduce the level to l1 untill it drop below that
   temp or after [6] h"* (~13:2x, TTL revised down from 12 h that afternoon). The LEARNED hold,
-  persisted in `ac_leveling_level_hold` (**52**). (⚠️ Its watch-stall armer was removed 2026-08-06;
-  the hold and its other armers are unchanged.)
+  persisted in `ac_leveling_level_hold` (**52**). (⚠️ Its watch-stall armer was removed 2026-08-06,
+  and the OBSERVED manual-raise armer is power-event-guarded the same day — a firmware level restore
+  after a blink is not "by own observation or manual raise". The hold itself is unchanged.)
 - *"an off with 1 amp or less of drop means the compressor was not running"* — his own experiment,
   now a signal: `compressorOffLikely` from a graded lone off's drop, feeding `isNonCooling`, arming
   the learned hold, and surfaced as `coolingState` per AC (**55**).

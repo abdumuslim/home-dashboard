@@ -1580,20 +1580,26 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
     const controller = new LevelingControllerV2(mock.pool, deps);
     const device = (id: string, level: number, temp: number) =>
       ({ ...(acDevice(id, true, level) as object), currentTemp: temp }) as never;
-    const ctx = [
-      { device: device(HOT, opts.hotLevel ?? 2, 32), managed: true, needTier: "full" as const, needDelta: opts.hotNeed ?? 5, slotGenCap: null },
+    // The hot room's SHADOW level, rebuilt per step so a test can make the
+    // device report a level nobody commanded (`observeHotAt`) — which is exactly
+    // what a TCL does when it power-cycles and restores its last level.
+    let hotLevel = opts.hotLevel ?? 2;
+    const ctxNow = () => [
+      { device: device(HOT, hotLevel, 32), managed: true, needTier: "full" as const, needDelta: opts.hotNeed ?? 5, slotGenCap: null },
       { device: device(COOL, 1, 27), managed: true, needTier: "full" as const, needDelta: 1, slotGenCap: null },
     ];
     let flip = 1;
-    const run = async (amps: number, steps: number, outdoorC: number | null) => {
+    // `gapMs` is the spacing between ESP readings: anything over
+    // `ESP_GAP_EVENT_MS` (20s) makes the NEXT reading a power event.
+    const run = async (amps: number, steps: number, outdoorC: number | null, gapMs = 5_000) => {
       for (let i = 0; i < steps; i++) {
         flip = -flip;
         controller.onPowerReading({ current_1: 0, current_2: amps + 0.01 * flip } as never);
-        vi.advanceTimersByTime(5_000);
-        await controller.tick(ctx as never, outdoorC);
+        vi.advanceTimersByTime(gapMs);
+        await controller.tick(ctxNow() as never, outdoorC);
       }
     };
-    return { mock, controller, sent, offs, run };
+    return { mock, controller, sent, offs, run, observeHotAt: (level: number) => void (hotLevel = level) };
   }
 
   it("a hold loaded from the DB governs the ladder immediately — a deploy does not erase it", async () => {
@@ -1697,6 +1703,64 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
       // nothing. That is the whole of the change: an observation, not a verdict.
       expect(status?.subFloorStalledMs ?? 0).toBeGreaterThanOrEqual(SUBFLOOR_WATCH_MS);
       expect(status?.coolingState).toBe("stalled");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("REGRESSION 2026-08-06 07:01:52: a level jump off L1 near a power event is firmware restore, not a human raise", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T06:44:00Z"));
+      const { mock, controller, run, observeHotAt } = setup({ hotLevel: 1 });
+      await controller.ensureLoaded();
+      // Settle so the reconciler holds a CONFIRMED L1 to jump off, near the
+      // limit so the leveler itself never buys that level — and run long enough
+      // that the boot source-change (a power event in its own right) is well
+      // outside the window. The BLINK below has to be the only thing explaining
+      // the skip, or this test would pass with the guard reading any stale event.
+      await run(14.6, 68, 43, 15_000);
+
+      // The generator brownout-blinked: ESP gaps of 25s and 28s at 07:00:49 and
+      // 07:01:23. The gap lands on the reading AFTER a long spacing, so the
+      // first call opens the silence and the second is where it is detected.
+      await run(14.6, 1, 43, 25_000);
+      // …and 29 s later the device poll came back with a level nobody sent. A
+      // TCL restores its last commanded level when it power-cycles, and in the
+      // shadow that is indistinguishable from a hand on the remote.
+      observeHotAt(2);
+      await run(14.6, 1, 43);
+
+      // Nobody touched the AC, so nothing was learned about L1. The bogus hold
+      // put Abdu's restore floor at L2 (6.5A instead of 4.3A) and stranded the
+      // hottest room off at 43°C outdoor.
+      expect(mock.levelHolds.size).toBe(0);
+      const status = controller.getStatus().acs.find((a) => a.deviceId === HOT);
+      expect(status?.levelHold ?? null).toBeNull();
+      expect(status?.minLevel).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still arms from the same jump when no power event is anywhere near it", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-06T06:30:00Z"));
+      const { mock, controller, run, observeHotAt } = setup({ hotLevel: 1 });
+      await controller.ensureLoaded();
+      // The FIRST reading is itself a power event (source none → gen), so the
+      // control has to outlast the window: ~17 min of unbroken 15 s readings,
+      // every one of them under the 20 s that would count as a gap.
+      await run(14.6, 68, 43, 15_000);
+
+      observeHotAt(2);
+      await run(14.6, 1, 43, 15_000);
+
+      // Same observation, no power event to explain it → somebody in the room
+      // decided L1 was not doing anything, and R14 learns it exactly as before.
+      expect(mock.levelHolds.get(HOT)).toMatchObject({ level: 1, outdoorC: 43 });
+      expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.minLevel).toBe(2);
     } finally {
       vi.useRealTimers();
     }

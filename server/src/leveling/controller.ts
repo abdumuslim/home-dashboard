@@ -151,6 +151,35 @@ const START_WINDOW_MS = AC_RAMP_MS;
  */
 const POWER_EVENT_RAMP_MAX_MS = 3 * AC_RAMP_MS;
 /**
+ * How long after a power event an observed level JUMP reads as the firmware
+ * restoring its last level rather than a hand on the remote (2026-08-06).
+ *
+ * A TCL that power-blinks comes back AT THE LEVEL IT WAS LAST LEFT AT, and in
+ * the cloud shadow that is indistinguishable from a human raise: an un-commanded
+ * level appearing above the confirmed one, with no send of ours to explain it.
+ * Live 07:01:52Z — 29 s after the second of two brownout ESP gaps (25 s at
+ * 07:00:49 and 28 s at 07:01:23, which also armed a strain derate) — Abdu's
+ * shadow rose off a confirmed L1 and armed the six-hour learned L1 hold
+ * (invariant 52) with nobody in the room. That hold put his restore floor at L2
+ * (6.5 A instead of 4.3 A) and stranded the hottest room off at 43 °C outdoor.
+ *
+ * Largest single increment that can consume it (hard rule 5c): the TCL
+ * send-to-confirm lag, which runs to ~13 min live (invariant 4) — the shadow can
+ * report a restored level that long after the blink that caused it, so the
+ * window has to outlast the lag or it guards only the fast half of the failure.
+ * That is WHY fifteen minutes, and it is deliberately the same number the
+ * collector's observed-OFF classifier already uses (`AC_POWER_EVENT_GRACE_MS`)
+ * for the identical judgment on the other edge: an un-commanded off near a power
+ * event is a power-loss off, not the user's hand. Two windows answering one
+ * question would drift.
+ *
+ * The failure direction is what lets it be generous: a skipped arm loses one
+ * OBSERVATION — the room proves it again the next time it genuinely fails to
+ * cool, and the two attributable armers (the graded off-drop, the dead window)
+ * are untouched — while a false arm spends the hottest room's amps for six hours.
+ */
+const POWER_EVENT_LEVEL_JUMP_GRACE_MS = 15 * 60_000;
+/**
  * How long a fan restore's amps stay charged as committed-but-unmetered. A fan
  * gear changes almost immediately — nothing like the 4-minute compressor ramp —
  * so this only has to outlive the ESP cadence plus a tick, and the absorption
@@ -470,6 +499,15 @@ export class LevelingControllerV2 {
    * nothing power-cycled there, so the amps really are on their way.
    */
   private powerEventRamp = new Map<string, { armedAt: number; heldSince: number | null }>();
+  /**
+   * When a POWER EVENT was last seen — exactly the set the collector's
+   * observed-off classifier trusts (changeover, collapse, ESP gap, frozen meter,
+   * dead circuit), because every one of them power-cycles the units. Stamped by
+   * `notePowerEvent`, which is also what tells the collector, so the two sides
+   * can never disagree about when the last one was. Read by the external
+   * level-jump guard (`POWER_EVENT_LEVEL_JUMP_GRACE_MS`).
+   */
+  private lastPowerEventAt = 0;
   /**
    * Rooms a graded LONE off measured as drawing about their fan (R6): the level
    * it was observed at, and the line it was observed on. Retained until
@@ -946,7 +984,7 @@ export class LevelingControllerV2 {
           }
           if (prevSource !== "none" && event.to !== "none") this.armRampOnSourceChange = true;
           log.info(`[leveler2] Power source changed → ${event.to}`);
-          this.deps.onPowerEvent?.(`source ${event.from} → ${event.to}`);
+          this.notePowerEvent(`source ${event.from} → ${event.to}`, now);
           // Journal it even though no command ships here. A changeover whose
           // entry batch happens to be a no-op is otherwise INVISIBLE: the
           // 2026-08-02 22:28Z gen→grid left a 3.8-hour hole in the only durable
@@ -988,7 +1026,7 @@ export class LevelingControllerV2 {
             `[leveler2] Power collapse ${event.fromAmps.toFixed(1)}A → ${event.toAmps.toFixed(1)}A on ${event.source} — probable trip/blackout; commands frozen until recovery` +
               (derated != null ? `; ${event.source} limit derated to ${derated.toFixed(1)}A while it cools` : ""),
           );
-          this.deps.onPowerEvent?.(`power collapse on ${event.source}`);
+          this.notePowerEvent(`power collapse on ${event.source}`, now);
           if (derated != null && (this.meterState.derate?.amps ?? 0) > 0) {
             void this.pushNotice(
               `${event.source === "gen" ? "Generator" : "Grid"} tripped at ${event.fromAmps.toFixed(1)}A — ` +
@@ -1018,7 +1056,7 @@ export class LevelingControllerV2 {
           log.info(`[leveler2] Power collapse recovered on ${event.source} — ramps re-armed`);
           break;
         case "esp_gap":
-          this.deps.onPowerEvent?.(`ESP gap ${Math.round(event.gapMs / 1000)}s`);
+          this.notePowerEvent(`ESP gap ${Math.round(event.gapMs / 1000)}s`, now);
           break;
         case "strain_derate": {
           // Not a trip: nothing is latched, nothing is frozen, no push. The
@@ -1068,7 +1106,7 @@ export class LevelingControllerV2 {
             `[leveler2] Power meter FROZEN — no micro-change for ${Math.round(event.frozenForMs / 1000)}s ` +
               `(stuck at ${event.amps.toFixed(2)}A). Raises suspended until the reading moves.`,
           );
-          this.deps.onPowerEvent?.("meter frozen");
+          this.notePowerEvent("meter frozen", now);
           void this.pushNotice(
             `Power meter frozen at ${event.amps.toFixed(1)}A — readings unchanged for ` +
               `${Math.round(event.frozenForMs / 60_000)} min. AC raises suspended; check the ESP monitor.`,
@@ -1227,6 +1265,28 @@ export class LevelingControllerV2 {
     this.recon = noteLevelSend(this.recon, deviceId, target, now).state;
     log.info(`[leveler2] Manual gen target on ${deviceId} → L${target}`);
     return { reverted: false, level: target };
+  }
+
+  /**
+   * One door for every power event: stamp it here, then tell the collector.
+   *
+   * Both sides ask the SAME question of it — "is this un-commanded device change
+   * the firmware or a human?" — the collector of an observed OFF, this
+   * controller of an observed level JUMP off L1. Before this the timestamp lived
+   * only in the collector and the leveler had nothing to consult, which is how
+   * the 2026-08-06 07:01:52Z brownout minted a six-hour hold nobody armed.
+   */
+  private notePowerEvent(kind: string, now: number = Date.now()): void {
+    this.lastPowerEventAt = now;
+    this.deps.onPowerEvent?.(kind);
+  }
+
+  /**
+   * Is `now` inside the window where a device change we did not command is the
+   * firmware coming back rather than a hand on the remote?
+   */
+  private inPowerEventWindow(now: number): boolean {
+    return this.lastPowerEventAt > 0 && now - this.lastPowerEventAt < POWER_EVENT_LEVEL_JUMP_GRACE_MS;
   }
 
   /**
@@ -1536,7 +1596,7 @@ export class LevelingControllerV2 {
         `${Math.round((now - this.entryCollapseSince) / 1000)}s — probable breaker trip; commands frozen, ` +
         `${source} limit derated to ${derated.toFixed(1)}A`,
     );
-    this.deps.onPowerEvent?.(`AC circuit dead on ${source}`);
+    this.notePowerEvent(`AC circuit dead on ${source}`, now);
     void this.pushNotice(
       `AC circuit appears dead on the ${source === "gen" ? "generator" : "grid"} — check the breaker. ` +
         `Levelling is frozen until the rooms come back.`,
@@ -1841,8 +1901,31 @@ export class LevelingControllerV2 {
           // Same evidence as a dashboard raise, arriving by remote or by the
           // vendor app instead (R14): somebody in the room decided L1 was not
           // doing anything. The hold outlives the pin.
+          //
+          // …UNLESS the house just blinked. A TCL restores the level it was last
+          // left at when it power-cycles, and in the shadow that restore is the
+          // SAME observation a hand raise makes — un-commanded, above the
+          // confirmed level. The observed-OFF classifier has had this guard since
+          // 2026-07-06 (an off near a power event is a power-loss off, never a
+          // manual-off lock); the observed-RAISE armer had none, and on
+          // 2026-08-06 07:01:52Z a brownout's firmware restore minted a six-hour
+          // hold that cost the hottest room its restore. Hard rule 5b's spirit:
+          // never infer a HUMAN event from device shape near a power event.
+          //
+          // ⚠ Only the ARMER is guarded. The dashboard path (`onUserGenLevel`)
+          // is an authenticated REST command with a person behind it, so it is
+          // attributable no matter what the line is doing.
           if (wasConfirmedAt === 1 && result.level > 1) {
-            await this.noteLevelHold(device.id, 1, outdoorTempC, now, "raised off L1 externally");
+            if (this.inPowerEventWindow(now)) {
+              log.info(
+                `[leveler2] ${device.name}: level jump off L1 within ` +
+                  `${POWER_EVENT_LEVEL_JUMP_GRACE_MS / 60_000}min of a power event ` +
+                  `(${Math.round((now - this.lastPowerEventAt) / 1000)}s) — firmware restore, ` +
+                  `not a human raise; no hold`,
+              );
+            } else {
+              await this.noteLevelHold(device.id, 1, outdoorTempC, now, "raised off L1 externally");
+            }
           }
         }
       } else if (result.kind === "late_confirm") {

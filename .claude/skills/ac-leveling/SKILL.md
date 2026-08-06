@@ -858,6 +858,18 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     window, power-event ramp, FLOORS, `fromLevel === 1`) and
     `raiseRiseSaysCompressorWasOff` all remain — as observability, and as the
     scaffolding a net-of-house version would reuse.
+    ⚠️ **And the third armer's OBSERVED half is power-event-guarded** (07:01:52Z
+    the same morning): a TCL that power-blinks RESTORES its last level, which in
+    the shadow is character-for-character a hand raise off L1 — so the device-poll
+    armer stands down inside `POWER_EVENT_LEVEL_JUMP_GRACE_MS` (15 min, the
+    collector's own `AC_POWER_EVENT_GRACE_MS`, sized to outlast the ~13-min TCL
+    confirm lag) of any power event, `controller.notePowerEvent` stamping
+    `lastPowerEventAt` on the same five events it forwards so the two windows are
+    one clock. The DASHBOARD armer is deliberately unguarded — an authenticated
+    REST command is attributable whatever the line is doing. Cost of the hole: a
+    6 h hold that floored Abdu at L2 (6.5 A vs 4.3 A) and stranded the hottest room
+    off at 43 °C. Hard rule 5b's spirit, on the rise side: never infer a HUMAN
+    event from device shape near a power event.
 
 **Added 2026-08-06, the user's own approval of the parked proposal, from the same morning:**
 57. **A shed room may be bought back by switching a CLEARLY COOLER one off —
