@@ -270,6 +270,125 @@ describe("sendControlVerified (5s × 3 confirm-or-resend)", () => {
   });
 });
 
+// Last-write-wins verifier (2026-08-08 05:55): power is a BINARY field, so the
+// third-value escape can never fire for it — the only value other than the
+// commanded one IS the pre-command value. Two overlapping set_power verify
+// loops (a fast OFF then ON, 3s apart) each read the other's landed value as
+// "my command not applied" and re-sent — off→on→off→on, 3 re-sends each over
+// 24s, physically cycling Najat's compressor. A per-(device, command)
+// generation makes the older loop yield to the newer verified send.
+describe("sendControlVerified last-write-wins (binary set_power)", () => {
+  type Shadow = { reported: Record<string, number>; reportedAt: number | null };
+
+  // Queue shadow — for the single ordered scenario where the ON verifier must
+  // visibly re-send then confirm while the superseded OFF stays quiet.
+  function queueTcl(dev: AcDevice, shadows: Array<Record<string, number>>): {
+    tcl: TclCloud;
+    publishWithRetry: ReturnType<typeof vi.fn>;
+    getThingShadow: ReturnType<typeof vi.fn>;
+  } {
+    const tcl = tclWithDevice(dev);
+    const seam = tcl as unknown as {
+      sendControl: unknown; publishWithRetry: unknown; getThingShadow: unknown; controlVerifyDelay: unknown;
+    };
+    const publishWithRetry = vi.fn(async () => undefined);
+    const queue: Shadow[] = shadows.map((reported) => ({ reported, reportedAt: null }));
+    const getThingShadow = vi.fn(async () => queue.length > 1 ? queue.shift()! : queue[0]);
+    seam.sendControl = vi.fn(async () => undefined);
+    seam.publishWithRetry = publishWithRetry;
+    seam.getThingShadow = getThingShadow;
+    seam.controlVerifyDelay = vi.fn(async () => undefined);
+    return { tcl, publishWithRetry, getThingShadow };
+  }
+
+  // Fixed per-device shadow — for isolation cases where both loops must run to
+  // completion regardless of interleaving (the shadow never matches the command,
+  // so each un-superseded loop re-sends its full 3 times and gives up).
+  function fixedTcl(devices: AcDevice[], shadowFor: (id: string) => Record<string, number>): {
+    tcl: TclCloud;
+    publishWithRetry: ReturnType<typeof vi.fn>;
+  } {
+    const tcl = new TclCloud("user", "pass");
+    (tcl as unknown as { cachedDevices: AcDevice[] }).cachedDevices = devices;
+    const seam = tcl as unknown as {
+      sendControl: unknown; publishWithRetry: unknown; getThingShadow: unknown; controlVerifyDelay: unknown;
+    };
+    const publishWithRetry = vi.fn(async () => undefined);
+    seam.sendControl = vi.fn(async () => undefined);
+    seam.publishWithRetry = publishWithRetry;
+    seam.getThingShadow = vi.fn(async (id: string) => ({ reported: shadowFor(id), reportedAt: null }));
+    seam.controlVerifyDelay = vi.fn(async () => undefined);
+    return { tcl, publishWithRetry };
+  }
+
+  // The verify loops are pure microtasks (mocked delays/shadow/publish), so one
+  // macrotask hop drains every pending re-send.
+  const drain = () => new Promise((r) => setTimeout(r, 0));
+
+  it("stops the older set_power verify when a newer one supersedes it (off then on)", async () => {
+    const { tcl, publishWithRetry } = queueTcl(acDevice({}), [
+      { powerSwitch: 1 }, // OFF pre-command capture (device on)
+      { powerSwitch: 0 }, // ON pre-command capture (device now off)
+      { powerSwitch: 0 }, // ON verify #1: still off → re-send on
+      { powerSwitch: 1 }, // ON verify #2: on applied → confirm
+    ]);
+    // Called synchronously: the ON bumps the generation before the OFF's verify
+    // loop runs its first tick, so the OFF is superseded with zero re-sends —
+    // exactly the 3s-apart production ordering (ON lands before the 5s tick).
+    const off = tcl.sendControlVerified("ac1", "set_power", 0);
+    const on = tcl.sendControlVerified("ac1", "set_power", 1);
+    await off;
+    await on;
+    await drain();
+
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 1 });     // ON proceeds normally
+    expect(publishWithRetry).not.toHaveBeenCalledWith("ac1", { powerSwitch: 0 }); // OFF yields, never fights
+  });
+
+  it("a lone set_power verify still re-sends up to 3 times when the shadow never applies", async () => {
+    // No second command → the generation never moves → behavior is unchanged.
+    const { tcl, publishWithRetry } = queueTcl(acDevice({}), [
+      { powerSwitch: 1 }, // never reaches the commanded 0
+    ]);
+    await tcl.sendControlVerified("ac1", "set_power", 0);
+    await (tcl as unknown as { lastControlVerify: Promise<void> }).lastControlVerify;
+
+    expect(publishWithRetry).toHaveBeenCalledTimes(CONTROL_VERIFY_MAX_RESENDS);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 0 });
+  });
+
+  it("supersession is per device — a set_power on ac2 does not cancel ac1's verify", async () => {
+    const { tcl, publishWithRetry } = fixedTcl(
+      [acDevice({ id: "ac1" }), acDevice({ id: "ac2" })],
+      (id) => (id === "ac1" ? { powerSwitch: 1 } : { powerSwitch: 0 }),
+    );
+    const a = tcl.sendControlVerified("ac1", "set_power", 0); // wants 0, shadow stuck at 1
+    const b = tcl.sendControlVerified("ac2", "set_power", 1); // wants 1, shadow stuck at 0
+    await a;
+    await b;
+    await drain();
+
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 0 }); // ac1 not superseded by ac2
+    expect(publishWithRetry).toHaveBeenCalledWith("ac2", { powerSwitch: 1 });
+  });
+
+  it("supersession is per command — a set_temperature does not cancel a set_power verify", async () => {
+    const { tcl, publishWithRetry } = fixedTcl(
+      [acDevice({ id: "ac1" })],
+      () => ({ powerSwitch: 1, targetTemperature: 22 }),
+    );
+    const p = tcl.sendControlVerified("ac1", "set_power", 0);        // wants powerSwitch 0
+    const t = tcl.sendControlVerified("ac1", "set_temperature", 24); // wants targetTemperature 24
+    await p;
+    await t;
+    await drain();
+
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 0 });        // set_power verify still ran
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { targetTemperature: 24 }); // set_temperature verify ran
+  });
+});
+
 // The TAC-12CHSD "shadow says yes but device says no" quirk: when fan props
 // share a shadow update with ANY other property, the firmware applies the other
 // property, internally resets the blower, and still reports the fan as applied.

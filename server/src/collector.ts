@@ -286,6 +286,27 @@ export class Collector {
    */
   private lastServerAcOnAt = new Map<string, number>();
   private readonly AC_SERVER_ON_SHADOW_GRACE_MS = 120_000;
+  /**
+   * Last time the LIVE shadow was observed powered ON. The server-on grace is
+   * only shadow-lag while the shadow has not yet confirmed our ON
+   * (observedOnAt < serverOnAt); once it has, a later OFF is a real transition,
+   * not lag, and must lock on the FIRST observation. Stamped in
+   * noteAcObservedPower alongside acManualOffSeenOff.
+   */
+  private lastAcObservedOnAt = new Map<string, number>();
+  /**
+   * When the server-on grace REVERSES an observed off (our own ON still
+   * unconfirmed by the shadow), it stamps this. Belt for the residual lag-window
+   * fight: a REMOTE (TCL-app) off is not commanded through us, so the automation
+   * re-sends power=1 and re-arms the grace (2026-08-08: Najat cycled on/off with
+   * nothing in the dashboard). A repeat off within AC_REPEAT_OFF_MANUAL_MS of
+   * the previous reversal, with an ON confirmed in between (lastAcObservedOnAt >
+   * this) and AWAY from any power event, is a human flipping through the lag:
+   * record the lock. A stale shadow shows no intervening ON, so it can never
+   * trip this. Cleared whenever the device's lock is recorded or cleared.
+   */
+  private acServerOnReversalAt = new Map<string, number>();
+  private readonly AC_REPEAT_OFF_MANUAL_MS = 10 * 60_000;
   // Loop-liveness watchdog (2026-07-06 ~3h silent stall): heartbeat + per-step
   // deadlines so one hung external call can never freeze every automation.
   private lastLoopTickAt = Date.now();
@@ -348,6 +369,9 @@ export class Collector {
     // read ON for a while. Require a real observed-off before trusting an ON to
     // clear it (a stale shadow must not auto-undo this lock).
     this.acManualOffSeenOff.delete(deviceId);
+    // The reversal episode is resolved (this off is now locked) — forget it so a
+    // future grace reversal starts a fresh repeat window.
+    this.acServerOnReversalAt.delete(deviceId);
     await this.pool.query(
       `INSERT INTO ac_manual_off_locks (device_id, locked_at, reason)
        VALUES ($1, NOW(), $2)
@@ -366,6 +390,8 @@ export class Collector {
     const wasLocked = this.acManualOffLocks.delete(deviceId);
     this.acManualOffLockTimes.delete(deviceId);
     this.acManualOffSeenOff.delete(deviceId);
+    // The AC is back on — any pending repeat-off window is stale.
+    this.acServerOnReversalAt.delete(deviceId);
     if (wasLocked) {
       await this.pool.query("DELETE FROM ac_manual_off_locks WHERE device_id = $1", [deviceId]);
     }
@@ -437,9 +463,12 @@ export class Collector {
     return this.acManualOffSeenOff.has(deviceId);
   }
 
-  /** Note a LIVE-observed power state for a locked AC: observing the OFF proves
-   * the lock took effect, which is the precondition for a later ON to clear it. */
+  /** Note a LIVE-observed power state for an AC: observing the OFF proves a
+   * lock took effect (precondition for a later ON to clear it), and observing
+   * the ON confirms our server ON reached the shadow — which transition-gates
+   * the observed-off shadow-lag grace. */
   private noteAcObservedPower(deviceId: string, power: "on" | "off" | undefined): void {
+    if (power === "on") this.lastAcObservedOnAt.set(deviceId, Date.now());
     if (power === "off" && this.acManualOffLocks.has(deviceId)) {
       this.acManualOffSeenOff.add(deviceId);
     }
@@ -564,12 +593,49 @@ export class Collector {
       log.info(`[collector] ${context}: device ${deviceId} observed OFF but already manual-off locked — keeping the lock`);
       return false;
     }
-    // An OFF observed shortly after a power ON we ourselves commanded is the
-    // shadow lagging our own command, not a hand on the remote — never lock.
+    // An OFF observed shortly after a power ON we ourselves commanded CAN be the
+    // shadow lagging our own command — but only until the shadow actually
+    // CONFIRMS the ON. The fingerprint carries no staleness information (a shed
+    // room's stale shadow reads exactly power=0/beep=false, identical to a
+    // genuine remote off), which is why the grace exists. So the fast-path is
+    // TRANSITION-GATED: once the shadow has been observed ON since our server ON,
+    // a later OFF is a REAL transition, not lag — skip the fast-path and let
+    // classifyObservedAcOff apply the power-event window, the fingerprints, and
+    // lock on the FIRST observation (2026-08-08: a remote off cycled Najat while
+    // the dashboard showed nothing; the grace kept reversing it forever).
     const serverOnAt = this.lastServerAcOnAt.get(deviceId) ?? 0;
-    if (serverOnAt > 0 && Date.now() - serverOnAt < this.AC_SERVER_ON_SHADOW_GRACE_MS) {
+    const observedOnAt = this.lastAcObservedOnAt.get(deviceId) ?? 0;
+    if (
+      serverOnAt > 0 &&
+      Date.now() - serverOnAt < this.AC_SERVER_ON_SHADOW_GRACE_MS &&
+      observedOnAt < serverOnAt // the shadow has NOT confirmed this server ON yet
+    ) {
+      // Repeat guard: a belt for offs that arrive before the shadow ever
+      // confirmed our ON (the residual lag-window fight). A stale shadow never
+      // shows an intervening ON, so it can NEVER trip this; a human flipping
+      // off→on→off through the lag does (observedOnAt lands after the previous
+      // reversal). The power-event exclusion is load-bearing (hard rule 2): a
+      // changeover can blink a room off twice in 10 min, and an off near a power
+      // event must NEVER record a lock.
+      const lastReversal = this.acServerOnReversalAt.get(deviceId) ?? 0;
+      const nearPowerEvent = Date.now() - this.lastPowerEventAt < this.AC_POWER_EVENT_GRACE_MS;
+      if (
+        this.config.observedOffLocks &&
+        lastReversal > 0 &&
+        Date.now() - lastReversal < this.AC_REPEAT_OFF_MANUAL_MS &&
+        !nearPowerEvent &&
+        observedOnAt > lastReversal // an intervening confirmed ON = a human flip, not staleness
+      ) {
+        log.info(`[collector] ${context}: device ${deviceId} observed OFF again ${Math.round((Date.now() - lastReversal) / 1000)}s after a reversal, with an ON confirmed in between (no power event) — a human is insisting, recording lock`);
+        await this.recordObservedManualOff(
+          deviceId, "observed_off_repeat", "AC automation paused — repeated off",
+          `${deviceName} was turned off by hand again — automations stay off until it's turned back on from the dashboard.`,
+        );
+        return false;
+      }
+      this.acServerOnReversalAt.set(deviceId, Date.now());
       log.info(
-        `[collector] ${context}: device ${deviceId} observed OFF ${Math.round((Date.now() - serverOnAt) / 1000)}s after a server-commanded ON — shadow lag, not a manual off`,
+        `[collector] ${context}: device ${deviceId} observed OFF ${Math.round((Date.now() - serverOnAt) / 1000)}s after a server-commanded ON the shadow has not confirmed — shadow lag, not a manual off`,
       );
       return true;
     }
@@ -579,13 +645,18 @@ export class Collector {
       return true;
     }
     log.info(`[collector] ${context}: device ${deviceId} manually turned OFF, recording manual-off lock`);
-    await this.recordAcManualOff(deviceId, "observed_off");
-    void this.broadcastPush({
-      title: "AC automation paused",
-      body: `${deviceName} was turned off by hand — automations stay off until it's turned back on from the dashboard.`,
-      type: "leveling",
-    });
+    await this.recordObservedManualOff(
+      deviceId, "observed_off", "AC automation paused",
+      `${deviceName} was turned off by hand — automations stay off until it's turned back on from the dashboard.`,
+    );
     return false;
+  }
+
+  /** Record an observed-off manual lock and push the paused alert (one wrong
+   * guess is a 10-second fix from the phone instead of a hot room at dawn). */
+  private async recordObservedManualOff(deviceId: string, reason: string, title: string, body: string): Promise<void> {
+    await this.recordAcManualOff(deviceId, reason);
+    void this.broadcastPush({ title, body, type: "leveling" });
   }
 
   async reconcileAcManualOffLocks(devices: Pick<AcDevice, "id" | "power">[]): Promise<Set<string>> {

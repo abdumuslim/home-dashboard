@@ -4456,6 +4456,27 @@ describe("observed-off classification — power events vs manual (2026-07-06)", 
     });
   }
 
+  // The observed-off handler drives the repeat guard through internal state
+  // (lastServerAcOnAt / acServerOnReversalAt) that is awkward to stage twice
+  // through the range flow, so the repeat-guard cases call it directly.
+  function observedOff(collector: Collector, deviceId = "ac1", name = "Mom"): Promise<boolean> {
+    return (collector as never as {
+      handleObservedAcOff: (context: string, deviceId: string, deviceName: string) => Promise<boolean>;
+    }).handleObservedAcOff("test", deviceId, name);
+  }
+
+  function serverOnMap(collector: Collector): Map<string, number> {
+    return (collector as never as { lastServerAcOnAt: Map<string, number> }).lastServerAcOnAt;
+  }
+
+  function reversalMap(collector: Collector): Map<string, number> {
+    return (collector as never as { acServerOnReversalAt: Map<string, number> }).acServerOnReversalAt;
+  }
+
+  function observedOnMap(collector: Collector): Map<string, number> {
+    return (collector as never as { lastAcObservedOnAt: Map<string, number> }).lastAcObservedOnAt;
+  }
+
   it("does not lock an observed off inside the power-event window and re-turns the AC on (the 02:44 incident)", async () => {
     const { collector, tclCloud, actions, locks } = createCollector();
     setTrig(collector, 1);
@@ -4578,25 +4599,89 @@ describe("observed-off classification — power events vs manual (2026-07-06)", 
     expect(actions[0].action.power).toBe(1);
   });
 
-  it("an off observed right after a server-commanded ON is shadow lag, never a manual off (2026-07-27 Najat)", async () => {
-    // Live 17:15:53: a leveler restore's power-on was 5.8s old, the TCL shadow
-    // still read OFF, and the classifier minted an observed_off lock — beep was
-    // false (the unit never lost power), which the fingerprint reads as "a hand
-    // did it". The commanded-ON grace must win over every fingerprint.
+  it("an off observed after a server-commanded ON the shadow never confirmed is shadow lag, never a manual off (2026-07-27 Najat)", async () => {
+    // Live 17:15:53: a leveler restore's power-on was 5.8s old and the TCL shadow
+    // still read OFF. beep=false too (a shed room's stale shadow reads exactly
+    // power=0/beep=false — identical to a genuine remote off), yet this is OUR ON
+    // in flight. The fingerprint carries no staleness info, so it must NOT beat
+    // the grace; the grace holds while the shadow has NOT confirmed our ON.
     const { collector, tclCloud, actions, locks, beepPrefs } = createCollector();
     setTrig(collector, 1);
     beepPrefs.add("ac1");
-    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never);
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: false }] as never); // shadow never reads ON
     tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: false, fanSpeed: 1 }]);
-    // The leveler restore path stamps this via the setDevicePowerCache dep.
     (collector as never as { noteServerAcOn: (id: string) => void }).noteServerAcOn("ac1");
 
     await setWeatherValue(collector, 27);
     await checkAcRangeAutomation(collector, acRangeRule());
 
-    expect(locks.size).toBe(0); // no bogus sacred lock
-    expect(actions).toHaveLength(1); // the automation simply re-asserts the ON
+    expect(locks.size).toBe(0);        // no bogus sacred lock despite beep=false
+    expect(actions).toHaveLength(1);   // the automation simply re-asserts the ON
     expect(actions[0].action.power).toBe(1);
+  });
+
+  it("an off observed AFTER the shadow confirmed our ON locks on the first observation (real transition, not lag)", async () => {
+    // Once the shadow has been observed ON since our server ON, a later OFF is a
+    // genuine remote off — lock + push immediately, no reversal loop at all.
+    const { collector, tclCloud, locks } = createCollector();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: true, fanSpeed: 3 }]);
+    const pushed: string[] = [];
+    (collector as never as { broadcastPush: (p: { title?: string }) => Promise<void> }).broadcastPush =
+      async (p) => { pushed.push(p.title ?? ""); };
+    serverOnMap(collector).set("ac1", Date.now() - 10_000);   // server ON 10s ago (inside grace)
+    observedOnMap(collector).set("ac1", Date.now() - 5_000);  // shadow CONFIRMED the ON since then
+
+    const result = await observedOff(collector);
+
+    expect(result).toBe(false);         // real transition → manual
+    expect(locks.has("ac1")).toBe(true);
+    expect(pushed).toContain("AC automation paused"); // pushed on the FIRST off
+  });
+
+  it("a stale shadow (no ON ever confirmed) keeps reversing however many times, never locking", async () => {
+    // The residual lag window: the shadow stays OFF and never confirms the ON, so
+    // observedOnAt < serverOnAt on every observation — pure staleness, never a
+    // human flip, so no repeat count can ever manufacture a lock.
+    const { collector, tclCloud, locks } = createCollector();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: true, fanSpeed: 3 }]);
+    serverOnMap(collector).set("ac1", Date.now()); // inside grace; observedOnAt stays 0 (never ON)
+
+    for (let i = 0; i < 5; i++) {
+      expect(await observedOff(collector)).toBe(true); // always reversed
+    }
+    expect(locks.has("ac1")).toBe(false); // never locked
+  });
+
+  it("a repeat off with an ON confirmed between the reversals records the lock (a human flipping through the lag)", async () => {
+    // off→on→off IS a flip, not staleness: the shadow showed an intervening ON
+    // (observedOnAt > the previous reversal), so a person is insisting — lock it.
+    const { collector, tclCloud, locks } = createCollector();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: true, fanSpeed: 3 }]);
+    serverOnMap(collector).set("ac1", Date.now());          // still inside the server-on grace
+    reversalMap(collector).set("ac1", Date.now() - 60_000);  // a reversal 1 min ago (< 10 min)
+    observedOnMap(collector).set("ac1", Date.now() - 30_000); // an ON confirmed AFTER that reversal
+
+    const result = await observedOff(collector);
+
+    expect(result).toBe(false);         // a person is insisting → manual
+    expect(locks.has("ac1")).toBe(true);
+  });
+
+  it("a repeat off with an intervening ON but INSIDE a power event is not locked (hard rule 2)", async () => {
+    // Hard rule 2: an observed off near a power event must NEVER record a lock —
+    // a changeover can blink a room off twice inside 10 min. The repeat guard
+    // catches only the human-flip shape, never a flaky supply.
+    const { collector, tclCloud, locks } = createCollector();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: false, beep: true, fanSpeed: 3 }]);
+    collector.notePowerEvent("source grid → gen"); // stamps lastPowerEventAt = now
+    serverOnMap(collector).set("ac1", Date.now());
+    reversalMap(collector).set("ac1", Date.now() - 60_000);
+    observedOnMap(collector).set("ac1", Date.now() - 30_000); // an intervening ON — repeat guard is otherwise armed
+
+    const result = await observedOff(collector);
+
+    expect(result).toBe(true);           // reversed as a power-loss off, not locked
+    expect(locks.has("ac1")).toBe(false);
   });
 
   it("the commanded-ON grace expires — a later observed off still locks", async () => {

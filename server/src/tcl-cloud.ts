@@ -1064,6 +1064,14 @@ export class TclCloud {
    * manual-intent recording happens.
    */
   async sendControlVerified(deviceId: string, command: string, value: unknown): Promise<void> {
+    // Claim a generation for this device+command BEFORE the first send — any
+    // older verify loop for the same field now sees a newer generation and
+    // stops (last-write-wins). Bumped for every call, so even a no-verify
+    // command (e.g. fan Auto) supersedes an in-flight verify of the same field.
+    const genKey = `${deviceId}:${command}`;
+    const generation = (this.controlGenerations.get(genKey) ?? 0) + 1;
+    this.controlGenerations.set(genKey, generation);
+
     const payload = this.controlShadowPayload(deviceId, command, value);
     let pre: Record<string, number> | null = null;
     if (payload) {
@@ -1077,21 +1085,47 @@ export class TclCloud {
     if (!payload) return;
     // Fire-and-forget — the route responds immediately; kept on a field so
     // tests can await the loop.
-    this.lastControlVerify = this.verifyControlApplied(deviceId, command, payload, pre).catch((err) => {
+    this.lastControlVerify = this.verifyControlApplied(deviceId, command, payload, pre, generation).catch((err) => {
       log.warn(`[tcl] Verify-resend loop failed for ${command} on ${deviceId}: ${(err as Error).message}`);
     });
   }
 
   private lastControlVerify: Promise<void> | null = null;
 
+  /**
+   * Last-write-wins generation per `(deviceId, command)` — bumped by every
+   * sendControlVerified call, keyed by command KIND so a `set_power` never
+   * cancels an unrelated field's verify. A verify loop captures the generation
+   * at send time and stops the moment a newer verified send of the SAME field
+   * has bumped it. Power is a BINARY field, so the pre-existing third-value
+   * escape below can never fire for it (the only "other" value IS the
+   * pre-command value); two overlapping set_power loops therefore each read the
+   * other's landed value as "my command not applied" and re-sent — off→on→off→on
+   * over 24s, physically cycling Najat's compressor (2026-08-08 05:55). This
+   * makes the older loop yield to the newer one.
+   */
+  private controlGenerations = new Map<string, number>();
+
   private async verifyControlApplied(
     deviceId: string,
     command: string,
     payload: Record<string, number>,
     pre: Record<string, number> | null,
+    generation: number,
   ): Promise<void> {
+    const genKey = `${deviceId}:${command}`;
     for (let attempt = 1; attempt <= CONTROL_VERIFY_MAX_RESENDS + 1; attempt++) {
       await this.controlVerifyDelay();
+      // A newer verified send of the SAME field started while we were waiting —
+      // yield to it (last-write-wins). Without this, two overlapping binary
+      // set_power loops re-send against each other, cycling the compressor
+      // (2026-08-08). An EXTERNAL opposing change during a binary verify stays
+      // indistinguishable from "not applied" and is still bounded by the 3
+      // re-sends; this only removes the OUR-vs-OURS fight the log showed.
+      if (this.controlGenerations.get(genKey) !== generation) {
+        log.info(`[tcl] ${command} on ${deviceId} superseded by a newer command — verify stopped`);
+        return;
+      }
       const reported = (await this.getThingShadow(deviceId)).reported;
       const mismatched = Object.keys(payload).filter((k) => reported[k] !== payload[k]);
       if (mismatched.length === 0) {
