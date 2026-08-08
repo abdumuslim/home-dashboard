@@ -5,7 +5,7 @@ import { describe, it, expect } from "vitest";
 import { Scenario, type SimAcSetup } from "./scenario.js";
 import { meterView } from "./sensing.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
-import { FAN_RESTORE_AFTER_CUT_MS } from "./fan-trim.js";
+import { FAN_BOUNCE_WINDOW_MS, FAN_RESTORE_AFTER_CUT_MS } from "./fan-trim.js";
 import type { Command } from "./types.js";
 
 const cfg: LevelingConfigV2 = {
@@ -551,31 +551,42 @@ describe("power collapse (external trip — the dominant real-world event)", () 
 
 describe("restore backoff (kills the 49m/1h18m strands, bounds the shed↔restore churn)", () => {
   it("a bouncing restore retries on a growing-but-CAPPED ladder — no strand, no machine-gunning", () => {
-    // Peers pinned at floors with no fan slack; Najat's startup surge (2× her
-    // L1 cap — the measured 4.4A vs 2.2A) breaches the limit after every
-    // restore, so the ONLY cover is re-shedding her: the v1 bounce loop.
+    // Peers pinned at floors with no fan slack; Najat's restore SETTLES over the
+    // limit in the SMOOTHED mean, so re-shedding her is the only cover: the v1
+    // bounce loop. Her L1 draw is capped at 3.3A while the model prices her at
+    // 2.7A, so admission fits (committed ~12.0 + 2.7 = 14.7 < 14.9) but the
+    // settled 12.0 + 3.3 = 15.3 crosses the mean → genuine re-shed every cycle.
+    //
+    // The fixture originally staged this as a startup SURGE (2× cap, 60s ramp).
+    // F3 (2026-08-08) deliberately rides a startup surge through when the smoothed
+    // mean stays under the limit (the mean is the truth about load; settle, don't
+    // bounce) — so a surge-only breach now correctly produces `restores: 1,
+    // sheds: 0` and no bounce at all. To still exercise the bounce ladder the
+    // breach is staged in the MEAN, where F3 is inactive and the re-shed is real.
     const s = new Scenario(
       cfg,
       [
         { ...ABDU, level: 1, fan: 1, demandAmps: 6, needDelta: 2 },
         { ...ABDULLAH, level: 1, fan: 1, demandAmps: 3.5, needDelta: 1 },
-        { ...NAJAT, shed: true, fan: 1, demandAmps: 4.5, needDelta: 0.8, surgeFactor: 2, rampSeconds: 60 },
+        { ...NAJAT, shed: true, fan: 1, capAmps: [3.3, 3.9, 5.3], demandAmps: 4.5, needDelta: 0.8 },
       ],
       { nonAcAmps: 5.7, source: "gen" }, // total with Najat off ≈ 12.0
     );
     const t0 = s.now;
-    // An hour, not the original half: since R9 a room's own shed leaves a meter
-    // BAR for one blame window (5 min), so the first few retries are paced by
-    // that rather than by the ladder and their gaps come out equal. The ladder
-    // only visibly overtakes it at the 15-minute rung.
+    // An hour. Since R9 a room's own shed leaves a meter BAR for one blame window,
+    // and invariant 67 COMPOUNDS that bar's persistence per bounce (600s → 1200s →
+    // 1800s cap), so the retry gaps grow toward the compounded cap rather than the
+    // old flat 15-min blame window.
     s.advance(60 * 60);
     const restores = s.commandsSince(t0, "power_on");
     const sheds = s.commandsSince(t0, "power_off");
     // Retries keep happening (no strand)…
     expect(restores.length).toBeGreaterThanOrEqual(2);
-    // …every failure is followed by a bounded wait (ladder cap 15m + slack):
+    // …every failure is followed by a bounded wait (the bar's compounded cap
+    // 1800s + slack; the fixture predates the bounce-compounded bar, which raised
+    // the ceiling from the old 15-min blame window):
     for (let i = 1; i < restores.length; i++) {
-      expect(restores[i].at - restores[i - 1].at).toBeLessThanOrEqual(16 * 60_000);
+      expect(restores[i].at - restores[i - 1].at).toBeLessThanOrEqual(31 * 60_000);
     }
     // …and the gaps GROW (the ladder bites — v1 re-shed 6× in 31 minutes):
     if (restores.length >= 3) {
@@ -1545,10 +1556,11 @@ describe("the 2026-07-31 gen trip", () => {
       s.setNonAc(2.6); // back under, calm rebuilds
       s.advance(75);
     }
-    const fans = s
+    const fanCmds = s
       .commandsSince(t0, "set_fan")
       .filter((e) => e.cmd.deviceId === "abdu")
-      .map((e) => (e.cmd as Extract<Command, { kind: "set_fan" }>).fan);
+      .map((e) => ({ at: e.at, cmd: e.cmd as Extract<Command, { kind: "set_fan" }> }));
+    const fans = fanCmds.map((e) => e.cmd.fan);
     // Direction reversals are the bounce; a staged climb is not.
     let reversals = 0;
     for (let i = 2; i < fans.length; i++) {
@@ -1557,9 +1569,23 @@ describe("the 2026-07-31 gen trip", () => {
       if (prev !== 0 && curr !== 0 && prev !== curr) reversals++;
     }
     expect(reversals).toBeLessThanOrEqual(3);
-    // And no full-swing restore: 1→7 in one command was the disease.
-    for (let i = 1; i < fans.length; i++) {
-      expect(fans[i] - fans[i - 1]).toBeLessThanOrEqual(2);
+    // Every climb is ≤ 2 gears, EXCEPT at most ONE full swing that STICKS. The
+    // oscillation now parks the fan at 1 via the bounce compounding (2026-08-08 —
+    // reversals collapsed to 1), and the single post-storm recovery is invariant
+    // 60's fast path (2026-08-06, user-approved): a one-command full climb when
+    // spendable is wide. That is told from the 2026-07-31 disease — a full swing
+    // that BOUNCES — by whether it STICKS: no further fan CUT within
+    // FAN_BOUNCE_WINDOW_MS after it. Repeated full swings, or one followed by a
+    // cut, still fail.
+    let fullSwings = 0;
+    for (let i = 1; i < fanCmds.length; i++) {
+      if (fanCmds[i].cmd.fan - fanCmds[i - 1].cmd.fan <= 2) continue;
+      fullSwings++;
+      expect(fullSwings, "more than one full-swing restore").toBeLessThanOrEqual(1);
+      const reCut = fanCmds
+        .slice(i + 1)
+        .some((e) => e.cmd.reason === "trim" && e.at - fanCmds[i].at < FAN_BOUNCE_WINDOW_MS);
+      expect(reCut, "full-swing restore was re-cut within the bounce window").toBe(false);
     }
   });
 });

@@ -29,6 +29,7 @@ function view(overrides: Partial<MeterView> = {}): MeterView {
     collapsed: false,
     frozen: false,
     flickerAmps: 0,
+    flickerMarginAmps: 0,
     derateAmps: 0,
     commandedCutCreditAmps: 0,
     commandedCutAnchorAmps: 0,
@@ -120,6 +121,19 @@ describe("requiredSavingsAmps", () => {
     // speaks even though the mean sits well under the limit.
     const streak = view({ overLimitReadings: [17.0, 17.2], smoothedAmps: 13.0, flickerAmps: 0 });
     expect(requiredSavingsAmps(streak, 15, 0.1)).toBeCloseTo(2.1); // 17.0 − 15 + 0.1
+  });
+
+  it("an attributable inrush stands the severe streak down to the smoothed floor (#10375 2026-08-08)", () => {
+    // Our own restore's compressor start spans two consecutive samples that both
+    // clear the severe bar, while the SMOOTHED mean sits 1.3A under the limit and
+    // flicker is 0 (a start does not revert). The streak's "two spikes are still
+    // two spikes" argument fails for ONE physical event, so it stands down and
+    // the honest smoothed floor sizes it — 1.3A shed of a room restored 82s
+    // earlier becomes max(0.1, 13.7−15) + 0.1.
+    const banked = view({ overLimitReadings: [16.2, 16.4], smoothedAmps: 13.7, flickerAmps: 0 });
+    expect(requiredSavingsAmps(banked, 15, 0.1, true)).toBeCloseTo(0.2);
+    // …and with no turn-on in flight the SAME raws still size from the streak.
+    expect(requiredSavingsAmps(banked, 15, 0.1)).toBeCloseTo(1.3); // min(16.2, 16.4) − 15 + 0.1
   });
 });
 
@@ -224,6 +238,32 @@ describe("assessPressure", () => {
     expect(assessPressure({ ...riding, commandedCutCreditAmps: 5 }, cfg)).not.toMatchObject({
       severity: "extreme",
     });
+  });
+
+  it("caps severity at mild during an attributable inrush with the mean under the limit (#10375)", () => {
+    // The classification half of F3: the raw-banked severe term stands down while
+    // a room is ramping and the mean has not crossed, exactly as the streak
+    // sizing does. Without the flag the same two raws classify severe.
+    const banked = view({ overLimitBudget: 0, overLimitReadings: [16.2, 16.4], smoothedAmps: 13.7, flickerAmps: 0 });
+    expect(assessPressure(banked, cfg, { attributableInrush: true })).toMatchObject({
+      kind: "over",
+      severity: "mild",
+    });
+    expect(assessPressure(banked, cfg)).toMatchObject({ kind: "over", severity: "severe" });
+  });
+
+  it("the sustained clock still escalates during an attributable inrush — it reads the honest mean", () => {
+    // The escape hatch: the flag suppresses only the RAW-banked evidence. Once
+    // the SMOOTHED mean has been over for 45s the tier stops depending on it, so
+    // a ride the reducer cannot fix still reaches severe even mid-ramp.
+    const riding = view({
+      overLimitBudget: 0,
+      overLimitReadings: [16.2, 16.4],
+      smoothedAmps: 14.9,
+      smoothedOverMs: SUSTAINED_OVER_SEVERE_MS,
+      flickerAmps: 0,
+    });
+    expect(assessPressure(riding, cfg, { attributableInrush: true })).toMatchObject({ severity: "severe" });
   });
 
   it("a projected near-limit turn-on acts proactively (no over-limit readings yet)", () => {

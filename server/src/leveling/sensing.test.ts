@@ -25,6 +25,7 @@ import {
   cutTrendOf,
   determineSource,
   flickerAmps,
+  flickerMarginAmps,
   ingestReading,
   latchCollapse,
   initialMeterState,
@@ -99,6 +100,50 @@ describe("flicker estimator (2026-08-02: gen wobbles, grid does not)", () => {
     const { state } = feedGen([12, 12.1, 13.1, 12.05, 12, 13.0, 12.1, 12]);
     expect(flickerAmps(state)).toBeGreaterThan(0.8);
     expect(flickerAmps(state)).toBeLessThanOrEqual(FLICKER_MAX_AMPS);
+  });
+
+  it("a SINGLE reverting spike mints NOTHING — one event cannot satisfy the two-event guard (2026-08-08)", () => {
+    // Until 2026-08-08 flickerOfRing pushed BOTH legs of one excursion as two
+    // array entries, so the two-entry guard passed for a lone spike and the
+    // second-largest returned that spike's own larger leg — 1.5A (capped) off ONE
+    // reverting reading, flatly contradicting the estimator's documented contract
+    // ("a single spike-shaped coincidence still mints nothing"). Counted as
+    // EVENTS, a single spike is one event: mint nothing.
+    const { state } = feedGen([13.5, 13.5, 13.5, 13.5, 13.5, 16.4, 13.6, 13.6]);
+    expect(flickerAmps(state)).toBe(0);
+  });
+
+  it("two SEPARATED spikes read the second-largest EVENT, not the biggest spike's leg", () => {
+    // Two clean reverting excursions of 0.8A and 1.3A on an otherwise flat line.
+    // The old both-legs count put the 1.3A spike's two legs in the top two slots
+    // and returned 1.3; per-event it returns the genuine runner-up, 0.8A.
+    const { state } = feedGen([13, 13, 13.8, 13, 13, 13, 14.3, 13]);
+    expect(flickerAmps(state)).toBeCloseTo(0.8, 5);
+  });
+
+  it("the spender MARGIN reads the LARGEST event, not the classification runner-up (2026-08-08)", () => {
+    // Two different spikes: classification discounts by the honest runner-up
+    // (0.8A), but a spender must survive the BIGGEST wobble (1.3A) or it re-crosses
+    // on the next big spike and bounces (hard rule 5c; invariant 58).
+    const { state } = feedGen([13, 13, 13.8, 13, 13, 13, 14.3, 13]);
+    expect(flickerAmps(state)).toBeCloseTo(0.8, 5);
+    expect(flickerMarginAmps(state)).toBeCloseTo(1.3, 5);
+  });
+
+  it("a SINGLE spike mints NOTHING for classification but the full wobble for the margin", () => {
+    // The 2-event guard is a CLASSIFICATION rule (a lone spike must not loosen the
+    // severe bar). A spender must survive even one observed spike, so the margin
+    // is NOT gated on two events — it charges the spike's size (capped), matching
+    // the old (double-counted) estimate the saturated-line restore refused on.
+    const { state } = feedGen([13.5, 13.5, 13.5, 13.5, 13.5, 16.4, 13.6, 13.6]);
+    expect(flickerAmps(state)).toBe(0);
+    expect(flickerMarginAmps(state)).toBe(FLICKER_MAX_AMPS); // 2.9A spike, capped
+  });
+
+  it("margin equals the classification estimate on a quiet line (both 0)", () => {
+    const { state } = feedGen([12, 12.01, 12, 12.01, 12, 12.01, 12, 12.01]);
+    expect(flickerAmps(state)).toBe(0);
+    expect(flickerMarginAmps(state)).toBe(0);
   });
 
   it("is capped, so noise tolerance can never grow without bound", () => {

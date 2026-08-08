@@ -4,6 +4,7 @@ import type { LevelingDeps } from "./api.js";
 import { SUBFLOOR_WATCH_MS } from "./needs.js";
 import { EXTERNAL_ON_DONOR_SHIELD_MS } from "./raise.js";
 import { noteAttempt, noteFailure, restoreBounces, restoreFailures, type PacingState } from "./pacing.js";
+import { houseLoadAmps, type HouseLoadState } from "./house-load.js";
 
 // Minimal in-memory mock of the Postgres pool the controller talks to. Only the
 // tables the flavor re-sync touches are backed by mutable state; everything else
@@ -532,6 +533,244 @@ describe("LevelingControllerV2 — shed observed-ON vs confirm lag", () => {
       expect(
         readViews(controller, ctx, Date.now()).find((v) => v.deviceId === "b")?.recentlyExternalOn,
       ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-08: a leveler restore's own shadow echo was misclassified as an
+// EXTERNAL ON. `reconcileObservedOn` runs on the device poll BEFORE the tick,
+// and per invariant 4 the shed stays set until the ON confirms — so the
+// restore's echo arrives while the room is still shed, often AFTER its off was
+// observed, and the "post-off ON = external hand" branch fired: it reset the
+// bounce count (killing the invariant-67 compounding — the journal printed
+// "1st bounce" across four real bounces) and stamped a bogus 15-min swap-donor
+// shield on every room the leveler itself restored. The fix keys BOTH the
+// reconcile branch and the tick's `!wasShed` fallback on `restoreInFlight` — the
+// same restore-pacing signal the tick's `restore_confirmed` branch already
+// trusts — so our own echo is graded a confirm, never a hand. Device-poll path
+// scenarios.test.ts cannot see; this file is the only net.
+// ---------------------------------------------------------------------------
+describe("LevelingControllerV2 — a restore's own echo is not an external hand (2026-08-08)", () => {
+  const tclStub = () =>
+    ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never;
+  const pacingOf = (c: LevelingControllerV2) => (c as unknown as { pacing: PacingState }).pacing;
+  const setPacing = (c: LevelingControllerV2, p: PacingState) => {
+    (c as unknown as { pacing: PacingState }).pacing = p;
+  };
+  const readViews = (controller: LevelingControllerV2, ctx: unknown[], now: number) =>
+    (
+      controller as unknown as {
+        buildViews: (
+          ctx: unknown[],
+          outdoorTempC: number | null,
+          now: number,
+        ) => Array<{ deviceId: string; recentlyExternalOn?: boolean }>;
+      }
+    ).buildViews(ctx, 30, now);
+
+  // Drive ticks on a line too full to restore the shed room, so the ONLY thing
+  // that can clear the shed is the reconcile/flip under test. Each tick the
+  // shadow shows the room OFF stamps `shedOffObservedAt` — the shed's power_off
+  // having landed, which is what the "post-off ON = external hand" branch reads.
+  const bootObservedOff = async (controller: LevelingControllerV2, ctx: unknown[]) => {
+    let flip = 1;
+    for (let i = 0; i < 4; i++) {
+      flip = -flip;
+      controller.onPowerReading({ current_1: 0, current_2: 14 + 0.01 * flip } as never);
+      vi.advanceTimersByTime(5_000);
+      await controller.tick(ctx as never, 30);
+    }
+  };
+
+  it("reconcileObservedOn during OUR restore clears the shed, keeps the bounces, and does NOT shield", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-08T09:00:00Z"));
+      const mock = createGradePool({}, ["b"]);
+      const controller = new LevelingControllerV2(mock.pool, { ...createDeps(), getTclCloud: tclStub });
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: acDevice("b", false, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+      ];
+      await bootObservedOff(controller, ctx);
+      expect(controller.isShed("b")).toBe(true);
+      // Two bounces booked, and OUR restore is in flight (a `noteAttempt`).
+      const now = Date.now();
+      let p = pacingOf(controller);
+      p = noteFailure(noteFailure(p, "b", "restore", now, true), "b", "restore", now, true);
+      p = noteAttempt(p, "b", "restore", now);
+      setPacing(controller, p);
+      expect(restoreBounces(pacingOf(controller), "b")).toBe(2);
+      // The restore's OWN ON echo arrives on the device poll (reconcile runs
+      // BEFORE the tick, which is the production race the tick guard misses).
+      await controller.reconcileObservedOn("b");
+      expect(controller.isShed("b"), "our restore confirmed — the shed clears").toBe(false);
+      expect(
+        restoreBounces(pacingOf(controller), "b"),
+        "a restore confirm must NOT reset the bounce count",
+      ).toBe(2);
+      expect(
+        readViews(controller, ctx, Date.now()).find((v) => v.deviceId === "b")?.recentlyExternalOn,
+        "our own restore never shields itself as a swap donor",
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconcileObservedOn with NO restore in flight is still an external hand (clears, un-bounces, shields)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-08T09:00:00Z"));
+      const mock = createGradePool({}, ["b"]);
+      const controller = new LevelingControllerV2(mock.pool, { ...createDeps(), getTclCloud: tclStub });
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: acDevice("b", false, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+      ];
+      await bootObservedOff(controller, ctx);
+      // A bounce stands, but NO restore was attempted — the ON is a genuine hand.
+      const now = Date.now();
+      setPacing(controller, noteFailure(pacingOf(controller), "b", "restore", now, true));
+      expect(restoreBounces(pacingOf(controller), "b")).toBe(1);
+      await controller.reconcileObservedOn("b");
+      expect(controller.isShed("b"), "external hand — cleared").toBe(false);
+      expect(restoreBounces(pacingOf(controller), "b"), "an external ON ends the episode").toBe(0);
+      expect(
+        readViews(controller, ctx, Date.now()).find((v) => v.deviceId === "b")?.recentlyExternalOn,
+        "a remote re-enable of a shed room is shielded from the donor pick",
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the tick's !wasShed fallback does not stamp external after a restore-confirm cleared the shed", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-08T09:00:00Z"));
+      const mock = createGradePool({}, ["b"]);
+      const controller = new LevelingControllerV2(mock.pool, { ...createDeps(), getTclCloud: tclStub });
+      await controller.ensureLoaded();
+      const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+      const ctx = [
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+      ];
+      await bootObservedOff(controller, ctx);
+      // OUR restore is in flight; the device-poll reconcile clears the shed as a
+      // confirm, so by tick time `b` is on-but-no-longer-shed (`wasShed` false).
+      const now = Date.now();
+      setPacing(controller, noteAttempt(pacingOf(controller), "b", "restore", now));
+      await controller.reconcileObservedOn("b");
+      expect(controller.isShed("b")).toBe(false);
+      // The shadow now flips off→on on the tick: the `!wasShed` fallback would
+      // stamp an external ON without the shared guard.
+      b.power = true;
+      controller.onPowerReading({ current_1: 0, current_2: 8 } as never);
+      vi.advanceTimersByTime(5_000);
+      await controller.tick(ctx, 30);
+      expect(
+        readViews(controller, ctx, Date.now()).find((v) => v.deviceId === "b")?.recentlyExternalOn,
+        "the flip of a room the reconcile just restore-confirmed must not shield",
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-08: the house-load drop detector's memory froze across a restore→shed
+// round trip, so a commanded off booked the dying compressor as house (7.2A
+// phantom, live). The round trip completed inside the 240s ramp, so no tick
+// advanced `lastModeledAmps`: the pendingOn stand-down skipped the sampleHouseLoad
+// CALL between send and confirm, and the ramping early-return skipped the advance
+// between confirm and ramp end. At the shed the modeled-now equalled the frozen
+// stored total → NO drop detected → the cooldown never armed → the first tick
+// booked smoothed − stale-modeled as house. The fix advances the memory on EVERY
+// tick and a belt arms the cooldown on every commanded cut.
+//
+// SHELL test on purpose: scenario.ts cannot forge the device-poll pendingOn /
+// shadow-confirm timing this replays.
+// ---------------------------------------------------------------------------
+describe("LevelingControllerV2 — a restore→shed round trip is not phantom house (2026-08-08)", () => {
+  const tclStub = () =>
+    ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never;
+  const houseOf = (c: LevelingControllerV2) => (c as unknown as { houseLoad: HouseLoadState }).houseLoad;
+  const pacingOf = (c: LevelingControllerV2) => (c as unknown as { pacing: PacingState }).pacing;
+  const setPacing = (c: LevelingControllerV2, p: PacingState) => {
+    (c as unknown as { pacing: PacingState }).pacing = p;
+  };
+  const pendingOnOf = (c: LevelingControllerV2) =>
+    (c as unknown as { pendingOn: Map<string, number> }).pendingOn;
+
+  it("never books the dying compressor as house after the re-shed (cooldown armed)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-08T12:00:00Z"));
+      const mock = createGradePool({ genAmpModels: { b: { baseAmps: 2, stepAmps: 2 } } }, ["b"]);
+      const controller = new LevelingControllerV2(mock.pool, { ...createDeps(), getTclCloud: tclStub });
+      await controller.ensureLoaded();
+      const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+      const ctx = [
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+      ];
+      let flip = 1;
+      const run = async (genAmps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(5_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+
+      // Establish the gen source first (the source-change resetPacing would wipe
+      // any pacing set before it), then block b's auto-restore so the test — not
+      // the planner — owns the restore timing (no attemptMeterAmps is set, so the
+      // probe re-arm cannot override the backoff either).
+      await run(6, 1);
+      expect(controller.isShed("b")).toBe(true);
+      let p = pacingOf(controller);
+      for (let i = 0; i < 4; i++) p = noteFailure(p, "b", "restore", Date.now(), true);
+      setPacing(controller, p);
+
+      // Settle past the boot-quiet window with b shed: the meter is pure house
+      // (b's model is out of the running set), sampled at ~6A tagged "".
+      await run(6, 40);
+      expect(houseOf(controller).gen?.lastModeledAmps).toBe(0);
+      const honest = houseLoadAmps(houseOf(controller), "gen", Date.now(), []);
+      expect(honest).toBeGreaterThan(4);
+      expect(honest).toBeLessThan(8);
+
+      // The restore ships — exactly what executeAndJournal's power_on does.
+      pendingOnOf(controller).set("b", Date.now());
+      await run(6, 2); // unconfirmed-ON stand-down: no sample, memory still 0
+      expect(houseOf(controller).gen?.lastModeledAmps).toBe(0);
+
+      // The shadow confirms: b flips on and RAMPS. The memory must rebase to
+      // include b (2A) though no sample is taken — the step that used to freeze.
+      b.power = true;
+      await run(8, 1);
+      expect(controller.isShed("b")).toBe(false);
+      expect(controller.rampWindowOpen("b")).toBe(true);
+      expect(houseOf(controller).gen?.lastModeledAmps).toBeCloseTo(2, 1);
+
+      // Re-shed still inside the ramp: slam the line over the limit so the reducer
+      // sheds b. The belt arms the house cooldown on the commanded cut, and the
+      // modeled drop (2 → 0) is now visible to the detector too.
+      vi.advanceTimersByTime(90_000);
+      await run(24, 8);
+      expect(controller.isShed("b")).toBe(true);
+      expect(houseOf(controller).gen?.cooldownUntil ?? 0).toBeGreaterThan(Date.now());
+
+      // The next readings carry b's dying compressor (~14A over a 0A model), but
+      // the cooldown refuses them — the honest "" peak carries, never the phantom.
+      await run(14, 3);
+      expect(houseLoadAmps(houseOf(controller), "gen", Date.now(), [])).toBeLessThan(8);
     } finally {
       vi.useRealTimers();
     }

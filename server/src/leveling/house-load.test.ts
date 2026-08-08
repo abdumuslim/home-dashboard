@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  armDropCooldown,
   HOUSE_LOAD_WINDOW_MS,
   houseLoadAmps,
   houseLoadResidual,
@@ -195,7 +196,13 @@ describe("houseLoadAmps — the rolling PEAK", () => {
     expect(houseLoadAmps(s, "none", T, live())).toBe(0);
   });
 
-  it("a ramping tick leaves the state untouched", () => {
+  it("a ramping tick records no sample but ADVANCES the drop detector's memory (2026-08-08)", () => {
+    // Was `expect(after).toBe(before)` — the old behavior this fix corrects. A
+    // restore→shed round trip completes entirely inside the ramp, and a memory
+    // frozen at the pre-restore total never sees the re-shed's modeled drop, so
+    // the first tick that resumed sampling booked the dying compressor as house
+    // (7.2 A phantom, live). No usable residual while a compressor ramps, but
+    // the memory must move.
     const before = initialHouseLoad();
     const after = sampleHouseLoad(before, {
       source: "gen",
@@ -204,7 +211,8 @@ describe("houseLoadAmps — the rolling PEAK", () => {
       acs: [ac("abdu", { ramping: true })],
       config: cfg,
     });
-    expect(after).toBe(before);
+    expect(after.gen?.samples ?? []).toHaveLength(0);
+    expect(after.gen?.lastModeledAmps).toBeCloseTo(4.3, 5); // abdu L1
   });
 
   it("ignores samples taken with a DIFFERENT set of ACs running", () => {
@@ -361,6 +369,86 @@ describe("turn-off decay contamination (2026-08-01)", () => {
     const resumed = T + 150_000 + COOLDOWN_MS + 1_000;
     s = sampleHouseLoad(s, { source: "gen", at: resumed, smoothedAmps: 8.4, acs: soloAbdu(), config: cfg });
     expect(houseLoadAmps(s, "gen", resumed, soloAbdu())).toBeCloseTo(4.1, 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-08: a restore→shed round trip that completes entirely inside a
+// sampling suppression froze the drop detector's memory at the PRE-restore
+// total, so the re-shed's modeled drop was invisible and the first tick that
+// resumed sampling booked the dying compressor as house (7.2A phantom, live,
+// tagged with the 2-room set so it recurred on every re-shed). The memory must
+// advance on EVERY tick — the ramp skip and the shell's stand-downs gate the
+// SAMPLE only — and the belt (`armDropCooldown`) pauses sampling the moment a
+// commanded cut ships, even if the detector's memory is ever starved again.
+// ---------------------------------------------------------------------------
+
+describe("restore→shed round trip inside a suppression (2026-08-08)", () => {
+  const peer = () => [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("abdu", { currentLevel: 1 })]; // 9.1
+
+  it("the ramp rebases the memory so the re-shed's drop arms the cooldown", () => {
+    // Peer set settled, sampling live: 12.9 − 9.1 = 3.8A honest house.
+    let s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen", at: T, smoothedAmps: 12.9, acs: peer(), config: cfg,
+    });
+    expect(s.gen?.lastModeledAmps).toBeCloseTo(9.1, 5);
+    // Najat's restore is sent — the shell suppresses the SAMPLE (unconfirmed ON)
+    // but the memory must still advance. Najat is still shed (modeled 9.1).
+    s = sampleHouseLoad(s, {
+      source: "gen", at: T + 5_000, smoothedAmps: 12.9, acs: peer(), config: cfg,
+      sampleSuppressed: true,
+    });
+    expect(s.gen?.samples).toHaveLength(1); // no new sample under the stand-down
+    expect(s.gen?.lastModeledAmps).toBeCloseTo(9.1, 5);
+    // The shadow confirms: najat joins the running set and RAMPS. No sample, but
+    // the memory rebases UP to 11.4 — the step that used to freeze.
+    s = sampleHouseLoad(s, {
+      source: "gen", at: T + 10_000, smoothedAmps: 13.5,
+      acs: [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("abdu"), ac("najat", { ramping: true })],
+      config: cfg,
+    });
+    expect(s.gen?.samples).toHaveLength(1);
+    expect(s.gen?.lastModeledAmps).toBeCloseTo(11.4, 5);
+    // Najat is re-shed 90s later (inside the ramp). The next tick's smoothed still
+    // carries her dying compressor (15.1), but the modeled side has already
+    // dropped to 9.1: the drop is SEEN (11.4 → 9.1), the cooldown arms, and the
+    // 15.1 − 9.1 = 6.0A phantom is never recorded — the honest pre-restore peak
+    // (3.8) carries instead.
+    s = sampleHouseLoad(s, {
+      source: "gen", at: T + 100_000, smoothedAmps: 15.1, acs: peer(), config: cfg,
+    });
+    expect(s.gen?.samples).toHaveLength(1);
+    expect(houseLoadAmps(s, "gen", T + 100_000, peer())).toBeCloseTo(3.8, 5);
+    // Past the cooldown the meter has settled: the NEW sample is the honest
+    // 11.1 − 9.1 = 2.0A residual, not the phantom.
+    const resumed = T + 100_000 + COOLDOWN_MS + 1_000;
+    s = sampleHouseLoad(s, { source: "gen", at: resumed, smoothedAmps: 11.1, acs: peer(), config: cfg });
+    const samples = s.gen?.samples ?? [];
+    expect(samples).toHaveLength(2);
+    expect(samples[samples.length - 1].amps).toBeCloseTo(2.0, 5);
+  });
+
+  it("armDropCooldown pauses sampling without touching the detector's memory", () => {
+    // The belt: a commanded cut arms the cooldown directly. The reading that
+    // follows — the dying compressor still on the meter — is refused as a sample,
+    // and the memory is left for the detector alone (no phantom drop or rise).
+    let s = sampleHouseLoad(initialHouseLoad(), {
+      source: "gen", at: T, smoothedAmps: 12.9, acs: peer(), config: cfg,
+    });
+    const before = s.gen?.lastModeledAmps;
+    s = armDropCooldown(s, "gen", T + 1_000);
+    expect(s.gen?.lastModeledAmps).toBe(before); // memory untouched
+    s = sampleHouseLoad(s, { source: "gen", at: T + 5_000, smoothedAmps: 15.1, acs: peer(), config: cfg });
+    expect(s.gen?.samples).toHaveLength(1); // refused inside the armed cooldown
+    const resumed = T + 1_000 + COOLDOWN_MS + 1_000;
+    s = sampleHouseLoad(s, { source: "gen", at: resumed, smoothedAmps: 11.5, acs: peer(), config: cfg });
+    expect(s.gen?.samples).toHaveLength(2); // honest sampling resumes
+  });
+
+  it("armDropCooldown on a source with no record arms the cooldown from nothing", () => {
+    const s = armDropCooldown(initialHouseLoad(), "gen", T);
+    const after = sampleHouseLoad(s, { source: "gen", at: T + 5_000, smoothedAmps: 15.1, acs: peer(), config: cfg });
+    expect(after.gen?.samples ?? []).toHaveLength(0);
   });
 });
 

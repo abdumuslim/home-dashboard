@@ -70,6 +70,7 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     collapsed: false,
     frozen: false,
     flickerAmps: 0,
+    flickerMarginAmps: 0,
     derateAmps: 0,
     commandedCutCreditAmps: 0,
     commandedCutAnchorAmps: 0,
@@ -366,19 +367,75 @@ describe("turn-on inrush blanking (2026-07-25 restore-bounce storm)", () => {
     expect(out.decisions.some((d) => d.blockedBy === "turn-on inrush")).toBe(true);
   });
 
-  it("a severe overshoot is never blanked — a real breach still sheds", () => {
+  it("a severe RAW reading mid-ramp with the mean UNDER the limit is now capped to mild (F3, 2026-08-08)", () => {
+    // Inverted from the day it shipped, deliberately: until 2026-08-08 a raw
+    // reading over the severe bar shed immediately even mid-ramp with the mean
+    // far under the limit — the exact shape of journal 10375, where our own
+    // restore's ~10s locked-rotor transient spanned consecutive samples and shed
+    // a room restored 82s earlier. A compressor start does not revert, so it
+    // mints no flicker to discount it, and the streak sizing never consults the
+    // mean. While a room is ramping and the SMOOTHED meter is under the limit,
+    // that raw-only evidence may no longer classify past mild or shed; the
+    // sustained clock is the escape once the MEAN actually crosses (below).
     const out = run(pinned(true), overMeter([16.5], 12));
-    expect(out.severity).toBe("severe");
-    expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
+    expect(out.severity).toBe("mild");
+    expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(0);
+    expect(out.decisions.some((d) => d.blockedBy === "turn-on inrush")).toBe(true);
   });
 
   it("when a shed IS taken, the lone ramping room is the one undone", () => {
     // `a` is the bystander and would otherwise be a candidate; `b`'s own
-    // turn-on caused this, so `b` pays.
-    const out = run(pinned(true), overMeter([16.5], 12));
+    // turn-on caused this, so `b` pays. Staged on the MEAN over the limit (15.6)
+    // so a shed is genuinely taken — a mean-under-limit severe raw is now capped
+    // (F3), and the preferShed logic only runs when the reducer must actually cut.
+    const out = run(pinned(true), overMeter([16.5], 15.6));
     const offs = out.commands.filter((c) => c.kind === "power_off");
     expect(offs.map((c) => c.deviceId)).toEqual(["b"]);
     expect(out.decisions.some((d) => d.action === "shed preference" && d.deviceId === "b")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — our own restore's compressor-start inrush classifies and sizes a SEVERE
+// episode while the smoothed mean is under the limit (2026-08-08, journal 10375,
+// 14:45:16Z). power_on sent 82s earlier; a ~10s locked-rotor transient spanned
+// TWO consecutive raw samples ≥16.2A on a 15A gen while the smoothed mean sat
+// 13.7A — 1.3A UNDER the limit. Flicker read 0 (a compressor start does not
+// revert, so it mints nothing), so the severe bar sat at its floor: the two raws
+// classified severe AND the streak sized a 1.3A deficit that shed a room
+// restored 82s earlier. While a room is inside its ramp AND the mean is under the
+// limit, raw-banked evidence may neither classify nor size past mild.
+// ---------------------------------------------------------------------------
+describe("attributable inrush cap (2026-08-08 journal 10375)", () => {
+  const pinned = (ramping: boolean): AcView[] => [
+    ac("a", { currentLevel: 1, fanSpeed: 1, needDelta: 2 }),
+    ac("b", { currentLevel: 1, fanSpeed: 1, needDelta: 0.3, ramping }),
+  ];
+
+  it("does not shed for two consecutive inrush raws while the mean is under the limit", () => {
+    const out = run(pinned(true), overMeter([16.2, 16.4], 13.7));
+    expect(out.severity).toBe("mild");
+    expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(0);
+    expect(out.decisions.some((d) => d.blockedBy === "turn-on inrush")).toBe(true);
+    // The streak sizing stands down to the honest smoothed floor: max(0.1, 13.7−15) + 0.1.
+    expect(out.requiredAmps).toBeCloseTo(0.2);
+  });
+
+  it("the SAME raws with NO room ramping shed with the streak sizing (the branch survives)", () => {
+    const out = run(pinned(false), overMeter([16.2, 16.4], 13.7));
+    expect(out.severity).toBe("severe");
+    expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
+    // min(16.2, 16.4) − 15 + 0.1 — a genuine fast overload is still sized undiscounted.
+    expect(out.requiredAmps).toBeCloseTo(1.3);
+  });
+
+  it("a real overload mid-ramp (mean ABOVE the limit) still sheds — the guard is guarded", () => {
+    // The flag is only set with the mean at/under the limit, so a genuine
+    // overload during a ramp is never blanked (invariant 33's history: the +0.5A
+    // slack that once blocked the one instant actuator was reverted).
+    const out = run(pinned(true), overMeter([16.2, 16.4], 15.4));
+    expect(out.severity).toBe("severe");
+    expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
   });
 });
 

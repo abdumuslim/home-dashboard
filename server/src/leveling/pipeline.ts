@@ -169,8 +169,22 @@ export function plan(input: PlanInput): PlanOutput {
     ]);
   }
 
-  const pressure = assessPressure(meter, config, { projectedExtraAmps: input.projectedExtraAmps });
   const onManaged = acs.filter((a) => a.on && a.managed && !a.shed);
+  // Our own restore's compressor-start inrush can spike two consecutive raw
+  // readings over the severe bar while the SMOOTHED mean is still under the
+  // limit — a locked-rotor transient does not revert, so it mints no flicker to
+  // discount it, and the streak sizing deliberately never consults the mean
+  // (2026-08-08, journal 10375: a room restored 82s earlier shed at a 13.7A mean
+  // on a 15A gen). While a room is inside its ramp AND the mean has not crossed,
+  // raw-banked evidence may neither classify nor size past mild — the same
+  // stand-down the mild inrush blanking already applies to the shed rung. Gated
+  // on the mean, so a real overload mid-ramp escalates exactly as before, and the
+  // sustained clocks stay the emergency escape.
+  const attributableInrush = meter.smoothedAmps <= limit && onManaged.some((a) => a.ramping);
+  const pressure = assessPressure(meter, config, {
+    projectedExtraAmps: input.projectedExtraAmps,
+    attributableInrush,
+  });
   const corrections = invariantCorrections(acs, now, source);
 
   // ---- Over-limit: the one graduated reducer, at every severity ----
@@ -619,9 +633,11 @@ export function plan(input: PlanInput): PlanOutput {
       // restore ceiling (2026-08-06 14:00–14:04Z). A restore admitted with
       // 0.48A to spare on a line flickering ±0.4–0.8A cannot survive, and a
       // restore that cannot survive costs the room an off/on cycle and — that
-      // afternoon — a second room with it. 0 on a quiet line, so grid and every
-      // steady generator hour are unchanged (see raise.ts restoreCeiling).
-      flickerAmps: meter.flickerAmps,
+      // afternoon — a second room with it. The MARGIN statistic (largest event),
+      // not the accurate classification `flickerAmps`: a spender must survive the
+      // biggest spike, not the runner-up (2026-08-08, hard rule 5c). 0 on a quiet
+      // line, so grid and every steady generator hour are unchanged.
+      flickerMarginAmps: meter.flickerMarginAmps,
       // Where a cut still in flight is taking the meter — a restore admitted on
       // the trough of its own shed comes straight back out (2026-08-03).
       cutAnchorAmps: meter.commandedCutAnchorAmps,
@@ -785,8 +801,9 @@ export function plan(input: PlanInput): PlanOutput {
       // limit with every level at its floor has only the fan left, so the
       // restore lands right back inside the flicker band that trimmed it —
       // live 2026-08-06, one fan commanded 10× in 22 minutes (see
-      // planFanRestore). 0 on a quiet line, so this changes nothing there.
-      flickerAmps: meter.flickerAmps,
+      // planFanRestore). The MARGIN statistic (largest event) — a fan must
+      // survive the biggest spike (2026-08-08). 0 on a quiet line, unchanged there.
+      flickerMarginAmps: meter.flickerMarginAmps,
       book,
       source,
       now,

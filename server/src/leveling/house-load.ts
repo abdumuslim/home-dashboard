@@ -167,13 +167,28 @@ export function sampleHouseLoad(
      * sample time is genuinely ~0, so the superset reuse rules stay honest.
      */
     deadWindow?: boolean;
+    /**
+     * The SHELL's own reasons this reading may not be recorded as a sample — an
+     * unconfirmed ON drawing amps the model cannot see yet, the boot quiet
+     * window, a frozen meter. Gates the SAMPLE only; the drop detector's memory
+     * and cooldown below advance regardless (2026-08-08). A restore→shed round
+     * trip completes entirely inside the unconfirmed-ON stand-down and the
+     * compressor ramp, so a memory frozen at the pre-restore total never sees the
+     * re-shed's modeled drop — and the first tick that resumed sampling booked
+     * the dying compressor as house (7.2 A phantom, live). This was a shell-side
+     * `if` that skipped the CALL, which is exactly what froze the memory.
+     */
+    sampleSuppressed?: boolean;
   },
 ): HouseLoadState {
   const direct = opts.deadWindow === true;
   const running = opts.acs.filter((a) => a.on && a.managed && !a.shed);
-  // A ramping tick is unusable AND must not advance the drop detector — the
-  // modeled side already carries draw the meter has not seen.
-  if (!direct && running.some((a) => a.ramping)) return state;
+  // A ramping tick yields no usable residual — the modeled side already carries
+  // draw the meter has not seen — but it MUST still advance the drop detector
+  // below: a restore→shed round trip that completes inside the ramp otherwise
+  // freezes the memory at the pre-restore total and the re-shed's drop goes
+  // unseen (2026-08-08). Gates the SAMPLE, never the memory.
+  const ramping = !direct && running.some((a) => a.ramping);
   const modeled = modeledRunningAmps(opts.acs, opts.config, opts.source);
   const rec = state[opts.source];
   const dropped = rec != null && modeled < rec.lastModeledAmps - MODELED_DROP_EPSILON_AMPS;
@@ -182,8 +197,10 @@ export function sampleHouseLoad(
     .filter((s) => opts.at - s.at < HOUSE_LOAD_WINDOW_MS)
     .slice(-(MAX_SAMPLES - 1));
   const usable =
-    direct ||
-    (opts.at >= cooldownUntil && modeled - opts.smoothedAmps <= RESIDUAL_TRUST_GAP_AMPS);
+    !ramping &&
+    opts.sampleSuppressed !== true &&
+    (direct ||
+      (opts.at >= cooldownUntil && modeled - opts.smoothedAmps <= RESIDUAL_TRUST_GAP_AMPS));
   const samples = usable
     ? [
         ...kept,
@@ -195,6 +212,30 @@ export function sampleHouseLoad(
       ]
     : kept;
   return { ...state, [opts.source]: { samples, lastModeledAmps: modeled, cooldownUntil } };
+}
+
+/**
+ * Arm the modeled-drop cooldown directly — the belt to `sampleHouseLoad`'s own
+ * tick-by-tick drop detector (2026-08-08). The shell knows every load-lowering
+ * batch it sends (`noteCommandedCut`), and a commanded cut IS a modeled drop
+ * whose meter follows over the compressor wind-down: pausing sampling here means
+ * a commanded off can never be booked as house even if the detector's memory is
+ * ever starved again (a restore→shed round trip that completed entirely inside a
+ * sampling stand-down booked 7.2 A of dying compressor as house). Touches ONLY
+ * the cooldown — `lastModeledAmps` is the detector's alone, so the belt can
+ * never fabricate a phantom drop or rise of its own.
+ */
+export function armDropCooldown(
+  state: HouseLoadState,
+  source: Exclude<PowerSource, "none">,
+  at: number,
+): HouseLoadState {
+  const cooldownUntil = at + HOUSE_SAMPLE_COOLDOWN_MS;
+  const rec = state[source];
+  if (rec == null) {
+    return { ...state, [source]: { samples: [], lastModeledAmps: 0, cooldownUntil } };
+  }
+  return { ...state, [source]: { ...rec, cooldownUntil: Math.max(rec.cooldownUntil, cooldownUntil) } };
 }
 
 /**

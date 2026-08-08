@@ -198,9 +198,24 @@ export interface MeterView {
    * Live supply-flicker estimate in amps (0 when unestimable or stale). A
    * generator wobbles reading-to-reading where the grid does not; a raw
    * reading within this much of the limit is supply noise, not load. Severity
-   * classification discounts by it — the smoothed mean never is.
+   * classification discounts by it — the smoothed mean never is. This is the
+   * ACCURATE figure (second-largest event); a SPENDER reads `flickerMarginAmps`.
    */
   flickerAmps: number;
+  /**
+   * The wobble a SPENDER must SURVIVE — the LARGEST reverting excursion, not the
+   * second-largest `flickerAmps` above. A fan- or shed-restore admitted with only
+   * the runner-up of margin re-crosses on the biggest spike and bounces
+   * (2026-08-06); classification wants the honest figure, admission wants the
+   * conservative one (hard rule 5c: a guard sized against the whole quantity it
+   * guards; invariant 58). Same caps/min-samples/discontinuity rules as
+   * `flickerAmps`, and equal to it on a QUIET or GRID line (both 0) — so grid and
+   * every steady hour are unchanged. It DIVERGES on a lone spike: classification
+   * reads 0 (the 2-event guard — one spike must not loosen the severe bar), but
+   * this reads the spike's size, because a spender must survive even a single
+   * observed spike (no 2-event guard here). 0 when unestimable or stale.
+   */
+  flickerMarginAmps: number;
   /**
    * Amps to subtract from the configured limit for the active source right now
    * (0 normally). Grows with each recent power collapse — see the derate note

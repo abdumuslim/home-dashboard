@@ -53,6 +53,7 @@ import { ceilOf, floorOf, nextSubFloorWatch, type SubFloorWatch, worstCaseLevel 
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
 import { absorbedSharesAmps, EXTERNAL_ON_DONOR_SHIELD_MS, rampDebitAmps, SWAP_QUIET_AFTER_OVER_MS } from "./raise.js";
 import {
+  armDropCooldown,
   EXTERNAL_ON_VOID_MS,
   HOUSE_SAMPLE_COOLDOWN_MS,
   houseLoadAmps,
@@ -1360,15 +1361,12 @@ export class Scenario {
     // house the shell cannot see, and no harness test could ever disagree.
     // Mirror of the shell's boot quiet: no sampling for the first cooldown.
     if (this.firstStepAt == null) this.firstStepAt = this.now;
-    // Shell parity: no house sampling while any ON is unconfirmed — the room
-    // draws before the shadow says so, and the residual would book it as house.
-    if (
-      view.source !== "none" &&
-      view.sampleCount >= 2 &&
-      !view.frozen &&
-      this.pendingOn.size === 0 &&
-      this.now - this.firstStepAt >= HOUSE_SAMPLE_COOLDOWN_MS
-    ) {
+    // Shell parity (controller.tick, 2026-08-08): call EVERY step with a live
+    // source so the drop detector's memory advances even when the SAMPLE is
+    // suppressed. `sampleSuppressed` carries the shell's own stand-downs — an
+    // unconfirmed ON (the room draws before the shadow says so), the boot quiet
+    // window, a frozen meter — while memory and cooldown advance regardless.
+    if (view.source !== "none") {
       this.houseLoad = sampleHouseLoad(this.houseLoad, {
         source: view.source,
         at: this.now,
@@ -1378,6 +1376,11 @@ export class Scenario {
         // Shell parity: with every room power-cycled and no compressor drawing,
         // the meter IS the house — a residual would floor at a fictitious zero.
         deadWindow: houseIsDirect,
+        sampleSuppressed:
+          view.sampleCount < 2 ||
+          view.frozen ||
+          this.pendingOn.size > 0 ||
+          this.now - this.firstStepAt < HOUSE_SAMPLE_COOLDOWN_MS,
       });
     }
     const out = plan({
@@ -1479,6 +1482,13 @@ export class Scenario {
       // the gen start clamp.
       if (out.commandedCutAmps > 0) {
         this.meterState = noteCommandedCut(this.meterState, out.commandedCutAmps, this.now);
+      }
+      // Shell parity (belt, 2026-08-08): a commanded OFF arms the house sampler's
+      // drop cooldown directly, so a commanded off cannot be booked as house even
+      // if the tick-by-tick detector's memory is ever starved. Scoped to
+      // `power_off` — a fan trim lowers load but never drops the model.
+      if (view.source !== "none" && out.commands.some((c) => c.kind === "power_off")) {
+        this.houseLoad = armDropCooldown(this.houseLoad, view.source, this.now);
       }
       // Shell parity: a turn-on invalidates banked over-limit readings.
       if (out.commands.some((c) => c.kind === "power_on")) {

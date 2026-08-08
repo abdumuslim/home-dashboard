@@ -225,8 +225,8 @@ export const FLICKER_REVERT_FRACTION = 0.5;
 export const FLICKER_REVERT_WINDOW = 2;
 
 /**
- * Live supply-flicker estimate: the second-largest REVERTING excursion in the
- * ring.
+ * The flicker EVENTS in the ring, sorted descending — one entry per qualifying
+ * REVERTING excursion plus each boundary spike.
  *
  * A generator is not a stable line — live 2026-08-02 the gen wobbled ~±1A
  * reading-to-reading while the mean sat comfortably under the limit, and every
@@ -236,50 +236,84 @@ export const FLICKER_REVERT_WINDOW = 2;
  * UNDER. Riding near the limit is the whole point of the controller, and on gen
  * it was self-defeating.
  *
- * What makes an estimate of noise safe to trust is that LOAD can never mint it.
- * This shipped as "second-largest jump between consecutive readings", whose
- * stated argument — a spike is two jumps and survives, a genuine step is one
- * jump and is filtered — holds only while the ring contains at most ONE real
- * event. Two compressors cycling inside one 8-reading window (the ordinary
- * steady state of this house) are two large jumps, so the estimate pinned at
- * its 1.5A cap and loosened severity, calm, the drain rung and the deficit
- * sizing all at once — the second compressor's own start minting the tolerance
- * that then hid it. A monotonic ramp (or a shed's own wind-down) read as its
- * per-reading step for the same reason.
+ * What makes an estimate of noise safe to trust is that LOAD can never mint it,
+ * so an excursion counts only if the signal comes BACK: flicker spikes and
+ * returns within a reading or two, while a compressor step, a shed landing and a
+ * ramp all walk away from where they started and stay there. ONE entry per
+ * excursion, not per leg: until 2026-08-08 this pushed BOTH legs, so a SINGLE
+ * spike filled two slots and minted an estimate the contract forbids it. The
+ * magnitude is still fed by both legs (the max of the out and return jumps) so
+ * it does not shrink to the baseline wobble.
  *
- * So an excursion counts only if the signal comes BACK: flicker spikes and
- * returns within a reading or two, while a compressor step, a shed landing and
- * a ramp all walk away from where they started and stay there. Two qualifying
- * excursions are required, so a single spike-shaped coincidence — a turn-on
- * that we shed two readings later, say — still mints nothing.
+ * A spike at a window BOUNDARY has only one leg in the ring — its partner is off
+ * the edge — so the reverting scan never sees it, yet the supply is genuinely
+ * spiking (the original double-count existed precisely so the estimate "doesn't
+ * collapse when the newest reading IS the spike"). Count it ONCE from its single
+ * visible leg, guarded by a FLAT baseline on the other side: a spike jumps away
+ * from quiet readings, a ramp's boundary is just its next step, whose neighbour
+ * has already moved by more than the floor.
  *
- * Returns 0 below `FLICKER_MIN_SAMPLES` clean readings, so a fresh boot, a
- * source change, an ESP gap or a post-collapse window behaves exactly as it did
- * before this existed — never more permissive than the code it replaced.
+ * Empty below `FLICKER_MIN_SAMPLES` clean readings, so a fresh boot, a source
+ * change, an ESP gap or a post-collapse window behaves exactly as it did before
+ * this existed — never more permissive than the code it replaced.
  */
-function flickerOfRing(recent: readonly number[]): number {
-  if (recent.length < FLICKER_MIN_SAMPLES) return 0;
-  const excursions: number[] = [];
-  for (let i = 1; i < recent.length; i++) {
+function flickerEventsOf(recent: readonly number[]): number[] {
+  if (recent.length < FLICKER_MIN_SAMPLES) return [];
+  const n = recent.length;
+  const events: number[] = [];
+  for (let i = 1; i < n; i++) {
     const origin = recent[i - 1];
     const size = Math.abs(recent[i] - origin);
     if (size < FLICKER_MIN_AMPS) continue;
-    const last = Math.min(i + FLICKER_REVERT_WINDOW, recent.length - 1);
+    const last = Math.min(i + FLICKER_REVERT_WINDOW, n - 1);
     for (let j = i + 1; j <= last; j++) {
       if (Math.abs(recent[j] - origin) <= size * FLICKER_REVERT_FRACTION) {
-        // BOTH legs — the excursion out and the return. This is what the
-        // original "second-largest jump" was really counting whenever the
-        // signal was genuinely noisy, and dropping it here would make the
-        // estimate collapse to the baseline wobble whenever the newest reading
-        // happened to BE the spike (its return leg is not in the ring yet).
-        excursions.push(size, size);
+        events.push(Math.max(size, Math.abs(recent[i] - recent[j])));
         break;
       }
     }
   }
-  if (excursions.length < 2) return 0;
-  excursions.sort((a, b) => b - a);
-  return Math.min(FLICKER_MAX_AMPS, excursions[1]);
+  const endJump = n >= 2 ? Math.abs(recent[n - 1] - recent[n - 2]) : 0;
+  if (n >= 3 && endJump >= FLICKER_MIN_AMPS && Math.abs(recent[n - 2] - recent[n - 3]) < FLICKER_MIN_AMPS) {
+    events.push(endJump);
+  }
+  const startJump = n >= 2 ? Math.abs(recent[0] - recent[1]) : 0;
+  if (n >= 3 && startJump >= FLICKER_MIN_AMPS && Math.abs(recent[1] - recent[2]) < FLICKER_MIN_AMPS) {
+    events.push(startJump);
+  }
+  events.sort((a, b) => b - a);
+  return events;
+}
+
+/**
+ * CLASSIFICATION flicker: the SECOND-largest event. Two qualifying excursions
+ * are required (a single spike-shaped coincidence mints nothing), and the runner-
+ * up — not the biggest spike — is the honest amount of noise the severe bar, the
+ * bucket drain, the median discount (invariant 63) and calm may discount by.
+ */
+function flickerOfRing(recent: readonly number[]): number {
+  const events = flickerEventsOf(recent);
+  return events.length < 2 ? 0 : Math.min(FLICKER_MAX_AMPS, events[1]);
+}
+
+/**
+ * SPENDER-ADMISSION flicker margin: the LARGEST event. A fan- or shed-restore
+ * admitted with only the runner-up of margin re-crosses on the BIGGEST spike and
+ * bounces (2026-08-06), so a spender must be charged the wobble it has to
+ * survive, not the one classification discounts by (hard rule 5c; invariant 58).
+ *
+ * Deliberately NOT gated on two events, unlike `flickerOfRing`: that guard is a
+ * CLASSIFICATION rule (a lone spike must not loosen the severe bar), but a
+ * spender must survive even a SINGLE observed spike — a restore admitted into a
+ * window that has spiked once re-crosses on the next one. So a lone reverting
+ * spike charges its full size here while it mints nothing there, which is exactly
+ * what keeps a saturated line's restore refused where the old (double-counted)
+ * estimate refused it. Still 0 with no events at all, so grid/quiet lines are
+ * byte-identical to `flickerOfRing`.
+ */
+function flickerMarginOfRing(recent: readonly number[]): number {
+  const events = flickerEventsOf(recent);
+  return events.length === 0 ? 0 : Math.min(FLICKER_MAX_AMPS, events[0]);
 }
 
 /**
@@ -294,6 +328,11 @@ function flickerWindowOf(recent: readonly number[], samples: number): readonly n
 
 export function flickerAmps(state: MeterState): number {
   return flickerOfRing(flickerWindowOf(state.recent, state.flickerSamples));
+}
+
+/** The spender-admission margin (largest event) — see `flickerMarginOfRing`. */
+export function flickerMarginAmps(state: MeterState): number {
+  return flickerMarginOfRing(flickerWindowOf(state.recent, state.flickerSamples));
 }
 
 /**
@@ -1111,6 +1150,7 @@ export function meterView(state: MeterState, now: number): MeterView {
     collapsed: state.collapse != null,
     frozen: state.frozen,
     flickerAmps: stale ? 0 : flickerAmps(state),
+    flickerMarginAmps: stale ? 0 : flickerMarginAmps(state),
     commandedCutCreditAmps: pendingCutCredit(state, now),
     ...liveCutFigures(state.pendingCut, now),
   };

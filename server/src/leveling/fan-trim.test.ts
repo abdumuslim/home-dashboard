@@ -66,7 +66,7 @@ describe("planFanRestore", () => {
   const opts = (over: Partial<Parameters<typeof planFanRestore>[2]> = {}) => ({
     calmMs: FAN_RESTORE_CALM_MS,
     headroomAmps: 1,
-    flickerAmps: 0,
+    flickerMarginAmps: 0,
     book: {},
     source: "gen" as const,
     now: T,
@@ -85,14 +85,16 @@ describe("planFanRestore", () => {
 
   it("holds a freshly-cut fan for the cut cooldown even when the meter is calm", () => {
     // Live 2026-07-31: Abdu's fan was cut at 17:30:24 and fully restored at
-    // 17:31:44 — 80s. A fan-only batch never rewinds the shared calm clock, so
-    // the calm gate alone could not see the cut that had just happened.
-    // 1A of room: enough for the bounded climb, short of the 0.5A swing plus
-    // FAN_RESTORE_FAST_MARGIN_AMPS that would buy the shorter window instead.
+    // 17:31:44 — 80s. A fan-only batch never rewinds the shared calm clock, so the
+    // calm gate alone could not see the cut that had just happened;
+    // FAN_RESTORE_AFTER_CUT_MS (120s) is what does.
+    // 0.8A of room: enough for the bounded climb, short of the 0.5A swing plus
+    // FAN_RESTORE_FAST_MARGIN_AMPS (0.5) that would buy the shorter fast window —
+    // so this hold owes the full 120s, and 80s ago is still inside it.
     const justCut = recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - 80_000);
-    expect(planFanRestore(justCut, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 1 }))).toBeNull();
+    expect(planFanRestore(justCut, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 0.8 }))).toBeNull();
     const cooled = recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - FAN_RESTORE_AFTER_CUT_MS);
-    expect(planFanRestore(cooled, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 1 }))).not.toBeNull();
+    expect(planFanRestore(cooled, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 0.8 }))).not.toBeNull();
   });
 
   it("a climb already under way does not re-pay the full anti-bounce window per gear", () => {
@@ -131,10 +133,10 @@ describe("planFanRestore", () => {
     // The bug: the old search took the HIGHEST target whose cost fits, and a
     // 6-gear swing prices at ~0.9A — so 1→7 fitted essentially always. Abdu ran
     // 7→5→3→1→7→1→7→4 in nine minutes on 2026-07-31.
-    // 0.6A of swing against 1.5A of room: it fits, which is exactly the case the
-    // bound exists for. Only swing + FAN_RESTORE_FAST_MARGIN_AMPS lifts it.
+    // 0.6A of swing against 1.0A of room: it fits, which is exactly the case the
+    // bound exists for. Only swing + FAN_RESTORE_FAST_MARGIN_AMPS (0.5 → 1.1A) lifts it.
     const book = updateCost({}, "a", "gen", "fan:step", 0.1, T);
-    const step = planFanRestore(cutLongAgo(7), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 1.5 }));
+    const step = planFanRestore(cutLongAgo(7), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 1.0 }));
     expect(step!.command).toMatchObject({ kind: "set_fan", fan: 1 + FAN_RESTORE_MAX_STEP });
     expect(step!.final).toBe(false);
     expect(step!.holds.a.lastSetFan).toBe(1 + FAN_RESTORE_MAX_STEP);
@@ -181,7 +183,7 @@ describe("planFanRestore", () => {
     ).not.toBeNull();
     // …and none of it once ±0.3A of supply flicker is charged first.
     expect(
-      planFanRestore(cutLongAgo(6), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 0.4, flickerAmps: 0.3 })),
+      planFanRestore(cutLongAgo(6), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 0.4, flickerMarginAmps: 0.3 })),
     ).toBeNull();
   });
 
@@ -193,7 +195,7 @@ describe("planFanRestore", () => {
       planFanRestore(cutLongAgo(0), [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 0.6 })),
     ).not.toBeNull();
     expect(
-      planFanRestore(cutLongAgo(0), [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 0.6, flickerAmps: 0.3 })),
+      planFanRestore(cutLongAgo(0), [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 0.6, flickerMarginAmps: 0.3 })),
     ).toBeNull();
   });
 
@@ -206,7 +208,7 @@ describe("planFanRestore", () => {
       planFanRestore(cutLongAgo(6), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 0.5 }))!.command,
     ).toMatchObject({ fan: 3 });
     expect(
-      planFanRestore(cutLongAgo(6), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 0.5, flickerAmps: 0.2 }))!
+      planFanRestore(cutLongAgo(6), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 0.5, flickerMarginAmps: 0.2 }))!
         .command,
     ).toMatchObject({ fan: 2 });
   });
@@ -221,12 +223,12 @@ describe("planFanRestore", () => {
     // supply flicker is charged first.
     const gentle = recordGentleRestoreHold({}, "a", T - 600_000, false);
     expect(
-      planFanRestore(gentle, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 0.6, flickerAmps: 0.8 })),
+      planFanRestore(gentle, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 0.6, flickerMarginAmps: 0.8 })),
     ).not.toBeNull();
     // The 2026-08-06 bounce lived entirely on the fromCut side, so its margin
     // stays: the identical figures on a cut hold still refuse.
     expect(
-      planFanRestore(cutLongAgo(0), [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 0.6, flickerAmps: 0.8 })),
+      planFanRestore(cutLongAgo(0), [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 0.6, flickerMarginAmps: 0.8 })),
     ).toBeNull();
   });
 
@@ -312,12 +314,14 @@ describe("planFanRestore", () => {
   it("a generous budget owes the SHORT after-cut wait; a thin one still owes the full 120s", () => {
     const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
     const cutAt = (ago: number) => recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - ago);
-    // 70s after the last cut: past FAN_RESTORE_AFTER_CUT_FAST_MS, short of 120s.
+    // 70s after the last cut: past FAN_RESTORE_AFTER_CUT_FAST_MS (60s), short of
+    // the full 120s. A generous 3A budget covers the 1.2A swing + the 0.5A fast
+    // margin, so it climbs home on the SHORT window…
     expect(
       planFanRestore(cutAt(70_000), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 3 })),
     ).not.toBeNull();
-    // 1.5A of room does not cover 1.2A of swing plus the margin, so this hold
-    // owes the anti-bounce window every episode has always owed…
+    // 1.5A of room does not cover 1.2A of swing plus the 0.5A margin, so this hold
+    // owes the full anti-bounce window every episode has always owed…
     expect(
       planFanRestore(cutAt(70_000), [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 1.5 })),
     ).toBeNull();
@@ -335,7 +339,7 @@ describe("planFanRestore", () => {
     const step = planFanRestore(
       cutLongAgo(7),
       [ac("a", { fanSpeed: 1 })],
-      opts({ book, headroomAmps: 3, flickerAmps: 1.5 }),
+      opts({ book, headroomAmps: 3, flickerMarginAmps: 1.5 }),
     );
     expect(step!.command).toMatchObject({ fan: 1 + FAN_RESTORE_MAX_STEP });
     expect(step!.final).toBe(false);
@@ -350,6 +354,35 @@ describe("planFanRestore", () => {
     expect(
       planFanRestore(justCut, [ac("a", { fanSpeed: 1, ramping: true })], opts({ book, headroomAmps: 3 })),
     ).toBeNull();
+  });
+
+  it("a re-cut within the bounce window compounds the after-cut wait; a survived restore resets it (2026-08-08)", () => {
+    const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
+    // A fan restored a gear 60s ago (lastRestoreAt), then re-cut now → a bounce
+    // (60s < FAN_BOUNCE_WINDOW_MS 180s), so the counter climbs to 1.
+    const restored: FanHolds = {
+      a: {
+        deviceId: "a", originalFan: 7, lastSetFan: 5, heldAt: T - 600_000, fromCut: true,
+        lastCutAt: T - 400_000, lastRestoreAt: T - 60_000, bounces: 0,
+      },
+    };
+    const bounced = recordFanCut(restored, ac("a", { fanSpeed: 5 }), 1, T);
+    expect(bounced.a.bounces).toBe(1);
+    // One bounce DOUBLES the base after-cut (thin 120s → 240s): a cut 130s ago is
+    // past the base but short of the compounded wait → still held…
+    const heldBounced: FanHolds = { a: { ...bounced.a, lastCutAt: T - 130_000 } };
+    expect(planFanRestore(heldBounced, [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 1 }))).toBeNull();
+    // …while the SAME 130s-old cut with no bounces restores on the ordinary 120s.
+    const heldFresh: FanHolds = { a: { ...bounced.a, bounces: 0, lastCutAt: T - 130_000 } };
+    expect(planFanRestore(heldFresh, [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 1 }))).not.toBeNull();
+    // A re-cut OUTSIDE the window (the prior restore survived) resets the counter.
+    const survived = recordFanCut(
+      { a: { ...restored.a, lastRestoreAt: T - 300_000 } },
+      ac("a", { fanSpeed: 5 }),
+      1,
+      T,
+    );
+    expect(survived.a.bounces).toBe(0);
   });
 
   it("skips OFF ACs and ACs without holds", () => {

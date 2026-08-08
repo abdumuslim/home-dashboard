@@ -480,11 +480,15 @@ export interface RaiseInput {
    */
   nonAcAmps: number;
   /**
-   * Live supply flicker (`MeterView.flickerAmps`) — 0 on a quiet, stale or
-   * unestimable line. Charged as MARGIN against the RESTORE ceiling only; see
-   * `restoreCeiling` below for why, and why raises are deliberately left out.
+   * The supply-flicker MARGIN a spender must survive (`MeterView.flickerMarginAmps`,
+   * the LARGEST reverting excursion) — 0 on a quiet, stale or unestimable line.
+   * Charged as MARGIN against the RESTORE ceiling only; see `restoreCeiling` below
+   * for why, and why raises are deliberately left out. NOT the accurate
+   * `flickerAmps` classification figure (the second-largest): a restore admitted
+   * with only the runner-up of margin re-crosses on the biggest spike and bounces
+   * (2026-08-06, invariant 58 / hard rule 5c).
    */
-  flickerAmps: number;
+  flickerMarginAmps: number;
   /**
    * The smoothed meter as it stood when the reducing batch still in flight was
    * commanded, or 0 when no cut is live. With `commandedCutAmps` this says
@@ -789,7 +793,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
    * strand every shed room off in silence — the worse failure by the user's own
    * ranking, and the one this margin exists to avoid in the first place.
    */
-  const flickerCharge = input.flickerAmps > 0 ? input.flickerAmps : 0;
+  const flickerCharge = input.flickerMarginAmps > 0 ? input.flickerMarginAmps : 0;
   const chargedRestoreCeiling = restoreCeiling - flickerCharge;
   const flickerNote = flickerCharge > 0 ? ` (−${flickerCharge.toFixed(1)}A flicker)` : "";
   const restoreCalmOk = input.calmMs >= config.restoreCalmSeconds * 1000;

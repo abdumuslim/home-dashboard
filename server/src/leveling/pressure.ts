@@ -104,14 +104,34 @@ export const OVER_MEDIAN_MIN_READINGS = 3;
  * term speaks only once OVER_MEDIAN_MIN_READINGS have banked — under that count
  * `median` IS the transient, so the floor stands alone (#9343, 2026-08-07).
  */
-export function requiredSavingsAmps(view: MeterView, limit: number, marginAmps: number): number {
+export function requiredSavingsAmps(
+  view: MeterView,
+  limit: number,
+  marginAmps: number,
+  attributableInrush = false,
+): number {
   const over = view.overLimitReadings;
   const isSevere = (r: number): boolean => isSevereOverReading(r, limit, view.flickerAmps);
   const severe = over.filter(isSevere);
   // The newest readings, not merely the count: two spikes minutes apart in an
   // 8-deep ring are still two spikes, and the question this answers is whether
   // the line is severe NOW, before the 8-wide median has caught up with it.
-  const streak = over.length >= SEVERE_STREAK_READINGS && over.slice(-SEVERE_STREAK_READINGS).every(isSevere);
+  //
+  // …but that argument fails for ONE physical event spanning 2+ consecutive
+  // samples, which is exactly our own restore's compressor start: a locked-rotor
+  // transient runs ~10s and lands on two consecutive readings at the ESP cadence,
+  // and a compressor start does not revert so it mints no flicker to discount it.
+  // Live 2026-08-08 (journal 10375) two consecutive 16.2/16.4A raws sized a 1.3A
+  // streak deficit at a 13.7A smoothed mean — 1.3A UNDER a 15A gen — and shed a
+  // room restored 82s earlier. So while a room is inside its ramp and the mean
+  // has not crossed, the streak stands down to the honest smoothed floor. The
+  // guard is guarded upstream: the flag is only true with the mean at/under the
+  // limit, so a real overload mid-ramp still sizes exactly as before, and the
+  // sustained clocks (invariant 33) remain the emergency escape.
+  const streak =
+    !attributableInrush &&
+    over.length >= SEVERE_STREAK_READINGS &&
+    over.slice(-SEVERE_STREAK_READINGS).every(isSevere);
   const overshoot = streak
     ? Math.min(...severe) - limit
     : over.length >= OVER_MEDIAN_MIN_READINGS
@@ -123,7 +143,7 @@ export function requiredSavingsAmps(view: MeterView, limit: number, marginAmps: 
 export function assessPressure(
   view: MeterView,
   config: LevelingConfigV2,
-  opts: { projectedExtraAmps?: number } = {},
+  opts: { projectedExtraAmps?: number; attributableInrush?: boolean } = {},
 ): Pressure {
   if (view.source === "none") return { kind: "hold" };
   // Derated after a recent trip — the same number sensing classified its
@@ -162,7 +182,7 @@ export function assessPressure(
     // is the double-cut this fixes. The SEVERE tier still keys off the raw
     // readings, and the credit both expires (PENDING_CUT_MS) and is spent as
     // the meter absorbs it, so a cut that never lands stops excusing anything.
-    const rawRequired = requiredSavingsAmps(view, limit, config.marginAmps);
+    const rawRequired = requiredSavingsAmps(view, limit, config.marginAmps, opts.attributableInrush);
     const required = Math.max(0, rawRequired - view.commandedCutCreditAmps);
     const extremeAt = Math.max(EMERGENCY_SHED_OVERSHOOT_AMPS, EMERGENCY_SHED_OVERSHOOT_FRACTION * limit);
     // Severe keys off the mean OR a reading that clears the rung by more than
@@ -177,10 +197,18 @@ export function assessPressure(
     // and the breaker got there first. Twice. Once the MEAN has been over for
     // SUSTAINED_OVER_SEVERE_MS the tier stops depending on how far over it is.
     const sustainedSevere = view.smoothedOverMs >= SUSTAINED_OVER_SEVERE_MS;
+    // …and the raw-banked term stands down during an attributable inrush, for
+    // the same reason it stands down in the streak sizing above: our own
+    // restore's compressor start spans consecutive samples that a single raw is
+    // enough to classify severe, while the SMOOTHED mean — the honest signal —
+    // sits under the limit (2026-08-08, journal 10375). The mean-over and
+    // sustained-clock terms are untouched, so a real overload mid-ramp still
+    // escalates (the flag is only true with the mean at/under the limit).
     const severe =
       sustainedSevere ||
       view.smoothedAmps - limit > OVER_LIMIT_SEVERE_AMPS ||
-      view.overLimitReadings.some((r) => isSevereOverReading(r, limit, view.flickerAmps));
+      (!opts.attributableInrush &&
+        view.overLimitReadings.some((r) => isSevereOverReading(r, limit, view.flickerAmps)));
     // Two full minutes of mean-over-limit: whatever the reducer could cut, it
     // has cut, and it is not arriving fast enough. This is the last rung — it
     // forces exactly ONE room off (invariant 26's one-shed ceiling is

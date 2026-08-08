@@ -55,6 +55,7 @@ import {
 } from "./pacing.js";
 import { planFanRestore, recordFanCut, releaseFanHold, type FanHolds } from "./fan-trim.js";
 import {
+  armDropCooldown,
   EXTERNAL_ON_VOID_MS,
   HOUSE_SAMPLE_COOLDOWN_MS,
   houseLoadAmps,
@@ -981,6 +982,23 @@ export class LevelingControllerV2 {
     );
   }
 
+  /**
+   * Is one of OUR restores in flight for this device? A restore ships a
+   * `power_on` and books a `noteAttempt(… "restore" …)`, and per invariant 4 the
+   * shed record is kept until that ON confirms on the shadow. So between send and
+   * confirm the room is still `shed`, its off may already have been observed, and
+   * the ON echo of our own restore is otherwise shape-indistinguishable from a
+   * hand re-enabling the room. Both the device-poll `reconcileObservedOn` and the
+   * tick's `!wasShed` fallback read this so that echo is graded a restore
+   * confirm, never an external hand (2026-08-08). Keyed on the SAME window
+   * `projectedExtraAmps` uses to re-price a just-restored room
+   * (`GRADE_TURN_ON_MS`), extracted here so the two edges cannot drift — this
+   * file has paid for two-sites-one-quantity drift before.
+   */
+  private restoreInFlight(deviceId: string, now: number): boolean {
+    return attemptedWithin(this.pacing, deviceId, "restore", GRADE_TURN_ON_MS, now);
+  }
+
   async reconcileObservedOn(deviceId: string): Promise<void> {
     // A live poll found this room ON. Whatever we thought, it has been drawing
     // for an unknown stretch — void the house samples that modeled it off.
@@ -994,6 +1012,19 @@ export class LevelingControllerV2 {
     const now = Date.now();
     this.voidPhantomHouse(deviceId, now);
     if (!this.shedIds.has(deviceId)) return;
+    // OUR OWN restore, still in flight: per invariant 4 the shed is not cleared
+    // until the ON confirms, so a restore's own ON echo arrives while the room is
+    // still shed — and often AFTER its off was observed, which the branch below
+    // would read as an external hand. This device-poll reconcile runs BEFORE the
+    // tick on the very same ON reading, so without this it stole the tick's
+    // `restore_confirmed` handling: it reset the bounce count and stamped a bogus
+    // swap-donor shield on every room the leveler restored (2026-08-08). Grade it
+    // exactly as the tick's structural-flip branch does — clear the shed, no
+    // external stamp — keyed on the SAME signal the tick uses.
+    if (this.restoreInFlight(deviceId, now)) {
+      await this.clearShed(deviceId, "restore_confirmed");
+      return;
+    }
     const shedAt = this.shedTimes.get(deviceId);
     const offObservedAt = this.shedOffObservedAt.get(deviceId);
     // Did the shed's power_off actually LAND before this ON? A poll that saw the
@@ -2075,7 +2106,13 @@ export class LevelingControllerV2 {
             // half is power-event-indistinguishable from a hand (invariant 56),
             // and the shield's fifteen minutes match that grace exactly. A
             // restore-confirm is OUR command and never shields.
-            if (!wasShed) this.noteExternalOn(device.id, now);
+            //
+            // …unless OUR restore is in flight: `reconcileObservedOn` may have
+            // already cleared the shed as a `restore_confirmed` on this same ON
+            // (it runs first, on the device poll), so `wasShed` reads false here
+            // for a room the leveler itself restored. The shared predicate keeps
+            // the echo from being stamped external on this edge too (2026-08-08).
+            if (!wasShed && !this.restoreInFlight(device.id, now)) this.noteExternalOn(device.id, now);
           }
           // A room coming on is load ARRIVING, and `batchLoadDirections` only
           // ever sees our OWN commands — so without this an external turn-on
@@ -2405,13 +2442,15 @@ export class LevelingControllerV2 {
     for (const [deviceId, sentAt] of this.pendingOn) {
       if (now - sentAt >= UNCONFIRMED_SEND_TTL_MS) this.pendingOn.delete(deviceId);
     }
-    if (
-      view.source !== "none" &&
-      view.sampleCount >= 2 &&
-      !view.frozen &&
-      this.pendingOn.size === 0 &&
-      now - this.firstTickAt >= HOUSE_SAMPLE_COOLDOWN_MS
-    ) {
+    if (view.source !== "none") {
+      // Call EVERY tick with a live source so the modeled-drop detector's memory
+      // advances even when the SAMPLE is suppressed (2026-08-08). A restore→shed
+      // round trip completes entirely inside the unconfirmed-ON stand-down and
+      // the compressor ramp; a memory frozen at the pre-restore total never sees
+      // the re-shed's drop, so the first resumed sample booked the dying
+      // compressor as house. `sampleSuppressed` carries the shell's own
+      // stand-downs — the same set the old `if` guarded the CALL with — while the
+      // memory and the cooldown advance regardless.
       this.houseLoad = sampleHouseLoad(this.houseLoad, {
         source: view.source,
         at: now,
@@ -2422,6 +2461,11 @@ export class LevelingControllerV2 {
         // and nothing else, so record it directly instead of a residual that
         // `max(0, …)` would floor at a fictitious zero.
         deadWindow: houseIsDirect,
+        sampleSuppressed:
+          view.sampleCount < 2 ||
+          view.frozen ||
+          this.pendingOn.size > 0 ||
+          now - this.firstTickAt < HOUSE_SAMPLE_COOLDOWN_MS,
       });
     }
 
@@ -3180,6 +3224,18 @@ export class LevelingControllerV2 {
     // batches where cuts and a turn-on cancel out on paper.
     if (out.commandedCutAmps > 0) {
       this.meterState = noteCommandedCut(this.meterState, out.commandedCutAmps, now);
+    }
+    // Belt to house-load's own modeled-drop detector (2026-08-08): a commanded
+    // OFF is a room leaving — a modeled drop the meter follows over the
+    // compressor wind-down — so pause house sampling here too. Should the
+    // tick-by-tick detector's memory ever be starved again (a restore→shed round
+    // trip once completed entirely inside a sampling stand-down and booked the
+    // dying compressor as house), the residual still cannot be sampled until the
+    // fall lands. Scoped to `power_off`: a fan trim also lowers load but never
+    // drops the MODEL, so it is not the drop this cooldown exists to cover — and
+    // arming on it would newly pause sampling the detector never paused for.
+    if (view.source !== "none" && commands.some((c) => c.kind === "power_off")) {
+      this.houseLoad = armDropCooldown(this.houseLoad, view.source, now);
     }
     // A turn-on changes the load picture wholesale: over-limit readings banked
     // BEFORE it are no longer evidence about the house that exists now, and

@@ -12,10 +12,20 @@ import type { CostBook } from "./costs.js";
 import { fanTrimSavings } from "./costs.js";
 
 /**
- * Sustained calm required before a held fan starts climbing back. Kept short
- * (2026-07-24, user "make the fan restoration faster") — the bounded climb
- * below is what stops a 1↔full swing, so a fast gate just returns comfort
- * sooner once the meter is calm.
+ * Sustained calm required before a held fan CUT for an overload starts climbing
+ * back — the "may this fan come back at all" minute, and the anti-bounce guard
+ * (2026-07-24, user "make the fan restoration faster").
+ *
+ * Briefly 30s on 2026-08-08; reverted to 60s the same day. The 30s cut re-opened
+ * the 2026-07-31 fan cascade (7→5→3→1→7→1→7→4): at 30s calm the fan fully restores
+ * inside a ~75s over/under oscillation, and a full restore releases the hold (on
+ * SEND, controller.ts) — taking the bounce counter with it, so the compounding
+ * below never bites and the fan plays up and down. The 60s first-gear minute is
+ * the binding cascade protection (empirically the fix). The user's "fan 1 is
+ * emergency-only, should not take too long to come back" is served instead by
+ * `FAN_RESTORE_GENTLE_CALM_MS` (30s, for admission pins — never CUT for an
+ * overload) and the fast path (a wide budget climbs home in one command), not by
+ * shortening this overload-trim gate.
  */
 export const FAN_RESTORE_CALM_MS = 60_000;
 
@@ -67,9 +77,15 @@ export const FAN_RESTORE_MAX_STEP = 2;
  * fully restored 80s later — v1's 61s bounce median, reproduced in v2.
  *
  * 180s → 120s on 2026-08-05 (user request, watching his fans sit at 1 after an
- * episode ended). Still comfortably past the 60s first-gear calm gate plus the
- * meter's smoothing window, and a fresh cut restarts it — the anti-bounce
- * argument is unchanged, the episode tail is a minute shorter.
+ * episode ended). Briefly 60s on 2026-08-08, reverted the same day: 60s is below
+ * the ~75s re-cross period of a genuinely oscillating house and re-opened the
+ * 2026-07-31 fan cascade. The user's "fan 1 is emergency-only, should not take
+ * too long to come back" is served instead by the FAST PATH (a wide budget climbs
+ * home in one command, owing FAN_RESTORE_AFTER_CUT_FAST_MS) and the 30s GENTLE
+ * calm for admission pins — speed for a fan that CAN come back, not a shorter wait
+ * for an overload-trim that keeps re-crossing. A bouncing fan is slowed further by
+ * FAN BOUNCE COMPOUNDING below, not sped up. Still past the calm gate plus the
+ * smoothing window, and a fresh cut restarts it.
  */
 export const FAN_RESTORE_AFTER_CUT_MS = 120_000;
 
@@ -90,8 +106,15 @@ export const FAN_RESTORE_AFTER_CUT_MS = 120_000;
  * case with measured physics, so the blanket slowness pays for protection that
  * already exists. On a saturated line `spendable` never reaches swing + this
  * margin, so the fast path is unreachable exactly where the bounce lived.
+ *
+ * 1.0A → 0.5A on 2026-08-08 (user: "the time to restore fan does not need to be
+ * that long"). `spendable` already nets the measured flicker before this margin
+ * is applied, so on a flickery generator the full 1.0A double-charged the wobble
+ * and the fast path missed the bar by ~0.1-0.5A every time — it only ever fired
+ * on the last 0.3A gear. The remaining 0.5A covers model error on the swing
+ * pricing; the flicker charge is what keeps the saturated line unreachable.
  */
-export const FAN_RESTORE_FAST_MARGIN_AMPS = 1.0;
+export const FAN_RESTORE_FAST_MARGIN_AMPS = 0.5;
 
 /**
  * The after-cut wait a GENEROUS hold owes instead of `FAN_RESTORE_AFTER_CUT_MS`.
@@ -102,6 +125,27 @@ export const FAN_RESTORE_FAST_MARGIN_AMPS = 1.0;
  * however much room there is.
  */
 export const FAN_RESTORE_AFTER_CUT_FAST_MS = 60_000;
+
+/**
+ * FAN BOUNCE COMPOUNDING (2026-08-08, invariant 67's shape one rung down). A fan
+ * we handed back that is RE-CUT within this window bounced — the restore could
+ * not survive — and each consecutive bounce DOUBLES the after-cut wait the NEXT
+ * restore owes (base 120s → 240 → 480 → 960 cap; the fast path's 60s multiplied
+ * the same way), so a fan that keeps re-crossing waits longer each time.
+ *
+ * It bites on PARTIAL-climb bounces — the fan re-cut before it reaches
+ * `originalFan`, so the hold (and this counter) survives. A FULL restore releases
+ * the hold on send (controller.ts) and resets the count, which is why the 60s
+ * first-gear calm (`FAN_RESTORE_CALM_MS`), not this, is the primary guard against
+ * the full-restore cascade. The counter resets when a restored fan survives past
+ * this window, on a source change (the hold's timestamps go stale, so the next cut
+ * lands outside it and resets), and on a manual/user fan change (the controller
+ * releases the hold) — mirroring how the shed-side bounce episode ends on an
+ * external ON (`clearBounces`).
+ */
+export const FAN_BOUNCE_WINDOW_MS = 180_000;
+/** Ceiling on the compounded after-cut wait — a bounce ladder must not strand a fan forever. */
+export const FAN_BOUNCE_AFTER_CUT_CAP_MS = 960_000;
 
 export interface FanHold {
   deviceId: string;
@@ -145,12 +189,33 @@ export interface FanHold {
    * which errs trip-safe.
    */
   gentle?: boolean;
+  /**
+   * Consecutive fan BOUNCES — a restore step RE-CUT within `FAN_BOUNCE_WINDOW_MS`
+   * (the restore could not survive). Each doubles the after-cut wait the next
+   * restore owes (capped at `FAN_BOUNCE_AFTER_CUT_CAP_MS`), so an oscillating
+   * house stops cascading (2026-07-31). In-memory only, like `lastCutAt`: a
+   * restart loses it and the ladder starts fresh (the safe direction). Reset by a
+   * cut outside the window (the prior restore survived, or a source change staled
+   * the anchor) and by a manual fan change (the controller releases the hold).
+   */
+  bounces?: number;
+  /**
+   * When the last restore STEP fired — the anchor a re-cut is judged a bounce
+   * against, and the clock the survive-past-window reset reads. In-memory only.
+   */
+  lastRestoreAt?: number;
 }
 
 export type FanHolds = Readonly<Record<string, FanHold>>;
 
 export function recordFanCut(holds: FanHolds, ac: AcView, target: number, now: number): FanHolds {
   const existing = holds[ac.deviceId];
+  // A cut within FAN_BOUNCE_WINDOW_MS of the last restore STEP is a bounce: the
+  // fan we just handed back re-crossed the limit. Compound the counter; a cut
+  // OUTSIDE the window (the prior restore survived, or a source change staled the
+  // anchor) or with no restore yet resets it to 0.
+  const bounced =
+    existing?.lastRestoreAt != null && now - existing.lastRestoreAt < FAN_BOUNCE_WINDOW_MS;
   return {
     ...holds,
     [ac.deviceId]: {
@@ -164,6 +229,9 @@ export function recordFanCut(holds: FanHolds, ac: AcView, target: number, now: n
       // A new cut ends any climb in progress: the next one re-earns the full
       // anti-bounce window rather than inheriting a half-finished one.
       climbStartedAt: undefined,
+      bounces: bounced ? (existing?.bounces ?? 0) + 1 : 0,
+      // Consumed — the next restore step re-stamps it.
+      lastRestoreAt: undefined,
     },
   };
 }
@@ -220,9 +288,11 @@ export interface FanRestoreStep {
 
 /**
  * Propose at most ONE fan-restore step. `headroomAmps` is the room under the
- * resting ceiling, and `flickerAmps` is the live supply flicker, which a fromCut
- * admission below is charged BEFORE the cost (a gentle pin is judged on bare
- * headroom — see `spendable`). Auto (0) originals restore in one
+ * resting ceiling, and `flickerMarginAmps` is the supply-flicker MARGIN (the
+ * LARGEST reverting excursion — the wobble a spender must survive, not the
+ * accurate `flickerAmps` classification figure), which a fromCut admission below
+ * is charged BEFORE the cost (a gentle pin is judged on bare headroom — see
+ * `spendable`). Auto (0) originals restore in one
  * jump (the gear is indivisible — there is no "half of auto"); numeric originals
  * climb at most `FAN_RESTORE_MAX_STEP` gears, to the highest such target whose
  * learned cost fits, and nothing climbs until the last cut is
@@ -262,8 +332,14 @@ export function planFanRestore(
   opts: {
     calmMs: number;
     headroomAmps: number;
-    /** Live supply flicker (`MeterView.flickerAmps`) — 0 on a quiet or stale line. */
-    flickerAmps: number;
+    /**
+     * The supply-flicker MARGIN a fromCut restore must survive
+     * (`MeterView.flickerMarginAmps`, the LARGEST reverting excursion) — 0 on a
+     * quiet or stale line. NOT the accurate `flickerAmps` classification figure:
+     * a fan handed back with only the runner-up of margin re-crosses on the
+     * biggest spike and bounces (2026-08-06, invariant 58 / hard rule 5c).
+     */
+    flickerMarginAmps: number;
     book: CostBook;
     source: Exclude<PowerSource, "none">;
     now: number;
@@ -293,7 +369,7 @@ export function planFanRestore(
     // is why the margin stays there; a gentle hold's pin was admission pricing,
     // not overload relief, and charging it the wobble was invariant 58's own
     // admitted regression axis, now user-confirmed (2026-08-08).
-    const spendable = opts.headroomAmps - ((hold.fromCut ?? true) ? opts.flickerAmps : 0);
+    const spendable = opts.headroomAmps - ((hold.fromCut ?? true) ? opts.flickerMarginAmps : 0);
     // First gear decides "may this fan come back at all" — the long anti-bounce
     // minute for a cut, the shorter GENTLE calm for a pin that was never cut.
     // Continuation gears only ask "has the last one landed" and pay the short
@@ -320,21 +396,33 @@ export function planFanRestore(
         ? `fan restore step (fast: ${swingCost.toFixed(1)}A swing, ${spendable.toFixed(1)}A spendable)`
         : "fan restore step";
     // Cut→restore hysteresis. A fan-only batch does not rewind the shared calm
-    // clock, so without this the 60s calm gate let a fan cut come all the way
-    // back 80s later and the over-limit episode simply repeated. Gentle-restore
-    // holds are exempt: nothing was cut (see FanHold.fromCut).
-    if (
-      (hold.fromCut ?? true) &&
-      opts.now - (hold.lastCutAt ?? hold.heldAt) <
-        (fast ? FAN_RESTORE_AFTER_CUT_FAST_MS : FAN_RESTORE_AFTER_CUT_MS)
-    ) {
+    // clock, so without this the calm gate let a fan cut come all the way back
+    // ~80s later and the over-limit episode simply repeated. Gentle-restore holds
+    // are exempt: nothing was cut (see FanHold.fromCut).
+    //
+    // COMPOUNDED by consecutive bounces (2026-08-08): each doubles whichever wait
+    // applies (fast or base), capped, so a fan that keeps re-crossing waits longer
+    // each time instead of cascading (2026-07-31). A prior restore that SURVIVED
+    // past FAN_BOUNCE_WINDOW_MS ends the episode — the count resets here, so the
+    // fan is not penalised forever once the line settles.
+    const survivedPriorRestore =
+      hold.lastRestoreAt != null && opts.now - hold.lastRestoreAt >= FAN_BOUNCE_WINDOW_MS;
+    const bounces = survivedPriorRestore ? 0 : hold.bounces ?? 0;
+    const afterCutWait = Math.min(
+      FAN_BOUNCE_AFTER_CUT_CAP_MS,
+      (fast ? FAN_RESTORE_AFTER_CUT_FAST_MS : FAN_RESTORE_AFTER_CUT_MS) * 2 ** bounces,
+    );
+    if ((hold.fromCut ?? true) && opts.now - (hold.lastCutAt ?? hold.heldAt) < afterCutWait) {
       continue;
     }
     if (hold.originalFan === 0) {
       // Built-in auto: single indivisible jump, costed as a full swing — which
       // is `swingCost` above, the same 6 gears.
       if (swingCost <= spendable) {
-        const holds2 = { ...holds, [ac.deviceId]: { ...hold, lastSetFan: 0, climbStartedAt: hold.climbStartedAt ?? opts.now } };
+        const holds2 = {
+          ...holds,
+          [ac.deviceId]: { ...hold, lastSetFan: 0, climbStartedAt: hold.climbStartedAt ?? opts.now, bounces, lastRestoreAt: opts.now },
+        };
         return {
           command: { deviceId: ac.deviceId, kind: "set_fan", fan: 0, reason: "trim_restore" },
           final: true,
@@ -364,7 +452,7 @@ export function planFanRestore(
     const final = target === hold.originalFan;
     const holds2 = {
       ...holds,
-      [ac.deviceId]: { ...hold, lastSetFan: target, climbStartedAt: hold.climbStartedAt ?? opts.now },
+      [ac.deviceId]: { ...hold, lastSetFan: target, climbStartedAt: hold.climbStartedAt ?? opts.now, bounces, lastRestoreAt: opts.now },
     };
     return {
       command: { deviceId: ac.deviceId, kind: "set_fan", fan: target, reason: "trim_restore" },

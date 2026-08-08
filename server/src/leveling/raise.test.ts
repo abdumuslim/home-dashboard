@@ -82,7 +82,7 @@ function raise(acs: AcView[], overrides: Partial<RaiseInput> = {}) {
     nonAcAmps: 0,
     // A quiet line by default: the flicker charge is a MARGIN, so 0 leaves
     // every case written before 2026-08-06 admitting exactly what it did.
-    flickerAmps: 0,
+    flickerMarginAmps: 0,
     cutAnchorAmps: 0,
     commandedCutAmps: 0,
     limitAmps: 15,
@@ -383,7 +383,7 @@ describe("a restore may not spend the wobble of the supply itself (2026-08-06 do
       reason: "restore",
       fan: 1,
     });
-    const wobbly = raise(shedRoom(), { smoothedAmps: 12.6, headroomAmps: 2.0, flickerAmps: 0.4 });
+    const wobbly = raise(shedRoom(), { smoothedAmps: 12.6, headroomAmps: 2.0, flickerMarginAmps: 0.4 });
     expect(wobbly.commands.every((c) => c.kind !== "power_on")).toBe(true);
     // …and the journal says WHY, or the next forensic session re-derives it. It
     // is its own refusal tag now (invariant 58 follow-up): a room that fits the
@@ -410,7 +410,7 @@ describe("a restore may not spend the wobble of the supply itself (2026-08-06 do
       smoothedAmps: 12.5,
       headroomAmps: 2.2,
       book,
-      flickerAmps: 0.5,
+      flickerMarginAmps: 0.5,
     });
     expect(wobbly.commands.every((c) => c.kind !== "power_on")).toBe(true);
     expect(wobbly.probeRestoreIds).toEqual([]);
@@ -425,7 +425,7 @@ describe("a restore may not spend the wobble of the supply itself (2026-08-06 do
     const p = raise(shedRoom(), {
       smoothedAmps: 12.6,
       headroomAmps: 2.0,
-      flickerAmps: 0.4,
+      flickerMarginAmps: 0.4,
       // An anchor already stands, well inside the patience window.
       flickerRefusedSince: () => T - 30_000,
     });
@@ -445,7 +445,7 @@ describe("a restore may not spend the wobble of the supply itself (2026-08-06 do
     // against — report the room so the shell stamps `now`, and let the raise
     // phase run this one tick. From the next tick the anchor stands and the
     // reservation above kicks in.
-    const p = raise(shedRoom(), { smoothedAmps: 12.6, headroomAmps: 2.0, flickerAmps: 0.4 });
+    const p = raise(shedRoom(), { smoothedAmps: 12.6, headroomAmps: 2.0, flickerMarginAmps: 0.4 });
     expect(p.flickerRefused).toEqual(["b"]);
     expect(p.reservedAmps).toBe(0);
     expect(p.commands).toContainEqual({ deviceId: "a", kind: "set_level", level: 2 });
@@ -458,7 +458,7 @@ describe("a restore may not spend the wobble of the supply itself (2026-08-06 do
     const p = raise(shedRoom(), {
       smoothedAmps: 12.6,
       headroomAmps: 2.0,
-      flickerAmps: 0.4,
+      flickerMarginAmps: 0.4,
       flickerRefusedSince: () => T - (FLICKER_PATIENCE_MS + 1_000),
     });
     expect(p.commands).toContainEqual({
@@ -483,7 +483,7 @@ describe("a restore may not spend the wobble of the supply itself (2026-08-06 do
     // committed 13.5 + 2.0 = 15.5 clears neither the 14.9A bare ceiling nor the
     // charged one — ordinary no-headroom, so flicker patience never engages: no
     // anchor is reported and nothing is reserved.
-    const p = raise(shedRoom(), { smoothedAmps: 13.5, headroomAmps: 1.1, flickerAmps: 0.4 });
+    const p = raise(shedRoom(), { smoothedAmps: 13.5, headroomAmps: 1.1, flickerMarginAmps: 0.4 });
     expect(p.flickerRefused).toEqual([]);
     expect(p.reservedAmps).toBe(0);
     expect(p.decisions).toContainEqual(
@@ -524,7 +524,7 @@ describe("a restore may not spend the wobble of the supply itself (2026-08-06 do
       expect.objectContaining({ deviceId: "a", blockedBy: "own shed trough" }),
     );
 
-    const wobbly = raise(scene(), { ...opts, flickerAmps: 0.4 });
+    const wobbly = raise(scene(), { ...opts, flickerMarginAmps: 0.4 });
     // The flicker must not buy `cool`'s room for a restore the bar — not the
     // wobble — is holding back.
     expect(wobbly.swap).toBeNull();
@@ -550,7 +550,7 @@ describe("a restore may not spend the wobble of the supply itself (2026-08-06 do
     expect(quiet.probeRestoreIds).toEqual(["a"]);
     expect(quiet.swap).toBeNull();
 
-    const wobbly = raise(scene(), { ...opts, flickerAmps: 0.4 });
+    const wobbly = raise(scene(), { ...opts, flickerMarginAmps: 0.4 });
     expect(wobbly.swap).toBeNull();
     expect(wobbly.commands).toEqual([]);
     // It is now tagged as the flicker-only refusal it is (invariant 58
@@ -896,7 +896,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -925,7 +925,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -948,7 +948,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -968,7 +968,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1000,7 +1000,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1026,7 +1026,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 6,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1061,7 +1061,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 6,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: heavyCfg,
@@ -1339,7 +1339,7 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       smoothedAmps: 10.11,
       rampDebitAmps: rampDebitAmps(acs, 10.11, liveCfg, "gen"),
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1365,7 +1365,7 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       smoothedAmps: 14.8, // Abdu's 4.3A is fully on the meter now
       rampDebitAmps: rampDebitAmps(acs, 14.8, liveCfg, "gen"),
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1506,7 +1506,7 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       smoothedAmps: 10.11,
       rampDebitAmps: rampDebitAmps(acs, 10.11, liveCfg, "gen"),
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1541,7 +1541,7 @@ describe("funding swap — dormant peer levels pay for a hot room", () => {
       smoothedAmps: 11.7,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1652,7 +1652,7 @@ describe("need rebalance — the extra level follows the hotter room", () => {
       smoothedAmps: 12.7,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1828,7 +1828,7 @@ describe("house load in the raise envelope (2026-07-31 gen trip)", () => {
       smoothedAmps: 9.91,
       rampDebitAmps: 0,
       nonAcAmps: 0,
-      flickerAmps: 0,
+      flickerMarginAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
