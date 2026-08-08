@@ -132,6 +132,22 @@ export function rampReleaseBarAmps(modeledSteadyAmps: number): number {
   return Math.min(RAMP_RELEASE_MAX_AMPS, RAMP_RELEASE_FRACTION * modeledSteadyAmps);
 }
 
+/**
+ * The committed steady draw a ramp was armed against — the exact figure
+ * `rampDebitAmps` charges a ramping AC (`raise.ts`), factored out so admission
+ * and the early-release path below price a compressor's arrival from ONE
+ * arithmetic. A committed draw computed two ways is a committed draw that
+ * eventually disagrees (the 2026-08-05 pooling bug was two sites reading the
+ * same rise differently).
+ */
+export function rampCommittedAmps(
+  ac: Pick<ModeledAc, "deviceId" | "currentLevel" | "maxLevel">,
+  config: LevelingConfigV2,
+  source: Exclude<PowerSource, "none">,
+): number {
+  return steadyDraw(ac.currentLevel, ac.maxLevel, modelFor(config, ac.deviceId, source));
+}
+
 /** Has this AC's compressor demonstrably started? (evidence (a)) */
 export function rampAbsorptionLanded(
   absorbedAmps: number,
@@ -139,8 +155,102 @@ export function rampAbsorptionLanded(
   config: LevelingConfigV2,
   source: Exclude<PowerSource, "none">,
 ): boolean {
-  const modeled = steadyDraw(ac.currentLevel, ac.maxLevel, modelFor(config, ac.deviceId, source));
-  return absorbedAmps >= rampReleaseBarAmps(modeled);
+  return absorbedAmps >= rampReleaseBarAmps(rampCommittedAmps(ac, config, source));
+}
+
+// ---------------------------------------------------------------------------
+// Amp evidence releases the ramp WINDOW before its clock (user directive,
+// 2026-08-08: "we can watch the amps to know if it worked and stable without
+// the need to wait the end of time").
+//
+// `AcView.ramping` is armed for 240 s (`AC_RAMP_MS`) and, before this, only ever
+// expired on that clock — so the raise gate, house sampling, swap-donor
+// eligibility, the fan-restore self-skip and the FLOORS "nothing ramping" clear
+// all waited out the full four minutes even when the meter had already shown the
+// compressor land and settle. A rise the meter has already digested is not a
+// rise still in transit; the window has nothing left to protect once the
+// evidence is in.
+//
+// "PROVEN done" has TWO halves, and both are required — a rise is done only when
+// it has (i) risen enough to prove a compressor started, and (ii) STOPPED
+// rising:
+//   (i)  the ratchet crossed the "a compressor genuinely started" bar
+//        (`rampReleaseBarAmps`), so it is not the changeover dead window (a room
+//        drawing its fan while restart protection holds the compressor off); and
+//   (ii) the ratchet has PLATEAUED — no growth of `RAMP_SETTLED_EPSILON_AMPS`
+//        for `RAMP_SETTLED_STALL_MS`.
+//
+// The plateau reports which kind of landing it was, for the log:
+//   * "absorbed"  — it settled AT OR ABOVE its committed model draw. The ordinary
+//     healthy compressor that reached what the ramp was priced for.
+//   * "plateaued" — it settled ABOVE the bar but BELOW its model. The compressor
+//     that runs under its cap: a satisfied 1-ton, a room the weather does not
+//     push to its ceiling. Without recognising it, such a room would pin its
+//     window for the full 240 s again.
+//
+// ⚠ The plateau is required even after full absorption, and it is load-bearing.
+// The committed figure is the MODEL draw (what `rampDebitAmps` charges), and an
+// UNDER-MODELLED room crosses it while STILL CLIMBING toward a higher real draw.
+// Releasing there is not "stable" — it is mid-ramp — and it defeats the reducer's
+// turn-on attribution: 2026-07-27, Najat's real 3.7 A L1 draw against a 2.7 A
+// model crossed the model ~15 s before her own transient tipped the meter over
+// the breaker, so `ramping` dropped, `preferShed` lost her, and the reducer shed
+// the innocent hotter bystander (Abdu) — the 2026-07-25 incident, reopened. The
+// stall clock is what makes the release match the user's own words ("worked AND
+// stable"): a compressor that is still climbing has a live growth stamp and is
+// never called done, whatever value it has passed through.
+//
+// NEVER on flatness alone: a ratchet UNDER the bar is a compressor that has not
+// started (the changeover dead window above), and it keeps its full window and
+// invariant 44's extension machinery.
+// ---------------------------------------------------------------------------
+
+/**
+ * How little the absorption ratchet may grow and still count as PLATEAUED
+ * (mechanism (b)). Sized above the 8-wide median's residual wobble so ordinary
+ * smoothing noise does not read as a compressor still climbing — a room that
+ * genuinely creeps up 0.05 A a reading is settled, and holding its window open
+ * for that noise would defeat the whole point of (b).
+ */
+export const RAMP_SETTLED_EPSILON_AMPS = 0.15;
+
+/**
+ * How long the ratchet must sit within `RAMP_SETTLED_EPSILON_AMPS` before the
+ * plateau is believed.
+ *
+ * ≳2× the 8-wide median's ~12–20 s settle lag, deliberately: a smoothed step
+ * still in transit keeps growing for the length of that lag, so a stall shorter
+ * than it could call a compressor "plateaued" while its own rise has not yet
+ * finished reaching the meter. 45 s clears the lag with margin, and the failure
+ * direction is benign — releasing late costs a raise that arms a few readings
+ * later, exactly the pre-2026-08-08 behaviour.
+ */
+export const RAMP_SETTLED_STALL_MS = 45_000;
+
+/**
+ * Is this ramp's rise PROVEN done, so its window may close before the clock?
+ * `absorbedAmps` is the ratcheted peak rise of the smoothed meter since the ramp
+ * armed; `committedAmps` is `rampCommittedAmps` (the same figure the debit
+ * charges); `lastGrowthAt` is when the ratchet last grew by at least the epsilon.
+ *
+ * Both halves are required. A ratchet still CLIMBING has a fresh growth stamp and
+ * is never called done — that is what stops an under-modelled compressor being
+ * released mid-ramp the instant it passes its model (2026-07-27, see the header).
+ * A ratchet UNDER the bar has not proven a compressor at all and keeps its window
+ * (the changeover dead window). Returns "absorbed" when it settled at/above its
+ * model draw, "plateaued" when it settled above the bar but below it, else null.
+ */
+export function rampProvenDone(opts: {
+  absorbedAmps: number;
+  committedAmps: number;
+  lastGrowthAt: number;
+  now: number;
+}): "absorbed" | "plateaued" | null {
+  // Still climbing → not settled → not done, whatever value it has passed.
+  if (opts.now - opts.lastGrowthAt < RAMP_SETTLED_STALL_MS) return null;
+  // Under the started bar → the compressor never started (dead window).
+  if (opts.absorbedAmps < rampReleaseBarAmps(opts.committedAmps)) return null;
+  return opts.absorbedAmps >= opts.committedAmps ? "absorbed" : "plateaued";
 }
 
 /**

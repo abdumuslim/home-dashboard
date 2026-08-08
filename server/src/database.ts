@@ -256,6 +256,23 @@ const MIGRATIONS: string[] = [
     outdoor_c   REAL NOT NULL,
     observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`,
+  // Who changed Smart AC Leveling config — the 2026-08-06 gap: someone disabled
+  // the whole controller from the dashboard at ~19:14Z and it stayed off 7h12m,
+  // and PUT /api/ac/leveling was neither audited nor logged (unlike ac_control_audit
+  // for per-AC commands). "A shed must be LOUD" — killing the controller must be at
+  // least as attributable. Mirrors ac_control_audit: BIGSERIAL id, BRIN on at, kept
+  // 30 days (opportunistic prune on the same PUT path).
+  `CREATE TABLE IF NOT EXISTS ac_leveling_config_audit (
+    id             BIGSERIAL PRIMARY KEY,
+    at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    auth_kind      TEXT,
+    ip             TEXT,
+    user_agent     TEXT,
+    changed_keys   TEXT[],
+    enabled_before BOOLEAN,
+    enabled_after  BOOLEAN
+  )`,
+  "CREATE INDEX IF NOT EXISTS ac_leveling_config_audit_at_brin ON ac_leveling_config_audit USING BRIN (at)",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

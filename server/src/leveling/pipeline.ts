@@ -90,6 +90,12 @@ export interface PlanInput {
    * "nothing recent", which is what an un-wired caller had before this existed.
    */
   overLimitActedRecently?: boolean;
+  /**
+   * When each shed room first sat refused ONLY by the supply-flicker margin —
+   * the shell owns the anchor and stamps it from `flickerRefused` below. Forwarded
+   * to `RaiseInput.flickerRefusedSince`; defaults to "nothing refused".
+   */
+  flickerRefusedSince?: (deviceId: string) => number | undefined;
 }
 
 export interface PlanOutput extends Plan {
@@ -227,10 +233,35 @@ export function plan(input: PlanInput): PlanOutput {
     // extreme: that rung is itself gated on the same trend (`stalled`), and it
     // is the last one before the breaker.
     const cutTrend = cutTrendOf(meter);
+    // …and the credit alone is still not the right gate for either hold,
+    // because `pendingCutCredit` (invariant 38) zeroes it the INSTANT the
+    // smoothed meter rises past the cut's send-time anchor by more than the
+    // flicker — with no minimum age. That outrun revocation is correct and
+    // load-bearing (a house genuinely outrunning its cut must reach the last
+    // rung; it cost a breaker on 2026-08-03), but it means a SECOND compressor
+    // ramping independently at the moment of a shed — a restore, or a
+    // power-blink restart — ticks the smoothed meter past the anchor within a
+    // reading or two, zeroes the credit, and drops BOTH holds. Live 2026-08-06
+    // that shed a second room 2.5–5.5s after the first, four times in 24h
+    // (#8929→#8930, #9180→#9181, #9213→#9214, #9369→#9370) — physically before
+    // the first shed's off could reach the 8-wide smoothed median (median lag
+    // alone is ~12–20s; a compressor wind-down is minutes).
+    //
+    // So both holds also fire while the cut is `settling` per `cutTrendOf` (a
+    // cut exists, is younger than CREDIT_LANDING_GRACE_MS (60s), and its fall
+    // is still short), whether or not the void has already zeroed its credit.
+    // Inside that 60s a severe raw reading seconds after a shed is
+    // overwhelmingly the not-yet-landed cut plus a ramping peer — the median
+    // cannot have absorbed the cut yet — while a genuine runaway still reaches
+    // the EXTREME rung, which is never held: its sustained clock and
+    // required-sizing are the emergency escape (invariant 48's "fires on
+    // stalled" contract stays intact).
+    const cutLanding = meter.commandedCutCreditAmps > 0 || cutTrend === "settling";
     const escalationHold =
       mode === "SETTLING" &&
-      meter.commandedCutCreditAmps > 0 &&
-      (pressure.severity === "mild" || (pressure.severity === "severe" && cutTrend === "arriving"));
+      cutLanding &&
+      (pressure.severity === "mild" ||
+        (pressure.severity === "severe" && (cutTrend === "arriving" || cutTrend === "settling")));
     // …and when what we have ALREADY commanded off covers the whole raw
     // deficit, the next batch is not an escalation, it is a duplicate. Live
     // 2026-08-03 00:41Z: three batches in 13 seconds took 12.9A off the house
@@ -246,7 +277,7 @@ export function plan(input: PlanInput): PlanOutput {
     const settleHold =
       pressure.severity === "mild" &&
       mode === "SETTLING" &&
-      meter.commandedCutCreditAmps > 0 &&
+      cutLanding &&
       meter.commandedCutTotalAmps >= pressure.rawRequiredAmps;
     if (settleHold) {
       // Corrections still ship (they are hard invariants, and reductions), but
@@ -345,16 +376,28 @@ export function plan(input: PlanInput): PlanOutput {
       // a humid room from a hot one.
       ...reduction.toShed.map((deviceId) => {
         const ac = onManaged.find((a) => a.deviceId === deviceId);
+        // …and when the two rooms were inside the gap and PRIORITY is what
+        // settled it, say so (user, 2026-08-06). The thermometer alone shed the
+        // top-priority room over 0.05°C at 14:38:11Z, and a tie-break nobody can
+        // see in the journal is the next forensic mystery.
+        const tie = reduction.priorityTieBreak;
+        const spared = tie?.shedDeviceId === deviceId
+          ? onManaged.find((a) => a.deviceId === tie.protectedDeviceId)
+          : undefined;
         return {
           at: now,
           deviceId,
           action: "shed choice",
           detail:
-            ac == null
+            (ac == null
               ? "ranked on real temperature"
               : `real need ${ac.rankNeedDelta.toFixed(1)}°C` +
                 `${ac.roomTempC != null ? ` (room ${ac.roomTempC.toFixed(1)}°C)` : " (thermometer dead — ranked on its own metric)"}` +
-                `, own metric ${ac.needDelta.toFixed(1)}°C`,
+                `, own metric ${ac.needDelta.toFixed(1)}°C`) +
+            (spared != null && ac != null
+              ? `, within ${SHED_NEED_GAP_C.toFixed(1)}°C of ${spared.name}` +
+                ` (${ac.rankNeedDelta.toFixed(1)} vs ${spared.rankNeedDelta.toFixed(1)}) — priority decided`
+              : ""),
         } satisfies Decision;
       }),
       ...(preferShed != null
@@ -572,6 +615,13 @@ export function plan(input: PlanInput): PlanOutput {
       // Gen only, the same split the envelope guard and ramp debit use: grid
       // starts every AC full by directive and leans on the reducer as its safety.
       nonAcAmps: source === "gen" ? (input.nonAcAmps ?? 0) : 0,
+      // …and the wobble of the supply itself, charged as MARGIN against the
+      // restore ceiling (2026-08-06 14:00–14:04Z). A restore admitted with
+      // 0.48A to spare on a line flickering ±0.4–0.8A cannot survive, and a
+      // restore that cannot survive costs the room an off/on cycle and — that
+      // afternoon — a second room with it. 0 on a quiet line, so grid and every
+      // steady generator hour are unchanged (see raise.ts restoreCeiling).
+      flickerAmps: meter.flickerAmps,
       // Where a cut still in flight is taking the meter — a restore admitted on
       // the trough of its own shed comes straight back out (2026-08-03).
       cutAnchorAmps: meter.commandedCutAnchorAmps,
@@ -641,6 +691,11 @@ export function plan(input: PlanInput): PlanOutput {
         meter.commandedCutTotalAmps <= 0 &&
         input.overLimitActedRecently !== true,
       swapInFlight: input.swapInFlight ?? null,
+      // …and the per-room flicker-patience anchor: a restore refused only by the
+      // supply-flicker margin ages into a bare-ceiling admission (invariant 58
+      // follow-up). The shell owns the map; the plan reports which rooms are
+      // flicker-refused this tick via `flickerRefused` below.
+      flickerRefusedSince: input.flickerRefusedSince,
     });
     if (raisePlan.commands.length > 0 || corrections.commands.length > 0) {
       // A gentle restore (power_on carrying a pinned fan) records a fan hold so
@@ -676,6 +731,7 @@ export function plan(input: PlanInput): PlanOutput {
         fanOnly: false,
         fundingDonors: raisePlan.fundingDonors,
         swap: raisePlan.swap,
+        flickerRefused: raisePlan.flickerRefused,
       };
     }
     // Nothing to raise — walk any SATISFIED room parked above its need ceiling
@@ -711,6 +767,7 @@ export function plan(input: PlanInput): PlanOutput {
           fanHolds: input.fanHolds,
           attempts: [],
           fanOnly: false,
+          flickerRefused: raisePlan.flickerRefused,
         };
       }
       raisePlan.decisions.push(...demotes.decisions);
@@ -724,6 +781,12 @@ export function plan(input: PlanInput): PlanOutput {
     const fanStep = planFanRestore(input.fanHolds, acs, {
       calmMs: meter.calmMs,
       headroomAmps: pressure.headroomAmps - raisePlan.reservedAmps - rampDebit,
+      // …and never into the wobble of the supply itself. A house riding the
+      // limit with every level at its floor has only the fan left, so the
+      // restore lands right back inside the flicker band that trimmed it —
+      // live 2026-08-06, one fan commanded 10× in 22 minutes (see
+      // planFanRestore). 0 on a quiet line, so this changes nothing there.
+      flickerAmps: meter.flickerAmps,
       book,
       source,
       now,
@@ -734,16 +797,23 @@ export function plan(input: PlanInput): PlanOutput {
         expectedDeltaAmps: 0,
         commandedCutAmps: 0,
         compareAfter: now + GRADE_FAN_MS,
-        decisions: [...raisePlan.decisions, { at: now, deviceId: fanStep.command.deviceId, action: "fan restore step" }],
+        // The step names itself: a fast-path restore prints the arithmetic that
+        // admitted it, because a fan that comes all the way back in one batch
+        // and a fan that BOUNCED are the same line in a command log, and are
+        // told apart only by what the budget was at the time (2026-08-06).
+        decisions: [...raisePlan.decisions, { at: now, deviceId: fanStep.command.deviceId, action: fanStep.action }],
         reason: "fan_restore",
         severity: null,
         requiredAmps: null,
         fanHolds: fanStep.holds,
         attempts: [],
         fanOnly: true,
+        flickerRefused: raisePlan.flickerRefused,
       };
     }
-    return { ...emptyPlan(input, "idle", raisePlan.decisions) };
+    // A pure flicker-only refusal ships no command — carry its `flickerRefused`
+    // report through the idle return so the shell still anchors it.
+    return { ...emptyPlan(input, "idle", raisePlan.decisions), flickerRefused: raisePlan.flickerRefused };
   }
 
   // ---- hold: the deliberate near-limit ride — do nothing, on purpose.

@@ -35,10 +35,17 @@ export interface ModeState {
   collapsed: boolean;
   /** End of the settle window after the last command batch. */
   settleUntil: number;
+  /**
+   * When the current settle window was armed (the last `noteBatch`). The early
+   * exit (`clearSettleIfDone`) needs an arm anchor for its 10 s floor — the
+   * median has to be able to MOVE at all before "the meter digested the batch"
+   * can mean anything.
+   */
+  settleArmedAt: number;
 }
 
 export function initialModeState(): ModeState {
-  return { floors: null, gridFull: null, collapsed: false, settleUntil: 0 };
+  return { floors: null, gridFull: null, collapsed: false, settleUntil: 0, settleArmedAt: 0 };
 }
 
 export function deriveMode(state: ModeState, now: number): Mode {
@@ -60,7 +67,7 @@ export function applyMeterEvent(state: ModeState, event: MeterEvent, now: number
       // Entering grid arms the symmetric full-start.
       const floors = event.to === "gen" ? { since: now, until: now + FLOORS_MAX_MS } : null;
       const gridFull = event.to === "grid" ? { since: now, until: now + GRID_FULL_MAX_MS } : null;
-      return { floors, gridFull, collapsed: false, settleUntil: 0 };
+      return { floors, gridFull, collapsed: false, settleUntil: 0, settleArmedAt: 0 };
     }
     case "collapse":
       return { ...state, collapsed: true };
@@ -92,7 +99,43 @@ export function applyMeterEvent(state: ModeState, event: MeterEvent, now: number
 /** A command batch shipped — open the matching settle window. */
 export function noteBatch(state: ModeState, opts: { fanOnly: boolean }, now: number): ModeState {
   const settleUntil = now + (opts.fanOnly ? FAN_SETTLE_MS : SETTLE_MS);
-  return { ...state, settleUntil: Math.max(state.settleUntil, settleUntil) };
+  return { ...state, settleUntil: Math.max(state.settleUntil, settleUntil), settleArmedAt: now };
+}
+
+/**
+ * SETTLING early exit — call each evaluation while the settle clock runs, beside
+ * the FLOORS/GRID_FULL clears (user directive, 2026-08-08: watch the amps rather
+ * than wait out the timer).
+ *
+ * The settle window protects the meter's DIGESTION of the last batch. When the
+ * meter has demonstrably digested everything the batch commanded — nothing owed
+ * in EITHER direction — the window has nothing left to protect, so it ends now.
+ * Three conditions, all required:
+ *   1. at least `FAN_SETTLE_MS` since the batch armed (the median must have had a
+ *      chance to move at all — the 10 s floor);
+ *   2. no commanded FALL still landing (`commandedCutTotalAmps <= 0`); and
+ *   3. nothing on the SPEND side unabsorbed either (`rampDebitAmps === 0`, which
+ *      folds in every ramping compressor's committed draw and every live level /
+ *      fan debit the meter has not shown yet).
+ *
+ * Deliberately the FULL-landing condition, NOT "the cut is arriving" (35%
+ * landed): `escalationHold`/`settleHold` (pipeline.ts) key on `mode ===
+ * "SETTLING"`, so exiting while most of a cut is still in flight would drop the
+ * invariant-64 double-shed holds. At full landing those holds are already
+ * vacuous by construction — credit and total are 0, so `cutLanding` is false —
+ * and no protection is lost. It may only ever make the window SHORTER: a slow
+ * level-cut wind-down (`commandedCutTotalAmps > 0` for up to 180 s) simply keeps
+ * the 30 s clock, which is unchanged behaviour.
+ */
+export function clearSettleIfDone(
+  state: ModeState,
+  evidence: { commandedCutTotalAmps: number; unabsorbedSpendAmps: number },
+  now: number,
+): ModeState {
+  if (now >= state.settleUntil) return state; // window already over — nothing to shorten
+  if (now < state.settleArmedAt + FAN_SETTLE_MS) return state;
+  if (evidence.commandedCutTotalAmps > 0 || evidence.unabsorbedSpendAmps > 0) return state;
+  return { ...state, settleUntil: now };
 }
 
 /**

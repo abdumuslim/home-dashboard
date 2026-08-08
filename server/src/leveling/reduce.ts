@@ -72,9 +72,14 @@ export const SUBFLOOR_NEED_FRACTION = 0.9;
  * shape he objected to (a 1.7°C gap) still clears the smaller bar; what the
  * change buys is that a genuinely hotter room is protected sooner.
  *
+ * Amended 2026-08-06 for the TOP-PRIORITY room ONLY: when IT is the causer the
+ * bar drops to "strictly cooler" (see `exportBarClearedBy` in planReduction).
+ * Every other causer keeps the full degree described above.
+ *
  * Also read by the FLOORS recovery admission (pipeline.ts), which uses it for
  * the same question in the other direction: once a room has been refused, may a
- * COOLER one take the amps it could not use?
+ * COOLER one take the amps it could not use? — and by the shed-choice priority
+ * tie-break below, which asks it of two candidate plans.
  */
 export const SHED_NEED_GAP_C = 1.0;
 
@@ -104,6 +109,16 @@ export interface ReducePlan {
   overCutAmps: number;
   /** Whether the plan covers requiredAmps. */
   satisfied: boolean;
+  /**
+   * Set when the priority tie-break (see `shedPriorityTieBreak`) actually
+   * CHANGED the shed choice — the room the raw need ordering would have taken,
+   * and the lower-priority room that goes off in its place. Null otherwise.
+   *
+   * Forensics on shed choices is how every one of these rules got debugged, so
+   * the pipeline names it in the `shed choice` decision. A silent tie-break is
+   * a future mystery.
+   */
+  priorityTieBreak: { shedDeviceId: string; protectedDeviceId: string } | null;
 }
 
 export interface ReduceInput {
@@ -150,6 +165,14 @@ interface AcMove {
   subFloorNeed: number;
   /** This move leaves the AC running ABOVE its floor — a level is still on offer. */
   aboveFloor: boolean;
+  /**
+   * This move takes the room OUT OF SERVICE: a shed, or a level parked below an
+   * active comfort floor that will not cool it (invariant 36 — "a level that
+   * does not cool is an off"). The priority tie-break protects rooms by this
+   * test, not by `level == null`, so it cannot save a room from the off and then
+   * hand it a silent one.
+   */
+  outOfService: boolean;
 }
 
 interface ComboScore {
@@ -166,6 +189,13 @@ interface ComboScore {
    * immediately after feasibility so it beats every other preference.
    */
   exportsShed: boolean;
+  /**
+   * Index in the priority-ordered `acs` array of the BEST-PROTECTED room this
+   * plan takes out of service (0 = top priority), or -1 when it takes nobody
+   * out. The key the priority tie-break compares — a scalar `shedNeed` cannot
+   * say WHICH rooms a plan sheds, and that is the whole question.
+   */
+  protectedIndex: number;
 }
 
 /** Output order: least-needy first, top-priority last (historical shed-order semantics). */
@@ -175,10 +205,95 @@ function reductionOutputOrder(acs: AcView[]): AcView[] {
   return top ? [...sorted, top] : sorted;
 }
 
-function reductionBetter(a: ComboScore, b: ComboScore, required: number): boolean {
+/**
+ * May PRIORITY promote this plan over the thermometer's own pick?
+ *
+ * Three conditions, all measured against the ANCHOR — the plan the raw need
+ * ordering took (see `reductionBetter`):
+ *
+ *  - it protects a better room than the anchor does. The whole rule is "the
+ *    top-priority room survives", so a promotion may only ever move the off
+ *    DOWN the priority list; a plan that sacrifices a better-placed room than
+ *    the thermometer's own pick has nothing to offer here;
+ *  - it sits INSIDE the gap of the anchor. The boundary is exclusive, to match
+ *    every other reader of this constant: `shedsOnlyMilder` calls a room
+ *    "clearly milder" at exactly the gap, and so does the recovery admission in
+ *    pipeline.ts. One constant, one meaning — live 2026-07-28 07:18 two rooms
+ *    sat exactly 1.0°C apart, and an inclusive boundary would have re-decided
+ *    that shed on priority;
+ *  - the thermometer ranks it STRICTLY needier than the anchor. The tie-break
+ *    only ever promotes a plan the need rung would have refused; plans the need
+ *    rung calls equal (it rounds to a tenth) never reached it in the first
+ *    place and keep the tail that has decided them since v1 — the shed cost's
+ *    own `(acs.length - 1 - index)` term, which already breaks equal-need ties
+ *    toward the lowest priority, and the re-shed penalty, which on an equal-need
+ *    pair still moves the shed off a room that just bounced.
+ */
+function priorityPromotable(score: ComboScore, anchor: ComboScore): boolean {
+  if (score.protectedIndex <= anchor.protectedIndex) return false;
+  if (Math.abs(score.shedNeed - anchor.shedNeed) >= SHED_NEED_GAP_C - 1e-9) return false;
+  return Math.round(score.shedNeed * 10) !== Math.round(anchor.shedNeed * 10);
+}
+
+/**
+ * Rank reduction plans. `anchor` — when non-null — turns on the shed-choice
+ * priority tie-break (user, 2026-08-06 14:38:11Z).
+ *
+ * Shed choice has been thermometer-only since 2026-08-04, top priority
+ * included — and at 14:38 that shed Abdullah, priority #1, real need 4.0°C,
+ * because Abdu ranked 0.05°C hotter and this rung rounds `shedNeed` to a tenth.
+ * Both rooms sat far inside `SHED_NEED_GAP_C` of each other: the band the user
+ * himself calibrated as "equally hot — 1 c is enough to switch between acs".
+ * His rule, verbatim that afternoon: when the shed candidates are inside the
+ * gap the configured priority list breaks the tie, and the top-priority room
+ * survives. Outside it the thermometer still decides absolutely.
+ *
+ * The gap is measured against ONE anchor — the protection total of the plan the
+ * raw need ordering would have taken — and never pairwise between the two plans
+ * in hand. A pairwise gap test is not a transitive relation, and `best` is a
+ * streaming best-so-far scan, so the winner of a chain would depend on the
+ * order the search happens to enumerate leaves in. Staircase three rooms 0.6°C
+ * apart (4.0 / 4.6 / 5.4): every adjacent pair is inside the gap and the ends
+ * are not, so shed-mid loses to shed-low on priority, then shed-TOP takes the
+ * incumbent on raw need — and the room the rule exists to protect goes off,
+ * silently, with the journal reporting a plain thermometer choice. Anchoring
+ * makes the rule a property of the FIELD of candidates, which is what the user
+ * stated, and a total order, which is what the scan needs.
+ *
+ * The tie-break refines the shedNeed rung and nothing else: the lexicographic
+ * ladder above it (feasibility, then `exportsShed` — "undo the turn-on, don't
+ * make a bystander pay", invariant 43) and the cost/overcut/commands/disturbed
+ * tail below are untouched, and only a plan the need rung ranks strictly worse
+ * than the anchor can be promoted (see `priorityPromotable`). It is a plain
+ * lexicographic key — promotable first, then best-protected — so the streaming
+ * scan cannot be talked into a different answer by a different enumeration
+ * order.
+ *
+ * A plan that takes NOBODY out of service is never promotable, so it keeps its
+ * whole ordering against a shed plan: there is no tie to break, and such a plan
+ * must never be ranked against one that sheds on anything but the need total.
+ * (It cannot be on the losing side of a promotion either — a feasible non-
+ * exporting no-shed plan has `shedNeed` 0 and would be the anchor itself.)
+ *
+ * Protection totals are the full scalars, so a plan that "spares" the
+ * top-priority room by parking it below a floor that will not cool it is not
+ * inside the gap of one that simply sheds a peer (invariant 36).
+ */
+function reductionBetter(a: ComboScore, b: ComboScore, required: number, anchor: ComboScore | null = null): boolean {
   if (a.feasible !== b.feasible) return a.feasible;
   if (a.exportsShed !== b.exportsShed) return !a.exportsShed;
   if (a.feasible) {
+    if (anchor != null) {
+      const aUp = priorityPromotable(a, anchor);
+      const bUp = priorityPromotable(b, anchor);
+      // A promotable plan is inside the gap of the cheapest-in-need plan there
+      // is, so it beats one that is not: the other plan is either the anchor's
+      // own need class — the class priority is being asked to overrule — or
+      // genuinely needier, where the raw ordering says the same thing.
+      if (aUp !== bUp) return aUp;
+      // Lower priority pays: the LARGER index is the better-protected plan.
+      if (aUp && a.protectedIndex !== b.protectedIndex) return a.protectedIndex > b.protectedIndex;
+    }
     const an = Math.round(a.shedNeed * 10);
     const bn = Math.round(b.shedNeed * 10);
     if (an !== bn) return an < bn;
@@ -204,9 +319,43 @@ export function planReduction(input: ReduceInput): ReducePlan {
   const topId = acs[0]?.deviceId ?? null;
   const needById = new Map(acs.map((a) => [a.deviceId, Math.max(0, a.rankNeedDelta)]));
   const preferShedNeed = preferShed != null ? (needById.get(preferShed) ?? 0) : 0;
+  // The TOP-priority room's own turn-on exports to any room that is genuinely
+  // cooler — the user's amendment of his own causer rule, 2026-08-06 evening
+  // ("can turn Najat off instead"), for that one room only.
+  //
+  // The rule it amends is 2026-08-03 ("why it turned off mine not najat?"),
+  // which bought the SHED_NEED_GAP_C bar below: inside a degree the rooms are
+  // comparably warm, and flipping your AC on must not switch off a bystander.
+  // Live 15:48:47Z that protected Najat (3.4) from Abdullah's own click
+  // (priority #1, need 4.0) in a house where a room off was the only rung left
+  // — the third such cycle of the day on the room the priority list exists to
+  // keep cooling. Told the cost, the user took the trade: for the top room, a
+  // comparably warm peer may pay, provided it really is cooler.
+  //
+  // "Cooler" at the shedNeed rung's OWN resolution (it rounds to a tenth), so a
+  // room the thermometer cannot distinguish from the causer is not cooler and
+  // the causer still undoes its own turn-on. Every other causer keeps the full
+  // degree, unchanged.
+  //
+  // ⚠ The top room is the head of the CONFIGURED priority list, not `topId`
+  // (= acs[0], the first room that happens to be ON). The two differ exactly
+  // when the #1 room is off, and conflating them is a bug this file has already
+  // paid for once — invariant 10, live 2026-07-28 16:06, where Najat inherited
+  // the top slot and the surcharge meant for the #1 room started shielding a
+  // satisfied one. Here it would let a #2 room export the overload of its own
+  // leveler RESTORE onto a peer a tenth of a degree cooler (the 2026-07-27
+  // evening bounce loop pins the opposite: her ramp must undo HER turn-on).
+  // The user amended the rule for his top room; this keeps it that narrow.
+  // With no configured list the order handed to the reducer IS the priority, so
+  // acs[0] is the top room by definition.
+  const topPriorityId = config.priority[0] ?? topId;
+  const exportBarClearedBy = (shedNeed: number): boolean =>
+    preferShed != null && preferShed === topPriorityId
+      ? Math.round(shedNeed * 10) < Math.round(preferShedNeed * 10)
+      : shedNeed + SHED_NEED_GAP_C <= preferShedNeed;
   /** Every room this plan sheds is clearly milder than the room that caused it. */
   const shedsOnlyMilder = (shedIds: string[]): boolean =>
-    shedIds.every((id) => (needById.get(id) ?? 0) + SHED_NEED_GAP_C <= preferShedNeed);
+    shedIds.every((id) => exportBarClearedBy(needById.get(id) ?? 0));
 
   // "Reduce the levels, then the fan speed as the last try before turning off"
   // (user, 2026-07-31). The floor gate used to be PER-AC: a room already at its
@@ -358,6 +507,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
           // rooms keep their sub-floor rung free.
           subFloorNeed: isNonCooling(ac, level) ? Math.max(0, ac.rankNeedDelta) * SUBFLOOR_NEED_FRACTION : 0,
           aboveFloor: level > floor,
+          outOfService: isNonCooling(ac, level),
         });
       }
     }
@@ -379,6 +529,7 @@ export function planReduction(input: ReduceInput): ReducePlan {
         shedNeed: Math.max(0, ac.rankNeedDelta),
         subFloorNeed: 0,
         aboveFloor: false, // a room that is off is not withholding a level
+        outOfService: true,
       });
     }
     return { ac, moves };
@@ -387,6 +538,13 @@ export function planReduction(input: ReduceInput): ReducePlan {
   // Exhaustive cartesian search — ≤3 ACs × ~10 moves ≈ a few hundred leaves.
   const EPS = 1e-9;
   let best: ComboScore | null = null;
+  // The winner of the SAME search scored without the priority tie-break — the
+  // thermometer's own pick. It is both the anchor the tie-break measures its gap
+  // against and, at the end, how the journal knows whether priority actually
+  // changed the answer.
+  let bestRaw: ComboScore | null = null;
+  // Non-null only on the second pass (see the maxSheds loop below).
+  let anchor: ComboScore | null = null;
   let maxSheds = 1;
   const combo: AcMove[] = new Array(perAc.length);
   const recurse = (
@@ -479,8 +637,13 @@ export function planReduction(input: ReduceInput): ReducePlan {
           shedIds.length > 0 &&
           !shedIds.includes(preferShed) &&
           !shedsOnlyMilder(shedIds),
+        // Priority order IS the `acs`/`combo` index order, so the first room
+        // this plan takes out of service is the best-protected one it sacrifices.
+        // A non-cooling sub-floor counts only once the plan already sheds —
+        // exactly the condition the protection term above is gated on.
+        protectedIndex: sheds > 0 ? combo.findIndex((mv) => mv.outOfService) : -1,
       };
-      if (best == null || reductionBetter(candidate, best, requiredAmps)) best = candidate;
+      if (best == null || reductionBetter(candidate, best, requiredAmps, anchor)) best = candidate;
       return;
     }
     for (const mv of perAc[i].moves) {
@@ -546,8 +709,30 @@ export function planReduction(input: ReduceInput): ReducePlan {
   const SHED_BATCH_MAX = 2;
   const shedCeiling = Math.min(perAc.length, SHED_BATCH_MAX);
   for (maxSheds = 1; maxSheds <= shedCeiling; maxSheds++) {
+    // Two passes, because the priority tie-break is anchored on the answer the
+    // thermometer alone would give and that answer is not known until the field
+    // has been scored once (see reductionBetter). The second pass runs only when
+    // there IS a shed to re-decide, and a pass is a few hundred leaves.
+    anchor = null;
     best = null;
     recurse(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    // `recurse` fills `best` through the closure, which the narrowing from the
+    // assignment above cannot see (same reason as the cast on the break below).
+    const raw = best as ComboScore | null;
+    bestRaw = raw;
+    // Nothing to re-decide unless the thermometer's pick took a room out of
+    // service and some LOWER-priority room could take its place instead.
+    if (
+      raw != null &&
+      raw.feasible &&
+      !raw.exportsShed &&
+      raw.protectedIndex >= 0 &&
+      raw.protectedIndex < perAc.length - 1
+    ) {
+      anchor = raw;
+      best = null;
+      recurse(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
     if (best != null && (best as ComboScore).feasible) break;
   }
 
@@ -561,7 +746,20 @@ export function planReduction(input: ReduceInput): ReducePlan {
       shedNeed: 0,
       feasible: requiredAmps <= EPS,
       exportsShed: false,
+      protectedIndex: -1,
     };
+  const shedIdsOf = (score: ComboScore): string[] =>
+    score.combo.flatMap((mv, idx) => (mv.level == null ? [perAc[idx].ac.deviceId] : []));
+  // "The tie-break decided" = the priority pick and the raw-need pick disagree
+  // about who goes off. Anything less (the same shed set reached by a different
+  // level combination) is not a shed choice and does not belong in the journal.
+  const rawShed = bestRaw != null ? shedIdsOf(bestRaw) : [];
+  const tieShed = shedIdsOf(chosen);
+  const protectedDeviceId = rawShed.find((id) => !tieShed.includes(id));
+  const shedDeviceId = tieShed.find((id) => !rawShed.includes(id));
+  const priorityTieBreak =
+    protectedDeviceId != null && shedDeviceId != null ? { shedDeviceId, protectedDeviceId } : null;
+
   const moveOf = new Map<string, AcMove>();
   perAc.forEach((p, i) => moveOf.set(p.ac.deviceId, chosen.combo[i]));
 
@@ -593,5 +791,6 @@ export function planReduction(input: ReduceInput): ReducePlan {
     estimatedSavingsAmps: chosen.savings,
     overCutAmps: Math.max(0, chosen.savings - requiredAmps),
     satisfied: chosen.feasible,
+    priorityTieBreak,
   };
 }

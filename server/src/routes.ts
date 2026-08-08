@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import pg from "pg";
+import webpush from "web-push";
 import { getBaghdadPrayerTimes } from "./prayer.js";
 import type { TimeName } from "./prayer-engine/index.js";
 import type { Config } from "./config.js";
@@ -14,6 +15,7 @@ import type { AcCalibrationStatus, CalibrationResultRow, CalibrationFit } from "
 import { PowerStatsService } from "./power-stats-service.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession, clientIp, type AuthKind } from "./auth.js";
 import { childLogger } from "./logger.js";
+import { computeChangedKeys } from "./leveling-config-audit.js";
 import {
   createBaghdadPrayerResolver,
   getLegacyRangeSlots,
@@ -1252,6 +1254,66 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
   }
 
+  const LEVELING_AUDIT_RETENTION_DAYS = 30;
+  let lastLevelingAuditPruneAt = 0;
+
+  /**
+   * Durable record of who changed Smart AC Leveling config. On 2026-08-06 someone
+   * disabled the whole controller from the dashboard and it stayed off 7h12m with
+   * NOTHING to attribute it — PUT /api/ac/leveling was neither audited nor logged,
+   * unlike the per-AC ac_control_audit path. Killing the controller is at least as
+   * loud as a shed now. Fire-and-forget: an audit failure must never fail the save.
+   */
+  function auditLevelingConfig(req: Request, changedKeys: string[], enabledBefore: boolean | null, enabledAfter: boolean): void {
+    const authKind: AuthKind = req.authKind ?? "user";
+    const ip = clientIp(req);
+    const uaHeader = req.headers["user-agent"];
+    const userAgent = (Array.isArray(uaHeader) ? uaHeader[0] : uaHeader)?.slice(0, 300) ?? null;
+    log.info(`[routes] Leveling config saved: keys=[${changedKeys.join(",")}] enabled ${enabledBefore}→${enabledAfter} (${authKind}, ip=${ip})`);
+    void pool
+      .query(
+        `INSERT INTO ac_leveling_config_audit (auth_kind, ip, user_agent, changed_keys, enabled_before, enabled_after)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [authKind, ip, userAgent, changedKeys, enabledBefore, enabledAfter],
+      )
+      .catch((err) => log.warn("[routes] Leveling config audit insert failed:", err));
+
+    const now = Date.now();
+    if (now - lastLevelingAuditPruneAt > 24 * 3_600_000) {
+      lastLevelingAuditPruneAt = now;
+      void pool
+        .query("DELETE FROM ac_leveling_config_audit WHERE at < NOW() - ($1 || ' days')::interval", [
+          String(LEVELING_AUDIT_RETENTION_DAYS),
+        ])
+        .catch((err) => log.warn("[routes] Leveling config audit prune failed:", err));
+    }
+  }
+
+  /**
+   * Push to the "Smart AC Leveling alerts" audience (opt-in subscriptions). Mirrors
+   * collector.broadcastPush — which is private to the Collector and not injected
+   * here — so the PUT handler can announce a controller ON/OFF flip from the same
+   * request path that persists it, the way notifyAcLockCleared announces a released
+   * manual-off. Fire-and-forget: a push failure never fails the save.
+   */
+  async function broadcastLevelingPush(payload: Record<string, unknown>): Promise<void> {
+    try {
+      const result = await pool.query(
+        "SELECT subscription FROM push_subscriptions WHERE leveling_notifications = true",
+      );
+      for (const row of result.rows) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await webpush.sendNotification(row.subscription as any, JSON.stringify(payload));
+        } catch (err) {
+          log.warn(`[routes] Leveling config push failed:`, (err as Error).message);
+        }
+      }
+    } catch (err) {
+      log.warn("[routes] Leveling config push broadcast failed:", (err as Error).message);
+    }
+  }
+
   router.post("/api/ac/devices/:id/control", requireAuth, async (req: Request, res: Response) => {
     const cloud = getTclCloud?.();
     if (!cloud || !cloud.isReady()) {
@@ -1411,6 +1473,13 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     const validationError = validateLevelingConfig(body);
     if (validationError) { res.status(400).json({ error: validationError }); return; }
     try {
+      // Read the pre-save config BEFORE we persist so the audit's before-image and
+      // the enabled transition reflect the real prior state (2026-08-06: a dashboard
+      // disable that stayed off 7h12m with nothing to attribute it). getConfig() is
+      // the acting controller's merged view — the cleanest existing read.
+      const prevConfig = (await acLeveling.getConfig().catch(() => ({}))) as Record<string, unknown>;
+      const enabledBefore = prevConfig.enabled === true ? true : prevConfig.enabled === false ? false : null;
+      const enabledAfter = body.enabled === true;
       const config = await acLeveling.updateConfig({
         enabled: body.enabled === true,
         gridLimitAmps: body.gridLimitAmps as number,
@@ -1451,6 +1520,28 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
           return;
         }
         await acLeveling.updateV2Config(Object.fromEntries(v2Keys.filter((k) => k in v2Body).map((k) => [k, v2Body[k]])));
+      }
+      // Attribute the save: which top-level keys changed and any enabled flip. Loud
+      // like a shed — killing the controller must leave a trail (ac_control_audit did
+      // for per-AC commands; this PUT did not, hence the 2026-08-06 blind spot).
+      const changedKeys = computeChangedKeys(prevConfig, req.body as Record<string, unknown>);
+      auditLevelingConfig(req, changedKeys, enabledBefore, enabledAfter);
+      // A controller ON/OFF flip is announced to the leveling-alerts audience the same
+      // way a released manual-off is: OFF is CRITICAL (the household current is no longer
+      // being kept under the breaker limit), ON is a normal-urgency all-clear.
+      const source = (req.authKind ?? "user") === "agent" ? "the Hermes agent" : "the dashboard";
+      if (enabledBefore === true && enabledAfter === false) {
+        void broadcastLevelingPush({
+          title: "Smart AC Leveling turned OFF",
+          body: `Smart AC Leveling was turned OFF from ${source} (${clientIp(req)}) — household current is no longer kept under the breaker limit.`,
+          type: "leveling",
+        });
+      } else if (enabledBefore === false && enabledAfter === true) {
+        void broadcastLevelingPush({
+          title: "Smart AC Leveling turned back ON",
+          body: `Smart AC Leveling was turned back ON from ${source} (${clientIp(req)}).`,
+          type: "leveling",
+        });
       }
       res.json({ config });
     } catch (err) {

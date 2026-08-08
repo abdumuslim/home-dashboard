@@ -142,9 +142,16 @@ describe("escalation settle (2026-08-02 trim → double shed in 7 seconds)", () 
   });
 
   it("does NOT hold a severe breach", () => {
-    const out = run(pinned(), overMeter([16.5], 15.2), {
+    // Re-staged 2026-08-07: the lone-spike median guard (OVER_MEDIAN_MIN_READINGS,
+    // pressure.ts) now correctly refuses to size a shed from a single 16.5A raw
+    // reading over a mean that is barely over (smoothed 15.2 sized required
+    // below the shed threshold). Stage the breach honestly on the MEAN so the
+    // test still exercises what it names — a severe reading with an
+    // uninformative credit does not hold. Smoothed 16.5 lands required at
+    // exactly the 1.0A the old fixture produced.
+    const out = run(pinned(), overMeter([16.5], 16.5), {
       mode: "SETTLING",
-      meter: { ...overMeter([16.5], 15.2), commandedCutCreditAmps: 0.6 },
+      meter: { ...overMeter([16.5], 16.5), commandedCutCreditAmps: 0.6 },
     });
     expect(out.severity).toBe("severe");
     expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
@@ -194,6 +201,77 @@ describe("escalation settle (2026-08-02 trim → double shed in 7 seconds)", () 
     it("an arriving cut never holds the EXTREME rung — it is the last one", () => {
       const extreme = live({ smoothedOverMs: 200_000 });
       const out = run(pinned(), extreme, { mode: "SETTLING" });
+      expect(out.severity).toBe("extreme");
+      expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // The third face of "a credit is not the whole gate" (2026-08-06). The outrun
+  // void (invariant 38) zeroes `commandedCutCreditAmps` the INSTANT the smoothed
+  // meter rises past the cut's send-time anchor — with no minimum age. A second
+  // compressor ramping independently at the moment of a shed (a restore, or a
+  // power-blink restart) does exactly that within a reading or two, so BOTH
+  // holds — each gated on `credit > 0` — fell and a second room was shed
+  // 2.5–5.5s after the first, four times in 24h (#8929→#8930, #9180→#9181,
+  // #9213→#9214, #9369→#9370). That is physically impossible as a real breach:
+  // the first shed's off cannot have reached the 8-wide smoothed median yet
+  // (median lag alone is ~12–20s; a compressor wind-down is minutes). The holds
+  // now also fire while the cut is `settling` (younger than the landing grace,
+  // fall still short), whether or not the void has zeroed the credit.
+  // -------------------------------------------------------------------------
+  describe("…and holds when the outrun void has already zeroed the credit (2026-08-06)", () => {
+    // The peer's ramp has already lifted the smoothed meter ABOVE the cut's
+    // anchor, so sensing's outrun void has returned 0 credit — but the cut is
+    // only seconds old. `overMeter` supplies the bucket_empty evidence; the
+    // commandedCut fields are the post-revocation view the shell publishes.
+    const outrun = (readings: number[], smoothed: number, over: Partial<MeterView> = {}): MeterView => ({
+      ...overMeter(readings, smoothed),
+      commandedCutCreditAmps: 0, // revoked: smoothed sits above the anchor
+      commandedCutTotalAmps: 4.0, // a ~4A shed sent seconds ago
+      commandedCutAnchorAmps: smoothed - 1.0, // the meter when that cut began; the peer lifted it ~1A
+      commandedCutAgeMs: 4_000, // seconds — well under CREDIT_LANDING_GRACE_MS (60s)
+      ...over,
+    });
+
+    it("a peer ramping past the anchor does not fell the escalation hold seconds after a shed (#9180→#9181)", () => {
+      const m = outrun([15.4], 15.4);
+      // Precondition: the void has zeroed the credit AND the meter sits above the
+      // anchor — the exact state where both `credit > 0` holds used to fall.
+      expect(m.commandedCutCreditAmps).toBe(0);
+      expect(m.smoothedAmps).toBeGreaterThan(m.commandedCutAnchorAmps);
+      const out = run(pinned(), m, { mode: "SETTLING" });
+      expect(out.severity).toBe("mild");
+      expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(0);
+      expect(out.decisions.some((d) => d.blockedBy === "escalation settle")).toBe(true);
+    });
+
+    it("holds a SEVERE breach the same way while the cut is young (#8929→#8930 shape)", () => {
+      const m = outrun([16.5], 16.0);
+      expect(m.commandedCutCreditAmps).toBe(0);
+      const out = run(pinned(), m, { mode: "SETTLING" });
+      expect(out.severity).toBe("severe");
+      expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(0);
+      expect(out.decisions.some((d) => d.blockedBy === "escalation settle")).toBe(true);
+    });
+
+    it("…and sheds once that cut ages past the grace without landing (trend stalled)", () => {
+      // Same outrun geometry, but the cut is now older than CREDIT_LANDING_GRACE_MS
+      // with its fall still short → `cutTrendOf` reports "stalled". No permanent
+      // freeze was introduced: the ladder acts the moment settling ends.
+      const m = outrun([16.5], 16.0, { commandedCutAgeMs: 91_000 });
+      const out = run(pinned(), m, { mode: "SETTLING" });
+      expect(out.severity).toBe("severe");
+      expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
+    });
+
+    it("never holds the EXTREME rung, even fresh in the settling window", () => {
+      // The last rung before the breaker. Two full minutes of mean-over-limit
+      // makes this `extreme` even with a small deficit and the credit voided;
+      // settling must not hold it — the emergency escape stays open, and it
+      // sheds exactly ONE room (invariant 26's one-shed ceiling is unchanged).
+      const m = outrun([16.5], 16.0, { smoothedOverMs: 200_000 });
+      const out = run(pinned(), m, { mode: "SETTLING" });
       expect(out.severity).toBe("extreme");
       expect(out.commands.filter((c) => c.kind === "power_off")).toHaveLength(1);
     });
@@ -438,6 +516,11 @@ describe("idle demote precedence in the calm branch", () => {
     // so the assertion below is a real ordering, not an absent alternative.
     const fanOnly = run([ac("a", { currentLevel: 1, fanSpeed: 1, needDelta: 0 })], m, { fanHolds: held });
     expect(fanOnly.reason).toBe("fan_restore");
+    // …and the step carries planFanRestore's own words into the journal. On a
+    // 6A meter the whole swing fits with amps to spare, so this one took the
+    // fast path — and "the fan came all the way back in one batch" is told
+    // apart from "the fan bounced" ONLY by the budget printed beside it.
+    expect(fanOnly.decisions.some((d) => d.action.includes("fast"))).toBe(true);
 
     const out = run([satisfied("a")], m, { fanHolds: held });
     expect(out.reason).toBe("demote");
@@ -547,16 +630,19 @@ describe("raise cooldowns reach the planner", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The gated proactive shed ships its donor's `power_off` ALONE (invariant 9,
-// restated by 57). `plan()` merges `invariantCorrections` into the same batch,
-// and the grading shell only grades a batch whose meter commands number exactly
-// one — so a tick that carries a correction would ship the trade in a 2-command
-// batch and silently lose BOTH the free `on@L` cost sample and the off-drop
-// compressor evidence (invariant 55) the trade was designed to harvest, while
-// the SKILL still claimed "ships ALONE". Found on review, 2026-08-06.
+// The gated proactive shed ships its donor's `power_off` and the receiver's
+// gentle restore in ONE batch (user, 2026-08-08: instant sequencing — the
+// off-cliff lands in seconds while the receiver's compressor engages minutes
+// later, so they never overlap on the line). A `plan()` tick that also carries
+// an `invariantCorrection` would put a THIRD command in that batch, so the
+// `swapAllowed` gate still stands the trade down on a correction tick — the
+// trade re-arms on the next clean calm tick. (The batch already forfeits cost
+// learning by design: two meter commands, so `meterCmds.length === 1` is false
+// and it journals but never learns.) Found on review, 2026-08-06; batch shape
+// updated 2026-08-08.
 // ---------------------------------------------------------------------------
 
-describe("proactive shed: the donor's power_off may not share a batch", () => {
+describe("proactive shed: the donor's power_off ships with the receiver's on", () => {
   // The scene has to be built so the correction does NOT rescue the restore on
   // its own, or the swap never reaches its branch and the test proves nothing:
   //  - `hot` is shed and needs 5.0A; committed 12.5A against a 14.9A ceiling,
@@ -577,11 +663,15 @@ describe("proactive shed: the donor's power_off may not share a batch", () => {
   const cool = () => ac("c", { name: "cool", currentLevel: 1, needDelta: 1.0, rankNeedDelta: 1.0 });
   const calm = () => meter({ smoothedAmps: 12.5, calmMs: 300_000 });
 
-  it("arms the trade on a clean tick (the control)", () => {
+  it("arms the trade and ships both commands in ONE batch (the control)", () => {
     const out = run([hot(), mid(), cool()], calm(), { config: swapCfg });
     expect(out.swap).toEqual({ donorId: "c", receiverId: "a" });
-    // ALONE — this is the assertion the fix exists to keep true.
-    expect(out.commands).toEqual([{ deviceId: "c", kind: "power_off", reason: "shed" }]);
+    // ONE batch (user, 2026-08-08): donor off + receiver gentle restore together,
+    // and NO invariant correction shares it (the gate the describe exists to keep).
+    expect(out.commands).toEqual([
+      { deviceId: "c", kind: "power_off", reason: "shed" },
+      { deviceId: "a", kind: "power_on", level: 1, reason: "restore", fan: 1 },
+    ]);
   });
 
   it("stands down on a tick where an invariant correction also ships", () => {

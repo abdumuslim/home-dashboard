@@ -84,7 +84,10 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
 9. **Never spend a saving that has not landed.** The funding swap is **split by blocker**:
    envelope-blocked + meter already holds the amps → same batch; **meter-blocked → demote ALONE**,
    raise next calm window. A satisfied compressor throttles down over minutes; the breaker tripped at
-   15.65 A on 2026-07-26.
+   15.65 A on 2026-07-26. Since 2026-08-08 the meter-blocked demote MAY ship
+   same-batch with its raise when the freed amps close the gap with
+   `REBALANCE_FUND_MARGIN_AMPS` to spare (69); the deferred demote-alone path
+   remains the fallback.
 10. **Dormant levels are not comfort.** The +25 `topPriority` surcharge applies only to cuts ending
     BELOW that AC's `ceilOf` (else it protects a cool room over a hot one — the tier-down version of
     the complaint 2026-06-13 fixed for sheds).
@@ -437,6 +440,41 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
   reach them (invariant 12's open ⚠). Fixing it moves the netting into the pure
   layer, which is where the harness can finally see it.
 
+**2026-08-06 — the fan physics constant, and why invariants 58–60 have no
+scenario for their own incident.** `scenario.ts` prices a fan gear at
+**0.05 A** (`(fan − 1) × 0.05`, two call sites); the live book prices the same
+gear at **0.11–0.15 A** — the sweet-spot arithmetic in `FAN_RESTORE_MAX_STEP`
+uses ~0.15 (a 6-gear swing ≈ 0.9 A), and the 2026-08-06 graded 1→7 swing came in
+at **+0.64 A** (≈ 0.11/gear). Two to three times too cheap, in the permissive
+direction for the *cut* side and the restrictive direction for the *restore*
+side: **no scenario can stage a fan-driven limit crossing at all**, which is
+precisely the 13:12–13:34Z bounce house (58). The fast path (60) is likewise
+unfalsifiable in simulation — with gears that cheap, `spendable ≥ swing + 1.0`
+is nearly always true, so the sim cannot exhibit the saturated case where the
+fast path must NOT fire; that arm is pinned in `fan-trim`'s own unit tests and
+by the zero-churn acceptance scenario instead. Reconciling the constant is not a
+one-line edit: every fan-bearing fixture's amp budget was tuned against 0.05, so
+the family has to move together with each assertion re-derived — the same shape
+as the dead-window debt above. Until then, treat a green `scenarios.test.ts` as
+saying nothing whatsoever about fan-driven overloads. Also still unmirrored from
+2026-08-06: `scenario.ts` does not clear `fundingDemotedAt`/`reducedAt` on a
+source change while the shell does (pre-existing, same class as the swap-record
+clear fixed the same day).
+
+**2026-08-07 — one more device-poll debt.** `shedOffObservedAt` and the
+`reconcileObservedOn` three-way (invariant 66) live entirely shell-side; the
+harness does not mirror the device-poll path, so `controller.test.ts` is the only
+net for them.
+
+**2026-08-08 — the swap batch and the ramp release mirror; the anchor lifecycle
+does not.** `scenario.ts` now mirrors the ONE-BATCH swap shape (donor off +
+receiver on together, 69), the ramp early release (via the imported
+`rampProvenDone` — "Shell parity (`maybeReleaseRampEarly`)", 70), and
+`clearSettleIfDone` ("Shell parity (`clearSettleIfDone`)", 70). Still shell-side,
+so `controller.test.ts` is their only net: the flicker-patience anchor lifecycle
+(`flickerRefusedSince` — the stamp, the drop-on-unrefused, the non-raise-tick
+guard, the source-change clear; invariant 68) and `maybeReleaseRampEarly` itself.
+
 **Added 2026-08-03 (midday) after the top-priority room sat 20 min at a level its compressor will not run at:**
 36. **A level that does not cool is an off — in BOTH directions.** A comfort
     floor means "below this, this room does not cool in this weather", so a HOT
@@ -775,6 +813,15 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     arm it: a room waiting out its own calm, backoff, victim or funding cooldown
     is serving a sentence that expires on its own, and fencing its peers behind
     it would turn every cooldown into a house-wide freeze.
+    ⚠️ OPEN QUESTION (2026-08-06, user observation — **not decided, do not
+    implement either way**): should a MANUAL level pin jump this fence? He
+    watched his own L2 pin wait ~4 minutes behind a needier room's reservation
+    before the funding demote (21/9) freed the amps and it landed. "Manual wins"
+    (42) is about a pin the automation may not overrule, and it is silent on
+    whether a pin may overtake a hotter room's queue position; letting it jump
+    would also hand a user the one lever that outranks the thermometer while a
+    peer is stranded. It resolved itself here, which is the argument for leaving
+    it alone. Ask before changing it.
 54. **The trough a shed digs outlives the credit that explains it.** Invariant
     41 floors the committed meter at `cutAnchorAmps − commandedCutAmps` while a
     cut is in flight, and that claim dies twice over — with `PENDING_CUT_MS`
@@ -886,15 +933,19 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     CLOSE the gap — the receiver fits after the donor's off at the PLAIN learned
     price (never the probe, invariant 3) with `REBALANCE_FUND_MARGIN_AMPS` to
     spare, on the meter AND on the envelope.
-    ⚠️ Execution is invariant 9 verbatim: the donor's `power_off` ships **ALONE**
-    (credited via `commandedCutAmps`, so its cliff cannot latch a phantom
-    collapse — 11/31), the receiver's amps are **RESERVED across ticks**
-    (`controller.swap`, mirrored in `scenario.ts` — **including the
-    source-change clear**, added on review 2026-08-06: a trade reserved amps on
-    a budget the changeover deleted, and the entry mode re-decides who runs from
-    scratch), released when the receiver returns or at `SWAP_RESERVATION_MS` =
-    `ATTEMPT_BLAME_WINDOW_MS`; and the restore is admitted on a LATER tick
-    against the committed meter (41/54).
+    ⚠️ **Execution SUPERSEDED 2026-08-08 by 69 — ONE batch now.** *Was* invariant
+    9 verbatim: the donor's `power_off` shipped **ALONE** and the receiver restored
+    on a LATER tick against the committed meter (41/54). Since 2026-08-08 the
+    donor's off and the receiver's gentle `power_on` ship TOGETHER (the off still
+    credited via `commandedCutAmps`, so its cliff cannot latch a phantom
+    collapse — 11/31), which FORFEITS grading (a 2-meter-command batch is never
+    learned) but spares the receiver the 36 s wait. The receiver's amps are still
+    **RESERVED across ticks** (`controller.swap`, mirrored in `scenario.ts` —
+    **including the source-change clear**, added on review 2026-08-06: a trade
+    reserved amps on a budget the changeover deleted, and the entry mode re-decides
+    who runs from scratch), and that reservation now covers the FAILED-SEND case —
+    the old "swap landing" deferral is the retry path — released when the receiver
+    returns or at `SWAP_RESERVATION_MS` = `ATTEMPT_BLAME_WINDOW_MS`.
     ONE swap in flight house-wide, only the HOTTEST shed room may arm one.
     ⚠️ **"ALONE" is enforced at the ARM, not hoped for:** `plan()` merges
     `invariantCorrections` into the same batch, and the grading shell only
@@ -902,7 +953,11 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     the trade in a 2-command batch and silently forfeit BOTH the free `on@L`
     sample and the off-drop compressor evidence (55) it was designed to harvest.
     `swapAllowed` therefore requires `corrections.commands.length === 0`
-    (review, 2026-08-06; the trade stands down and re-arms next tick).
+    (review, 2026-08-06; the trade stands down and re-arms next tick). ⚠️ This
+    gate REMAINS after 69 made the trade a deliberate two-command batch: grading is
+    now forfeited by design (69, an accepted cost), and the gate keeps a THIRD
+    (correction) command off the batch rather than protecting a grade that no
+    longer happens.
     ⚠️ The donor gets an ordinary shed row (so it auto-restores when budget
     genuinely allows) but is barred from restoring for `FUNDING_COOLDOWN_MS` —
     invariant 30 one rung down, and a `power_off` now stamps that cooldown, not
@@ -922,6 +977,394 @@ was mirrored the same day (`projectedExtraAmps`). Still open:
     CURRENT tick, and the acceptance replay traded a room away **50 s** after a
     level cut with all of them satisfied. Journalled as `proactive_shed`, with a
     push naming donor → receiver (a shed must be LOUD).
+
+**Added 2026-08-06 (evening) after a fan commanded 10× in 22 minutes and two double sheds:**
+58. **The supply's wobble is a MARGIN every spender pays — and it may only ever
+    turn an admission into a SKIP.** Invariant 24 taught the REDUCER that the
+    mean is the truth about load; the spenders were still admitting against a
+    bare ceiling on a line the same estimator was measuring at ±0.4–1.0 A. Two
+    incidents, one arithmetic. 13:12–13:34Z: a saturated gen house, ~5 A heater,
+    every level at its floor, flicker 0.96 A — the reducer's only rung was a
+    fan, and `planFanRestore` handed the gear back at `cost ≤ headroom` the
+    moment the meter dipped, so the re-cross was arithmetic and the cycle ran
+    every ~5 min (Abdu's fan 10 commands in 22 min, Abdullah's 5). Every rule
+    behaved as written; together they were a limit cycle, which is a bug.
+    14:00:32→14:04:24Z: Najat shed, the house settled at 11.6 A, and this phase
+    bought her back **34 seconds later** — committed 12.12 A + a 2.3 A probe =
+    14.42 A against a 14.9 A ceiling, 0.48 A of margin on a line wobbling
+    ±0.4–0.8 A. She crossed 15.3 A, was re-shed at 14:04:10, and because her own
+    cut had not yet crossed the 8-wide median Abdullah was shed 14 s after her
+    (invariant 19's shape); the same double ran again 14:38:05→14:38:11Z. So the
+    fan restore spends `headroom − flicker` and the shed-restore admission judges
+    against `restoreCeiling − flicker`, journalled as `(−0.4A flicker)`. A quiet
+    line estimates 0 (the estimator needs two reverting excursions ≥
+    `FLICKER_MIN_AMPS`), so grid and every steady generator hour are
+    byte-identical to what this replaces.
+    ⚠️ **MARGIN, never a price.** `restoreCostAmps` and the probe pricing are
+    untouched: admission and the controller's freshly-on projection must re-price
+    each other exactly (invariant 3, the 2026-07-25 storm). Level RAISES are
+    uncharged too — they answer to the physics envelope plus the measured house
+    (16), and the failure being fixed here is restore-shaped.
+    ⚠️ **The charge may never change WHICH refusal branch a room takes** (review,
+    2026-08-06 — a MAJOR, caught before it had run a full day). Every branch that
+    SPENDS is classified at the BARE ceiling, whole resolution included (price as
+    well as fit), and both halves ran the *aggressive* way — the margin made the
+    controller LESS conservative in the corner it exists to make more
+    conservative: a room blocked by its own shed bar (54) judged on the charged
+    figure stops looking bar-blocked, silently dropping the R9 reservation AND
+    falling through to the swap, which switches a cooler room off to fund a
+    restore the bare ceiling had already admitted; and a room whose PROBE fits
+    bare is a room a quiet line RESTORES, so refusing it for the wobble and then
+    buying it a donor spends a room's comfort on a margin.
+    ⚠️ The gated proactive shed (57) is flicker-exempt **END TO END** — it may
+    neither be ARMED by a flicker refusal nor REFUSED by one once armed. A live
+    trade's receiver is admitted at the bare ceiling and `swapDonorFor` predicts
+    against the same one (a prediction and the admission it predicts must ask the
+    same question, or the donor loses its compressor for a fit the receiver is
+    then refused); `REBALANCE_FUND_MARGIN_AMPS` is that path's margin, sized
+    against exactly this noise band. Charging it stranded the trade in the
+    ±0.5 A-noise acceptance replay: donor off, receiver refused for the whole
+    reservation, DONOR brought back — a room cycled for nothing, the one outcome
+    `swapDonorFor`'s contract rules out.
+    Written as a `> 0` test, never `Math.max`: an absent or NaN estimate degrades
+    to "quiet line", i.e. to the behaviour this replaces. A NaN reaching the
+    ceiling makes every comparison false and strands every shed room off in
+    silence — the worse failure by the user's own ranking.
+    ✅ RESOLVED 2026-08-08 by 68 (user-confirmed). *Was OPEN:* a restore the
+    flicker ALONE refused reserved **nothing**, so a peer raise could take those
+    amps. Now such a refusal journals `blockedBy: "flicker margin"`, RESERVES its
+    bare cost once its anchor stands, and ages into a bare-ceiling admission after
+    `FLICKER_PATIENCE_MS` (120 s). The first refusal tick still reserves nothing
+    (no anchor yet), the safe residue of the old default. 58's OTHER descendant —
+    the gentle-hold-charged-the-flicker regression axis flagged in 60 — is likewise
+    closed 2026-08-08 (60's amendment below).
+59. **A fan hold never restores into its OWN compressor's ramp.** 14:03:20Z
+    Najat's gentle hold went to auto **134 s into her own 240 s ramp** and helped
+    carry the smoothed meter to 15.3 A — the re-shed of 58's first double, and a
+    second room fourteen seconds behind it. A PEER's ramp has been charged
+    through the pipeline's `rampDebit` subtraction since invariant 12; nothing
+    covered the self case, because a room's own committed-but-unmetered draw is
+    exactly what its fan would be sitting on top of — and
+    `recordGentleRestoreHold`'s own contract already claimed the fan was pinned
+    "while the compressor is still ramping" while the release was only calm- and
+    headroom-gated. `ac.ramping` now skips the hold outright. Both hold kinds pay
+    it: a fromCut hold climbing back mid-ramp after a power event is the same
+    physics.
+60. **Fans are cheap, so their restore may not be slow.** User, 2026-08-06
+    evening, verbatim: *"the fan speed is barely taking cost, so putting all at
+    speed 1 is only just a last emergency action, and should not taking too much
+    [time]."* The book agrees — a full 1→7 swing graded **+0.64 A** that
+    afternoon, under half a compressor level — yet recovery cost ~5 minutes of
+    stacked time gates whether the budget was razor-thin or wide open, because
+    those gates were sized when the fan restore itself was tripping the line
+    (18). So a hold whose ENTIRE remaining swing fits with
+    `FAN_RESTORE_FAST_MARGIN_AMPS` (1.0) of `spendable` to spare climbs home in
+    ONE command and owes `FAN_RESTORE_AFTER_CUT_FAST_MS` (60 s) instead of the
+    full 120 s window.
+    ⚠️ The fast path is judged on **`spendable`** — headroom net of 58's flicker
+    charge — which is what makes it arithmetically unreachable exactly where the
+    bounce lives: on the saturated line of 58's first incident `spendable` never
+    reaches swing + 1.0 (the zero-churn ACCEPTANCE scenario is the proof). Every
+    other gate is untouched in both paths: the 60 s first-gear calm gate ("may
+    this fan come back at all" deserves its calm minute however much room there
+    is), the self-ramp skip (59), the fan debit armed at exactly the price
+    admitted (18), and the fromCut/gentle distinction. Journalled as
+    `fan restore step (fast: …A swing, …A spendable)` — a fan that comes all the
+    way back in one batch and a fan that BOUNCED are the same line in a command
+    log, told apart only by what the budget was at the time. The label is scoped
+    to `fromCut` holds: a gentle hold never owed the cut wait and its auto
+    original was always one jump, so the claim would over-state (the GATE still
+    applies to both).
+    ✅ RESOLVED 2026-08-08 (user-confirmed, *"fan 1 is emergency-only and should
+    not take too long to come back"*). *Was OPEN:* on a flickery line `spendable`
+    was permanently smaller, so a GENTLE hold sat pinned at fan 1 longer than
+    before 58. Now `spendable` charges the flicker PER HOLD — only the `fromCut`
+    side pays the margin (the 13:12Z bounce lived entirely there); a gentle pin is
+    admission pricing, not overload relief, so it is judged on bare headroom. A
+    gentle hold also owes `FAN_RESTORE_GENTLE_CALM_MS` (30 s) first-gear calm
+    instead of the full `FAN_RESTORE_CALM_MS` minute (it was never CUT, so there is
+    no bounce to guard). And with 70's early ramp release the fan clears its own
+    self-skip (59) once the compressor plateaus, so it now returns ~60–95 s after a
+    landed restore instead of 240 s-plus.
+61. **Inside the gap the configured priority breaks a shed tie — anchored on the
+    thermometer's own pick, NEVER pairwise.** 14:38:11Z the reducer shed
+    Abdullah — priority #1, real need 4.0 °C — because Abdu ranked **0.05 °C**
+    hotter and the shedNeed rung rounds to a tenth. Two rooms far inside
+    `SHED_NEED_GAP_C` (1.0), the band the user himself calibrated as "equally hot
+    — 1 c is enough to switch between acs". His rule: inside the gap the
+    configured priority list decides and the top room survives; outside it the
+    thermometer rules absolutely (2026-08-04 policy, unchanged). Built as a
+    lexicographic refinement of the shedNeed rung and nothing else — feasibility
+    and `exportsShed` above it (43), and the cost/overcut/commands/disturbed tail
+    below it, are untouched — and only a plan the need rung ranks STRICTLY worse
+    than the anchor is promotable (equal-need pairs keep the v1 tail that has
+    always decided them).
+    ⚠️ **The gap is measured against ONE anchor — `bestRaw`, the winner of the
+    same search scored without the tie-break — and never pairwise between the two
+    plans in hand.** A pairwise gap test is not a transitive relation and `best`
+    is a streaming best-so-far scan, so the winner of a chain would depend on the
+    order the search happens to enumerate leaves in. Staircase three rooms 0.6 °C
+    apart (4.0 / 4.6 / 5.4): every adjacent pair is inside the gap and the ends
+    are not, so shed-mid loses to shed-low on priority and then shed-TOP takes the
+    incumbent on raw need — **the room the rule exists to protect goes off,
+    silently, with the journal reporting a plain thermometer choice.** Both
+    reviewers proved this independently with executed repros before it ever ran
+    live. Anchoring makes the rule a property of the FIELD of candidates (what the
+    user actually stated) and a total order (what the scan needs); it costs one
+    extra pass of a few hundred leaves, run only when there IS a shed to
+    re-decide. Protection is `protectedIndex` — the best-protected room a plan
+    takes OUT OF SERVICE, keyed on `outOfService` and not `level == null`, so the
+    rule cannot save a room from the off and then hand it a silent one (36); a
+    plan that takes nobody out is never promotable. Journal: `— priority decided`
+    appended to the `shed choice` detail, and only when the pick and `bestRaw`
+    genuinely disagree about WHO goes off. A silent tie-break is the next
+    forensic mystery.
+62. **The TOP-priority room's own turn-on exports to any room that is genuinely
+    cooler** — the user amending his own 2026-08-03 rule, 2026-08-06 evening
+    ("can turn Najat off instead"). 15:48:47Z Abdullah, priority #1, need 4.0,
+    was shed by his OWN click while Najat sat 0.6 °C cooler and running, because
+    0.6 is inside `SHED_NEED_GAP_C` and invariant 43's bar protects the
+    comparably-warm bystander; then at 15:52:46Z the swap (57) traded Abdu off to
+    bring Abdullah back. Three rules composing correctly into a bad outcome — the
+    third such cycle that day on the room the priority list exists to keep
+    cooling, and a room cycled to reach a state one step would have. Told the
+    cost, the user took the trade: for that ONE room the export bar drops from
+    `+SHED_NEED_GAP_C` to **strictly cooler at the shedNeed rung's own tenth
+    rounding**, so a room the thermometer cannot distinguish from the causer is
+    not cooler and the causer still undoes its own turn-on. Every other causer
+    keeps the full degree, unchanged: flipping your AC on must not switch off a
+    comparably warm bystander (43, bought after a 0.3 A overshoot shed the user's
+    own 33 °C room at 20:24:50 on 2026-08-03). Both decisions stand; neither is
+    re-litigable.
+    ⚠️ "Top" is `config.priority[0] ?? topId` — the head of the CONFIGURED list,
+    **never `acs[0]`**, which is merely the first room that happens to be ON. The
+    two differ exactly when the #1 room is off, and this file has already paid for
+    that conflation once (invariant 10, live 2026-07-28 16:06, where Najat
+    inherited the top slot and a surcharge meant for #1 began shielding a
+    satisfied room — the same fixture the literal form breaks today). Here it
+    would let a #2 room export the overload of its own leveler RESTORE onto a peer
+    a tenth of a degree cooler, the opposite of the 2026-07-27 bounce loop's
+    ruling that her ramp must undo HER turn-on. With no configured list the order
+    handed to the reducer IS the priority, so `acs[0]` is the top room by
+    definition.
+
+**Added 2026-08-07 after the post-deploy forensics (premature sheds, double sheds, the swap-vs-manual fight, a silent disable):**
+63. **A lone banked raw reading may never SIZE a shed — the MEDIAN branch needs a
+    quorum too.** `requiredSavingsAmps`'s flicker-discounted median term speaks
+    only once `OVER_MEDIAN_MIN_READINGS` (3) have banked; below that count the
+    smoothed-overshoot floor stands ALONE. `median([x]) === x`, so a median of one
+    or two readings is a single transient VERBATIM. Live 2026-08-07 05:40Z
+    (journal #9343): one ~17.84 A compressor-inrush sample banked while the
+    SMOOTHED mean sat 12.675 A against a 14 A limit and flicker read 0 (a lone
+    non-reverting spike is no excursion the estimator sees) — `median([17.84]) −
+    14 − 0` sized a **3.94 A** deficit that classified "extreme" purely because it
+    cleared the threshold, and a 2-ton room went off with 1.3 A of real headroom.
+    Not isolated: in 24 h, **10 of 16 severe/extreme rows fired with the MEAN
+    already under the limit and 6 shed a room** (#9308 sized 1.49 A off a lone
+    16.39 A at 13.215 A; #9175 sized 6.32 A off ~21.7 A at 14.245 A). The streak
+    branch (invariant 49) already carried this guard (`SEVERE_STREAK_READINGS`);
+    its argument bounded only the fallback's LOWER end — the smoothed overshoot is
+    a floor, so it never sizes too SMALL — and never the upper, where one raw
+    reading times the median at whatever it likes. **Hard rule 5c a second time**:
+    a guard sized against only part of what it guards. No reaction time lost — a
+    genuine fast overload banks its two severe readings within ~10 s and the
+    streak branch sizes it undiscounted before this branch is ever reached.
+64. **The outrun void is read-side and stays; the escalation and settle HOLDS get
+    their own landing grace.** Invariant 38's `pendingCutCredit` zeroes the credit
+    the instant the smoothed meter rises past the cut's send-time anchor by more
+    than the flicker, with NO minimum age — correct and load-bearing (a house
+    genuinely outrunning its cut must reach the last rung; it cost a breaker on
+    2026-08-03). But a SECOND compressor ramping independently at the moment of a
+    shed — a restore, or a power-blink restart — ticks the smoothed meter past the
+    anchor within a reading or two, zeroes the credit, and dropped BOTH holds while
+    the first shed's own off was still minutes from the meter. Live: four
+    double-sheds in 24 h, the second room 2.5–5.5 s behind the first (#8929→#8930,
+    **#9180→#9181 2.5 s apart with the meter RISING**, #9213→#9214, #9369→#9370) —
+    physically before the first off could reach the 8-wide smoothed median (median
+    lag alone ~12–20 s; a compressor wind-down is minutes). So both holds also fire
+    while the newest cut is `settling` per `cutTrendOf` (a cut exists, is younger
+    than `CREDIT_LANDING_GRACE_MS` (60 s), its fall still short), whether or not
+    the void has zeroed the credit: `cutLanding = commandedCutCreditAmps > 0 ||
+    cutTrend === "settling"`. `escalationHold` holds SEVERE while `arriving` OR
+    `settling`; `settleHold` still covers mild when `commandedCutTotalAmps ≥
+    rawRequiredAmps`. ⚠️ EXTREME is NEVER held — its sustained clock and
+    required-sizing are the emergency escape, and invariant 48's "fires on
+    `stalled`" contract stays intact: a genuine runaway inside the 60 s still
+    reaches the last rung.
+65. **"Manual wins" covers the POWER BUTTON for the comfort tool.**
+    `AcView.recentlyExternalOn` — stamped on a REST manual-ON (`onUserPowerOn`) and
+    on every observed external ON (a bare OFF→ON flip of an un-shed room, and a
+    shed room's shadow reading ON), live for `EXTERNAL_ON_DONOR_SHIELD_MS`
+    (15 min) — bars a room from `swapDonorFor` selection: the gated proactive shed
+    (57) is a comfort optimisation and may not un-do a human's explicit ON. Fifteen
+    minutes is deliberately `AC_POWER_EVENT_GRACE_MS` /
+    `POWER_EVENT_LEVEL_JUMP_GRACE_MS`, because a TCL power-blink RESTORES its last
+    level, which in the shadow is character-for-character an external ON (invariant
+    56) — the two edges judge on one clock or they drift. ⚠️ Deliberately NOT
+    cleared on a source change: a person's choice survives a changeover, unlike the
+    victim/funding cooldowns, which are per-LINE physics. Ordinary overload sheds
+    are unaffected — invariant 43's causer logic is untouched; only the comfort
+    TRADE is barred. Live 2026-08-06 18:35–19:14Z: the leveler shed the
+    priority-#1 room FOUR times (two reduces plus the swaps #9224/#9228,
+    audit-proven) while a household member re-enabled it THREE times, and the
+    occupant then disabled the whole controller for **7 h 12 m**. Cross-reference
+    57.
+66. **A widened shed grace must tell a stale echo from a human's hand.**
+    `SHED_CLEAR_GRACE_MS` 15 s → **60 s** — invariant 4's send-to-confirm lag runs
+    5.8 s to 13 min, and #9268/#9270 (2026-08-07 04:15Z) is why: at gen entry the
+    leveler shed Najat and 17.4 s later sent a GENUINE DUPLICATE `power_off`, but a
+    stale still-ON shadow at 17.4 s straddled the old 15 s grace, cleared the shed
+    mid-flight, the recovery-admission recompute saw "on, not shed" and re-shed
+    her, and the `power_off` dedupe (`SHED_RESEND_SPACING_MS`) was blind because it
+    keys on `shedIds` membership that had just been wrongly cleared. ⚠️ **Widening
+    ALONE would violate "manual wins" (42):** a remote re-enable 20 s post-shed
+    would read as a stale echo and the 30 s off-resend would fight the human — the
+    exact #9224/#9228 class. So `shedOffObservedAt` (stamped in the tick device
+    loop the moment a shed room's shadow reads OFF; cleared with the shed record in
+    `clearShed`/`recordShed`; reset on load) three-ways `reconcileObservedOn`: off
+    observed before the ON → external hand, clear IMMEDIATELY + shield stamp (65);
+    off never observed and inside the grace → stale echo, shed kept intact so
+    confirm-or-resend re-sends it; past the grace with no off ever seen → clear +
+    shield stamp. Harness note for the known-debt list: this state is shell-side —
+    `scenario.ts` does not mirror the device-poll path — so `controller.test.ts`
+    is the only net.
+
+**Added 2026-08-07 (afternoon) after Najat was shed five times in 23 minutes on a derated ceiling:**
+67. **A bounce compounds the shed-trough BAR's persistence, not the admission
+    ladder.** The strain derates (13:41/13:56Z, ESP power-feed gaps near a 14.4 A
+    mean — invariant 47) pulled the gen ceiling to 14.0–14.5 A under a settled
+    three-room ~14.8–15.6 A house, so that configuration was un-affordable by
+    arithmetic and the restore path retried the WHOLE three-room end-state every
+    ~5–6 min. Each round the own-shed-trough bar (54) refused CORRECTLY for exactly
+    its 300 s window — committed 12.4–12.6 A, needing 2.3 A against a 13.9–14.4 A
+    ceiling — then EXPIRED ON THE CLOCK, and the next admission spent the very
+    trough the bar exists to disbelieve. Restore→re-shed gaps were 52–69 s, and the
+    admission ladder's early rungs (`BACKOFF_LADDER_MS` 30/120/300 s for failures
+    1–3) are ALL ≤ the 300 s bar, so `canAttempt` was already satisfied when the bar
+    expired: the BAR, not the ladder, was the binding shed→restore clock and its
+    300 s plateau WAS the cycle period. The probe re-arm (22) was price-side and
+    orthogonal — every trough sat ≥ `PROBE_REARM_DROP_AMPS` (1.0) below the failed
+    attempt's anchor, re-enabling the gentle price each round, which governs WHICH
+    price admits, not WHEN. So a genuine `power_off` re-shed inside the blame window
+    — a BOUNCE (`AcPacing.bounces`, booked only through the `isShed` gate in
+    `noteFailure`; a `set_level` cut of a recently restored room is a ladder
+    failure, not a bounce) — doubles `barPersistMs` per consecutive bounce:
+    1→600 s, 2→1200 s, hard-capped at 1800 s (30 min). Invariants 39 and 54 both
+    named this ("a restore re-shed within N minutes must slow the ladder") as their
+    missing prerequisite; this is it, finally built.
+    ⚠️ **The ladder is left alone deliberately, and the fix is
+    restore-admission-side ONLY.** Compounding `canAttempt` broke invariant 22's
+    contract — its no-bar tests rely on the ladder EXPIRING so a genuine
+    (bar-released) drop re-admits — and the bar is precisely the gate that
+    discriminates a genuine-headroom drop (22 → re-admit) from a
+    survivors-mid-cycle trough (hold). Leaving the ladder untouched also keeps the
+    reducer's re-shed penalty (`reshedPenalized`) unmoved, so invariant 39's
+    unconditional non-cooling form stays rejected: this compounds only the
+    persistence of a refusal, it does not add one.
+    ⚠️ **Nothing may block unbounded (22's spirit) — four release valves.** The bar
+    is ABSOLUTE amps, so a RISING ceiling (derate recovery, 47) admits
+    arithmetically with no clock at all; a peer LOAD REMOVAL credits the bar down
+    (`creditPeerShedBars`, deduped per device by `OFF_CREDIT_DEDUP_MS` (60 s)
+    because `creditRoomOff` can observe one physical off twice — the REST tap, then
+    the device poll, which `onUserPowerOff` never suppresses); a restore that STICKS
+    (`noteSuccess` past the whole blame window) resets the count; a source change
+    wipes everything (per-line physics).
+    ⚠️ **The episode ends on an EXTERNAL ON.** `noteExternalOn` — the same sites
+    that stamp `externalOnAt` for the swap-donor shield (65) — clears the count: a
+    human/blink ON means the leveler's restore episode is OVER, and a stale count
+    would hand a FUTURE unrelated shed a 30-min bar (reviewer-caught). ⚠️
+    Deliberately NOT cleared on our own `restore_confirmed`: the shadow confirms
+    seconds after the send while the bounce books ~60 s LATER at the re-shed, so
+    clearing there would cap the counter at 1 forever and kill the compounding
+    (pinned by a `controller.test.ts` guard, "⚠ would cap it at 1"). LOUD: the
+    refusal journals `bounce backoff (Nth bounce — …s wait, …)`.
+    Harness note for the known-debt list: the off-credit dedup and the whole bounce
+    lifecycle are shell-side (`controller.test.ts` guards); `scenario.ts` mirrors
+    the bar arithmetic and `clearBounces` but collapses the two `creditRoomOff` call
+    sites into one, so `scenarios.test.ts` structurally cannot see the
+    double-credit path.
+
+**Added 2026-08-08 after the 02:44Z gen entry (slow restores behind a working controller):**
+68. **A restore refused ONLY by the flicker margin is patient, not stranded.** A
+    restore that fits the BARE ceiling and fails only on 58's flicker charge
+    (`chargedRestoreCeiling`) is a room waiting for a steadier line, not a room
+    physics cannot carry — so it is no longer an ordinary skip. It journals
+    `blockedBy: "flicker margin"`, RESERVES its bare cost once its anchor stands
+    (closing 58's open ⚠️ — a peer raise can no longer spend the amps it is waiting
+    on), and after `FLICKER_PATIENCE_MS` (120 s) of UNBROKEN flicker-only refusal
+    admits at the bare ceiling with a `flicker patience: …` note. 02:44Z gen entry:
+    Abdu shed at entry, then sat refused behind the margin while the rest of the
+    afternoon proved the line carried him fine.
+    ⚠️ The streak anchor is SHELL-owned (`controller.flickerRefusedSince`, stamped
+    from the plan's `flickerRefused` list) and a tick that never RAN the raise phase
+    — SETTLING after any batch, an over-limit episode, FLOORS — reports nothing and
+    must NOT break the streak: SETTLING follows every batch, so wiping the anchor on
+    it would restart patience forever on a busy line (caught in review). ⚠️ The
+    120 s sits far outside the 34 s double-shed shape 58 was written against, so a
+    patience window this long can never re-create it — and a patience admission that
+    is WRONG is not silent: it re-sheds and winds invariant 67's bounce backoff, the
+    net under it. Swap receivers never qualify (they are already judged at the bare
+    ceiling — `ceilingFor`), and a refusal that ALSO fails bare stays a plain
+    no-headroom skip that reserves nothing (the first refusal tick, before its
+    anchor exists, likewise reserves nothing).
+69. **A funded trade ships in ONE batch** (user, 2026-08-08: *"switching acs …
+    make that instantly, no need to wait — the AC won't run full at the first
+    moment"*). The gated proactive shed (57) now emits the donor's `power_off` and
+    the receiver's gentle `power_on` TOGETHER, and an ordinary funding demote ships
+    with the raise it funds when `jump ≤ available + freed − REBALANCE_FUND_MARGIN_AMPS`
+    (the meter-blocked branch re-asserts the envelope with the demote overrides as a
+    belt — demoting a peer only LOWERS the end-state). Physics licenses the instant
+    sequencing: the donor's cliff reaches the meter in ~10–40 s while the receiver's
+    compressor engages MINUTES later (TCL restart protection + soft-start), so the
+    two never overlap on the line — and the committed-meter machinery already prices
+    the gap (the off credited via `commandedCutAmps` so its cliff cannot latch a
+    phantom collapse, 11/31; the on arms `pendingOn` + a ramp debit, 12/28; the
+    receiver's `candidateCommitted` already reflects the saving, 41). It spares the
+    receiver the 36 s-plus wait it used to sit out for a LATER tick's committed
+    meter (02:44Z).
+    ⚠️ The receiver is admitted at the PLAIN learned price, never the probe (3): it
+    is NOT in `probeRestoreIds` and its recorded fan hold is `gentle=false`.
+    `controller.swap`'s reservation still arms and now exists for the FAILED-SEND
+    case ONLY — the old "swap landing" deferral branch is the retry path for a
+    receiver that never confirmed ON. ⚠️ ACCEPTED COST: a batch with TWO meter
+    commands is never graded (`meterCmds.length === 1`), so the trade forfeits the
+    donor's off-drop evidence (55) and the receiver's free `on@L` sample — inherent
+    to instant sequencing, since a window born beside another command is born
+    contaminated anyway (23). The demote-ALONE fallback (invariant 9's deferred
+    path) stands whenever the freed amps do not close the gap with margin.
+70. **Amp evidence releases the actuation timers, not only the clock** (user,
+    2026-08-08: *"we can watch the amps to know if it worked and stable without the
+    need to wait the end of time"*). `AcView.ramping`'s 240 s window (`rampUntil`)
+    used to expire only on that clock; `maybeReleaseRampEarly` (controller.ts) now
+    closes it the moment `rampProvenDone` fires — which gates the raise phase, house
+    sampling, swap-donor eligibility, the fan restore's self-skip (59) and the FLOORS
+    "nothing ramping" clear, all of which waited out the full four minutes even after
+    the meter had shown the compressor land and settle. "PROVEN done" has TWO halves,
+    both required: the ratchet crossed the "a compressor started" bar
+    (`rampReleaseBarAmps`) AND has PLATEAUED — grown less than
+    `RAMP_SETTLED_EPSILON_AMPS` (0.15) for `RAMP_SETTLED_STALL_MS` (45 s, ≳2× the
+    8-wide median's ~12–20 s lag).
+    ⚠️ The plateau is required EVEN at full absorption, and it is load-bearing: the
+    committed figure is the MODEL draw, and an UNDER-MODELLED compressor crosses its
+    model while STILL CLIMBING. Releasing there is mid-ramp, not stable — an executed
+    repro re-opened the 2026-07-27 shed-the-bystander shape (Najat's real 3.7 A L1
+    against a 2.7 A model dropped `ramping` ~15 s before her transient tipped the
+    breaker, and the reducer shed the innocent hotter room), which is why "worked AND
+    stable" needs both halves. ⚠️ NEVER on flatness alone: a ratchet UNDER the bar is
+    the restart-protection dead window (44) and keeps its full clock plus the
+    extension machinery. The committed price is ONE helper (`rampCommittedAmps`)
+    shared with `rampDebitAmps` — the 2026-08-05 lesson that two sites pricing one
+    quantity eventually disagree.
+    And the SETTLE window: `clearSettleIfDone` (modes.ts) ends SETTLING early
+    (≥ `FAN_SETTLE_MS` 10 s floor) only when NOTHING is owed in either direction
+    (`commandedCutTotalAmps ≤ 0` AND `rampDebitAmps === 0`, wired as
+    `unabsorbedSpendAmps`). ⚠️ Deliberately the FULL-landing condition, NOT "the cut
+    is arriving" (35 % landed): `escalationHold`/`settleHold` (pipeline.ts) key on
+    `mode === "SETTLING"`, so exiting mid-landing would drop the invariant-64
+    double-shed holds — but at full landing those holds are vacuous by construction
+    (credit and total are 0), so no protection is lost; it may only ever make the
+    window SHORTER. Learning windows, calm durations, pacing, and the shed-trough
+    bars are untouched.
 
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
@@ -1015,6 +1458,9 @@ Everything else (`Raise hysteresis buffer`, `Bounce detection`, `Emergency reduc
   `ac_leveling_journal`. Durable; docker logs rotate in ~1.5 days, so prefer the journal.
 - **Cost model:** `ac_leveling_costs`, per device × source × transition EWMA. Survives deploys; config
   saves do NOT wipe it. Explicit reset: `POST /api/ac/leveling/costs/reset`.
+- **Config audit:** `ac_leveling_config_audit` records every `PUT /api/ac/leveling` (`auth_kind`,
+  `ip`, `user_agent`, `changed_keys`, and the `enabled` flip); an enabled flip also PUSHES to the
+  leveling-alerts audience (OFF critical, ON an all-clear) — the 2026-08-06 silent-disable gap.
 - **Tests:** `server/src/leveling/*.test.ts` — `scenarios.test.ts` replays incident regressions against
   the physics harness (`scenario.ts`), plus `controller.test.ts` and `pipeline.test.ts`.
 

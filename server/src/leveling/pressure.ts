@@ -47,6 +47,35 @@ export const EMERGENCY_SHED_OVERSHOOT_FRACTION = 0.2;
 export const SEVERE_STREAK_READINGS = 2;
 
 /**
+ * How many banked over-limit readings the MEDIAN branch needs before its
+ * flicker-discounted term may size the deficit. `median([x]) === x`, so a median
+ * of fewer than three readings can be a single transient VERBATIM — and a lone
+ * spike must never size a shed, exactly as SEVERE_STREAK_READINGS already forbids
+ * it to on the min-severe branch.
+ *
+ * Live 2026-08-07 (journal #9343): one ~17.84A compressor-inrush sample banked
+ * while the SMOOTHED mean sat at 12.675A against a 14A limit and flicker read 0
+ * (a lone, non-reverting spike is not an excursion the estimator sees) —
+ * `median([17.84]) − 14 − 0` sized a **3.94A** deficit that classified "extreme"
+ * purely because it cleared the extreme threshold, and a 2-ton room went off with
+ * 1.3A of real headroom. Not an isolated tick: in 24h, 10 of 16 severe/extreme
+ * rows fired with the MEAN already under the limit; 6 of them shed a room
+ * (#9308 sized 1.49A off a lone 16.39A at 13.215A; #9175 sized 6.32A off ~21.7A
+ * at 14.245A).
+ *
+ * The 2026-08-04 guard (SEVERE_STREAK_READINGS) closed this exact hole on the
+ * min-severe branch, and its argument bounded only the fallback's LOWER end —
+ * the smoothed overshoot is a floor, so the fallback never sizes too SMALL. It
+ * never bounded the upper: one raw reading times the median at whatever it likes.
+ * Hard rule 5c a second time — a guard sized against part of what it guards.
+ * Below this count the deficit is the smoothed-overshoot floor ALONE, the honest
+ * figure for a mean that sits at the line — and no reaction time is lost, because
+ * a genuine fast overload banks its two severe readings within ~10s and the
+ * streak branch sizes it undiscounted before this branch is ever reached.
+ */
+export const OVER_MEDIAN_MIN_READINGS = 3;
+
+/**
  * Meter-sized savings target for an over-limit episode: the overshoot the
  * readings actually support, plus the margin so the landing point is just
  * under the limit (never deep below — the anti-over-reduction rule).
@@ -71,7 +100,9 @@ export const SEVERE_STREAK_READINGS = 2;
  * raising it to the mean would change sizing in a case no live incident has
  * asked for.) What the flicker discount removes is the
  * 2026-08-02 failure — a lone 16.04A spike against a 14.92A mean sized a 1.14A
- * demand, and the reducer paid it by shedding a 4.8A room.
+ * demand, and the reducer paid it by shedding a 4.8A room. And the median's own
+ * term speaks only once OVER_MEDIAN_MIN_READINGS have banked — under that count
+ * `median` IS the transient, so the floor stands alone (#9343, 2026-08-07).
  */
 export function requiredSavingsAmps(view: MeterView, limit: number, marginAmps: number): number {
   const over = view.overLimitReadings;
@@ -83,7 +114,9 @@ export function requiredSavingsAmps(view: MeterView, limit: number, marginAmps: 
   const streak = over.length >= SEVERE_STREAK_READINGS && over.slice(-SEVERE_STREAK_READINGS).every(isSevere);
   const overshoot = streak
     ? Math.min(...severe) - limit
-    : Math.max(view.smoothedAmps - limit, median([...over]) - limit - view.flickerAmps);
+    : over.length >= OVER_MEDIAN_MIN_READINGS
+      ? Math.max(view.smoothedAmps - limit, median([...over]) - limit - view.flickerAmps)
+      : view.smoothedAmps - limit;
   return Math.max(0.1, overshoot) + marginAmps;
 }
 

@@ -22,6 +22,7 @@ import {
   applyMeterEvent,
   clearFloorsIfDone,
   clearGridFullIfDone,
+  clearSettleIfDone,
   deriveMode,
   FLOORS_MAX_MS,
   initialModeState,
@@ -33,12 +34,15 @@ import {
   ATTEMPT_BLAME_WINDOW_MS,
   attemptedRecently,
   attemptedWithin,
+  barPersistMs,
+  clearBounces,
   initialPacingState,
   noteAttempt,
   noteFailure,
   noteSuccess,
   reshedPenalized,
   resetPacing,
+  restoreBounces,
   type AttemptKind,
   type PacingState,
 } from "./pacing.js";
@@ -47,7 +51,7 @@ import type { CostBook } from "./costs.js";
 import { fanTrimSavings, raiseJumpAmps, restoreCostAmps, turnOnAmps } from "./costs.js";
 import { ceilOf, floorOf, nextSubFloorWatch, type SubFloorWatch, worstCaseLevel } from "./needs.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
-import { absorbedSharesAmps, SWAP_QUIET_AFTER_OVER_MS } from "./raise.js";
+import { absorbedSharesAmps, EXTERNAL_ON_DONOR_SHIELD_MS, rampDebitAmps, SWAP_QUIET_AFTER_OVER_MS } from "./raise.js";
 import {
   EXTERNAL_ON_VOID_MS,
   HOUSE_SAMPLE_COOLDOWN_MS,
@@ -64,6 +68,9 @@ import {
   meterIsSteady,
   modeledGapAmps,
   rampAbsorptionLanded,
+  rampCommittedAmps,
+  rampProvenDone,
+  RAMP_SETTLED_EPSILON_AMPS,
 } from "./dead-window.js";
 
 export interface SimAcSetup {
@@ -170,6 +177,15 @@ interface SimAc {
   rampBaseline: number | null;
   /** Peak rise above `rampBaseline` seen since it armed (shell: rampAbsorbed). */
   rampAbsorbed: number;
+  /**
+   * Amp evidence retired this ramp WINDOW before its clock (shell: a deleted
+   * `rampUntil`). Consumed by `isRamping`; set by the harness `noteRampAbsorption`
+   * when `rampProvenDone` fires.
+   */
+  rampReleased: boolean;
+  /** Stall-clock anchor for the plateau test (shell: rampGrowth.{at,absorbed}). */
+  rampGrowthAt: number;
+  rampGrowthAbsorbed: number;
   /** When the current ramp window armed (shell: powerEventRamp.armedAt). */
   rampArmedAt: number;
   /** This ramp was opened by a power event, so it may be held (shell: powerEventRamp). */
@@ -195,6 +211,11 @@ interface SimAc {
   fanDebit: { amps: number; baseline: number | null; absorbed: number; until: number } | null;
   /** User-pinned level (manual wins over every automation ceiling). */
   manualTarget: number | null;
+  /**
+   * Shell parity (`controller.externalOnAt`): when a human/automation last
+   * turned this room on — the swap donor shield (invariant 42/57). 0 = never.
+   */
+  externalOnAt: number;
 }
 
 const STEP_MS = 5_000;
@@ -298,8 +319,10 @@ export class Scenario {
    * Shell parity (R9): the meter bar a room's OWN shed left — the smoothed
    * meter when the shedding batch went out, less what it was priced to save.
    * A restore is judged against that, not against the trough its shed dug.
+   * `credited` mirrors the shell's bounce-bar peer-credit release valve
+   * (2026-08-07).
    */
-  private shedBar = new Map<string, { amps: number; at: number }>();
+  private shedBar = new Map<string, { amps: number; at: number; credited: number }>();
   /**
    * Shell parity (`controller.swap`): the ONE gated proactive shed in flight
    * house-wide. Mirrored because the receiver's reservation must survive across
@@ -356,6 +379,9 @@ export class Scenario {
       startBaseline: null,
       rampBaseline: null,
       rampAbsorbed: 0,
+      rampReleased: false,
+      rampGrowthAt: 0,
+      rampGrowthAbsorbed: 0,
       rampArmedAt: 0,
       powerEventRamp: false,
       rampHeldUntil: 0,
@@ -366,6 +392,7 @@ export class Scenario {
       jumpDebit: null,
       fanDebit: null,
       manualTarget: null,
+      externalOnAt: 0,
     }));
   }
 
@@ -388,6 +415,11 @@ export class Scenario {
     const view = meterView(this.meterState, this.now);
     ac.rampBaseline = view.source !== "none" && view.sampleCount >= 2 ? view.smoothedAmps : null;
     ac.rampAbsorbed = 0;
+    // Shell parity (`rearmRamp`): a fresh ramp is not yet released, and its
+    // plateau stall clock starts here anchored at zero absorption.
+    ac.rampReleased = false;
+    ac.rampGrowthAt = this.now;
+    ac.rampGrowthAbsorbed = 0;
   }
 
   /** Shell parity for `noteRampAbsorption` — ratchet each live ramp's peak rise. */
@@ -406,12 +438,39 @@ export class Scenario {
       // Shell parity: a power-event ramp under review keeps ratcheting past its
       // nominal window — its absorption is the evidence that closes it.
       if (ac.rampBaseline == null || !(this.isRamping(ac) || ac.powerEventRamp)) continue;
-      ac.rampAbsorbed = Math.max(ac.rampAbsorbed, view.smoothedAmps - ac.rampBaseline);
+      const risen = view.smoothedAmps - ac.rampBaseline;
+      if (risen > ac.rampAbsorbed) {
+        ac.rampAbsorbed = risen;
+        // Shell parity (`rampGrowth`): re-stamp only on a meaningful step, so a
+        // noise creep still reads as plateaued.
+        if (risen - ac.rampGrowthAbsorbed >= RAMP_SETTLED_EPSILON_AMPS) {
+          ac.rampGrowthAt = this.now;
+          ac.rampGrowthAbsorbed = risen;
+        }
+      }
+      // Shell parity (`maybeReleaseRampEarly`): amp evidence retires the window
+      // before the clock — fully absorbed, or plateaued above the started bar.
+      const line = this.line;
+      if (line !== "none" && (this.isRamping(ac) || ac.powerEventRamp) && !ac.rampReleased) {
+        const proof = rampProvenDone({
+          absorbedAmps: ac.rampAbsorbed,
+          committedAmps: rampCommittedAmps(
+            { deviceId: ac.setup.deviceId, currentLevel: this.observedLevelOf(ac), maxLevel: 3 },
+            this.cfg,
+            line,
+          ),
+          lastGrowthAt: ac.rampGrowthAt,
+          now: this.now,
+        });
+        if (proof != null) ac.rampReleased = true;
+      }
     }
   }
 
   private isRamping(ac: SimAc): boolean {
     if (!ac.on) return false;
+    // Amp evidence retired the window early (shell: a deleted `rampUntil`).
+    if (ac.rampReleased) return false;
     // The WINDOW, not the sim's physical ramp — see AC_RAMP_MS. Absorption is
     // what retires the debit inside it, exactly as in the shell.
     if (ac.turnedOnAt > 0 && this.now - ac.turnedOnAt < AC_RAMP_MS) return true;
@@ -588,6 +647,11 @@ export class Scenario {
     ac.shadowLevel = level;
     this.startRamp(ac);
     this.freshlyOn.push(deviceId);
+    // Shell parity (controller.noteExternalOn): an automation/user ON the leveler
+    // did not command — the swap donor shield (invariant 42/57) AND the end of any
+    // restore bounce episode for this room (`clearBounces`, 2026-08-07).
+    ac.externalOnAt = this.now;
+    this.pacing = clearBounces(this.pacing, deviceId);
     // Mirror the shell: a turn-on opens a start window on EITHER source,
     // anchored on the house load measured just before the compressor started.
     // Grid uses it to lift to the ceiling, gen to clamp down to the floor.
@@ -609,7 +673,12 @@ export class Scenario {
     // and the relative collapse floor would otherwise read it as a trip.
     if (this.line !== "none" && ac.on && !ac.shed) {
       const draw = this.drawOf(ac);
-      if (draw > 0) this.meterState = noteCommandedCut(this.meterState, draw, this.now);
+      if (draw > 0) {
+        this.meterState = noteCommandedCut(this.meterState, draw, this.now);
+        // Shell parity: an observed off is a peer removal for any bounce-extended
+        // shed bar (invariant 54's release valve, 2026-08-07).
+        this.creditPeerShedBars(draw, new Set([deviceId]));
+      }
     }
     ac.on = false;
     ac.physicalOn = false;
@@ -618,6 +687,9 @@ export class Scenario {
     ac.startBaseline = null;
     ac.rampBaseline = null;
     ac.rampAbsorbed = 0;
+    ac.rampReleased = false;
+    ac.rampGrowthAt = 0;
+    ac.rampGrowthAbsorbed = 0;
     ac.turnedOnAt = 0;
     ac.powerEventRamp = false;
     ac.rampHeldUntil = 0;
@@ -691,6 +763,12 @@ export class Scenario {
       ac.pendingShadowOn = null;
       ac.on = true;
       this.freshlyOn.push(ac.setup.deviceId);
+      // Shell parity: the controller learns of an external ON at THIS flip (its
+      // structural off→on scan), which is where it stamps the donor shield
+      // (invariant 42/57), not when the compressor physically started — and the
+      // end of any restore bounce episode for it (`clearBounces`, 2026-08-07).
+      ac.externalOnAt = this.now;
+      this.pacing = clearBounces(this.pacing, ac.setup.deviceId);
       const view = meterView(this.meterState, this.now);
       if (this.line !== "none" && view.sampleCount >= 2) {
         ac.startBaseline = { amps: view.smoothedAmps, until: this.now + GRID_START_MS };
@@ -744,6 +822,41 @@ export class Scenario {
    */
   measuredHouseAmps(): number {
     return houseLoadAmps(this.houseLoad, this.line, this.now, this.buildViews());
+  }
+
+  /** The effective shed bar for this room right now (introspection). */
+  effectiveShedBar(deviceId: string): number {
+    return this.shedBarValue(deviceId);
+  }
+
+  /**
+   * Shell parity for `controller.shedBarFor`: the bar a room's own shed left,
+   * expiring at `barPersistMs` (a blame window, or the compounded backoff while
+   * it bounces) and reduced by any peer removal since it was stamped.
+   */
+  private shedBarValue(deviceId: string): number {
+    const bar = this.shedBar.get(deviceId);
+    if (bar == null) return 0;
+    if (this.now - bar.at > barPersistMs(this.pacing, deviceId)) {
+      this.shedBar.delete(deviceId);
+      return 0;
+    }
+    return Math.max(0, bar.amps - bar.credited);
+  }
+
+  /**
+   * Shell parity for `controller.creditPeerShedBars`: a peer's removal shrinks
+   * the house every OTHER bounce-extended bar describes, priced by the same
+   * figure fed to `noteCommandedCut`. Scoped to bounce-persisting bars.
+   */
+  private creditPeerShedBars(amps: number, except: ReadonlySet<string>): void {
+    if (!(amps > 0)) return;
+    for (const [id, bar] of this.shedBar) {
+      if (except.has(id)) continue;
+      if (restoreBounces(this.pacing, id) < 1) continue;
+      if (this.now - bar.at > barPersistMs(this.pacing, id)) continue;
+      bar.credited += amps;
+    }
   }
 
   // ---- simulation core ----
@@ -971,6 +1084,9 @@ export class Scenario {
           0,
         ),
         reshedPenalized: reshedPenalized(this.pacing, ac.setup.deviceId, this.now),
+        // Shell parity (controller.externalOnAt): a room a human just switched
+        // on is shielded from the proactive swap (invariant 42/57).
+        recentlyExternalOn: this.now < ac.externalOnAt + EXTERNAL_ON_DONOR_SHIELD_MS && ac.externalOnAt > 0,
       };
     });
   }
@@ -1208,6 +1324,7 @@ export class Scenario {
 
     // FLOORS / GRID_FULL exit checks against confirmed shadows + ramps.
     const views = this.buildViews();
+    const view = meterView(this.meterState, this.now);
     const onManaged = views.filter((v) => v.on && v.managed && !v.shed);
     this.modeState = clearFloorsIfDone(this.modeState, {
       allConfirmedAtFloor: onManaged.every((v) => v.currentLevel > 0 && v.currentLevel <= floorOf(v)),
@@ -1219,10 +1336,23 @@ export class Scenario {
       ),
       anyShedPending: views.some((v) => v.managed && v.shed && !v.on),
     });
+    // Shell parity (`clearSettleIfDone`, 2026-08-08): end the settle window early
+    // once the meter has digested the batch — no commanded fall still landing and
+    // nothing owed on the spend side (`rampDebitAmps`). Only ever shortens it.
+    const settleLine = this.line;
+    if (settleLine !== "none") {
+      this.modeState = clearSettleIfDone(
+        this.modeState,
+        {
+          commandedCutTotalAmps: view.commandedCutTotalAmps,
+          unabsorbedSpendAmps: rampDebitAmps(views, view.smoothedAmps, this.cfg, settleLine),
+        },
+        this.now,
+      );
+    }
     this.modeState = { ...this.modeState, collapsed: this.meterState.collapse != null };
 
     const mode = deriveMode(this.modeState, this.now);
-    const view = meterView(this.meterState, this.now);
     // Shell parity (controller.tick): the planner does NOT get told `nonAcAmps`
     // — it must MEASURE the split off the simulated meter exactly the way the
     // shell does. Handing it the sim's ground truth would be the scenario.ts
@@ -1282,16 +1412,9 @@ export class Scenario {
       // has seen none of it yet.
       recoveryAdmission: this.now < this.recoveryAdmissionUntil,
       // Shell parity: a room's own shed leaves a hole its restore must not read
-      // as headroom, for a full blame window (R9).
-      shedBarAmps: (deviceId) => {
-        const bar = this.shedBar.get(deviceId);
-        if (bar == null) return 0;
-        if (this.now - bar.at > ATTEMPT_BLAME_WINDOW_MS) {
-          this.shedBar.delete(deviceId);
-          return 0;
-        }
-        return Math.max(0, bar.amps);
-      },
+      // as headroom, for a full blame window — or the compounded backoff while
+      // it bounces (R9, invariant 54, 2026-08-07), less any peer removal since.
+      shedBarAmps: (deviceId) => this.shedBarValue(deviceId),
       // Shell parity (`controller.swapInFlightFor`): the trade ends when the
       // receiver is back, or at SWAP_RESERVATION_MS — never on a bare clock
       // while the room it is holding amps for is still off.
@@ -1374,17 +1497,22 @@ export class Scenario {
       }
       // Shell parity (R9): stamp the bar each shed leaves behind, from the
       // PRE-batch meter less what the batch was priced to save.
+      const shedThisBatch = new Set<string>();
       for (const cmd of out.commands) {
         if (cmd.kind !== "power_off") continue;
-        this.shedBar.set(cmd.deviceId, { amps: view.smoothedAmps - out.commandedCutAmps, at: this.now });
+        this.shedBar.set(cmd.deviceId, { amps: view.smoothedAmps - out.commandedCutAmps, at: this.now, credited: 0 });
+        shedThisBatch.add(cmd.deviceId);
       }
+      // …and credit that removal to every OTHER bounce-extended peer bar.
+      this.creditPeerShedBars(out.commandedCutAmps, shedThisBatch);
       // Failure attribution: a reduction that undoes a recent raise/restore is
       // that attempt's failure (the bounce, hybrid-backoff side).
       for (const cmd of out.commands) {
         if (cmd.kind === "set_level" || cmd.kind === "power_off") {
           for (const kind of ["raise", "restore"] as const) {
             if (out.reason.startsWith("over") && attemptedRecently(this.pacing, cmd.deviceId, kind, this.now)) {
-              this.pacing = noteFailure(this.pacing, cmd.deviceId, kind, this.now);
+              // Shell parity: only a genuine `power_off` re-shed books a bounce.
+              this.pacing = noteFailure(this.pacing, cmd.deviceId, kind, this.now, cmd.kind === "power_off");
               // A failed attempt must not be graded a success later.
               this.attempts = this.attempts.filter(
                 (a) => !(a.deviceId === cmd.deviceId && a.kind === kind),

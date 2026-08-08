@@ -282,6 +282,13 @@ export interface Plan {
   decisions: Decision[];
   /** Reason tag for the journal ("over_mild", "over_severe", "floors", "raise", …). */
   reason: string;
+  /**
+   * Shed rooms refused this evaluation ONLY by the supply-flicker margin (they
+   * fit the bare restore ceiling — see `FLICKER_PATIENCE_MS`). The shell anchors
+   * these so a sustained flicker-only refusal eventually admits at the bare
+   * ceiling; absent/undefined outside the raise phase.
+   */
+  flickerRefused?: string[];
 }
 
 /** Pressure assessment for one evaluation. */
@@ -533,4 +540,19 @@ export interface AcView {
   unmeteredJumpAmps: number;
   /** A recent restore of this AC failed (backoff live) — re-shedding it is penalized. */
   reshedPenalized: boolean;
+  /**
+   * A human turned this room ON within the last `EXTERNAL_ON_DONOR_SHIELD_MS`
+   * (bare power button, dashboard, remote, or automation — anything the leveler
+   * did not command). SHIELDS it from being picked as a proactive-shed DONOR:
+   * "manual wins" (invariant 42) must cover the power button for the COMFORT
+   * tool, which may never un-do a human's explicit ON (invariant 57 — the swap
+   * is "a comfort optimisation, never an emergency tool"). Live 2026-08-06
+   * 18:35–19:14Z: the leveler shed the priority-#1 room, a household member
+   * turned it back on three times, and the swap re-selected it as donor and shed
+   * it again TWICE (#9224/#9228). Only `swapDonorFor` reads it — an ordinary
+   * overload shed of a manual-ON room stays allowed (invariant 43's causer
+   * logic depends on it). Optional/defaults false: view producers that never
+   * arm a swap need not set it.
+   */
+  recentlyExternalOn?: boolean;
 }

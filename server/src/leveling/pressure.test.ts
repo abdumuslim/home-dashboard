@@ -84,6 +84,43 @@ describe("requiredSavingsAmps", () => {
     const v = view({ overLimitReadings: [15.4], flickerAmps: 1.5, smoothedAmps: 15.6 });
     expect(requiredSavingsAmps(v, 15, 0.1)).toBeCloseTo(0.7);
   });
+
+  it("a lone banked inrush reading does not size the deficit (#9343 2026-08-07)", () => {
+    // Live #9343: one ~17.84A compressor-inrush sample banked while the SMOOTHED
+    // mean sat 12.675A against a 14A limit, flicker 0 (a lone non-reverting spike
+    // is no excursion the estimator sees). `median([17.84]) − 14 − 0` sized a
+    // 3.94A deficit that read "extreme" on the sole strength of that one sample,
+    // and a 2-ton room went off with 1.3A of real headroom. With the mean under
+    // the limit the honest floor is the margin — one raw reading is not a median.
+    const spike = view({ overLimitReadings: [17.84], smoothedAmps: 12.675, flickerAmps: 0 });
+    expect(requiredSavingsAmps(spike, 14, 0.1)).toBeCloseTo(0.2); // max(0.1, −1.325) + 0.1
+    // The old rule, for the record: 17.84 − 14 + 0.1.
+    expect(requiredSavingsAmps(spike, 14, 0.1)).not.toBeCloseTo(3.94);
+  });
+
+  it("two banked readings that are not both severe still fall to the floor", () => {
+    // #9308: not a streak (the newest reading is mild) and short of
+    // OVER_MEDIAN_MIN_READINGS, so the median — which would time 15.795 off two
+    // readings — may not speak; the 13.215A mean is the floor.
+    const v = view({ overLimitReadings: [16.39, 15.2], smoothedAmps: 13.215, flickerAmps: 0 });
+    expect(requiredSavingsAmps(v, 15, 0.1)).toBeCloseTo(0.2); // max(0.1, −1.785) + 0.1
+    expect(requiredSavingsAmps(v, 15, 0.1)).not.toBeCloseTo(0.895); // the old median sizing
+  });
+
+  it("three banked readings size from the median exactly as before", () => {
+    // At OVER_MEDIAN_MIN_READINGS the median can no longer be a single transient,
+    // so its flicker-discounted term sizes the deficit unchanged.
+    const v = view({ overLimitReadings: [15.6, 15.8, 15.7], smoothedAmps: 13.0, flickerAmps: 0 });
+    expect(requiredSavingsAmps(v, 15, 0.1)).toBeCloseTo(0.8); // median 15.7 − 15 + 0.1
+  });
+
+  it("two banked readings that ARE both severe still size from their min", () => {
+    // The streak branch is untouched by OVER_MEDIAN_MIN_READINGS: two severe
+    // readings are a genuine fast overload, not a lone spike, so min(severe)
+    // speaks even though the mean sits well under the limit.
+    const streak = view({ overLimitReadings: [17.0, 17.2], smoothedAmps: 13.0, flickerAmps: 0 });
+    expect(requiredSavingsAmps(streak, 15, 0.1)).toBeCloseTo(2.1); // 17.0 − 15 + 0.1
+  });
 });
 
 describe("assessPressure", () => {

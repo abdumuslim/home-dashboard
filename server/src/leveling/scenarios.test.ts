@@ -620,8 +620,14 @@ describe("fans are last-resort trim (57% of v1 fan cuts fired with level cuts av
     // 2026-07-26 gen trip. So the fan climbs back only once that window clears.
     s.advance(300);
     expect(s.commandsSince(t1, "set_fan").length).toBeGreaterThanOrEqual(1);
-    // …and it still never bounced inside the calm gate (the v1 61s failure).
-    expect(s.commandsSince(t1, "set_fan")[0].at - t1).toBeGreaterThan(60_000);
+    // …and it still never bounced inside the anti-bounce window, measured from
+    // the CUT — which is what that window is anchored to. `t1` is the load drop,
+    // and the old "> 60s after t1" reading of it was a proxy that the generous
+    // -budget fast path (2026-08-06) breaks without breaking the guard: this
+    // house frees ~1.8A, so the restore owes FAN_RESTORE_AFTER_CUT_FAST_MS from
+    // the cut rather than the full 120s, and lands 55s after the drop.
+    const cutAt = s.commandsSince(t0, "set_fan")[0].at;
+    expect(s.commandsSince(t1, "set_fan")[0].at - cutAt).toBeGreaterThanOrEqual(60_000);
   });
 });
 
@@ -832,7 +838,7 @@ describe("the 2026-07-24 restore-vs-raise incident (15A gen)", () => {
     expect(s.totalAmps()).toBeLessThanOrEqual(14.9);
   });
 
-  it("a gentle restore holds the fan at 1, then climbs back to auto after the long calm", () => {
+  it("a gentle restore holds the fan at 1 through its own ramp, then climbs back to auto", () => {
     const s = new Scenario(
       cfg,
       [
@@ -846,11 +852,20 @@ describe("the 2026-07-24 restore-vs-raise incident (15A gen)", () => {
     const restore = s.commandsSince(t0, "power_on").find((c) => c.cmd.deviceId === "najat");
     expect(restore).toBeDefined();
     expect((restore!.cmd as Extract<Command, { kind: "power_on" }>).fan).toBe(1);
-    // Fan stays pinned through the short term (< the calm gate)…
+    // Fan stays pinned while the compressor is still ramping — NOT released by
+    // the calm gate alone (2026-08-06 14:03:20Z: that release pushed a restored
+    // room back over the limit and cost a second room its compressor). The
+    // fan-restore self-skip (invariant 59) keys on `ramping`, so the pin holds
+    // for as long as the room is inside its ramp.
     s.advance(40);
     expect(s.commandsSince(restore!.at, "set_fan")).toHaveLength(0);
-    // …and climbs back toward auto once the calm gate passes.
-    s.advance(60);
+    // …and climbs back toward auto once the ramp is PROVEN settled. Amp evidence
+    // now retires the ramp window before its 240s clock (2026-08-08): this fast
+    // 1-ton lands and plateaus in ~30s + the 45s stall, so the pin releases
+    // ~95s after the restore rather than at four minutes — but only AFTER the
+    // compressor has demonstrably landed, which is what preserves the 08-06
+    // protection (the release is not mid-ramp, it is post-plateau).
+    s.advance(90);
     expect(s.commandsSince(restore!.at, "set_fan").length).toBeGreaterThanOrEqual(1);
   });
 });
@@ -1590,7 +1605,7 @@ describe("the 2026-08-01 phantom house (a turn-off books its own decay)", () => 
 // the hot room climbs in the next calm window, and the trade never reverses
 // while the need ordering holds.
 describe("the 2026-08-01 level rebalance (the extra level follows the hotter room)", () => {
-  it("hands Najat's extra level to a hotter 2-ton Abdu — demote first, raise after it lands, no churn", () => {
+  it("hands Najat's extra level to a hotter 2-ton Abdu — demote and raise in one batch, no churn", () => {
     const s = new Scenario(
       cfg,
       [
@@ -1603,13 +1618,15 @@ describe("the 2026-08-01 level rebalance (the extra level follows the hotter roo
     s.advance(8 * 60);
     expect(s.sim("najat").level).toBe(1);
     expect(s.sim("abdu").level).toBe(2);
-    // Invariant 9: the donor's cut ships before the raise, never together.
+    // One batch (2026-08-08 instant sequencing): the donor's demote and the raise
+    // it funds ship TOGETHER, the demote's fall credited so the meter cannot read
+    // it as a trip.
     const cmds = setLevels(s, t0);
     const demote = cmds.find((c) => c.cmd.deviceId === "najat" && c.cmd.level === 1);
     const raise = cmds.find((c) => c.cmd.deviceId === "abdu" && c.cmd.level === 2);
     expect(demote).toBeDefined();
     expect(raise).toBeDefined();
-    expect(raise!.at).toBeGreaterThan(demote!.at);
+    expect(raise!.at).toBe(demote!.at);
     expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps);
     // Settled: the needs still order the same way, so the trade must hold.
     const settled = s.commandsSince(t0, "set_level").length;
@@ -1946,11 +1963,15 @@ describe("the 2026-08-06 heater episode — the gated proactive shed", () => {
     const offs = s.commandsSince(t0, "power_off");
     expect(offs).toHaveLength(1);
     expect(offs[0].cmd.deviceId).toBe("najat");
-    // Invariant 9: the off ships in a batch of its own. The receiver's whole
-    // compressor may not be committed against a saving that has not landed.
+    // ONE batch (2026-08-08 instant sequencing): the donor's off and the
+    // receiver's gentle restore ship TOGETHER — the off-cliff reaches the meter
+    // in ~10-40s while the receiver's compressor engages minutes later, so the
+    // two never overlap on the line, and the off's fall is credited so it cannot
+    // latch a phantom collapse.
     const swapBatch = s.plans.find((p) => p.reason === "proactive_shed");
     expect(swapBatch?.commands).toEqual([
       { deviceId: "najat", kind: "power_off", reason: "shed" },
+      { deviceId: "abdu", kind: "power_on", level: 1, reason: "restore", fan: 1 },
     ]);
     expect(swapBatch?.swap).toEqual({ donorId: "najat", receiverId: "abdu" });
     // …and it says so, in the journal the user reads.
@@ -1963,7 +1984,7 @@ describe("the 2026-08-06 heater episode — the gated proactive shed", () => {
     );
   });
 
-  it("brings the hot room back within a few minutes, once the saving is on the meter", () => {
+  it("brings the hot room back in the SAME batch as the off, once the trade is priced", () => {
     const s = new Scenario(cfg, scene(), { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" });
     const t0 = s.now;
     s.advance(5 * 60);
@@ -1971,27 +1992,25 @@ describe("the 2026-08-06 heater episode — the gated proactive shed", () => {
     expect(ons).toHaveLength(1);
     expect(ons[0].cmd.deviceId).toBe("abdu");
     const off = s.commandsSince(t0, "power_off")[0];
-    // Minutes, not the seventeen the live house waited — and never in the same
-    // batch as the off.
-    expect(ons[0].at).toBeGreaterThan(off.at);
-    expect(ons[0].at - off.at).toBeLessThan(3 * 60_000);
+    // One batch (2026-08-08): the receiver returns TOGETHER with the donor's off,
+    // sparing it the 17 minutes — and the 36s-plus committed-meter wait — the
+    // live house sat out.
+    expect(ons[0].at).toBe(off.at);
   });
 
-  it("reserves the freed amps — no peer raise steals them between the off and the restore", () => {
+  it("commits the freed amps to the receiver in one batch — no peer raise steals them", () => {
     const s = new Scenario(cfg, scene(), { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" });
     const t0 = s.now;
     s.advance(5 * 60);
-    const off = s.commandsSince(t0, "power_off")[0];
-    const on = s.commandsSince(t0, "power_on")[0];
-    // Abdullah is the HOTTEST room in the house and would happily take 1.6A of
-    // the trade. Nothing moves a level in the window the reservation covers.
-    const between = setLevels(s, off.at).filter((e) => e.at <= on.at);
-    expect(between).toEqual([]);
-    expect(
-      s.plans.some((p) =>
-        p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "swap landing"),
-      ),
-    ).toBe(true);
+    // Abdullah is the HOTTEST room in the house and would happily take the 1.6A
+    // the trade frees. The swap ships the off and the receiver's restore as one
+    // batch and returns, so the raise phase never runs against those amps — the
+    // receiver is committed, not stealable.
+    const swapBatch = s.plans.find((p) => p.reason === "proactive_shed");
+    expect(swapBatch?.commands.some((c) => c.deviceId === "abdullah")).toBe(false);
+    // Abdullah never climbs off its floor onto the freed budget.
+    expect(setLevels(s, t0).filter((e) => e.cmd.deviceId === "abdullah")).toEqual([]);
+    expect(s.sim("abdullah").level).toBe(1);
   });
 
   it("holds the donor off until the heater releases — then restores it, with no oscillation", () => {
@@ -2089,5 +2108,513 @@ describe("the 2026-08-06 heater episode — the gated proactive shed", () => {
       const batch = s.plans.find((p) => p.commands.includes(e.cmd));
       expect(batch?.reason).toMatch(/^over_/);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-06 13:12-13:34Z, the user's own report: "the fan keeps bouncing".
+// The house was saturated at the generator limit with a ~5A heater running:
+// Abdullah at his L2 boost floor, Najat L1, Abdu L1 — ~10.2A modeled against a
+// 14.9A ceiling — and the measured supply flicker was 0.96A. Every rung but the
+// fan was already spent (invariant 17 satisfied), so the cycle ran roughly every
+// five minutes: mean creeps over -> over_mild -> trim a fan -> meter dips ->
+// calm -> `planFanRestore` hands the gear straight back at `cost <= headroom` ->
+// mean back inside the flicker band of the limit -> the next compressor/house
+// coincidence crosses -> trim again. Abdu's fan was commanded ten times in
+// twenty-two minutes (7->6->7->2->3->5->7->5->1->3->4->6->7), Abdullah's five.
+//
+// Every individual rule behaved as specified; together they are a limit cycle,
+// which is a bug by the user's standing rule (SETTLE, do not bounce). What
+// nothing charged was the live flicker: handing 0.2-0.6A back into a mean
+// sitting 0.7-1.1A under the ceiling, on a line that wobbles ±1A, guarantees
+// the re-cross.
+describe("2026-08-06 fan bounce: a restored fan may not re-enter the flicker band of the limit", () => {
+  // Model floors: abdullah L2 4.1, najat L1 2.7, abdu L1 4.5. Sim floors:
+  // 3.9 + 2.2 + 4.1 = 10.2A drawn, plus 0.7A of fan extras at 7/5/5.
+  const HOUSE_HEATER = 3.0; // ≈ 13.9A total — 0.9A under the 14.8A ceiling
+  const HOUSE_CROSSING = 4.1; // ≈ 15.0A — the coincidence that starts an episode
+  const HOUSE_HEATER_OFF = 1.0; // ≈ 11.6A — genuine, durable room
+
+  // What the meter actually taught the book that afternoon: the climb back to
+  // the original gear graded +0.64A, i.e. a gear is ~0.2A, not the 0.1A seed
+  // default. Load-bearing for this regression — at the seed price a gear costs
+  // less than the flicker estimate's own tick-to-tick wobble, and the sim can
+  // sneak a step through on a low tick that the live house never had.
+  const fanBook = Object.fromEntries(
+    ["abdu", "abdullah", "najat"].map((id) => [
+      `${id}|gen|fan:step`,
+      { ewmaAmps: 0.2, samples: 4, updatedAt: 1_000_000_000 },
+    ]),
+  );
+
+  const saturated = (): Scenario =>
+    new Scenario(
+      cfg,
+      [
+        { ...ABDULLAH, level: 2, minLevel: 2, demandAmps: 3.9, needDelta: 3, fan: 5 },
+        { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1, fan: 5 },
+        { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 2, fan: 7 },
+      ],
+      { nonAcAmps: HOUSE_HEATER, source: "gen", seed: 20260806, book: { ...fanBook } },
+    );
+
+  const ROOMS = ["abdu", "abdullah", "najat"] as const;
+  const fansOf = (s: Scenario): Record<string, number> =>
+    Object.fromEntries(ROOMS.map((id) => [id, s.sim(id).fan]));
+
+  /**
+   * Settle on the flickering line, then drive ONE mild crossing so the reducer
+   * — with every level already at its floor — takes the only rung it has left.
+   * Returns the fans as they stood before the trim, so each assertion can name
+   * the room the reducer actually chose rather than assuming one.
+   */
+  const trimAFan = (s: Scenario): { at: number; before: Record<string, number> } => {
+    s.advance(120);
+    // The live line: mostly quiet with a periodic reading a full amp high.
+    s.setFlicker({ baseAmps: 0.15, spikeAmps: 0.9, spikeEveryN: 4 });
+    s.advance(120);
+    const at = s.now;
+    const before = fansOf(s);
+    s.setNonAc(HOUSE_CROSSING);
+    s.advance(90);
+    s.setNonAc(HOUSE_HEATER);
+    return { at, before };
+  };
+
+  it("ACCEPTANCE: the trimmed fan stays down while the mean rides within flicker of the limit", () => {
+    const s = saturated();
+    const { at, before } = trimAFan(s);
+    expect(s.commandsSince(at, "set_fan").length).toBeGreaterThanOrEqual(1);
+    const trimmed = ROOMS.filter((id) => s.sim(id).fan < before[id]);
+    expect(trimmed.length).toBeGreaterThanOrEqual(1);
+
+    // Thirty minutes of exactly the house that produced the ten commands.
+    const t1 = s.now;
+    s.advance(30 * 60);
+    const churn = s.commandsSince(t1, "set_fan").map((e) => `${(e.at - t1) / 1000}s ${JSON.stringify(e.cmd)}`);
+    expect(churn, churn.join("\n")).toHaveLength(0);
+    // …and nobody was switched off to buy the quiet, either.
+    expect(s.commandsSince(t1, "power_off")).toEqual([]);
+    for (const id of trimmed) expect(s.sim(id).fan).toBeLessThan(before[id]);
+  });
+
+  it("RECOVERY: the heater goes off and the trimmed fan climbs all the way back", () => {
+    // The opposite bug is a fan stranded down forever. Once the house is
+    // genuinely, durably small the flicker charge is small change against 3A of
+    // room, and the bounded sweet-spot climb walks the gear back to original.
+    const s = saturated();
+    const { before } = trimAFan(s);
+    s.advance(5 * 60);
+    const trimmed = ROOMS.filter((id) => s.sim(id).fan < before[id]);
+    expect(trimmed.length).toBeGreaterThanOrEqual(1);
+    s.setNonAc(HOUSE_HEATER_OFF);
+    const t1 = s.now;
+    s.advance(8 * 60);
+    expect(s.commandsSince(t1, "set_fan").length).toBeGreaterThanOrEqual(1);
+    for (const id of trimmed) expect(s.sim(id).fan).toBe(before[id]);
+  });
+
+  it("FAST PATH: with the house genuinely small the whole swing comes back inside two minutes", () => {
+    // The user, same afternoon: "there is enough budget but the fan speed is
+    // taking too long … the fan speed is barely taking cost, so putting all at
+    // speed 1 is only just a last emergency action". The RECOVERY test above
+    // proves the fan comes home; this one prices how LONG that may take when
+    // the budget covers the entire remaining swing with an amp to spare — one
+    // batch, not the ~5 minutes of stacked time gates the bounded climb owes.
+    // The ACCEPTANCE case is the proof this cannot resurrect the bounce: there
+    // `spendable` never reaches swing + margin, so the fast path is unreachable
+    // by arithmetic rather than by a gate.
+    const s = saturated();
+    const { at, before } = trimAFan(s);
+    const cuts = s.commandsSince(at, "set_fan");
+    expect(cuts.length).toBeGreaterThanOrEqual(1);
+    const lastCut = cuts[cuts.length - 1].at;
+    const trimmed = ROOMS.filter((id) => s.sim(id).fan < before[id]);
+    expect(trimmed.length).toBeGreaterThanOrEqual(1);
+    // The heater goes off for good — a real, durable room, not a dip. ~11.2A
+    // against the 14.8A ceiling, so the 0.4A that is owed back is small change
+    // even after the 0.9A flicker charge.
+    s.setNonAc(HOUSE_HEATER_OFF);
+    // 100s: short of the 120s the after-cut gate alone owes on the thin path
+    // (live here it restored at exactly +120s), long enough for the 60s calm
+    // gate the fast path still pays in full.
+    while (s.now < lastCut + 100_000) s.advance(10);
+    for (const id of trimmed) {
+      expect(s.sim(id).fan, `${id} still short at +${(s.now - lastCut) / 1000}s`).toBe(before[id]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-06 14:00-14:04Z, the user's question: "why did it turn off both Najat
+// and Abdullah, when Najat-only-off was fine?"
+//
+// The same saturated generator afternoon, two hours after the fan bounce and on
+// the same flickering line. Every level was at its floor and the fans were
+// already trimmed, so the ladder's only remaining rung was a room:
+//
+//   14:00:32  mild overload -> Najat shed (coolest). Meter fell to 11.6A. This
+//             state was STABLE - the end state proved Najat-only-off was enough.
+//   14:01:06  34s later the restore path bought her straight back: committed
+//             max(smoothed 11.63, cutAnchor 14.42 - cut 2.3) = 12.12, probe cost
+//             2.3 -> 14.42A against a 14.9A ceiling. Admitted with 0.48A to
+//             spare, on a line flickering +/-0.4-0.8A.
+//   14:02:15  Abdullah's held fan restored to auto (+~0.6A).
+//   14:03:20  Najat's own held fan restored to auto 134s into HER OWN ramp
+//             (+~0.5A) - the hold whose doc comment already claimed to pin the
+//             fan "while the compressor is still ramping".
+//   14:04:10  smoothed 15.3 -> Najat re-shed (invariant 43, undo the turn-on).
+//   14:04:24  still 15.5 and RISING - her own cut had not crossed the 8-wide
+//             median, the commanded-cut credit was revoked by the rising meter
+//             (invariant 38, correctly), and there was no sub-floor rung in that
+//             heat (invariant 51) -> ABDULLAH shed too.
+//
+// Abdullah's off/on cycle was pure loss, and a single off/on cycle costs a room
+// several degrees. A restore that cannot survive is strictly worse than a
+// restore that waits, so the restore admission now charges the MEASURED flicker
+// as margin - a quiet line charges nothing and stays exactly as aggressive.
+// ---------------------------------------------------------------------------
+describe("2026-08-06 double shed: a restore may not buy back the trough its own shed dug", () => {
+  const HOUSE_HEATER = 5.4; // the ~5A heater of that afternoon
+  const HOUSE_HEATER_OFF = 1.5; // it cycles off, and the room is real again
+
+  /**
+   * The house at 14:00: three rooms at L1 (their floor), fans already trimmed to
+   * 1 by the earlier episode, and the heater on. 5.4 + 4.1 + 2.2 + 3.5 = 15.2A
+   * against a 14.9A limit — an overload the level and fan rungs cannot touch.
+   *
+   * Two modelling notes, both live evidence rather than convenience:
+   *
+   *  - Najat's L1 cap is 3.5A here against her 2.7A gen model. That gap IS the
+   *    incident (and invariant 3's own: "three fan-pinned restores of Najat
+   *    admitted at her steady 2.3A each ramped the meter +3.5-3.8A"). Without
+   *    it a restore priced at the model would settle exactly where admission
+   *    said, and no bounce is possible in either direction.
+   *  - Every room is at target (`needDelta` inside `nearTargetBandC`), so
+   *    `ceilOf` caps them at L1 and nobody competes for a level. The restore is
+   *    then the only spender in the house, which is what makes this regression
+   *    about the restore admission and nothing else.
+   */
+  const saturated = (): Scenario =>
+    new Scenario(
+      cfg,
+      [
+        { ...ABDULLAH, level: 1, demandAmps: 3.5, needDelta: 0.4, roomTempC: 29.0, fan: 1 },
+        { ...ABDU, level: 1, demandAmps: 6.0, needDelta: 0.4, roomTempC: 28.0, fan: 1 },
+        {
+          ...NAJAT,
+          level: 1,
+          capAmps: [3.5, 3.9, 5.3],
+          demandAmps: 3.5,
+          needDelta: 0.4,
+          roomTempC: 26.5,
+          fan: 1,
+          rampSeconds: 120,
+        },
+      ],
+      { nonAcAmps: HOUSE_HEATER, source: "gen", seed: 20260806 },
+    );
+
+  /** The live line: mostly quiet, with a periodic reading a full amp high. */
+  const flickering = (s: Scenario): void =>
+    s.setFlicker({ baseAmps: 0.15, spikeAmps: 0.9, spikeEveryN: 4 });
+
+  /** Run until the ladder reaches its last rung and switches a room off. */
+  const shedOne = (s: Scenario): { at: number; victim: string } => {
+    flickering(s);
+    const t0 = s.now;
+    s.advance(6 * 60);
+    const offs = s.commandsSince(t0, "power_off");
+    expect(offs, JSON.stringify(offs.map((e) => e.cmd))).toHaveLength(1);
+    return { at: offs[0].at, victim: offs[0].cmd.deviceId };
+  };
+
+  it("ACCEPTANCE: the shed room is not bought back into the flicker band, and no second room follows", () => {
+    const s = saturated();
+    const { at, victim } = shedOne(s);
+    // The coolest room, as the user's own policy says (26.5°C vs 28.0 and 29.0).
+    expect(victim).toBe("najat");
+
+    // Fifteen minutes of exactly the house that produced the double shed.
+    s.advance(15 * 60);
+    const ons = s.commandsSince(at, "power_on");
+    // …strictly AFTER the shed itself (`commandsSince` is inclusive).
+    const offs = s.commandsSince(at + 1, "power_off");
+    const churn = [...ons, ...offs]
+      .sort((x, y) => x.at - y.at)
+      .map((e) => `${(e.at - at) / 1000}s ${JSON.stringify(e.cmd)}`);
+    // A restore is allowed — what is forbidden is one that cannot survive. If
+    // the room came back, NOTHING may be switched off behind it.
+    for (const on of ons) {
+      expect(offs.filter((o) => o.at > on.at), churn.join("\n")).toEqual([]);
+    }
+    // …and the shape the user actually saw: two rooms off inside a minute.
+    const allOffs = [{ at, cmd: { deviceId: victim } }, ...offs];
+    const doubles = allOffs.filter((o, i) =>
+      allOffs.some((p, j) => j > i && p.at - o.at < 60_000),
+    );
+    expect(doubles, churn.join("\n")).toEqual([]);
+    // The end state the live house proved sufficient: one room off, two running.
+    expect(s.acsOn()).toEqual(["abdu", "abdullah"]);
+  });
+
+  it("RECOVERY: the heater releases and the shed room comes back promptly", () => {
+    // The opposite bug, and the user's primary complaint class: a room stranded
+    // off. The charge is a margin against a MEASURED wobble, not a new gate —
+    // once the house is genuinely small it is small change against 4A of room.
+    const s = saturated();
+    const { victim } = shedOne(s);
+    // Still off six minutes on: the flicker charge holds while the house is
+    // saturated. What follows is the other half of the bargain.
+    expect(s.acsOn()).not.toContain(victim);
+    s.setNonAc(HOUSE_HEATER_OFF);
+    const t1 = s.now;
+    s.advance(8 * 60);
+    expect(s.commandsSince(t1, "power_on").map((e) => e.cmd.deviceId)).toEqual([victim]);
+    expect(s.commandsSince(t1, "power_off")).toEqual([]);
+    expect(s.acsOn()).toEqual(["abdu", "abdullah", "najat"]);
+  });
+});
+
+describe("2026-08-06 14:38Z: decimals must not shed the top-priority room", () => {
+  // Najat already shed from the earlier episode; Abdullah (priority #1) and Abdu
+  // (priority #3) both at their L1 floor with their fans already trimmed, and a
+  // heater holding the non-AC house near 10A. 2.2 + 4.1 + 9.8 = 16.1A on a 14.9A
+  // gen — 1.2A over, with no level and no fan rung left on either room.
+  //
+  // Both rooms are hot to within a couple of tenths, and the thermometer-only
+  // rule of 2026-08-04 answered that by shedding ABDULLAH, because Abdu ranked
+  // 0.2°C higher and the comparator rounds shedNeed to a tenth. The user's rule
+  // that afternoon: inside SHED_NEED_GAP_C the two are "equally hot" and the
+  // priority list decides — the top-priority room survives.
+  const HOUSE_WITH_HEATER = 9.8;
+  const scene = (abdullahTempC: number, abduTempC: number): SimAcSetup[] => [
+    {
+      ...ABDULLAH,
+      level: 1,
+      fan: 1,
+      demandAmps: 3.5,
+      needDelta: abdullahTempC - cfg.comfortTargetC,
+      roomTempC: abdullahTempC,
+    },
+    { ...NAJAT, level: 1, fan: 1, shed: true, demandAmps: 3.0, needDelta: 0.5, roomTempC: 26.5 },
+    {
+      ...ABDU,
+      level: 1,
+      fan: 1,
+      demandAmps: 6.0,
+      needDelta: abduTempC - cfg.comfortTargetC,
+      roomTempC: abduTempC,
+    },
+  ];
+
+  it("sheds Abdu, not Abdullah, when the two are a couple of tenths apart", () => {
+    // 30.0 vs 30.2 — real needs 4.0 and 4.2, the live shape.
+    const s = new Scenario(cfg, scene(30.0, 30.2), { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" });
+    const t0 = s.now;
+    s.advance(200);
+    const offs = s.commandsSince(t0, "power_off");
+    expect(offs, JSON.stringify(offs.map((e) => e.cmd))).toHaveLength(1);
+    expect(offs[0].cmd.deviceId).toBe("abdu");
+    expect(s.acsOn()).toContain("abdullah");
+    // …and the journal says WHY, or the next forensic pass has a mystery.
+    const shedBatch = s.plans.find((p) => p.commands.some((c) => c.kind === "power_off"));
+    expect(shedBatch?.decisions).toContainEqual(
+      expect.objectContaining({
+        deviceId: "abdu",
+        action: "shed choice",
+        detail: expect.stringContaining("priority decided"),
+      }),
+    );
+  });
+
+  it("…but a clearly cooler Abdullah still pays (2026-08-04 stands)", () => {
+    // 30.0 vs 31.5 — 1.5°C apart, clear of the gap. The thermometer decides
+    // absolutely, top priority included, exactly as it has since 2026-08-04.
+    const s = new Scenario(cfg, scene(30.0, 31.5), { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" });
+    const t0 = s.now;
+    s.advance(200);
+    const offs = s.commandsSince(t0, "power_off");
+    expect(offs, JSON.stringify(offs.map((e) => e.cmd))).toHaveLength(1);
+    expect(offs[0].cmd.deviceId).toBe("abdullah");
+    expect(s.acsOn()).toContain("abdu");
+  });
+});
+
+describe("2026-08-06 15:48Z: the top room's turn-on exports to the cooler room", () => {
+  // The third Abdullah cycle of that afternoon. He was switched on at 15:47:25
+  // into a saturated house — the ~5A heater still running, both other rooms at
+  // their L1 floor with their fans already trimmed to 1, and his own sub-floor
+  // rung barred by the hard boost zone — and 82s later the smoothed meter sat
+  // 0.28A over the 14.9A gen. Nothing was left on the ladder but a room off,
+  // and the causer rule (invariant 43) named the room whose own click caused
+  // it: Najat, 0.6°C cooler, sat inside SHED_NEED_GAP_C and kept running.
+  //
+  // The user's amendment that evening: for the TOP-PRIORITY room the export bar
+  // is "strictly cooler", not a full degree. Najat pays instead — his own
+  // stated trade, for the top room only.
+  //
+  // Every room's own need metric reads satisfied (`needDelta` inside
+  // `nearTargetBandC`) so `ceilOf` caps them all at L1 and nobody competes for
+  // a level: the only rung the reducer can reach is the shed, which is what the
+  // live house had left. The thermometer still separates them — that split is
+  // invariant 50's own, and `rankNeedDelta` is what shed choice reads.
+  const HOUSE_WITH_HEATER = 6.7;
+  const floored = (setup: SimAcSetup, roomTempC: number, on = true): SimAcSetup => ({
+    ...setup,
+    on,
+    level: 1,
+    fan: 1,
+    needDelta: 0.4,
+    roomTempC,
+  });
+
+  it("sheds Najat, not the top-priority room whose own turn-on caused it", () => {
+    // 6.7 + 2.2 (Najat L1) + 4.1 (Abdu L1) = 13.0A, and Abdullah's own 2.2A
+    // puts the house at 15.2A on a 14.9A gen — the live 0.3A overshoot.
+    const s = new Scenario(
+      cfg,
+      [
+        floored(ABDULLAH, 30.0, false), // priority #1, need 4.0 — the causer
+        floored(NAJAT, 29.4), // 0.6°C cooler: inside the gap, strictly cooler
+        floored(ABDU, 30.2), // hotter than the causer: never a target
+      ],
+      { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" },
+    );
+    s.advance(120);
+    const t0 = s.now;
+    s.turnOn("abdullah", 1);
+    s.advance(200);
+    const offs = s.commandsSince(t0, "power_off");
+    expect(offs, JSON.stringify(offs.map((e) => e.cmd))).toHaveLength(1);
+    expect(offs[0].cmd.deviceId).toBe("najat");
+    expect(s.acsOn()).toContain("abdullah");
+  });
+
+  it("…and any OTHER causer still undoes its own turn-on inside the gap (2026-08-03)", () => {
+    // Same house, same arithmetic, but Najat (priority #2) is the newcomer and
+    // Abdu is the room 0.6°C cooler than her. The amendment reaches the top
+    // room only, so the full degree still stands here and Najat pays for her
+    // own click.
+    const s = new Scenario(
+      cfg,
+      [
+        floored(ABDULLAH, 30.6), // hottest, and never the causer here
+        floored(NAJAT, 30.0, false), // priority #2, need 4.0 — the causer
+        floored(ABDU, 29.4), // 0.6°C cooler: inside the gap, and it holds
+      ],
+      { nonAcAmps: HOUSE_WITH_HEATER, source: "gen" },
+    );
+    s.advance(120);
+    const t0 = s.now;
+    s.turnOn("najat", 1);
+    s.advance(200);
+    const offs = s.commandsSince(t0, "power_off");
+    expect(offs, JSON.stringify(offs.map((e) => e.cmd))).toHaveLength(1);
+    expect(offs[0].cmd.deviceId).toBe("najat");
+    expect(s.acsOn()).toContain("abdu");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-07 14:08–14:31Z — the strain derate pulled the gen ceiling to
+// 14.0–14.5A while the settled three-room house drew ~14.8–15.6A. Najat was shed
+// FIVE times in 23 minutes: the restore path admitted her at the post-shed trough
+// (~11A + her ~2.3A price fit under 14.5), her compressor ramped the house over,
+// "its own turn-on caused this" shed her, and the trough re-formed. Each
+// restore→re-shed gap was 52–69 s (inside the blame window), so `noteFailure`
+// fired and `failures` climbed 1→4; each shed→restore gap was ~3–5.5 min, paced
+// by the own-shed-trough bar's 300 s expiry ("own shed trough … judged at
+// 12.4–12.6A, needs 2.3A vs 13.9–14.4A") plus the admission cadence.
+//
+// The backoff ladder never slowed the cycle because its early rungs (30/120/300 s
+// for failures 1–3) are all ≤ the 300 s bar, so the BAR was the binding clock;
+// the ladder only exceeds it at failures=4 (900 s), past the observed cycle. So
+// the fix compounds the BINDING clock — the bar's persistence — past the ~5-min
+// plateau (600 → 1200 → 1800 s), keyed on a consecutive-bounce COUNT, and a
+// bouncing room is HELD rather than machine-gunned; the release valves (a rising
+// ceiling, a peer leaving) let it out the instant the arithmetic changes.
+//
+// Staged with Najat's cap (3.5A) above her model (2.7A) — the same gap the
+// 2026-08-06 double shed turns on — so her return is admitted at the model price
+// and then overshoots at the cap, and the bar (pre-shed meter − model cut) sits
+// ABOVE the settled two-room house, correctly disbelieving the trough. No flicker
+// and no fan physics: the bounce is pure level/shed, meter-visible end to end.
+// ---------------------------------------------------------------------------
+describe("2026-08-07 bounce backoff: a bouncing restore is held, not machine-gunned", () => {
+  const saturated = (): Scenario =>
+    new Scenario(
+      { ...cfg, genLimitAmps: 14.6 }, // restore ceiling 14.5 (own fresh config — mutated below)
+      [
+        { ...ABDU, level: 1, fan: 1, demandAmps: 4.1, needDelta: 0.4, roomTempC: 29.0 },
+        { ...ABDULLAH, level: 1, fan: 1, demandAmps: 2.2, needDelta: 0.4, roomTempC: 28.0 },
+        {
+          ...NAJAT,
+          level: 1,
+          fan: 1,
+          capAmps: [3.5, 3.9, 5.3], // draws 3.5A, priced at the 2.7A model
+          demandAmps: 3.5,
+          needDelta: 0.4,
+          roomTempC: 26.5, // the coolest room — the shed target every round
+          rampSeconds: 60,
+        },
+      ],
+      { nonAcAmps: 5.1, source: "gen" }, // total ≈ 14.9 over 14.6 → shed Najat
+    );
+
+  /** Run to the FIRST bounce: the initial shed, the 300 s bar, the restore, and
+   *  the re-shed that books bounce #1. Returns its timestamp. */
+  const runToFirstBounce = (s: Scenario): number => {
+    s.advance(12 * 60);
+    const offs = s.commandsSince(s.now - 12 * 60_000, "power_off").filter((e) => e.cmd.deviceId === "najat");
+    expect(offs.length, JSON.stringify(offs.map((e) => e.at))).toBeGreaterThanOrEqual(2);
+    return offs[1].at; // [0] the initial shed, [1] the first bounce
+  };
+
+  it("ACCEPTANCE: after the first bounce the room stays OFF (≤2 commands / 25 min), then returns when the ceiling rises and STICKS", () => {
+    const s = saturated();
+    const firstBounceAt = runToFirstBounce(s);
+
+    // 25 minutes of exactly the house that produced the five-shed machine-gun.
+    s.advance(25 * 60);
+    const churn = s
+      .commandsSince(firstBounceAt + 1)
+      .filter((e) => e.cmd.deviceId === "najat" && (e.cmd.kind === "power_on" || e.cmd.kind === "power_off"));
+    // The whole point: the compounded wait bounds the cycle to at most ONE more
+    // attempt — no second/third/fourth round. (v1 and the pre-fix v2 re-shed her
+    // five times in this window.)
+    expect(
+      churn.length,
+      churn.map((e) => `${((e.at - firstBounceAt) / 1000).toFixed(0)}s ${e.cmd.kind}`).join("\n"),
+    ).toBeLessThanOrEqual(2);
+    expect(s.acsOn()).toEqual(["abdu", "abdullah"]); // still off, held by the bar
+
+    // The strain derate recovers — the ceiling rises. The bar self-releases
+    // (12.2 + 2.7 = 14.9 ≤ 15.0) and she comes back and STICKS (two-room 11.4 +
+    // her 3.5 = 14.9 ≤ the new limit).
+    s.cfg.genLimitAmps = 15.1; // restore ceiling 15.0
+    const t2 = s.now;
+    s.advance(12 * 60);
+    expect(s.acsOn()).toContain("najat");
+    // …and no bounce this time — nothing switches off behind her.
+    expect(
+      s.commandsSince(t2 + 1, "power_off").filter((e) => e.cmd.deviceId === "najat"),
+    ).toEqual([]);
+    expect(s.totalAmps()).toBeLessThanOrEqual(15.05);
+  });
+
+  it("a peer leaving CREDITS the bounce bar — a house minus a room is not the house that bounced", () => {
+    const s = saturated();
+    runToFirstBounce(s);
+    // Najat is in the bounce state now (bar active, bounces ≥ 1). Its value is
+    // the pre-shed house less her own model cut.
+    const before = s.effectiveShedBar("najat");
+    expect(before).toBeGreaterThan(11.5);
+    // A household member switches a PEER off. That removal shrinks the house the
+    // bar describes, priced the way the meter credit prices it (~2.2A).
+    s.turnOff("abdullah");
+    const after = s.effectiveShedBar("najat");
+    expect(after).toBeLessThan(before - 1.5); // ~2.2A of Abdullah credited off the bar
+    expect(after).toBeGreaterThan(0);
   });
 });

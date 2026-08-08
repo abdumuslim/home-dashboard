@@ -28,6 +28,7 @@ import {
   clearFloorsIfDone,
   clearFloorsOnManual,
   clearGridFullIfDone,
+  clearSettleIfDone,
   deriveMode,
   FLOORS_MAX_MS,
   initialModeState,
@@ -40,6 +41,8 @@ import {
   ATTEMPT_BLAME_WINDOW_MS,
   attemptedRecently,
   attemptedWithin,
+  barPersistMs,
+  clearBounces,
   cooldownRemainingMs,
   initialPacingState,
   noteAttempt,
@@ -47,6 +50,7 @@ import {
   noteSuccess,
   reshedPenalized,
   resetPacing,
+  restoreBounces,
   type PacingState,
 } from "./pacing.js";
 import { planFanRestore, recordFanCut, releaseFanHold, type FanHolds } from "./fan-trim.js";
@@ -72,7 +76,10 @@ import {
   offDropSaysCompressorOn,
   raiseRiseSaysCompressorWasOff,
   rampAbsorptionLanded,
+  rampCommittedAmps,
+  rampProvenDone,
   RAMP_RELEASE_MAX_AMPS,
+  RAMP_SETTLED_EPSILON_AMPS,
   type ModeledAc,
 } from "./dead-window.js";
 import {
@@ -114,7 +121,7 @@ import {
   type LevelHold,
 } from "./level-hold.js";
 import { DEMOTE_HYSTERESIS_C } from "./demote.js";
-import { absorbedSharesAmps, SWAP_QUIET_AFTER_OVER_MS } from "./raise.js";
+import { absorbedSharesAmps, EXTERNAL_ON_DONOR_SHIELD_MS, rampDebitAmps, SWAP_QUIET_AFTER_OVER_MS } from "./raise.js";
 import { fanTrimSavings, modelCutAmps, raiseJumpAmps, steadyDraw, modelFor, restoreCostAmps, turnOnAmps, updateCost, type CostBook } from "./costs.js";
 import { LevelingStore } from "./store.js";
 import type { AcView, Command, MeterState, Mode, PowerSource } from "./types.js";
@@ -186,7 +193,32 @@ const POWER_EVENT_LEVEL_JUMP_GRACE_MS = 15 * 60_000;
  * ratchet retires it as soon as the meter shows the rise.
  */
 const FAN_DEBIT_MS = 60_000;
-const SHED_CLEAR_GRACE_MS = 15_000;
+/**
+ * How long a fresh shed's record is protected from `reconcileObservedOn`
+ * clearing it on a still-ON shadow reading — the window inside which an ON with
+ * NO off ever observed is presumed the stale echo of a `power_off` still in
+ * flight rather than an external hand.
+ *
+ * 60s, not the 15s it shipped with (#9268/#9270, 2026-08-07 04:15Z): at gen
+ * entry the leveler shed Najat and 17.4s later sent a GENUINE DUPLICATE
+ * power_off. TCL's send-to-confirm lag runs 5.8s to 13 MINUTES (invariant 4),
+ * so a stale still-ON shadow at 17.4s straddled the old 15s grace, cleared the
+ * shed mid-flight, and the recovery-admission recompute then saw the room as
+ * "on, not shed" and re-decided/re-sent — with the `power_off` dedupe
+ * (`SHED_RESEND_SPACING_MS`) blind, because it keys off `shedIds` membership
+ * that had just been wrongly cleared. 60s outruns the common lag; the rare
+ * multi-minute lag is caught by confirm-or-resend, which the intact shed keeps.
+ *
+ * ⚠ A wider grace ALONE would be a "manual wins" violation (invariant 42): a
+ * human re-enabling a shed room BY REMOTE 20s after the shed would be presumed
+ * a stale echo, and the 30s off-resend would switch the room back off against a
+ * human's explicit choice — the exact class the 2026-08-06 evening fight
+ * (#9224/#9228) already cost this project. So the grace only governs the case
+ * where the off was NEVER observed; once a poll has seen the shed room OFF
+ * (`shedOffObservedAt`), a later ON is unambiguous external evidence and clears
+ * immediately, whatever this window says (see `reconcileObservedOn`).
+ */
+const SHED_CLEAR_GRACE_MS = 60_000;
 /**
  * Send-side spacing for fan trims and sheds — mirrors the reconciler's
  * `LEVEL_RESEND_SPACING_MS`, which levels have always had and these two never
@@ -248,6 +280,13 @@ const VICTIM_COOLDOWN_MS = 120_000;
  * Nothing may reserve amps unboundedly (invariant 22's spirit).
  */
 const SWAP_RESERVATION_MS = ATTEMPT_BLAME_WINDOW_MS;
+/**
+ * De-dup window for `creditRoomOff`: the same physical off can be seen twice (the
+ * REST tap credits immediately, then the device poll re-observes it because
+ * `onUserPowerOff` never updates `prevPowerStates`). A second credit for the same
+ * device inside this window is skipped unless the room was seen ON in between.
+ */
+const OFF_CREDIT_DEDUP_MS = 60_000;
 /**
  * How long a shed room must keep reporting ON after a boot before its shed
  * record is cleared. The boot shadow can be up to 13 minutes stale, so one
@@ -429,6 +468,17 @@ export class LevelingControllerV2 {
   private shedIds = new Set<string>();
   private shedTimes = new Map<string, number>();
   /**
+   * When a device poll last saw a SHED room OFF — i.e. the shed's `power_off`
+   * having actually LANDED on the shadow. `reconcileObservedOn` reads it to tell
+   * two shapes of "shed room reads ON" apart (#9268/#9270, 2026-08-07): an ON
+   * *after* a confirmed off is an external hand (clear now + shield), while an
+   * ON with no off ever observed is the stale echo of an off still in flight
+   * (keep the shed inside the grace so confirm-or-resend re-sends it). Cleared
+   * with the shed record itself (recordShed/clearShed) so a stamp cannot leak
+   * from one shed cycle into the next.
+   */
+  private shedOffObservedAt = new Map<string, number>();
+  /**
    * Rooms commanded (or reported) ON whose shadow has not confirmed yet →
    * when the send happened. While any entry is live the compressor may be
    * drawing amps the model does not know about, so house sampling stands down.
@@ -448,8 +498,16 @@ export class LevelingControllerV2 {
    * is spent by absorption; this one is per-room and lives a full blame window,
    * because the TROUGH a shed digs outlives its credit. Live 07:19→07:20 today
    * a restore was admitted 31 s after the shed that caused it (R9, invariant 41).
+   *
+   * `credited` is the peer-load release valve for a BOUNCE-extended bar
+   * (2026-08-07): while the bar outlives its clock (`barPersistMs`), a peer's
+   * commanded or observed load removal since it was stamped shrinks the house the
+   * bar describes — a house minus a 4 A room is not the house that bounced — so
+   * that saving is subtracted at query time, priced by the same credit path the
+   * collapse detector uses. 0 for an ordinary (non-bounce) bar, which expires at
+   * the blame window untouched.
    */
-  private shedBar = new Map<string, { amps: number; at: number }>();
+  private shedBar = new Map<string, { amps: number; at: number; credited: number }>();
   /**
    * The ONE gated proactive shed in flight house-wide: the room we switched off
    * and the shed room its amps are reserved for (2026-08-06). Cleared when the
@@ -488,6 +546,16 @@ export class LevelingControllerV2 {
    * wherever `rampBaseline` is: the two are only meaningful together.
    */
   private rampAbsorbed = new Map<string, number>();
+  /**
+   * Per-ramp stall clock for the early-release plateau test (2026-08-08): `at` is
+   * when this ramp's absorption ratchet last grew by at least
+   * `RAMP_SETTLED_EPSILON_AMPS` (`lastRampGrowthAt`), and `absorbed` is the
+   * ratchet value at that stamp — the anchor the next growth is measured from, so
+   * a noise-sized creep across many readings still reads as PLATEAUED while a
+   * genuine cumulative climb re-stamps and keeps the window open. Armed at
+   * `rearmRamp`; cleared wherever `rampAbsorbed` is.
+   */
+  private rampGrowth = new Map<string, { at: number; absorbed: number }>();
   /**
    * Ramps opened by a POWER EVENT (changeover, collapse recovery) that are still
    * under evidence review → when they armed, and when (if ever) they were first
@@ -586,6 +654,38 @@ export class LevelingControllerV2 {
   /** Start of the current below-floor stretch, and the need it has yet to beat. */
   private subFloorSince = new Map<string, SubFloorWatch>();
   private prevPowerStates = new Map<string, boolean>();
+  /**
+   * When a HUMAN last turned each room on (bare power button, dashboard, remote,
+   * or automation — any ON the leveler did not command). Shields it from being
+   * traded away as a proactive-shed donor for `EXTERNAL_ON_DONOR_SHIELD_MS`
+   * (invariant 42/57, 2026-08-06 #9224/#9228). Deliberately NOT cleared on a
+   * source change: the human's intent survives a changeover, unlike the
+   * victim/funding cooldowns, which are per-LINE physics (a compressor's
+   * wind-down starts over when the line power-cycles; a person's choice does
+   * not). Persistence across restarts is not required — a restart already loses
+   * pins, and the shield is a comfort nicety, not a safety invariant.
+   */
+  private externalOnAt = new Map<string, number>();
+  /**
+   * When each shed room first sat refused ONLY by the supply-flicker margin
+   * (invariant 58 follow-up, 2026-08-08). Stamped from the plan's `flickerRefused`
+   * list and read back into `RaiseInput.flickerRefusedSince`, so a restore that
+   * only ever fails on the flicker charge ages into a bare-ceiling admission
+   * after `FLICKER_PATIENCE_MS`. Dropped the moment the room stops being
+   * flicker-refused (it restored, it now fits, or it went over-limit), on a
+   * restore, and on a source change — patience accrues only while the refusal is
+   * unbroken. Not persisted across restarts (a comfort nicety, like the swap).
+   */
+  private flickerRefusedSince = new Map<string, number>();
+  /**
+   * When each device's off was last CREDITED (`creditRoomOff`). One physical off
+   * can arrive twice — the REST tap credits immediately in `onUserPowerOff`,
+   * which never updates `prevPowerStates`, so the device poll re-observes the
+   * SAME off and would credit it again (a double meter credit AND a double
+   * peer-bar subtraction). A repeat within `OFF_CREDIT_DEDUP_MS` is skipped;
+   * cleared whenever the room is seen ON, so a genuine later off still credits.
+   */
+  private lastOffCreditAt = new Map<string, number>();
   private deviceNames = new Map<string, string>();
   /** Devices the collector reports as leveler-managed (opt-outs excluded). */
   private managedIds = new Set<string>();
@@ -656,6 +756,9 @@ export class LevelingControllerV2 {
     const shedRes = await this.pool.query("SELECT device_id, shed_at FROM ac_leveling_shed");
     this.shedIds = new Set<string>();
     this.shedTimes = new Map<string, number>();
+    // In-memory only, and only meaningful for a live shed record: a resync
+    // rebuilds the shed set from the DB, so any stamp from the old set is stale.
+    this.shedOffObservedAt = new Map<string, number>();
     for (const row of shedRes?.rows ?? []) {
       this.shedIds.add(row.device_id);
       this.shedTimes.set(row.device_id, new Date(row.shed_at).getTime());
@@ -824,6 +927,9 @@ export class LevelingControllerV2 {
     if (!this.shedIds.has(deviceId)) return;
     this.shedIds.delete(deviceId);
     this.shedTimes.delete(deviceId);
+    // The off-observed stamp is only meaningful for a LIVE shed record — drop it
+    // so it cannot survive into the next shed cycle (#9268/#9270).
+    this.shedOffObservedAt.delete(deviceId);
     await this.pool.query("DELETE FROM ac_leveling_shed WHERE device_id = $1", [deviceId]);
     log.info(`[leveler2] Cleared shed for AC ${this.deviceNames.get(deviceId) ?? deviceId} (${reason})`);
   }
@@ -865,6 +971,9 @@ export class LevelingControllerV2 {
   private async recordShed(deviceId: string, reason: string): Promise<void> {
     this.shedIds.add(deviceId);
     this.shedTimes.set(deviceId, Date.now());
+    // A fresh shed has, by definition, not been observed OFF yet — clear any
+    // stamp a prior cycle left so this shed's grace judgment starts clean.
+    this.shedOffObservedAt.delete(deviceId);
     await this.pool.query(
       `INSERT INTO ac_leveling_shed (device_id, shed_at, reason) VALUES ($1, NOW(), $2)
        ON CONFLICT (device_id) DO UPDATE SET shed_at = NOW(), reason = $2`,
@@ -882,15 +991,52 @@ export class LevelingControllerV2 {
     // path — and `houseLoadAmps` collapses to 0, which is the over-permissive
     // direction house-load.ts exists to prevent.
     if (!this.isManaged(deviceId)) return;
-    this.voidPhantomHouse(deviceId, Date.now());
+    const now = Date.now();
+    this.voidPhantomHouse(deviceId, now);
     if (!this.shedIds.has(deviceId)) return;
     const shedAt = this.shedTimes.get(deviceId);
-    if (shedAt != null && Date.now() - shedAt < SHED_CLEAR_GRACE_MS) return;
+    const offObservedAt = this.shedOffObservedAt.get(deviceId);
+    // Did the shed's power_off actually LAND before this ON? A poll that saw the
+    // room OFF since we shed it means the off propagated and the room was THEN
+    // switched back on — a remote/wall/TCL-app path that never touches our REST
+    // route. That is unambiguous external-hand evidence: clear the shed with no
+    // grace at all, and shield the room from being traded away as a swap donor
+    // (a remote re-enable of a shed room is exactly the #9224/#9228 class the
+    // shield exists for — invariant 42/57).
+    if (offObservedAt != null && (shedAt == null || offObservedAt >= shedAt)) {
+      this.noteExternalOn(deviceId, now);
+      await this.clearShed(deviceId, "observed_on_after_off");
+      return;
+    }
+    // The off was NEVER observed. Inside the grace this ON is presumed the stale
+    // echo of a power_off still in flight (#9268/#9270 — a naive widen alone is
+    // wrong: with no off-observed distinction a human re-enabling a shed room by
+    // remote 20s after the shed would be presumed a stale echo, and the 30s
+    // off-resend would switch it back off against his explicit choice — the
+    // #9224/#9228 class): keep the shed intact so confirm-or-resend re-sends the
+    // off and the `SHED_RESEND_SPACING_MS` dedupe stays armed.
+    if (shedAt != null && now - shedAt < SHED_CLEAR_GRACE_MS) return;
+    // Past the grace with no off ever seen: treat as external/already-cleared —
+    // clear the shed, and shield too, because any reconcile-path clear is
+    // external evidence and over-shielding a comfort tool costs nothing. (Our
+    // OWN restore confirms through the tick OFF→ON "restore_confirmed" branch,
+    // which deliberately does not shield — its test must stay green.)
+    this.noteExternalOn(deviceId, now);
     await this.clearShed(deviceId, "observed_on");
   }
 
   hasFanHold(deviceId: string): boolean {
     return this.fanHolds[deviceId] != null;
+  }
+
+  /**
+   * Introspection/test hook: is `deviceId` still inside its compressor ramp
+   * WINDOW (the `rampUntil` that `AcView.ramping` folds `device.power` into)?
+   * Reads the exact state the early-release path (2026-08-08) deletes, so a test
+   * can watch amp evidence retire the window before its 240s clock.
+   */
+  rampWindowOpen(deviceId: string): boolean {
+    return (this.rampUntil.get(deviceId) ?? 0) > Date.now();
   }
 
   async rememberStableLevel(deviceId: string): Promise<void> {
@@ -932,6 +1078,7 @@ export class LevelingControllerV2 {
           this.startBaseline.clear();
           this.rampBaseline.clear();
           this.rampAbsorbed.clear();
+          this.rampGrowth.clear();
           // A shed bar is a claim about one line's meter (R9) — 15A of gen and
           // 30A of grid are not the same number, and carrying it across would
           // strand a room off on the roomy source.
@@ -978,6 +1125,10 @@ export class LevelingControllerV2 {
           // longer exists, and the entry mode (FLOORS / GRID_FULL) re-decides
           // who runs from scratch. The donor keeps its ordinary shed row.
           this.swap = null;
+          // …and the flicker-patience anchors: they were measured against a
+          // supply that no longer exists, and the entry mode re-admits every room
+          // from scratch (invariant 58 follow-up).
+          this.flickerRefusedSince.clear();
           if (event.to === "grid") {
             this.manualCap.clear();
             this.manualTarget.clear();
@@ -1145,6 +1296,12 @@ export class LevelingControllerV2 {
   private creditRoomOff(deviceId: string, observedLevel: number | null, now: number): void {
     const source = this.meterState.source;
     if (source === "none" || this.shedIds.has(deviceId)) return;
+    // The same physical off arrives twice — the REST tap credits here, then the
+    // device poll re-observes it (`onUserPowerOff` never updates
+    // `prevPowerStates`). Skip a repeat within the window; the stamp is cleared
+    // whenever the room is seen ON, so a genuine off→on→off still credits twice.
+    const lastAt = this.lastOffCreditAt.get(deviceId);
+    if (lastAt != null && now - lastAt < OFF_CREDIT_DEDUP_MS) return;
     const from = this.recon[deviceId]?.confirmedLevel ?? observedLevel;
     if (from == null || from <= 0) return;
     const amps = modelCutAmps(
@@ -1155,7 +1312,28 @@ export class LevelingControllerV2 {
       null,
       this.deviceMaxLevel.get(deviceId) ?? 3,
     );
-    if (amps > 0) this.meterState = noteCommandedCut(this.meterState, amps, now);
+    if (amps > 0) {
+      this.meterState = noteCommandedCut(this.meterState, amps, now);
+      // An OBSERVED off is also a peer removal for any bounce-extended bar (the
+      // release valve, invariant 54): the house another room bounced in just
+      // lost this room, priced by the same figure the meter credit used.
+      this.creditPeerShedBars(amps, new Set([deviceId]), now);
+      this.lastOffCreditAt.set(deviceId, now);
+    }
+  }
+
+  /**
+   * Stamp an external ON (the swap donor shield, invariant 42/57) and end this
+   * room's restore bounce episode (`clearBounces`, 2026-08-07) — a human/blink
+   * put it back, so a future unrelated shed must not inherit a compounded trough
+   * bar. Also clears the off-credit dedup stamp: the room being ON is exactly the
+   * "seen ON in between" that lets a genuine later off credit again. Called at
+   * every external-ON stamp point, NEVER on our own `restore_confirmed`.
+   */
+  private noteExternalOn(deviceId: string, now: number): void {
+    this.externalOnAt.set(deviceId, now);
+    this.pacing = clearBounces(this.pacing, deviceId);
+    this.lastOffCreditAt.delete(deviceId);
   }
 
   // ---------- user hooks (manual always wins) ----------
@@ -1203,6 +1381,10 @@ export class LevelingControllerV2 {
     this.pendingOn.set(deviceId, now);
     // Load arriving that our own command list will never show (see tick()).
     this.lastLoadAddAt = now;
+    // He put the room on himself — the comfort swap may not trade it away for
+    // the shield window (invariant 42/57, 2026-08-06 #9224/#9228), and his ON
+    // ends any restore bounce episode (2026-08-07).
+    this.noteExternalOn(deviceId, now);
   }
 
   async onUserFanChange(deviceId: string): Promise<void> {
@@ -1310,6 +1492,9 @@ export class LevelingControllerV2 {
       // A fresh ramp has proven no absorption yet — the previous window's peak
       // is about a compressor start that is over.
       this.rampAbsorbed.delete(id);
+      // Start the plateau stall clock at arm time, anchored at zero absorption:
+      // (b) can only fire `RAMP_SETTLED_STALL_MS` from here at the earliest.
+      this.rampGrowth.set(id, { at: now, absorbed: 0 });
       if (baseline == null) this.rampBaseline.delete(id);
       else this.rampBaseline.set(id, baseline);
       if (opts.powerEvent === true) this.powerEventRamp.set(id, { armedAt: now, heldSince: null });
@@ -1463,12 +1648,24 @@ export class LevelingControllerV2 {
       // in the readings that land between two ticks.
       if ((this.rampUntil.get(id) ?? 0) <= now && !this.powerEventRamp.has(id)) continue;
       const risen = view.smoothedAmps - baseline;
-      if (risen > (this.rampAbsorbed.get(id) ?? 0)) this.rampAbsorbed.set(id, risen);
+      if (risen > (this.rampAbsorbed.get(id) ?? 0)) {
+        this.rampAbsorbed.set(id, risen);
+        // Stall clock (plateau test): re-stamp only when the ratchet has climbed
+        // a MEANINGFUL step since the last stamp, so a noise-sized creep does not
+        // keep resetting it — that is what lets (b) recognise a settled meter.
+        const mark = this.rampGrowth.get(id);
+        if (mark == null || risen - mark.absorbed >= RAMP_SETTLED_EPSILON_AMPS) {
+          this.rampGrowth.set(id, { at: now, absorbed: risen });
+        }
+      }
       // A whole amp of measured rise attributable to THIS room's ramp is a
       // compressor starting — positive evidence, so any standing "it was only
       // drawing its fan" record for it is retired (R6). Same bar the dead
       // window releases a held ramp on, so the two cannot disagree.
       if ((this.rampAbsorbed.get(id) ?? 0) >= RAMP_RELEASE_MAX_AMPS) this.compressorOff.delete(id);
+      // …and once the meter has PROVEN the rise landed (fully absorbed) or landed
+      // and settled (plateaued above the bar), close the window before its clock.
+      this.maybeReleaseRampEarly(id, view, now);
     }
     for (const debits of [this.jumpDebit, this.fanDebit]) {
       for (const [id, debit] of debits) {
@@ -1481,6 +1678,60 @@ export class LevelingControllerV2 {
         if (risen > debit.absorbed) debits.set(id, { ...debit, absorbed: risen });
       }
     }
+  }
+
+  /**
+   * Amp evidence retires a compressor ramp WINDOW before its `AC_RAMP_MS` clock
+   * (user directive, 2026-08-08). Runs per raw reading, right after the ratchet
+   * is fresh: once the meter has shown this ramp fully absorbed — or crossed the
+   * "a compressor started" bar and then plateaued — its window has nothing left
+   * to protect, so `ramping` (which buildViews folds out of `rampUntil`) drops
+   * now instead of at four minutes. Never on flatness alone: a ratchet under the
+   * bar is a compressor that has NOT started (the changeover dead window), and
+   * `rampProvenDone` returns null there, so the window keeps its full clock and
+   * the dead-window extension machinery above (dead-window.ts, invariant 44).
+   *
+   * A power-event ramp released here simply passes its own `landed` check the
+   * next time `holdPowerEventRamps` consults it, which drops its `powerEventRamp`
+   * entry — the two agree by construction (both are gated on the same bar).
+   */
+  private maybeReleaseRampEarly(id: string, view: ReturnType<typeof meterView>, now: number): void {
+    if ((this.rampUntil.get(id) ?? 0) <= now) return;
+    const source = view.source;
+    if (source === "none") return;
+    // Price the committed draw exactly as `rampDebitAmps` charges it (one helper,
+    // both sites). The confirmed shadow is the level the compressor is climbing
+    // to; with no confirm yet there is nothing to price against, so leave the clock.
+    const level = this.recon[id]?.confirmedLevel;
+    if (level == null || level < 1) return;
+    const committed = rampCommittedAmps(
+      { deviceId: id, currentLevel: level, maxLevel: this.deviceMaxLevel.get(id) ?? 3 },
+      this.config,
+      source,
+    );
+    const proof = rampProvenDone({
+      absorbedAmps: this.rampAbsorbed.get(id) ?? 0,
+      committedAmps: committed,
+      lastGrowthAt: this.rampGrowth.get(id)?.at ?? now,
+      now,
+    });
+    if (proof == null) return;
+    const armedAt = this.powerEventRamp.get(id)?.armedAt ?? (this.rampUntil.get(id) ?? now) - AC_RAMP_MS;
+    const absorbed = this.rampAbsorbed.get(id) ?? 0;
+    this.rampUntil.delete(id);
+    this.rampGrowth.delete(id);
+    // A level jump on the same device whose amps the meter has also fully shown
+    // owes nothing more — drop it. Bookkeeping hygiene, not behaviour: its
+    // `absorbed` already zeroes the owed amps in `unmeteredJumpAmps`.
+    const jd = this.jumpDebit.get(id);
+    if (jd != null && jd.amps - jd.absorbed <= 0) this.jumpDebit.delete(id);
+    const secs = Math.max(0, Math.round((now - armedAt) / 1000));
+    const name = this.deviceNames.get(id) ?? id;
+    log.info(
+      proof === "absorbed"
+        ? `[leveler2] ${name}: ramp released early — ${absorbed.toFixed(1)}A of ${committed.toFixed(1)}A absorbed in ${secs}s`
+        : `[leveler2] ${name}: ramp released early — plateaued at ${absorbed.toFixed(1)}A of ${committed.toFixed(1)}A after ${secs}s`,
+    );
   }
 
   /**
@@ -1751,6 +2002,15 @@ export class LevelingControllerV2 {
       this.deviceMaxLevel.set(device.id, device.maxGeneratorLevel || 3);
       if (managed) this.managedIds.add(device.id);
       else this.managedIds.delete(device.id);
+      // A poll showing a SHED room OFF is the shed's power_off having LANDED —
+      // the evidence `reconcileObservedOn` needs to tell a later ON apart
+      // (#9268/#9270): an ON after a confirmed off is an external hand (clear +
+      // shield), an ON with no off ever observed is the stale echo of an off
+      // still in flight (keep the shed). Stamped every tick the shadow shows it
+      // off; cleared with the shed record itself.
+      if (managed && !device.power && this.shedIds.has(device.id)) {
+        this.shedOffObservedAt.set(device.id, now);
+      }
       const prev = this.prevPowerStates.get(device.id);
       // FIRST sight of this device since boot. A shed record is persisted so it
       // survives a restart (a shed room must still be restored after a deploy)
@@ -1794,13 +2054,28 @@ export class LevelingControllerV2 {
           // command send (2026-07-27 bogus-lock incident). The OFF→ON flip
           // requires the shadow to have shown the off first, so a stale-ON
           // shadow can't trip this the way it could trip reconcileObservedOn.
-          if (managed && this.shedIds.has(device.id)) {
+          //
+          // Captured BEFORE the clear because `clearShed` removes the room from
+          // `shedIds`, so the second block below (which gives every fresh-on
+          // room its start window) runs for a restored room too. The donor
+          // shield must tell the two apart.
+          const wasShed = managed && this.shedIds.has(device.id);
+          if (wasShed) {
             await this.clearShed(device.id, "restore_confirmed");
           }
           if (managed && !this.shedIds.has(device.id)) {
             this.freshlyOn.push(device.id);
             // Automation turn-ons never pass through onUserPowerOn.
             this.noteTurnOn(device.id, now);
+            // A room WE never command on flipped on (`!wasShed` — the leveler
+            // only ever turns SHED rooms back on, which take the restore-confirm
+            // branch above): a remote, an automation, a hand, or a power-blink
+            // restore. The comfort swap may not trade it away for the shield
+            // window (invariant 42/57, 2026-08-06 #9224/#9228) — its OBSERVED
+            // half is power-event-indistinguishable from a hand (invariant 56),
+            // and the shield's fifteen minutes match that grace exactly. A
+            // restore-confirm is OUR command and never shields.
+            if (!wasShed) this.noteExternalOn(device.id, now);
           }
           // A room coming on is load ARRIVING, and `batchLoadDirections` only
           // ever sees our OWN commands — so without this an external turn-on
@@ -1830,6 +2105,7 @@ export class LevelingControllerV2 {
           this.rampUntil.delete(device.id);
           this.rampBaseline.delete(device.id);
           this.rampAbsorbed.delete(device.id);
+          this.rampGrowth.delete(device.id);
           this.powerEventRamp.delete(device.id);
           this.recon = clearOnPowerOff(this.recon, device.id);
           this.manualCap.delete(device.id);
@@ -2012,6 +2288,21 @@ export class LevelingControllerV2 {
       ),
       anyShedPending: acs.some((a) => a.managed && a.shed && !a.on),
     });
+    // SETTLING early exit (2026-08-08): end the settle window the moment the
+    // meter has digested everything the last batch commanded — no commanded fall
+    // still landing, and nothing owed on the spend side either (`rampDebitAmps`
+    // folds in every ramping compressor and every live level/fan debit). It can
+    // only ever SHORTEN the window; a slow level-cut wind-down keeps the clock.
+    if (view.source !== "none") {
+      this.modeState = clearSettleIfDone(
+        this.modeState,
+        {
+          commandedCutTotalAmps: view.commandedCutTotalAmps,
+          unabsorbedSpendAmps: rampDebitAmps(acs, view.smoothedAmps, this.config, view.source),
+        },
+        now,
+      );
+    }
     this.modeState = { ...this.modeState, collapsed: this.meterState.collapse != null };
     const mode = deriveMode(this.modeState, now);
 
@@ -2167,8 +2458,32 @@ export class LevelingControllerV2 {
       // …and the ladder's own recent history, which no meter field carries.
       overLimitActedRecently:
         this.lastOverLimitActAt != null && now - this.lastOverLimitActAt < SWAP_QUIET_AFTER_OVER_MS,
+      // …and the per-room flicker-patience anchor (invariant 58 follow-up): a
+      // restore refused only by the flicker margin ages into a bare-ceiling
+      // admission. The shell owns the map; the plan reports the refusals below.
+      flickerRefusedSince: (deviceId) => this.flickerRefusedSince.get(deviceId),
     });
     this.fanHolds = out.fanHolds;
+
+    // Flicker-patience anchors (invariant 58 follow-up): stamp a room refused
+    // ONLY by the flicker margin this tick, and drop the anchor for any room the
+    // raise phase stopped refusing — it restored, it now fits, or a different
+    // refusal class took over. `out.flickerRefused` is attached only by returns
+    // that RAN the raise phase; a tick that never got there (SETTLING after any
+    // batch, an over-limit episode, FLOORS) reports nothing and must NOT break
+    // the streak — SETTLING follows every batch, so wiping on it would restart
+    // patience forever on a busy line. Runs here rather than in
+    // `executeAndJournal` because a pure flicker refusal ships no command, and
+    // that path returns before its bookkeeping.
+    if (out.flickerRefused != null) {
+      const flickerRefused = new Set(out.flickerRefused);
+      for (const id of [...this.flickerRefusedSince.keys()]) {
+        if (!flickerRefused.has(id)) this.flickerRefusedSince.delete(id);
+      }
+      for (const id of flickerRefused) {
+        if (!this.flickerRefusedSince.has(id)) this.flickerRefusedSince.set(id, now);
+      }
+    }
 
     await this.executeAndJournal(out, view, mode, now, tcl, acs);
     this.lastStatus = this.buildStatus(acs, view, mode, out, now);
@@ -2300,11 +2615,35 @@ export class LevelingControllerV2 {
   private shedBarFor(deviceId: string, now: number): number {
     const bar = this.shedBar.get(deviceId);
     if (bar == null) return 0;
-    if (now - bar.at > ATTEMPT_BLAME_WINDOW_MS) {
+    // Normally the blame window; while consecutive bounces stand it outlives its
+    // clock for the room's compounded backoff (invariant 54 + the 2026-08-07
+    // cycle), so the trough stays disbelieved instead of expiring into the next
+    // re-admission. Bounded by `bounceBackoffMs`'s cap — nothing blocks unbounded.
+    if (now - bar.at > barPersistMs(this.pacing, deviceId)) {
       this.shedBar.delete(deviceId);
       return 0;
     }
-    return Math.max(0, bar.amps);
+    // Less any peer removal since the bar was stamped (the bounce-bar release
+    // valve — a genuinely smaller house is not the house that bounced).
+    return Math.max(0, bar.amps - bar.credited);
+  }
+
+  /**
+   * A peer's commanded/observed load removal shrinks the house every OTHER
+   * BOUNCE-extended shed bar describes (invariant 54's peer-credit valve,
+   * 2026-08-07). Priced by whatever the caller already handed the collapse
+   * detector — no second pricing path. Scoped to bounce-persisting bars so an
+   * ordinary bar (which expires at the blame window anyway) is byte-identical to
+   * before, and never credits the room whose own removal this is.
+   */
+  private creditPeerShedBars(amps: number, except: ReadonlySet<string>, now: number): void {
+    if (!(amps > 0)) return;
+    for (const [id, bar] of this.shedBar) {
+      if (except.has(id)) continue;
+      if (restoreBounces(this.pacing, id) < 1) continue;
+      if (now - bar.at > barPersistMs(this.pacing, id)) continue;
+      bar.credited += amps;
+    }
   }
 
   /**
@@ -2556,6 +2895,9 @@ export class LevelingControllerV2 {
         startBaselineAmps: this.startBaselineFor(device.id, device.power, now),
         unmeteredJumpAmps: this.unmeteredJumpAmps(device.id, now),
         reshedPenalized: reshedPenalized(this.pacing, device.id, now),
+        // A human turned this room on within the shield window → the proactive
+        // swap may not pick it as a donor (invariant 42/57).
+        recentlyExternalOn: now < (this.externalOnAt.get(device.id) ?? 0) + EXTERNAL_ON_DONOR_SHIELD_MS,
       };
     });
   }
@@ -2869,10 +3211,16 @@ export class LevelingControllerV2 {
     // not read as headroom. Anchored to the PRE-batch meter less what the batch
     // was priced to save — invariant 41's landing figure, frozen per room so it
     // outlives the shared credit (R9). Only rooms actually SENT an off.
+    const shedThisBatch = new Set<string>();
     for (const cmd of commands) {
       if (cmd.kind !== "power_off") continue;
-      this.shedBar.set(cmd.deviceId, { amps: view.smoothedAmps - out.commandedCutAmps, at: now });
+      this.shedBar.set(cmd.deviceId, { amps: view.smoothedAmps - out.commandedCutAmps, at: now, credited: 0 });
+      shedThisBatch.add(cmd.deviceId);
     }
+    // …and a PEER whose room this batch just lowered shrinks the house every
+    // OTHER bounce-extended bar describes (the peer-credit release valve). The
+    // freshly-stamped rooms already account for this cut in their own bar.
+    this.creditPeerShedBars(out.commandedCutAmps, shedThisBatch, now);
 
     // Failure attribution: an over-limit cut/shed of a recently-attempted AC.
     //
@@ -2888,7 +3236,10 @@ export class LevelingControllerV2 {
         if (cmd.kind !== "set_level" && cmd.kind !== "power_off") continue;
         for (const kind of ["raise", "restore"] as const) {
           if (attemptedRecently(this.pacing, cmd.deviceId, kind, now)) {
-            this.pacing = noteFailure(this.pacing, cmd.deviceId, kind, now);
+            // Only a genuine `power_off` re-shed books a BOUNCE (compounds the
+            // trough bar); a `set_level` cut of a recently restored room is a
+            // ladder failure but not a shed bounce (2026-08-07 review).
+            this.pacing = noteFailure(this.pacing, cmd.deviceId, kind, now, cmd.kind === "power_off");
             // A failed attempt must never be graded a SUCCESS later — its grade
             // window is still open and `gradeOne` calls noteSuccess on whatever
             // attempts it carries, which would reset the backoff we just grew.

@@ -14,14 +14,17 @@ import type { AcView, Command, CostEstimate, Decision, PowerSource } from "./typ
 import type { CostBook } from "./costs.js";
 import { levelCutSavings, modelCutAmps, modelFor, raiseJumpAmps, restoreCostAmps, steadyDraw } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
+import { rampCommittedAmps } from "./dead-window.js";
 import { ceilCapOf, ceilOf, floorOf, isNonCooling } from "./needs.js";
 import { SHED_NEED_GAP_C } from "./reduce.js";
 import { PENDING_CUT_MS } from "./sensing.js";
 import {
   attemptedWithin,
+  bounceBackoffMs,
   canAttempt,
   probeRearmed,
   RESTORE_CONFIRM_WAIT_MS,
+  restoreBounces,
   restoreFailures,
   type PacingState,
 } from "./pacing.js";
@@ -172,9 +175,10 @@ export function rampDebitAmps(
 ): number {
   const live = acs.filter((ac) => ac.on && ac.managed && !ac.shed);
   const ramping = live.filter((ac) => ac.ramping);
-  const committed = ramping.map((ac) =>
-    steadyDraw(ac.currentLevel, ac.maxLevel, modelFor(config, ac.deviceId, source)),
-  );
+  // The committed draw the ramp was armed against — the SAME figure the
+  // early-release path checks the ratchet against (`rampCommittedAmps`), so a
+  // ramp can never be charged as owed here while it is released as absorbed there.
+  const committed = ramping.map((ac) => rampCommittedAmps(ac, config, source));
   const absorbed = absorbedSharesAmps(
     ramping.map((ac, i) => ({
       committedAmps: committed[i],
@@ -295,6 +299,47 @@ export const SWAP_NEED_GAP_C = SHED_NEED_GAP_C;
  */
 export const SWAP_QUIET_AFTER_OVER_MS = PENDING_CUT_MS;
 
+/**
+ * How long after a human turns a room ON that room is shielded from being picked
+ * as a proactive-shed DONOR (`AcView.recentlyExternalOn`). "Manual wins"
+ * (invariant 42) must cover the power button for the COMFORT tool: the swap is
+ * documented as "a comfort optimisation, never an emergency tool", so it may
+ * never un-do a human's explicit ON. Live 2026-08-06 18:35–19:14Z — the leveler
+ * shed the priority-#1 room, a household member turned it back on three times,
+ * and the swap re-selected it as donor and shed it again TWICE (#9224/#9228, the
+ * second 1.6 s after the first's reservation expired). The occupant then killed
+ * the whole controller for seven hours.
+ *
+ * Fifteen minutes because it is the SAME number the collector's power-event
+ * guard uses (`AC_POWER_EVENT_GRACE_MS` / the shell's
+ * `POWER_EVENT_LEVEL_JUMP_GRACE_MS`): a TCL power-blink RESTORES its last level,
+ * which in the shadow is character-for-character an external ON (invariant 56),
+ * so the two edges must judge on one clock or they drift. Shielding a blinked
+ * room from DONATING for fifteen minutes costs a comfort tool nothing — an
+ * ordinary overload shed of the same room stays allowed (invariant 43).
+ */
+export const EXTERNAL_ON_DONOR_SHIELD_MS = 15 * 60_000;
+
+/**
+ * How long a restore may sit refused ONLY by the supply-flicker margin before it
+ * is admitted at the bare (un-charged) ceiling anyway (invariant 58 follow-up,
+ * 2026-08-08, user directive: rooms that ultimately ran fine sat refused behind
+ * the flicker margin).
+ *
+ * The flicker charge (`chargedRestoreCeiling`, invariant 58) is a MARGIN, not a
+ * price — a room refused by it fits the bare ceiling and is only waiting for a
+ * steadier line. A wobble that never settles must not strand the room forever, so
+ * after this much continuous flicker-only refusal the room admits at the bare
+ * ceiling.
+ *
+ * 120 s sits far outside the shape invariant 58 was written against: the
+ * 2026-08-06 double shed re-admitted the room 34 s after its shed, so a patience
+ * window this long can never re-create it. And a patience admission that is wrong
+ * is not silent — it re-sheds and winds invariant 67's bounce backoff, which is
+ * the net under it.
+ */
+export const FLICKER_PATIENCE_MS = 120_000;
+
 /** A proactive-shed trade: switch `donorId` off so `receiverId` can come back. */
 export interface SwapDecision {
   donorId: string;
@@ -361,6 +406,12 @@ export interface SwapDonorInput {
  *    always wins. Configured PRIORITY is deliberately NOT a shield: the user's
  *    2026-08-04 policy is that the thermometer decides and the coolest room
  *    goes off, top-priority included.
+ *  - **Not just switched on by a human** (`recentlyExternalOn`) — "manual wins"
+ *    covers the power button too, not only a level pin (invariant 42). A bare
+ *    ON mints no pin, so before this the swap traded away the very room a
+ *    household member had switched back on, three times over (2026-08-06
+ *    #9224/#9228). An ordinary overload shed of that room stays allowed — only
+ *    the comfort trade is barred.
  *  - **Not ramping** — a compressor mid-start has not shown its amps yet, so
  *    neither its saving nor the meter it would leave behind is knowable.
  *  - **Not cooling down** — a room inside a funding or victim cooldown is
@@ -391,6 +442,9 @@ export function swapDonorFor(input: SwapDonorInput): { donor: AcView; freedAmps:
         !a.ramping &&
         a.manualTarget == null &&
         a.manualCap == null &&
+        // A human just switched this room ON — the comfort trade may not un-do
+        // it (invariant 42/57, 2026-08-06 #9224/#9228). An overload shed still can.
+        !a.recentlyExternalOn &&
         !input.blocked(a.deviceId) &&
         a.rankNeedDelta + SWAP_NEED_GAP_C <= receiver.rankNeedDelta,
     )
@@ -425,6 +479,12 @@ export interface RaiseInput {
    * whole 2.0A gap was the house the guard never counted.
    */
   nonAcAmps: number;
+  /**
+   * Live supply flicker (`MeterView.flickerAmps`) — 0 on a quiet, stale or
+   * unestimable line. Charged as MARGIN against the RESTORE ceiling only; see
+   * `restoreCeiling` below for why, and why raises are deliberately left out.
+   */
+  flickerAmps: number;
   /**
    * The smoothed meter as it stood when the reducing batch still in flight was
    * commanded, or 0 when no cut is live. With `commandedCutAmps` this says
@@ -489,6 +549,15 @@ export interface RaiseInput {
    * saving is spent only once the meter has shown it).
    */
   swapInFlight?: SwapDecision | null;
+  /**
+   * When each shed room first sat refused ONLY by the supply-flicker margin, or
+   * undefined for a room that is not (or not yet) flicker-refused. The shell owns
+   * the anchor and stamps it from the plan's `flickerRefused` list; the pure
+   * layer reads it to age a flicker-only refusal into a bare-ceiling admission
+   * (see FLICKER_PATIENCE_MS). Mirrors the `fundingCooldown`/`shedBarAmps`
+   * per-device-lookup pattern. Defaults to "nothing refused".
+   */
+  flickerRefusedSince?: (deviceId: string) => number | undefined;
 }
 
 export interface RaisePlan {
@@ -528,6 +597,14 @@ export interface RaisePlan {
    * receiver's amps stay reserved across ticks until its restore lands.
    */
   swap: SwapDecision | null;
+  /**
+   * Shed rooms refused THIS tick ONLY by the supply-flicker margin (they fit the
+   * bare ceiling). The shell stamps `flickerRefusedSince` for any without an
+   * anchor and drops the anchor for any shed room that is NOT here, so patience
+   * accrues only while the flicker-only refusal is unbroken (see
+   * FLICKER_PATIENCE_MS).
+   */
+  flickerRefused: string[];
 }
 
 /**
@@ -595,6 +672,13 @@ export function invariantCorrections(
   return { commands, decisions };
 }
 
+/** "1st"/"2nd"/"3rd"/… for the LOUD bounce-backoff journal (2026-08-07). */
+function ordinalBounce(n: number): string {
+  const rem100 = n % 100;
+  if (rem100 >= 11 && rem100 <= 13) return `${n}th`;
+  return `${n}${["th", "st", "nd", "rd"][n % 10] ?? "th"}`;
+}
+
 export function planRaise(input: RaiseInput): RaisePlan {
   const { acs, config, book, source, now, pacing } = input;
   const decisions: Decision[] = [];
@@ -603,6 +687,8 @@ export function planRaise(input: RaiseInput): RaisePlan {
   /** Model-priced down-moves this plan emits (funding demotes, peer floor-downs). */
   let cutAmps = 0;
   const fundingDonors: string[] = [];
+  /** Shed rooms refused this tick ONLY by the flicker margin (see RaisePlan). */
+  const flickerRefused: string[] = [];
 
   const onManaged = acs.filter((a) => a.on && a.managed && !a.shed);
 
@@ -665,6 +751,47 @@ export function planRaise(input: RaiseInput): RaisePlan {
   // Restores are exempt from the resting buffer (a whole room off is worse
   // than riding near the limit): fits under limit − margin.
   const restoreCeiling = input.limitAmps - config.marginAmps;
+  /**
+   * …and the same ceiling less the wobble the supply is going to show anyway
+   * (2026-08-06 14:00–14:04Z, user: "why did it turn off both Najat and
+   * Abdullah, when Najat-only-off was fine?").
+   *
+   * A saturated gen house shed Najat at 14:00:32 and settled at 11.6A — a state
+   * the rest of the afternoon proved sufficient. Thirty-four seconds later this
+   * phase bought her back: committed 12.12A + a 2.3A probe = 14.42A against a
+   * 14.9A ceiling, admitted with 0.48A to spare on a line whose measured
+   * flicker was ±0.4–0.8A. Her compressor and two held fans crossed 15.3A, she
+   * was re-shed at 14:04:10 — and because her own cut had not yet crossed the
+   * 8-wide median, Abdullah was shed 14s after that. His off/on cycle was pure
+   * loss, and one off/on cycle costs a room several degrees.
+   *
+   * The buffer exemption above is a deliberate trade about a STEADY line: a
+   * whole room off is worse than riding near the limit. Riding near the limit
+   * on a MEASURED-wobbly line is not a tight ride — it is a bounce with a
+   * delay, and a bounce costs the room its cycle plus the backoff ladder. So
+   * the fixed buffer is replaced by a measured one: quiet line ⇒ zero charge
+   * and this is byte-identical to the old behaviour (including grid, where the
+   * flicker is ~0 and the headroom is huge anyway).
+   *
+   * MARGIN, never a price. `restoreCostAmps` and the probe pricing are
+   * untouched, because admission and the controller's freshly-on projection
+   * must re-price each other exactly (invariant 3, the 2026-07-25 storm). The
+   * gated proactive shed is left out END TO END — it may neither be armed nor
+   * refused by this charge, and it carries `REBALANCE_FUND_MARGIN_AMPS` as its
+   * own margin (see `ceilingFor` in the loop below for both halves and the
+   * evidence). Level RAISES are also left uncharged: they answer to the physics
+   * envelope plus the measured house (invariant 16), and the failure being
+   * fixed here is restore-shaped.
+   *
+   * Written as a `> 0` test rather than `Math.max`, deliberately: an absent or
+   * NaN estimate then degrades to "quiet line", i.e. to the behaviour this
+   * replaces. A NaN reaching the ceiling would make every comparison false and
+   * strand every shed room off in silence — the worse failure by the user's own
+   * ranking, and the one this margin exists to avoid in the first place.
+   */
+  const flickerCharge = input.flickerAmps > 0 ? input.flickerAmps : 0;
+  const chargedRestoreCeiling = restoreCeiling - flickerCharge;
+  const flickerNote = flickerCharge > 0 ? ` (−${flickerCharge.toFixed(1)}A flicker)` : "";
   const restoreCalmOk = input.calmMs >= config.restoreCalmSeconds * 1000;
   let reservedAmps = 0;
   /**
@@ -854,6 +981,28 @@ export function planRaise(input: RaiseInput): RaisePlan {
     );
     const candidateEntry = { deviceId: candidate.deviceId, level: floor, maxLevel: candidate.maxLevel };
 
+    /**
+     * The gated proactive shed (invariant 57) is deliberately flicker-free END
+     * TO END, and both halves of that are load-bearing:
+     *
+     *  - a trade may not be ARMED by a flicker refusal. The swap's whole cost is
+     *    a cool room's compressor; spending it to buy a restore the bare ceiling
+     *    would have admitted anyway turns this margin into a room-off machine.
+     *  - and once armed it may not be REFUSED by one. The amps a live trade is
+     *    waiting on are not ambient headroom — they are a named room's whole
+     *    draw, already switched off for this receiver and RESERVED across ticks.
+     *    Charging the wobble there strands the trade instead: the ±0.5A-noise
+     *    acceptance replay (whose alternating readings the estimator reads as a
+     *    full amp of flicker) switched Najat off, refused Abdu for the whole
+     *    reservation, and brought NAJAT back — a room cycled for nothing, the
+     *    one outcome `swapDonorFor`'s own contract rules out.
+     *
+     * `REBALANCE_FUND_MARGIN_AMPS` is the margin that answers for this path, and
+     * it was sized against exactly this noise band.
+     */
+    const isSwapReceiver = swapInFlight != null && swapInFlight.receiverId === candidate.deviceId;
+    const ceilingFor = isSwapReceiver ? restoreCeiling : chargedRestoreCeiling;
+
     // Both feasibilities up front, BEFORE any gate — the reservation decision
     // needs to know whether this room could return at all (plain, or by pulling
     // every raised peer down to its floor in the same batch).
@@ -887,20 +1036,16 @@ export function planRaise(input: RaiseInput): RaisePlan {
     }, 0);
     const floorOverrides = Object.fromEntries(onManaged.map((a) => [a.deviceId, floorOf(a)]));
     const envelopeFloorsOk = !envelopeGuard || envelopeWith(floorOverrides, candidateEntry) <= envelopeCeiling;
-    const fitsWith = (amps: number): { plain: boolean; atFloors: boolean } => ({
-      plain: envelopePlainOk && candidateCommitted + amps <= restoreCeiling,
-      atFloors: envelopeFloorsOk && candidateCommitted - savingsAtFloors + amps <= restoreCeiling,
+    const fitsUnder = (amps: number, ceiling: number): { plain: boolean; atFloors: boolean } => ({
+      plain: envelopePlainOk && candidateCommitted + amps <= ceiling,
+      atFloors: envelopeFloorsOk && candidateCommitted - savingsAtFloors + amps <= ceiling,
     });
-
-    let cost = plainCost;
-    let probe = false;
-    let fits = fitsWith(cost.amps);
-    // PROBE: the learned price blocks, but it may be stale-high — while there
-    // is ZERO bounce evidence this source-session, try once at the steady
-    // floor price. A bounce feeds the pacing ladder (failures > 0 disables
-    // further probes) and re-learns the on-cost from the shed's off-drop; a
-    // probe that sticks re-grades the learned cost cheap. Both wrong beliefs
-    // self-correct from the meter instead of stranding or storming.
+    // PROBE eligibility: the learned price blocks, but it may be stale-high —
+    // while there is ZERO bounce evidence this source-session, try once at the
+    // steady floor price. A bounce feeds the pacing ladder (failures > 0
+    // disables further probes) and re-learns the on-cost from the shed's
+    // off-drop; a probe that sticks re-grades the learned cost cheap. Both wrong
+    // beliefs self-correct from the meter instead of stranding or storming.
     //
     // EVIDENCE RE-ARM (2026-08-02): a bounce is evidence about the house the
     // probe bounced IN, not the house forever. Najat's probe failed at a
@@ -910,29 +1055,104 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // A committed meter ≥ PROBE_REARM_DROP_AMPS below the failed attempt's own
     // committed amps re-arms one probe (see probeRearmed — re-anchoring keeps
     // retries bounded).
-    if (
-      !fits.plain &&
-      !fits.atFloors &&
+    const probeEligible =
       gentleRestore &&
       plainCost.amps > probeCost.amps + 1e-9 &&
       (restoreFailures(pacing, candidate.deviceId) === 0 ||
-        probeRearmed(pacing, candidate.deviceId, candidateCommitted))
-    ) {
-      const probeFits = fitsWith(probeCost.amps);
-      if (probeFits.plain || probeFits.atFloors) {
-        cost = probeCost;
-        probe = true;
-        fits = probeFits;
+        probeRearmed(pacing, candidate.deviceId, candidateCommitted));
+    /**
+     * The whole admission — price AND fit — resolved against ONE ceiling.
+     * Ordinary admission passes `ceilingFor` (charged the live flicker); the
+     * classification below re-runs it bare, and a live trade's receiver is never
+     * charged at all (see `ceilingFor`). The probe re-runs the same fit test, so
+     * it inherits whichever ceiling applies for free — which is the point: a
+     * stale-high learned cost is a reason to try a cheaper price, not a reason
+     * to spend the supply's own wobble.
+     */
+    const resolveAt = (
+      ceiling: number,
+    ): { cost: CostEstimate; probe: boolean; fits: { plain: boolean; atFloors: boolean } } => {
+      const plainFits = fitsUnder(plainCost.amps, ceiling);
+      if (plainFits.plain || plainFits.atFloors || !probeEligible) {
+        return { cost: plainCost, probe: false, fits: plainFits };
       }
-    }
+      const probeFits = fitsUnder(probeCost.amps, ceiling);
+      return probeFits.plain || probeFits.atFloors
+        ? { cost: probeCost, probe: true, fits: probeFits }
+        : { cost: plainCost, probe: false, fits: plainFits };
+    };
+    const chargedAdmission = resolveAt(ceilingFor);
+    /**
+     * The SAME question with the charge taken off (review, 2026-08-06): the
+     * flicker may only ever turn an ADMISSION into a skip, never change WHICH
+     * refusal a room gets. Every branch below that spends something — the bar's
+     * reservation, and the trade that costs a cool room its whole compressor —
+     * is classified on this, so a wobbly line reaches exactly the branch a quiet
+     * one would.
+     *
+     * Both halves were live bugs the moment the charge shipped, and both ran the
+     * wrong way — the charge made the controller MORE aggressive in the corner
+     * it exists to make more conservative:
+     *
+     *  - a room blocked by its own shed bar has `fitsIgnoringBar` judged at the
+     *    HOUSE figure while the fit tests use the bar-inflated one. Charge the
+     *    house figure and the bar stops looking like the blocker: the R9
+     *    reservation is silently dropped AND the room falls through to the
+     *    trade, which switches a clearly-cooler running room off to fund a
+     *    restore the bare ceiling had already admitted. A quiet line just waits
+     *    the bar out (≤ one blame window) and restores for free.
+     *  - and a room whose PROBE fits the bare ceiling is a room a quiet line
+     *    RESTORES. Refusing it for the wobble and then buying it a donor spends
+     *    a room's comfort on a margin.
+     */
+    const bare = flickerCharge > 0 && !isSwapReceiver ? resolveAt(restoreCeiling) : chargedAdmission;
+    /**
+     * FLICKER PATIENCE (invariant 58 follow-up, 2026-08-08). A refusal that fails
+     * ONLY on the flicker charge — the charged ceiling refuses it, the bare one
+     * would admit it — is not a strand: the room fits the line, it is waiting for
+     * the wobble to settle. It is reserved while it waits (below) and, once it has
+     * been refused this way for FLICKER_PATIENCE_MS unbroken, admitted at the bare
+     * ceiling. Swap receivers never qualify (they are already judged at the bare
+     * ceiling — see `ceilingFor`).
+     */
+    const flickerOnlyRefusal =
+      flickerCharge > 0 &&
+      !isSwapReceiver &&
+      !chargedAdmission.fits.plain &&
+      !chargedAdmission.fits.atFloors &&
+      (bare.fits.plain || bare.fits.atFloors) &&
+      // A restore we already SENT is awaiting its confirm, not flicker-refused —
+      // let the confirm gate below own it, or a patience admission would keep
+      // re-refusing (and re-anchoring) its own in-flight restore while the shadow
+      // lags. The shed clears on confirm and this candidate leaves the queue.
+      !attemptedWithin(pacing, candidate.deviceId, "restore", RESTORE_CONFIRM_WAIT_MS, now);
+    const flickerAnchorAt = flickerOnlyRefusal ? input.flickerRefusedSince?.(candidate.deviceId) : undefined;
+    const flickerPatienceExpired = flickerAnchorAt != null && now - flickerAnchorAt >= FLICKER_PATIENCE_MS;
+    // Patience is up → `bare` IS the admission this candidate flows through: same
+    // cost/fits/probe, same emission path, with a note appended below so the
+    // journal says the wobble was waited out rather than admitted into.
+    const admitted = flickerPatienceExpired ? bare : chargedAdmission;
+    const cost = admitted.cost;
+    const probe = admitted.probe;
+    const fits = admitted.fits;
     const fitsPlain = fits.plain;
     const fitsAtFloors = fits.atFloors;
     const bar = barFor(candidate.deviceId);
-    /** Would it fit if we judged it on the trough its own shed dug? */
+    /**
+     * Would it fit if we judged it on the trough its own shed dug? The BARE
+     * ceiling on both sides of the comparison, per `bare` above: the bar
+     * reserves because it is a claim about the HOUSE (if the shed room cannot be
+     * afforded at that figure, nobody can), and that claim is about load, not
+     * about how steady the supply is. A room the flicker alone refuses still
+     * reserves nothing — it fits bare, so `bare.fits` is true and this branch is
+     * never reached; parking the whole raise phase on a supply wobble remains a
+     * different bug.
+     */
     const fitsIgnoringBar =
-      (envelopePlainOk && committedAmps + cost.amps <= restoreCeiling) ||
-      (envelopeFloorsOk && committedAmps - savingsAtFloors + cost.amps <= restoreCeiling);
-    const barIsTheBlocker = !fitsPlain && !fitsAtFloors && bar > committedAmps && fitsIgnoringBar;
+      (envelopePlainOk && committedAmps + bare.cost.amps <= restoreCeiling) ||
+      (envelopeFloorsOk && committedAmps - savingsAtFloors + bare.cost.amps <= restoreCeiling);
+    const barIsTheBlocker =
+      !bare.fits.plain && !bare.fits.atFloors && bar > committedAmps && fitsIgnoringBar;
 
     // Blocked ONLY by its own shed bar (R9): the room fits the meter in front of
     // us and does not fit the meter this house really has. RESERVE, don't skip.
@@ -942,18 +1162,32 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // bar is a claim about the HOUSE, so if the shed room cannot be afforded at
     // that figure then nobody can, and letting a raise take the amps would be
     // spending the very trough the bar exists to disbelieve. Bounded by the bar
-    // itself (one blame window from the shed), and a bar can only be renewed by
-    // another shed — which is itself a bounce that grows the backoff.
+    // itself (a blame window from the shed, or the compounded backoff while it
+    // bounces), and a bar can only be renewed by another shed — which is itself
+    // a bounce that grows the backoff.
     if (barIsTheBlocker) {
-      reservedAmps = Math.max(reservedAmps, cost.amps);
+      // `bare.cost`, with the bare ceiling in the note: this branch is the
+      // flicker-free classification, so the amps it reserves and the arithmetic
+      // it prints are the ones a quiet line would have used.
+      reservedAmps = Math.max(reservedAmps, bare.cost.amps);
+      // LOUD when this is a bounce cycle (2026-08-07): the bar outlives its clock
+      // and the room stays reserved for the compounded wait — say so, or the next
+      // forensic reader sees only a bar that "should have" expired.
+      const bounces = restoreBounces(pacing, candidate.deviceId);
+      const waitS = (bounceBackoffMs(bounces) / 1000).toFixed(0);
       decisions.push({
         at: now,
         deviceId: candidate.deviceId,
         action: "restore",
         blockedBy: "own shed trough",
         detail:
-          `meter ${committedAmps.toFixed(1)}A is the hole this room's own shed dug — ` +
-          `judged at ${bar.toFixed(1)}A, needs ${cost.amps.toFixed(1)}A vs ${restoreCeiling.toFixed(1)}A`,
+          bounces >= 1
+            ? `bounce backoff (${ordinalBounce(bounces)} bounce — ${waitS}s wait, ` +
+              `needs ${bare.cost.amps.toFixed(1)}A settled vs ${restoreCeiling.toFixed(1)}A; ` +
+              `meter ${committedAmps.toFixed(1)}A is this room's own shed trough, judged at ${bar.toFixed(1)}A)`
+            : `meter ${committedAmps.toFixed(1)}A is the hole this room's own shed dug — ` +
+              `judged at ${bar.toFixed(1)}A, needs ${bare.cost.amps.toFixed(1)}A vs ` +
+              `${restoreCeiling.toFixed(1)}A`,
       });
       continue;
     }
@@ -965,14 +1199,20 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // one back? (User: "after Najat on and be stable, there was enough budget to
     // turn off Najat and bring Abdu back on.")
     //
-    // Execution is invariant 9 verbatim — never spend a saving that has not
-    // landed. The donor's `power_off` ships ALONE (a reducing batch, credited
-    // via `commandedCutAmps` so its cliff cannot latch a phantom collapse —
-    // invariants 11/31), the receiver's amps are RESERVED, and the restore is
-    // admitted on a LATER tick once the committed meter shows the saving landed
-    // (invariant 41's bar arithmetic, which the same `candidateCommitted` above
-    // already applies). Shipping both in one batch would commit ~4 A of
-    // compressor on a 15 A line for however long the donor takes to wind down.
+    // ONE BATCH (user, 2026-08-08: "switching acs ... make that instantly, no
+    // need to wait — the AC won't run full at the first moment"). The donor's
+    // off-cliff reaches the meter in ~10–40 s while the receiver's compressor
+    // engages minutes later (TCL restart protection + soft-start ramp), so the
+    // two never actually overlap on the line — and the committed-meter machinery
+    // already prices exactly that gap: the off is credited via `commandedCutAmps`
+    // (so its cliff cannot latch a phantom collapse — invariants 11/31), the on
+    // arms `pendingOn` + a ramp debit, and the receiver's `candidateCommitted`
+    // already reflects the saving (invariant 41's bar arithmetic). So the donor's
+    // `power_off` and the receiver's restore ship TOGETHER, sparing the receiver
+    // the 36 s-plus wait it used to sit out for a LATER tick's committed meter.
+    //
+    // The `swapInFlight` branch below is now the failed-send/re-try path only: a
+    // trade armed by a previous tick whose receiver never confirmed ON.
     if (!fitsPlain && !fitsAtFloors && swapInFlight != null && swapInFlight.receiverId === candidate.deviceId) {
       // Our own trade is still landing. These amps are SPOKEN FOR — reserve
       // them (which parks the raise phase and the fan restore) so the swap
@@ -991,7 +1231,22 @@ export function planRaise(input: RaiseInput): RaisePlan {
       });
       continue;
     }
+    /**
+     * Infeasible on the BARE ceiling — the only refusal a trade may answer.
+     * A room refused only by the flicker charge is waiting for a steadier line,
+     * not for someone else's compressor, and buying it a room would spend a
+     * cool room's whole comfort on a margin (see `ceilingFor`).
+     *
+     * The whole `bare` resolution, price included: a room whose PROBE fits the
+     * bare ceiling is a room a quiet line RESTORES, so refusing it for the
+     * wobble may not then buy it a donor (review, 2026-08-06 — testing only the
+     * plain price here armed exactly that trade). The bar's own case never
+     * reaches this line: `barIsTheBlocker` is classified on the same `bare` and
+     * has already reserved and continued.
+     */
     if (
+      !bare.fits.plain &&
+      !bare.fits.atFloors &&
       !fitsPlain &&
       !fitsAtFloors &&
       input.swapAllowed === true &&
@@ -1013,6 +1268,15 @@ export function planRaise(input: RaiseInput): RaisePlan {
         // trade that costs another room its compressor.
         receiverCostAmps: plainCost.amps,
         committedAmps: candidateCommitted,
+        // The BARE ceiling, and the receiver's own admission uses the same one
+        // while the trade is live (`ceilingFor`) — a prediction and the
+        // admission it predicts must ask the same question, or the trade arms on
+        // a fit the receiver is then refused and the donor loses its compressor
+        // for nothing (invariant 3's principle, one rung out). Charging BOTH
+        // would be the other consistent answer and is the wrong one: it stands
+        // the trade down on any wobbly line, which on a generator is most of
+        // them, leaving the hotter room shed — the failure this feature exists
+        // to fix. `REBALANCE_FUND_MARGIN_AMPS` is this path's margin.
         ceilingAmps: restoreCeiling,
         // `currentLevel`, deliberately — the SAME level `commandedCutAmpsOf`
         // will price this `power_off` at when it credits the collapse detector.
@@ -1036,7 +1300,33 @@ export function planRaise(input: RaiseInput): RaisePlan {
         // applies to it exactly as it does to a level donor, which is what the
         // "donation cooldown" branch above spends.
         fundingDonors.push(donor.deviceId);
+        // …and the receiver ships in the SAME batch (see the header). Ordinary
+        // gentle-restore shape (`restoreCmd()` is declared later in this loop —
+        // TDZ — so it is constructed identically here). PLAIN price throughout:
+        // the swap admits at the learned price (invariant 3/57), never the
+        // probe, so the receiver is NOT in `probeRestoreIds` and its recorded fan
+        // hold stays gentle=false.
+        const receiverCmd: Command = gentleRestore
+          ? { deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore", fan: 1 }
+          : { deviceId: candidate.deviceId, kind: "power_on", level: floor, reason: "restore" };
+        commands.push(receiverCmd);
+        // Pacing must see this as a restore attempt exactly like an ordinary one;
+        // its probe re-arm anchor (invariant 22) is the committed meter the trade
+        // was ADMITTED at — the committed figure less the donor's freed draw.
+        const admittedAt = candidateCommitted - freedAmps;
+        attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: admittedAt });
+        // Belt: keep the receiver's cost reserved while the send is in flight
+        // (harmless — nothing else spends this tick, we return below), and keep
+        // returning `swap` so the shell arms `controller.swap`. Its release on the
+        // receiver's confirmed ON / SWAP_RESERVATION_MS / source change is
+        // unchanged and still covers a failed receiver send.
         reservedAmps = Math.max(reservedAmps, plainCost.amps);
+        // GRADING (accepted trade-off): this batch carries TWO meter commands, so
+        // the grading shell (controller.ts, `meterCmds.length === 1`) journals but
+        // never LEARNS it — the donor's off-drop evidence (invariant 55) and the
+        // receiver's free on@L sample are deliberately forfeited for instant
+        // sequencing (user, 2026-08-08). A window born beside another command
+        // would be born contaminated anyway (invariant 23).
         decisions.push({
           at: now,
           deviceId: donor.deviceId,
@@ -1054,22 +1344,52 @@ export function planRaise(input: RaiseInput): RaisePlan {
         decisions.push({
           at: now,
           deviceId: candidate.deviceId,
-          action: "restore",
-          blockedBy: "swap landing",
-          detail: `reserved ${plainCost.amps.toFixed(1)}A — restores once the meter shows the saving`,
+          action: `restore @L${floor}`,
+          detail:
+            `funded by ${donor.name} off — same batch: frees ~${freedAmps.toFixed(1)}A, ` +
+            `needs ${plainCost.amps.toFixed(1)}A at ${admittedAt.toFixed(1)}A committed ` +
+            `vs ${restoreCeiling.toFixed(1)}A`,
         });
         return {
           commands,
           decisions,
           attempts,
-          isTurnOn: false,
+          // Ships a power_on now — the batch wants the turn-on grade window; the
+          // pipeline still prints reason "proactive_shed" (it reads `swap`).
+          isTurnOn: true,
           reservedAmps,
           probeRestoreIds: [],
           cutAmps,
           fundingDonors,
           swap: { donorId: donor.deviceId, receiverId: candidate.deviceId },
+          flickerRefused,
         };
       }
+    }
+
+    // FLICKER-ONLY refusal (invariant 58 follow-up): it fits the bare ceiling
+    // and fails only on the flicker charge. Patience has NOT run out yet (the
+    // expired case has `admitted = bare` above, so it fell through as an
+    // admission), so hold it: report it so the shell anchors it, and — once the
+    // anchor stands — RESERVE the bare cost so a peer raise cannot spend the amps
+    // this room is waiting to take (closes 58's open item). On the very first
+    // refusal tick there is no anchor yet, so nothing is reserved; the shell
+    // stamps `now`, and the next tick reserves.
+    if (flickerOnlyRefusal && !flickerPatienceExpired) {
+      flickerRefused.push(candidate.deviceId);
+      const waitedS = ((flickerAnchorAt != null ? now - flickerAnchorAt : 0) / 1000).toFixed(0);
+      const patienceS = (FLICKER_PATIENCE_MS / 1000).toFixed(0);
+      if (flickerAnchorAt != null) reservedAmps = Math.max(reservedAmps, bare.cost.amps);
+      decisions.push({
+        at: now,
+        deviceId: candidate.deviceId,
+        action: "restore",
+        blockedBy: "flicker margin",
+        detail:
+          `flicker-only — floors ${(candidateCommitted - savingsAtFloors + bare.cost.amps).toFixed(1)}A ` +
+          `fits ${restoreCeiling.toFixed(1)}A bare, waiting ${waitedS}s of ${patienceS}s${flickerNote}${rampNote}`,
+      });
+      continue;
     }
 
     // Can't return this tick even with peer floor-downs → reserve NOTHING
@@ -1084,7 +1404,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
         // floors); if even that is over the breaker model, physics is the
         // blocker, not the meter — label it so the journal is diagnosable.
         blockedBy: !envelopeFloorsOk ? "physics envelope" : "no headroom",
-        detail: `floors ${(candidateCommitted - savingsAtFloors + cost.amps).toFixed(1)}A vs ${restoreCeiling.toFixed(1)}A${rampNote}`,
+        detail: `floors ${(candidateCommitted - savingsAtFloors + cost.amps).toFixed(1)}A vs ${ceilingFor.toFixed(1)}A${isSwapReceiver ? "" : flickerNote}${rampNote}`,
       });
       continue;
     }
@@ -1092,15 +1412,23 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // Feasible but its restore backoff is cooling (a recent restore bounced):
     // reserve its amps AND park raises (below) so a running AC can't grab the
     // headroom the moment the backoff clears. Bounded by the backoff ladder
-    // (≤15 min) — never permanent. Keep scanning: a less-needy room may ship.
+    // (≤15 min) or the compounded bounce wait (≤30 min) — never permanent. Keep
+    // scanning: a less-needy room may ship.
     if (!canAttempt(pacing, candidate.deviceId, "restore", now)) {
       reservedAmps = Math.max(reservedAmps, cost.amps);
+      // LOUD when a bounce stands: the ordinary ladder rung is cooling but the
+      // room we TRIED and failed carries bounce evidence (2026-08-07). Same class
+      // as the shed-trough refusal, told from the ladder side.
+      const bounces = restoreBounces(pacing, candidate.deviceId);
       decisions.push({
         at: now,
         deviceId: candidate.deviceId,
         action: "restore",
         blockedBy: "backoff",
-        detail: `reserved ${cost.amps.toFixed(1)}A`,
+        detail:
+          bounces >= 1
+            ? `bounce backoff (${ordinalBounce(bounces)} bounce) — reserved ${cost.amps.toFixed(1)}A`
+            : `reserved ${cost.amps.toFixed(1)}A`,
       });
       continue;
     }
@@ -1151,11 +1479,18 @@ export function planRaise(input: RaiseInput): RaisePlan {
     const probeDetail = probe
       ? `probe at ${cost.amps.toFixed(1)}A (learned ${plainCost.amps.toFixed(1)}A unproven)`
       : undefined;
+    // A flicker-only refusal whose patience ran out is admitted at the bare
+    // ceiling (invariant 58 follow-up) — mark it so the journal is not read as an
+    // ordinary admission into the flicker band.
+    const patienceDetail = flickerPatienceExpired
+      ? `flicker patience: admitted at bare ceiling after ${((now - (flickerAnchorAt ?? now)) / 1000).toFixed(0)}s`
+      : undefined;
+    const admitDetail = [probeDetail, patienceDetail].filter(Boolean).join(" · ") || undefined;
     if (fitsPlain) {
       commands.push(restoreCmd());
       attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: candidateCommitted });
-      decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}`, detail: probeDetail });
-      return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors, swap: null };
+      decisions.push({ at: now, deviceId: candidate.deviceId, action: `restore @L${floor}`, detail: admitDetail });
+      return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors, swap: null, flickerRefused };
     }
     for (const a of onManaged) {
       const f = floorOf(a);
@@ -1181,9 +1516,9 @@ export function planRaise(input: RaiseInput): RaisePlan {
       at: now,
       deviceId: candidate.deviceId,
       action: `restore @L${floor} with peer floor-downs`,
-      detail: probeDetail,
+      detail: admitDetail,
     });
-    return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors, swap: null };
+    return { commands, decisions, attempts, isTurnOn: true, reservedAmps, probeRestoreIds: probeIds, cutAmps, fundingDonors, swap: null, flickerRefused };
   }
 
   // A feasible restore is reserved but gated (backoff/calm) — park the ENTIRE
@@ -1200,7 +1535,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
       blockedBy: "restore reservation",
       detail: `${reservedAmps.toFixed(1)}A reserved`,
     });
-    return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors, swap: null };
+    return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors, swap: null, flickerRefused };
   }
 
   // ---- Raise phase: one-step, meter-anchored, most-needy first ----
@@ -1452,10 +1787,33 @@ export function planRaise(input: RaiseInput): RaisePlan {
             if (source === "gen") break;
             continue;
           }
-          // The swap fixes the envelope but the METER is short: free the amps
-          // now, raise in a later calm window once they have actually landed.
+          // The swap fixes the envelope but the METER is short. Free the amps —
+          // and, since the user asked for instant sequencing (2026-08-08), ship
+          // the raise in the SAME batch when the freed amps close the gap with
+          // margin. The end-state envelope has already passed (the outer `if`),
+          // and the demote's model-priced fall is credited via `commandedCutAmps`
+          // so the meter cannot read it as a trip. A raise the demote does NOT
+          // cover still ships the demote alone and follows in a later calm window
+          // against a meter that has really fallen (the satisfied-only harvest,
+          // whose `donorFundOk` is unconditional, is the case that reaches here).
           const freed = emitDemotes(funding);
           cutAmps += freed;
+          if (swapJump.amps <= Math.max(0, available) + freed - REBALANCE_FUND_MARGIN_AMPS) {
+            commands.push({ deviceId: ac.deviceId, kind: "set_level", level: desired });
+            attempts.push({ deviceId: ac.deviceId, kind: "raise" });
+            decisions.push({
+              at: now,
+              deviceId: ac.deviceId,
+              action: `raise L${ac.currentLevel}→L${desired} funded by peer demote`,
+              detail:
+                `${funding.map((f) => `${f.ac.deviceId}→L${f.target}`).join(", ")}; ` +
+                `${swapJump.amps.toFixed(1)}A ${swapJump.confidence} ≤ ${Math.max(0, available).toFixed(1)}A avail ` +
+                `+ ${freed.toFixed(1)}A freed − ${REBALANCE_FUND_MARGIN_AMPS.toFixed(1)}A margin — same batch`,
+            });
+            available -= swapJump.amps;
+            if (source === "gen") break;
+            continue;
+          }
           decisions.push({
             at: now,
             deviceId: ac.deviceId,
@@ -1482,13 +1840,14 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // A grid start was already admitted against its pre-start baseline — the
     // meter cannot price it while the compressor is still ramping.
     if (startTarget == null && jump.amps > available) {
-      // FUNDING SWAP, meter-blocked case: free the amps NOW, raise LATER.
-      // Deliberately not one batch — the credit for a demote is a prediction,
-      // and this room's raise is admissible only if that prediction is already
-      // true. Shipping both together would commit ~16A on a 15A generator for
-      // however long the demoted compressor takes to actually throttle down
-      // (seconds to minutes on this firmware). The raise follows in the next
-      // calm window, against a meter that has really fallen.
+      // FUNDING SWAP, meter-blocked case: free the amps and — since the user
+      // asked for instant sequencing (2026-08-08) — ship the raise in the SAME
+      // batch when the freed amps close the gap with margin. The demote's
+      // model-priced fall is credited via `commandedCutAmps` so the meter cannot
+      // read it as a trip, and the receiver's compressor engages minutes after
+      // the donor's throttle-down begins, so they do not actually overlap on the
+      // line. A raise the demote does NOT cover still ships the demote alone and
+      // follows in a later calm window against a meter that has really fallen.
       //
       // Satisfied rooms are demoted regardless of coverage (dormant levels are
       // not comfort); a comparative-need donor pays real comfort, so donors
@@ -1514,6 +1873,30 @@ export function planRaise(input: RaiseInput): RaisePlan {
       if (funding.length > 0) {
         const freed = emitDemotes(funding);
         cutAmps += freed;
+        // Same-batch when the freed amps close the gap with margin. The envelope
+        // was never the blocker here — the raise already cleared it against peers
+        // at their worst-case levels — but demoting those peers only LOWERS the
+        // end-state, so re-assert it (belt) with the demote overrides.
+        const closesGap = jump.amps <= Math.max(0, available) + freed - REBALANCE_FUND_MARGIN_AMPS;
+        const endStateOverrides: Record<string, number> = { [ac.deviceId]: target };
+        for (const f of funding) endStateOverrides[f.ac.deviceId] = f.target;
+        const envelopeOk = !envelopeGuard || raiseEnvelope(endStateOverrides) <= envelopeCeiling;
+        if (closesGap && envelopeOk) {
+          commands.push({ deviceId: ac.deviceId, kind: "set_level", level: target });
+          attempts.push({ deviceId: ac.deviceId, kind: "raise" });
+          decisions.push({
+            at: now,
+            deviceId: ac.deviceId,
+            action: `raise L${ac.currentLevel}→L${target} funded by peer demote`,
+            detail:
+              `${funding.map((f) => `${f.ac.deviceId}→L${f.target}`).join(", ")}; ` +
+              `${jump.amps.toFixed(1)}A ${jump.confidence} ≤ ${Math.max(0, available).toFixed(1)}A avail ` +
+              `+ ${freed.toFixed(1)}A freed − ${REBALANCE_FUND_MARGIN_AMPS.toFixed(1)}A margin — same batch`,
+          });
+          available -= jump.amps;
+          if (source === "gen") break;
+          continue;
+        }
         decisions.push({
           at: now,
           deviceId: ac.deviceId,
@@ -1558,5 +1941,5 @@ export function planRaise(input: RaiseInput): RaisePlan {
     if (source === "gen") break;
   }
 
-  return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors, swap: null };
+  return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors, swap: null, flickerRefused };
 }

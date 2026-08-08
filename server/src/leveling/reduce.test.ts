@@ -489,7 +489,14 @@ describe("preferShed — undo the turn-on that caused this, never a bystander", 
   it("sheds the preferred room when the bystander is comparably warm", () => {
     // Within SHED_NEED_GAP_C the no-surprise rule holds: you should not switch
     // your AC on and find a similarly-warm room switched off instead.
+    //
+    // `shield` is the top-priority room (priority order IS the `acs` order) and
+    // is only here to keep the causer OFF that slot: since 2026-08-06 the top
+    // room exports to any strictly cooler peer, which is a different rule with
+    // its own describe below. It is the hottest room in the house, so it is
+    // never a shed candidate and changes nothing else.
     const acs = [
+      ac("shield", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 9 }),
       ac("hot", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 3 }),
       ac("cool", { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: 3 - (SHED_NEED_GAP_C - 0.1) }),
     ];
@@ -526,6 +533,155 @@ describe("preferShed — undo the turn-on that caused this, never a bystander", 
     const p = plan(acs, 1.5, { preferShed: "hot" });
     expect(p.toShed).toEqual([]);
     expect(p.satisfied).toBe(true);
+  });
+
+  // 2026-08-06 15:48:47Z, the third Abdullah cycle of that day. Abdullah —
+  // priority #1, real need 4.0°C — was switched on into a saturated house (the
+  // ~5A heater on, fans trimmed house-wide, every room at its floor and his own
+  // sub-floor rung barred by the hard boost zone), and the 0.28A overshoot 82s
+  // later had exactly one enumerable answer: a room off. The causer rule named
+  // him, and Najat — 0.6°C cooler, inside the gap — kept running.
+  //
+  // The user's amendment that evening ("can turn Najat off instead"): for the
+  // TOP-PRIORITY room only, the export bar drops from SHED_NEED_GAP_C to
+  // "strictly cooler". He accepted the cost out loud — his own click may now
+  // switch off a comparably warm room, as long as it is genuinely cooler.
+  describe("the top-priority causer exports to any strictly cooler room (user, 2026-08-06)", () => {
+    const room = (id: string, need: number): AcView =>
+      ac(id, { currentLevel: 1, minLevel: 1, fanSpeed: 1, needDelta: need, rankNeedDelta: need });
+    // Priority order IS the `acs` order, so a NON-top causer needs a room above
+    // it. This one is the hottest in the house and never a shed candidate.
+    const shield = (): AcView => room("shield", 9);
+
+    it("sheds a peer six tenths cooler rather than the top room that caused it", () => {
+      const p = plan([room("abdullah", 4.0), room("najat", 3.4)], 1.5, { preferShed: "abdullah" });
+      expect(p.toShed).toEqual(["najat"]);
+    });
+
+    it("…but never one the thermometer cannot tell apart from it", () => {
+      // The shedNeed rung rounds to a tenth and so does this bar: a room cooler
+      // by less than the comparator's own resolution is not cooler, and the
+      // causer undoes its own turn-on exactly as it did before.
+      const p = plan([room("abdullah", 4.0), room("najat", 3.96)], 1.5, { preferShed: "abdullah" });
+      expect(p.toShed).toEqual(["abdullah"]);
+    });
+
+    it("every other causer still owes the full degree (2026-08-03 stands)", () => {
+      // Najat is the causer and priority #2, so the amendment does not reach
+      // her: 0.6°C is inside SHED_NEED_GAP_C and her own turn-on is undone.
+      const p = plan([shield(), room("najat", 4.0), room("abdu", 3.4)], 1.5, { preferShed: "najat" });
+      expect(p.toShed).toEqual(["najat"]);
+    });
+
+    it("…and a non-top causer still exports past that degree", () => {
+      const p = plan([shield(), room("najat", 4.0), room("abdu", 3.0)], 1.5, { preferShed: "najat" });
+      expect(p.toShed).toEqual(["abdu"]);
+    });
+  });
+});
+
+// 2026-08-06 14:38:11Z. Since 2026-08-04 the thermometer decides shed choice
+// absolutely, top priority included — and that afternoon it shed ABDULLAH,
+// priority #1, real need 4.0°C, because Abdu ranked a few DECIMALS hotter (the
+// comparator rounds shedNeed to a tenth, so 4.05 rounded past 4.0). The two
+// rooms sat far inside SHED_NEED_GAP_C of each other, which is the band the
+// user himself calibrated as "equally hot — 1°C is enough to switch between
+// acs".
+//
+// His rule, that afternoon: when the shed candidates are inside the gap, the
+// configured priority list breaks the tie and the top-priority room survives.
+// Outside the gap the thermometer still decides absolutely — a clearly cooler
+// top-priority room still sheds, and 2026-08-04 stands.
+describe("priority breaks a shed tie inside the need gap (user, 2026-08-06)", () => {
+  // Priority order is the `acs` array order: abdullah #1, najat #2, abdu #3.
+  const room = (id: string, need: number): AcView =>
+    ac(id, { currentLevel: 1, fanSpeed: 1, needDelta: need, rankNeedDelta: need });
+
+  it("sheds the LOW-priority room when the two are inside the gap", () => {
+    // 0.1°C apart: decimals, not a difference anyone reads off a thermometer.
+    // Either room's off covers the deficit several times over.
+    const p = plan([room("abdullah", 4.0), room("abdu", 4.1)], 1.5);
+    expect(p.toShed).toEqual(["abdu"]);
+    expect(p.satisfied).toBe(true);
+  });
+
+  it("reports the tie-break so the journal can name it", () => {
+    // A silent tie-break is a future mystery — every one of these shed rules
+    // was debugged off the shed-choice decision detail.
+    const p = plan([room("abdullah", 4.0), room("abdu", 4.1)], 1.5);
+    expect(p.priorityTieBreak).toEqual({ shedDeviceId: "abdu", protectedDeviceId: "abdullah" });
+  });
+
+  it("outside the gap the thermometer still decides absolutely (2026-08-04)", () => {
+    // 1.5°C apart, clear of the gap: the top-priority room is genuinely the
+    // cooler one, so it pays. This is the rule the tie-break must NOT undo.
+    const p = plan([room("abdullah", 4.0), room("abdu", 5.5)], 1.5);
+    expect(p.toShed).toEqual(["abdullah"]);
+    expect(p.priorityTieBreak).toBeNull();
+  });
+
+  it("exactly one gap apart is OUTSIDE it — the boundary shedsOnlyMilder already uses", () => {
+    // One constant, one meaning: `shedsOnlyMilder` and the recovery admission
+    // both call a room "clearly milder" at exactly the gap. Live 2026-07-28
+    // 07:18 the two remaining rooms sat exactly 1.0°C apart, and an inclusive
+    // boundary re-decides that shed on priority — which changes which cliff the
+    // collapse detector then has to explain.
+    const p = plan([room("abdullah", 0.5), room("abdu", 0.5 + SHED_NEED_GAP_C)], 1.5);
+    expect(p.toShed).toEqual(["abdullah"]);
+    expect(p.priorityTieBreak).toBeNull();
+  });
+
+  it("the causer still sheds inside the gap, priority or not (invariant 43)", () => {
+    // Abdullah is priority #1 AND the room whose own turn-on caused this.
+    // `exportsShed` is compared before the shedNeed rung, so undoing the
+    // turn-on outranks the tie-break: you do not flip your own AC on and find
+    // a comparably warm room switched off instead.
+    const p = plan([room("abdullah", 4.0), room("abdu", 4.1)], 1.5, { preferShed: "abdullah" });
+    expect(p.toShed).toEqual(["abdullah"]);
+  });
+
+  it("a two-room batch prefers the pair without the top-priority room", () => {
+    // No single off covers 3.5A (each room is worth 2A at L1), so the search
+    // escalates to pairs. {abdullah, najat} totals 4.0 and {najat, abdu} 4.1 —
+    // a tenth apart, deep inside the gap — and the best-protected room of each
+    // pair is what decides.
+    const p = plan([room("abdullah", 2.0), room("najat", 2.0), room("abdu", 2.1)], 3.5);
+    expect(p.toShed.slice().sort()).toEqual(["abdu", "najat"]);
+    expect(p.toShed).not.toContain("abdullah");
+    expect(p.satisfied).toBe(true);
+  });
+
+  it("never moves the off UP the priority list", () => {
+    // The thermometer has already picked the LOWER-priority room, and abdullah
+    // is 0.9°C hotter — inside the gap, but promoting him would sacrifice the
+    // better-protected room to protect a worse-placed one. "The top-priority
+    // room survives" is the whole rule; an off only ever moves down the list.
+    const p = plan([room("abdullah", 3.0), room("abdu", 2.1)], 1.5);
+    expect(p.toShed).toEqual(["abdu"]);
+    expect(p.priorityTieBreak).toBeNull();
+  });
+
+  it("a chain of three rooms still spares the top-priority one", () => {
+    // The rule is about the FIELD of candidates, not about pairs. Staircase the
+    // three rooms 0.6°C apart — abdullah #1 at 4.0, najat #2 at 4.6, abdu #3 at
+    // 5.4 — and every adjacent pair is inside the gap while the ends are 1.4°C
+    // apart. A pairwise gap test is not transitive over that shape: najat loses
+    // to abdu on priority, then abdullah takes the incumbent on raw need, and
+    // the room the rule exists to protect goes off while najat — 0.6°C inside
+    // his gap — keeps running.
+    //
+    // Anchoring on the thermometer's own pick is what makes it a rule: the raw
+    // winner is abdullah, najat is inside his gap and lower priority, abdu is
+    // not. najat pays.
+    const p = plan([room("abdullah", 4.0), room("najat", 4.6), room("abdu", 5.4)], 1.5);
+    expect(p.toShed).toEqual(["najat"]);
+    expect(p.priorityTieBreak).toEqual({ shedDeviceId: "najat", protectedDeviceId: "abdullah" });
+  });
+
+  it("leaves an ordinary shed-free plan alone — nobody off, nothing to break a tie between", () => {
+    const p = plan([ac("hot", { currentLevel: 3 }), ac("cool", { currentLevel: 3, needDelta: 0.5 })], 1.8);
+    expect(p.toShed).toEqual([]);
+    expect(p.priorityTieBreak).toBeNull();
   });
 });
 

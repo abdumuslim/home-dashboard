@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   envelopeTotalAmps,
+  FLICKER_PATIENCE_MS,
   invariantCorrections,
   planRaise,
   rampDebitAmps,
@@ -12,7 +13,7 @@ import {
 } from "./raise.js";
 import { SHED_NEED_GAP_C } from "./reduce.js";
 import { PENDING_CUT_MS } from "./sensing.js";
-import { initialPacingState, noteAttempt, noteFailure } from "./pacing.js";
+import { initialPacingState, noteAttempt, noteFailure, probeRearmed } from "./pacing.js";
 import { updateCost } from "./costs.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
 import type { AcView } from "./types.js";
@@ -57,6 +58,7 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
     rampBaselineAmps: null,
     rampAbsorbedAmps: null,
     reshedPenalized: false,
+    recentlyExternalOn: false,
     satisfiedForMs: 0,
     subFloorStalledMs: 0,
     compressorOffLikely: false,
@@ -78,6 +80,9 @@ function raise(acs: AcView[], overrides: Partial<RaiseInput> = {}) {
     // The AC-only envelope these cases were written against; the house term
     // gets its own suite below.
     nonAcAmps: 0,
+    // A quiet line by default: the flicker charge is a MARGIN, so 0 leaves
+    // every case written before 2026-08-06 admitting exactly what it did.
+    flickerAmps: 0,
     cutAnchorAmps: 0,
     commandedCutAmps: 0,
     limitAmps: 15,
@@ -274,6 +279,287 @@ describe("a room's own shed leaves a bar its restore must clear (R9)", () => {
     expect(p.commands).toContainEqual(
       expect.objectContaining({ deviceId: "b", kind: "power_on", reason: "restore" }),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-07 bounce backoff — the bar release valves. A room the bar holds back
+// against a low (trough) meter must let go the moment the arithmetic changes:
+// the ceiling rises (a derate recovers) or the price genuinely fits. The bar is
+// an absolute-amps claim about the house, so this falls out of keeping it a
+// number — but it is pinned here because it is the "can never strand" half of
+// the compounded bar persistence.
+// ---------------------------------------------------------------------------
+describe("2026-08-07 bounce backoff: the shed bar self-releases when the ceiling rises", () => {
+  const shedRoom = (): AcView[] => [
+    ac("a", { needDelta: 2 }),
+    ac("b", { on: false, shed: true, needDelta: 4 }),
+  ];
+
+  it("ceiling 14.5 refuses on the bar; ceiling 15.0 admits (bar + price fits)", () => {
+    // Bar 12.9, restore price 2.0 → 14.9A. The trough meter (11.0) plus the price
+    // fits either ceiling, but the BAR does not fit 14.5 and does fit 15.0.
+    const refused = raise(shedRoom(), {
+      smoothedAmps: 11.0,
+      headroomAmps: 3.4,
+      limitAmps: 14.6, // restore ceiling 14.5
+      shedBarAmps: (id) => (id === "b" ? 12.9 : 0),
+    });
+    expect(refused.commands.every((c) => c.kind !== "power_on")).toBe(true);
+    expect(refused.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "b", blockedBy: "own shed trough" }),
+    );
+
+    const admitted = raise(shedRoom(), {
+      smoothedAmps: 11.0,
+      headroomAmps: 3.9,
+      limitAmps: 15.1, // restore ceiling 15.0 — the derate recovered
+      shedBarAmps: (id) => (id === "b" ? 12.9 : 0),
+    });
+    expect(admitted.commands).toContainEqual(
+      expect.objectContaining({ deviceId: "b", kind: "power_on", reason: "restore" }),
+    );
+  });
+
+  it("the compounded bar OUTRANKS the probe re-arm — a bounce says 'we tried and failed'", () => {
+    // The probe re-arm (invariant 22) would fire — the meter sits a full amp
+    // below the failed attempt's anchor — but under bounce evidence the bar
+    // still holds the trough, and the refusal is LOUD about it. The probe governs
+    // the price once the bar releases; it may not spend the trough now.
+    const bounced = noteFailure(
+      noteAttempt(initialPacingState("gen"), "b", "restore", T - 95_000, 12.5),
+      "b",
+      "restore",
+      T - 31_000, // its 30 s ladder rung has expired — canAttempt is not the gate here
+    );
+    expect(probeRearmed(bounced, "b", 11.0)).toBe(true); // the re-arm WOULD fire
+    const p = raise(shedRoom(), {
+      smoothedAmps: 11.0,
+      headroomAmps: 3.4,
+      limitAmps: 14.6, // restore ceiling 14.5 — bar 12.9 + 2.0 does not fit
+      pacing: bounced,
+      shedBarAmps: (id) => (id === "b" ? 12.9 : 0),
+    });
+    expect(p.commands.every((c) => c.kind !== "power_on")).toBe(true);
+    const trough = p.decisions.find((d) => d.deviceId === "b" && d.blockedBy === "own shed trough");
+    expect(trough?.detail).toContain("bounce backoff");
+    expect(trough?.detail).toContain("1st bounce");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-06 14:00–14:04Z — the restore that could not survive, and cost a
+// second room its compressor. User: "why did it turn off both Najat and
+// Abdullah, when Najat-only-off was fine?"
+//
+// A saturated generator house (≈5A heater, every level at its floor, fans
+// already trimmed) shed Najat at 14:00:32 and settled at 11.6A. THIRTY-FOUR
+// SECONDS later the restore path bought her straight back: committed 12.12A,
+// probe cost 2.3A → 14.42A against a 14.9A ceiling. Admitted with 0.48A to
+// spare, on a line whose measured flicker was ±0.4–0.8A. Her compressor and two
+// held fans then took the smoothed meter to 15.3A, she was re-shed at 14:04:10
+// — and because her own cut had not crossed the 8-wide median yet, Abdullah
+// went off 14 seconds after that.
+//
+// The restore ceiling is deliberately exempt from `restingBufferAmps` ("a whole
+// room off is worse than riding near the limit"). That trade is about a STEADY
+// line: riding near the limit on a MEASURED-wobbly one is not a tight ride, it
+// is a bounce with a delay, and a bounce costs the room an off/on cycle plus
+// the backoff ladder. So the fixed buffer is replaced by a measured one.
+// ---------------------------------------------------------------------------
+describe("a restore may not spend the wobble of the supply itself (2026-08-06 double shed)", () => {
+  const shedRoom = (): AcView[] => [
+    ac("a", { needDelta: 2 }),
+    ac("b", { on: false, shed: true, needDelta: 4 }),
+  ];
+
+  it("admits with margin on a quiet line and refuses the identical restore on a wobbly one", () => {
+    // 12.6 + 2.0 = 14.6 against 14.9: the live 0.48A margin, near enough.
+    const quiet = raise(shedRoom(), { smoothedAmps: 12.6, headroomAmps: 2.0 });
+    expect(quiet.commands).toContainEqual({
+      deviceId: "b",
+      kind: "power_on",
+      level: 1,
+      reason: "restore",
+      fan: 1,
+    });
+    const wobbly = raise(shedRoom(), { smoothedAmps: 12.6, headroomAmps: 2.0, flickerAmps: 0.4 });
+    expect(wobbly.commands.every((c) => c.kind !== "power_on")).toBe(true);
+    // …and the journal says WHY, or the next forensic session re-derives it. It
+    // is its own refusal tag now (invariant 58 follow-up): a room that fits the
+    // bare ceiling is flicker-refused, not out of headroom, and the difference is
+    // whether patience will eventually admit it.
+    expect(wobbly.decisions).toContainEqual(
+      expect.objectContaining({
+        deviceId: "b",
+        action: "restore",
+        blockedBy: "flicker margin",
+        detail: expect.stringContaining("flicker"),
+      }),
+    );
+  });
+
+  it("charges the PROBE price identically — a stale-high learned cost is no licence", () => {
+    // The live admission was a probe (2.3A against a learned price that
+    // blocked). The probe re-runs the same fit test, so it inherits the charge:
+    // 12.5 + 2.0 = 14.5 fits the bare ceiling and not the charged one.
+    const book = updateCost({}, "b", "gen", "on@L1", 4, T);
+    const quiet = raise(shedRoom(), { smoothedAmps: 12.5, headroomAmps: 2.2, book });
+    expect(quiet.probeRestoreIds).toEqual(["b"]);
+    const wobbly = raise(shedRoom(), {
+      smoothedAmps: 12.5,
+      headroomAmps: 2.2,
+      book,
+      flickerAmps: 0.5,
+    });
+    expect(wobbly.commands.every((c) => c.kind !== "power_on")).toBe(true);
+    expect(wobbly.probeRestoreIds).toEqual([]);
+  });
+
+  it("a standing flicker-only refusal RESERVES its amps and reports itself to the shell", () => {
+    // Invariant 58 follow-up (2026-08-08): the "ordinary skip" this used to be
+    // stranded rooms that ultimately ran fine behind the wobble, and let a peer
+    // raise spend the very amps they were waiting on (58's own open item). Once
+    // the anchor stands, the amps are spoken for: the raise phase is PARKED, and
+    // the room is reported in `flickerRefused` so the shell keeps its anchor.
+    const p = raise(shedRoom(), {
+      smoothedAmps: 12.6,
+      headroomAmps: 2.0,
+      flickerAmps: 0.4,
+      // An anchor already stands, well inside the patience window.
+      flickerRefusedSince: () => T - 30_000,
+    });
+    expect(p.flickerRefused).toEqual(["b"]);
+    // b returns at its 2.0A floor cost — reserved, not spent.
+    expect(p.reservedAmps).toBeCloseTo(2.0, 1);
+    // …which parks the raise phase, inverting the old assertion: `a` does NOT
+    // take the amps b is waiting on.
+    expect(p.commands).not.toContainEqual({ deviceId: "a", kind: "set_level", level: 2 });
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ action: "raises", blockedBy: "restore reservation" }),
+    );
+  });
+
+  it("on the FIRST refusal tick (no anchor yet) it reports itself but reserves nothing", () => {
+    // The shell has not stamped an anchor yet, so there is nothing to reserve
+    // against — report the room so the shell stamps `now`, and let the raise
+    // phase run this one tick. From the next tick the anchor stands and the
+    // reservation above kicks in.
+    const p = raise(shedRoom(), { smoothedAmps: 12.6, headroomAmps: 2.0, flickerAmps: 0.4 });
+    expect(p.flickerRefused).toEqual(["b"]);
+    expect(p.reservedAmps).toBe(0);
+    expect(p.commands).toContainEqual({ deviceId: "a", kind: "set_level", level: 2 });
+  });
+
+  it("admits at the bare ceiling once patience expires, and says so in the journal", () => {
+    // The wobble never settled, but the room fits the line — after
+    // FLICKER_PATIENCE_MS of unbroken flicker-only refusal it comes back at the
+    // bare ceiling rather than sitting off forever.
+    const p = raise(shedRoom(), {
+      smoothedAmps: 12.6,
+      headroomAmps: 2.0,
+      flickerAmps: 0.4,
+      flickerRefusedSince: () => T - (FLICKER_PATIENCE_MS + 1_000),
+    });
+    expect(p.commands).toContainEqual({
+      deviceId: "b",
+      kind: "power_on",
+      level: 1,
+      reason: "restore",
+      fan: 1,
+    });
+    // It admitted, so it is no longer refused — the shell drops the anchor.
+    expect(p.flickerRefused).toEqual([]);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({
+        deviceId: "b",
+        action: "restore @L1",
+        detail: expect.stringContaining("flicker patience"),
+      }),
+    );
+  });
+
+  it("a refusal that fails even at the bare ceiling is a plain no-headroom skip", () => {
+    // committed 13.5 + 2.0 = 15.5 clears neither the 14.9A bare ceiling nor the
+    // charged one — ordinary no-headroom, so flicker patience never engages: no
+    // anchor is reported and nothing is reserved.
+    const p = raise(shedRoom(), { smoothedAmps: 13.5, headroomAmps: 1.1, flickerAmps: 0.4 });
+    expect(p.flickerRefused).toEqual([]);
+    expect(p.reservedAmps).toBe(0);
+    expect(p.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "b", action: "restore", blockedBy: "no headroom" }),
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // REGRESSION (review, 2026-08-06): the charge may only ever turn an ADMISSION
+  // into a skip. It may not change which REFUSAL a room gets — and both of the
+  // branches below hand a cool room's whole compressor to a margin, i.e. make
+  // the controller MORE aggressive in exactly the corner the charge exists to
+  // make it more conservative.
+  // -------------------------------------------------------------------------
+  const hot = (o: Partial<AcView> = {}): AcView =>
+    ac("a", { name: "hot", on: false, shed: true, needDelta: 3, rankNeedDelta: 3.0, ...o });
+  const mid = (o: Partial<AcView> = {}): AcView =>
+    ac("b", { name: "mid", currentLevel: 1, needDelta: 2.5, rankNeedDelta: 2.5, ...o });
+  const cool = (o: Partial<AcView> = {}): AcView =>
+    ac("c", { name: "cool", currentLevel: 1, needDelta: 1.5, rankNeedDelta: 1.5, ...o });
+
+  it("a room its own BAR blocks stays bar-blocked on a wobbly line — no trade, no lost reservation", () => {
+    // House 12.6A, `hot` returns at 2.0A ⇒ 14.6A, inside the 14.9A bare ceiling
+    // and outside the 14.5A charged one. Its own shed left a 13.5A bar, so at
+    // EVERY flicker the bar is what refuses it: reserve and wait the bar out
+    // (≤ one blame window), which is what a quiet line does.
+    const scene = (): AcView[] => [hot(), mid(), cool()];
+    const opts = {
+      smoothedAmps: 12.6,
+      headroomAmps: 1.2,
+      swapAllowed: true,
+      shedBarAmps: (id: string) => (id === "a" ? 13.5 : 0),
+    };
+    const quiet = raise(scene(), opts);
+    expect(quiet.swap).toBeNull();
+    expect(quiet.reservedAmps).toBeGreaterThan(0);
+    expect(quiet.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", blockedBy: "own shed trough" }),
+    );
+
+    const wobbly = raise(scene(), { ...opts, flickerAmps: 0.4 });
+    // The flicker must not buy `cool`'s room for a restore the bar — not the
+    // wobble — is holding back.
+    expect(wobbly.swap).toBeNull();
+    expect(wobbly.commands.every((c) => c.kind !== "power_off")).toBe(true);
+    // …nor lose the bar's reservation, which is the raise phase's only defence
+    // against a peer spending the trough the bar exists to disbelieve.
+    expect(wobbly.reservedAmps).toBeGreaterThan(0);
+    expect(wobbly.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", blockedBy: "own shed trough" }),
+    );
+  });
+
+  it("a room the PROBE would have restored on a quiet line may not arm a trade instead", () => {
+    // Learned 4.0A (stale-high), steady floor price 2.0A. At 12.9A committed the
+    // probe lands exactly on the 14.9A bare ceiling and misses the 14.5A charged
+    // one. The bare ceiling would have RESTORED this room for free; spending a
+    // cool room's compressor because the wobble refused it is the trade the
+    // charge's own contract rules out.
+    const book = updateCost({}, "a", "gen", "on@L1", 4, T);
+    const scene = (): AcView[] => [hot(), mid(), cool({ currentLevel: 2, minLevel: 2 })];
+    const opts = { smoothedAmps: 12.9, headroomAmps: 1.2, swapAllowed: true, book };
+    const quiet = raise(scene(), opts);
+    expect(quiet.probeRestoreIds).toEqual(["a"]);
+    expect(quiet.swap).toBeNull();
+
+    const wobbly = raise(scene(), { ...opts, flickerAmps: 0.4 });
+    expect(wobbly.swap).toBeNull();
+    expect(wobbly.commands).toEqual([]);
+    // It is now tagged as the flicker-only refusal it is (invariant 58
+    // follow-up) — still no trade, but the room is reported for the shell to
+    // anchor rather than skipped as out of headroom.
+    expect(wobbly.decisions).toContainEqual(
+      expect.objectContaining({ deviceId: "a", action: "restore", blockedBy: "flicker margin" }),
+    );
+    expect(wobbly.flickerRefused).toEqual(["a"]);
   });
 });
 
@@ -610,6 +896,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -638,6 +925,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -660,6 +948,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -679,6 +968,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -710,6 +1000,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 10.4,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -735,6 +1026,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 6,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -769,6 +1061,7 @@ describe("physics-envelope veto (2026-07-23: double-L3 on gen predicted 16.9A > 
       smoothedAmps: 6,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: heavyCfg,
@@ -1046,6 +1339,7 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       smoothedAmps: 10.11,
       rampDebitAmps: rampDebitAmps(acs, 10.11, liveCfg, "gen"),
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1071,6 +1365,7 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       smoothedAmps: 14.8, // Abdu's 4.3A is fully on the meter now
       rampDebitAmps: rampDebitAmps(acs, 14.8, liveCfg, "gen"),
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1211,6 +1506,7 @@ describe("ramp debit (committed-but-unmetered draw)", () => {
       smoothedAmps: 10.11,
       rampDebitAmps: rampDebitAmps(acs, 10.11, liveCfg, "gen"),
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1245,6 +1541,7 @@ describe("funding swap — dormant peer levels pay for a hot room", () => {
       smoothedAmps: 11.7,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1265,11 +1562,31 @@ describe("funding swap — dormant peer levels pay for a hot room", () => {
     expect(p.decisions.some((d) => d.action.includes("funded by peer demote"))).toBe(true);
   });
 
-  it("meter-blocked: the demote ships ALONE — never spend savings that have not landed", () => {
-    // Only 1.0A of real headroom; Abdu's L2→L3 needs 2.5A. Shipping both would
-    // commit ~16A on a breaker that tripped at 15.65A on 2026-07-26 while the
-    // satisfied compressor takes minutes to throttle down.
+  it("meter-short but the freed amps close the gap: demote and raise ship in ONE batch", () => {
+    // User directive 2026-08-08: switch instantly. Only 1.0A of live headroom,
+    // but Najat's L3→L1 frees 4.0A — far more than Abdu's 2.5A step needs — so
+    // both ship together. The off-cliff reaches the meter in seconds while
+    // Abdu's compressor engages minutes later, so they never overlap on the line
+    // (the committed meter already prices exactly that gap).
     const p = swap({ headroomAmps: 1.0, smoothedAmps: 13.7 });
+    expect(p.commands).toEqual([
+      { deviceId: "najat", kind: "set_level", level: 1 },
+      { deviceId: "abdu", kind: "set_level", level: 3 },
+    ]);
+    expect(p.decisions.some((d) => d.action.includes("funded by peer demote"))).toBe(true);
+  });
+
+  it("meter-short and the freed amps do NOT close the gap: the demote ships ALONE", () => {
+    // The demote-alone fallback survives the instant-sequencing change. Najat
+    // satisfied at L2 frees only 2.0A; Abdu's L2→L3 needs 2.5A against just 0.5A
+    // of headroom — 0.5 + 2.0 − 0.5 margin < 2.5, so the trade cannot close the
+    // gap this batch. The demote still ships (a satisfied level is not comfort)
+    // and the raise follows once the meter has really fallen.
+    const p = swap({
+      acs: [ac("najat", { currentLevel: 2, needDelta: 0.3 }), ac("abdu", { currentLevel: 2, needDelta: 1.9 })],
+      headroomAmps: 0.5,
+      smoothedAmps: 14.2,
+    });
     expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 1 }]);
     expect(p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "awaiting demote")).toBe(true);
   });
@@ -1335,6 +1652,7 @@ describe("need rebalance — the extra level follows the hotter room", () => {
       smoothedAmps: 12.7,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1345,12 +1663,17 @@ describe("need rebalance — the extra level follows the hotter room", () => {
       ...overrides,
     });
 
-  it("meter-blocked: the cooler room's step ships ALONE, the raise follows once it lands", () => {
-    // Abdu's 2.5A step vs 1.9A available — deficit 0.6A, Najat's step frees 2.0A.
+  it("meter-short but the demote closes the gap: donor step and raise ship in ONE batch", () => {
+    // Abdu's 2.5A step vs 1.9A available — deficit 0.6A, Najat's step frees 2.0A,
+    // closing it with margin. User directive 2026-08-08: ship instantly rather
+    // than wait a calm window for the saving to land.
     const p = rebal();
-    expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 1 }]);
+    expect(p.commands).toEqual([
+      { deviceId: "najat", kind: "set_level", level: 1 },
+      { deviceId: "abdu", kind: "set_level", level: 2 },
+    ]);
     expect(p.cutAmps).toBeCloseTo(2.0, 5);
-    expect(p.decisions.some((d) => d.deviceId === "abdu" && d.blockedBy === "awaiting demote")).toBe(true);
+    expect(p.decisions.some((d) => d.action.includes("funded by peer demote"))).toBe(true);
   });
 
   it("envelope-blocked but meter-funded: donor step and raise ship in ONE batch", () => {
@@ -1364,13 +1687,18 @@ describe("need rebalance — the extra level follows the hotter room", () => {
     expect(p.decisions.some((d) => d.action.includes("funded by peer demote"))).toBe(true);
   });
 
-  it("one step per swap — a donor two levels up still gives only one", () => {
+  it("one step per swap — a donor two levels up still gives only one (now same-batch)", () => {
+    // Najat at L3 gives exactly ONE level (L3→L2, never straight to L1), and
+    // Abdu's raise now ships in the same batch once that one step closes the gap.
     const p = rebal({
       acs: [ac("najat", { currentLevel: 3, needDelta: 0.8 }), ac("abdu", { currentLevel: 1, needDelta: 2.4 })],
       headroomAmps: 1.0,
       smoothedAmps: 13.6,
     });
-    expect(p.commands).toEqual([{ deviceId: "najat", kind: "set_level", level: 2 }]);
+    expect(p.commands).toEqual([
+      { deviceId: "najat", kind: "set_level", level: 2 },
+      { deviceId: "abdu", kind: "set_level", level: 2 },
+    ]);
   });
 
   it("inside the need gap nothing moves — near-equal rooms must not trade levels", () => {
@@ -1500,6 +1828,7 @@ describe("house load in the raise envelope (2026-07-31 gen trip)", () => {
       smoothedAmps: 9.91,
       rampDebitAmps: 0,
       nonAcAmps: 0,
+      flickerAmps: 0,
       limitAmps: 15,
       calmMs: 60_000,
       config: liveCfg,
@@ -1606,17 +1935,45 @@ describe("gated proactive shed: swapping a cool room's amps to a hot one", () =>
       ...overrides,
     });
 
-  it("sheds the coolest eligible donor ALONE and reserves the receiver's amps", () => {
+  it("sheds the coolest eligible donor and restores the receiver in ONE batch", () => {
     const p = swapRaise(swapScene());
-    // Invariant 9: the off ships by itself. A power_on in the same batch would
-    // commit a whole compressor against a saving that has not landed.
-    expect(p.commands).toEqual([{ deviceId: "c", kind: "power_off", reason: "shed" }]);
+    // User directive 2026-08-08: instant sequencing. The donor's off and the
+    // receiver's gentle restore ship TOGETHER — the off-cliff reaches the meter
+    // in seconds while the receiver's compressor engages minutes later, so they
+    // never overlap on the line (the committed meter already prices the gap).
+    expect(p.commands).toEqual([
+      { deviceId: "c", kind: "power_off", reason: "shed" },
+      { deviceId: "a", kind: "power_on", level: 1, reason: "restore", fan: 1 },
+    ]);
     expect(p.swap).toEqual({ donorId: "c", receiverId: "a" });
+    // It carries a power_on, so it wants the turn-on grade window.
+    expect(p.isTurnOn).toBe(true);
+    // The receiver is a restore ATTEMPT like any other (probe re-arm anchor).
+    expect(p.attempts).toContainEqual(expect.objectContaining({ deviceId: "a", kind: "restore" }));
+    // Admitted at the PLAIN price — never probe-priced (invariant 3/57), so its
+    // recorded fan hold stays gentle=false.
+    expect(p.probeRestoreIds).toEqual([]);
+    // Belt reservation stands while the send is in flight.
     expect(p.reservedAmps).toBeGreaterThan(0);
     // The donor gave a whole room — invariant 30's cooldown applies to it.
     expect(p.fundingDonors).toEqual(["c"]);
-    // Priced for the collapse detector at the model steady draw (invariant 11).
+    // The donor's freed draw is priced for the collapse detector at the model
+    // steady draw (invariant 11); the receiver's power_on contributes 0.
     expect(p.cutAmps).toBeCloseTo(2, 5);
+  });
+
+  it("NEVER ships a donor's off without the receiver's on in the same batch", () => {
+    // The whole point of the one-batch contract: no stranded-donor window. Any
+    // proactive `power_off` this path emits is paired with the receiver's on.
+    const p = swapRaise(swapScene());
+    expect(p.commands.some((c) => c.kind === "power_off" && c.deviceId === "c")).toBe(true);
+    expect(p.commands.some((c) => c.kind === "power_on" && c.deviceId === "a")).toBe(true);
+    // …and a trade that cannot close the gap ships NOTHING — never a lone donor
+    // off (14.5 committed: freeing 2A and spending 2A stays over the ceiling once
+    // the 0.5A funding margin is charged).
+    const refused = swapRaise(swapScene(), { smoothedAmps: 14.5, headroomAmps: 0.2 });
+    expect(refused.commands).toEqual([]);
+    expect(refused.swap).toBeNull();
   });
 
   it("journals the trade loudly, naming both rooms and both thermometers", () => {
@@ -1852,5 +2209,44 @@ describe("swapDonorFor: the gap constants must outrank each other (2026-07-31 le
         ],
       })?.donor.deviceId,
     ).toBe("a");
+  });
+
+  it("a donor a human just switched on is not traded away (#9224/#9228 2026-08-06)", () => {
+    // The leveler shed the priority-#1 room; a household member turned it back
+    // on; the swap re-selected THAT room as donor and shed it again. "Manual
+    // wins" (invariant 42) covers the power button for the comfort tool — the
+    // swap is a comfort optimisation, never an emergency, so it may not un-do a
+    // human's explicit ON (invariant 57). An ordinary overload shed still can.
+    //
+    // Two eligible donors, both clear of the 1.0°C gap below the hot receiver:
+    // `c` (coolest) and `b`. Without the shield the swap takes the coolest, `c`.
+    const receiver = ac("recv", { on: false, shed: true, rankNeedDelta: 3.5 });
+    const cool = ac("c", { rankNeedDelta: 1.5 });
+    const warm = ac("b", { rankNeedDelta: 2.0 });
+    const args = {
+      receiver,
+      receiverCostAmps: 2,
+      committedAmps: 13.5,
+      ceilingAmps: 14.9,
+      donorSavingsAmps: () => 2,
+      envelopeAfter: null,
+      blocked: () => false,
+    };
+    // Baseline: the coolest running room is the donor (this is the "pin" that
+    // the shield removes — field false selects exactly as before).
+    expect(swapDonorFor({ ...args, running: [cool, warm] })?.donor.deviceId).toBe("c");
+    // Mark the coolest room as freshly switched on by a human: the swap must
+    // SKIP it and fall through to the next eligible donor.
+    expect(
+      swapDonorFor({
+        ...args,
+        running: [{ ...cool, recentlyExternalOn: true }, warm],
+      })?.donor.deviceId,
+    ).toBe("b");
+    // And when it is the ONLY eligible donor, the swap arms nobody rather than
+    // trading away the room a human just asked for.
+    expect(
+      swapDonorFor({ ...args, running: [{ ...cool, recentlyExternalOn: true }] }),
+    ).toBeNull();
   });
 });
