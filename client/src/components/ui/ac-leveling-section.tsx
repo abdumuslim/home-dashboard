@@ -27,11 +27,13 @@ function defaultAmpModel(name: string): { baseAmps: number; stepAmps: number } {
 
 /** Fill priority/ampModels gaps so every known AC is configurable. */
 function seedDraft(config: AcLevelingConfig, acDevices: AcDevice[]): AcLevelingConfig {
-  const priority = [...config.priority];
-  const ampModels = { ...config.ampModels };
-  const genAmpModels = { ...(config.genAmpModels ?? {}) };
-  const levelBoosts = { ...(config.levelBoosts ?? {}) };
-  for (const d of acDevices) {
+  const eligible = acDevices.filter((device) => device.levelingEligible);
+  const ids = new Set(eligible.map((device) => device.id));
+  const priority = config.priority.filter((id) => ids.has(id));
+  const ampModels = Object.fromEntries(Object.entries(config.ampModels).filter(([id]) => ids.has(id)));
+  const genAmpModels = Object.fromEntries(Object.entries(config.genAmpModels ?? {}).filter(([id]) => ids.has(id)));
+  const levelBoosts = Object.fromEntries(Object.entries(config.levelBoosts ?? {}).filter(([id]) => ids.has(id)));
+  for (const d of eligible) {
     if (!priority.includes(d.id)) priority.push(d.id);
     if (!ampModels[d.id]) ampModels[d.id] = defaultAmpModel(d.name);
     // Gen draws more at lower voltage — start from the grid model until calibrated
@@ -527,7 +529,7 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
 
       <AcCalibrationPanel
         active={active}
-        acDevices={acDevices}
+        acDevices={acDevices.filter((device) => device.levelingEligible)}
         source={status?.source}
         onApplyFit={applyFit}
       />

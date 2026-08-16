@@ -40,37 +40,16 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
   const momDevice = devices.find((d) => d.name.toLowerCase() === "mom");
   const abduDevice = devices.find((d) => d.name.toLowerCase() === "abdu");
 
-  // ACs — all 3
-  const momAc = acDevices.find((d) => d.name.toLowerCase().includes("najat"));
-  const abduAc = acDevices.find((d) => d.name.toLowerCase().startsWith("abdu") && !d.name.toLowerCase().includes("abdullah"));
-  const abdullahAc = acDevices.find((d) => d.name.toLowerCase().includes("abdullah"));
-
-  const acEntries: AcEntry[] = [
-    momAc && acSendControl && {
-      device: momAc,
-      label: "Mom",
-      onControl: (cmd: string, val: unknown) => acSendControl(momAc.id, cmd, val),
-      timer: timers.find((t) => t.deviceId === momAc.id) ?? null,
-      onSetTimer: (a: "on" | "off", m: number, p?: Record<string, unknown>) => setTimer(momAc.id, a, m, p),
-      onCancelTimer: () => cancelTimer(momAc.id),
-    },
-    abduAc && acSendControl && {
-      device: abduAc,
-      label: "Abdu",
-      onControl: (cmd: string, val: unknown) => acSendControl(abduAc.id, cmd, val),
-      timer: timers.find((t) => t.deviceId === abduAc.id) ?? null,
-      onSetTimer: (a: "on" | "off", m: number, p?: Record<string, unknown>) => setTimer(abduAc.id, a, m, p),
-      onCancelTimer: () => cancelTimer(abduAc.id),
-    },
-    abdullahAc && acSendControl && {
-      device: abdullahAc,
-      label: "Abdullah",
-      onControl: (cmd: string, val: unknown) => acSendControl(abdullahAc.id, cmd, val),
-      timer: timers.find((t) => t.deviceId === abdullahAc.id) ?? null,
-      onSetTimer: (a: "on" | "off", m: number, p?: Record<string, unknown>) => setTimer(abdullahAc.id, a, m, p),
-      onCancelTimer: () => cancelTimer(abdullahAc.id),
-    },
-  ].filter(Boolean) as AcEntry[];
+  const acEntries: AcEntry[] = acSendControl
+    ? [...acDevices].sort((a, b) => a.displayOrder - b.displayOrder).map((ac) => ({
+        device: ac,
+        label: ac.displayName,
+        onControl: (cmd: string, val: unknown) => acSendControl(ac.id, cmd, val),
+        timer: timers.find((t) => t.deviceId === ac.id) ?? null,
+        onSetTimer: (a: "on" | "off", m: number, p?: Record<string, unknown>) => setTimer(ac.id, a, m, p),
+        onCancelTimer: () => cancelTimer(ac.id),
+      }))
+    : [];
 
   const purifierEntries: PurifierEntry[] = [
     momDevice && sendControl && {

@@ -1,4 +1,13 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+vi.mock("./ac-capabilities.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ac-capabilities.js")>();
+  return {
+    ...actual,
+    // Legacy controller tests use synthetic ac1/ac2 ids. Preserve those test
+    // fixtures while keeping the production policy fail-closed.
+    isAcLevelingEligible: (deviceId: string) => deviceId !== "DlXqDBFAAAE",
+  };
+});
 import type { Config } from "./config.js";
 import { Collector } from "./collector.js";
 import { acTimers } from "./routes.js";
@@ -719,6 +728,66 @@ async function checkAcLeveling(collector: Collector) {
 describe("Smart AC leveling", () => {
   beforeEach(() => {
     acTimers.clear();
+  });
+
+  it("keeps Guest out of the leveling context and ESP load attribution", async () => {
+    const { collector, tclCloud, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    await collector.acLeveler.ensureLoaded();
+    const devices = [
+      { id: "ac1", name: "Mom", power: true, generatorMode: 1, maxGeneratorLevel: 3, currentTemp: 28, mode: 1, levelingEligible: true },
+      { id: "DlXqDBFAAAE", name: "guest", power: true, generatorMode: 6, maxGeneratorLevel: 6, currentTemp: 28, mode: 1, levelingEligible: false },
+    ];
+    tclCloud.getDevices.mockReturnValue(devices);
+    tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+
+    gridReadings(collector, 10, 6);
+    await checkAcLeveling(collector);
+
+    expect(collector.acLeveler.getStatus().acs.map((ac) => ac.deviceId)).toEqual(["ac1"]);
+  });
+
+  it("never crosses per-device leveling callbacks for Guest automations or timers", async () => {
+    const { collector, tclCloud } = createCollector();
+    const leveler = collector.leveling();
+    const perDeviceSpies = [
+      vi.spyOn(leveler, "isShed"),
+      vi.spyOn(leveler, "hasFanHold"),
+      vi.spyOn(leveler, "reconcileObservedOn"),
+      vi.spyOn(leveler, "rememberStableLevel"),
+      vi.spyOn(leveler, "clearShed"),
+      vi.spyOn(leveler, "onUserGenLevel"),
+      vi.spyOn(leveler, "onUserFanChange"),
+    ];
+    const guest = {
+      id: "DlXqDBFAAAE", name: "guest", displayName: "guest", power: false,
+      generatorMode: 6, maxGeneratorLevel: 6, fanSpeed: 3, levelingEligible: false,
+    };
+    tclCloud.getDevices.mockReturnValue([guest]);
+    tclCloud.fetchDevicesLive.mockResolvedValue([guest] as never);
+
+    const rule = {
+      ...acRangeRule(),
+      device_id: guest.id,
+      device_name: guest.name,
+      device_ids: [guest.id],
+      device_names: [guest.name],
+    };
+    await setWeatherValue(collector, 28);
+    await checkAcRangeAutomation(collector, rule);
+
+    acTimers.set(guest.id, { deviceId: guest.id, action: "on", fireAt: Date.now() - 1 });
+    await checkAcTimers(collector);
+    collector.noteUserAcFanChange(guest.id);
+    collector.noteUserAcFanAuto(guest.id);
+    collector.noteUserAcGenLevel(guest.id);
+    await collector.onUserAcGenLevel(guest.id, 6);
+
+    expect((collector as never as { hasRecentUserGenChange: (deviceId: string) => boolean }).hasRecentUserGenChange(guest.id)).toBe(true);
+
+    for (const spy of perDeviceSpies) {
+      expect(spy.mock.calls.some((call) => call[0] === guest.id)).toBe(false);
+    }
   });
 
   it("does not record a manual-off lock or auto-on a leveler-shed AC", async () => {

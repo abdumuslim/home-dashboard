@@ -17,7 +17,7 @@ TL;DR: Home environmental monitoring dashboard at **https://home.altijwal.com** 
 
 Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.js/Express backend with React/TypeScript frontend, collects data from two sensor APIs, stores in PostgreSQL, and serves a dark-themed dashboard with live-updating cards and Chart.js charts. It also automates Xiaomi Mi Air Purifiers based on air quality metrics.
 
-**4 physical sensors, 2 APIs, 2 Purifiers, 3 ACs:**
+**4 physical sensors, 2 APIs, 2 Purifiers, 4 ACs:**
 - **Ambient Weather WS-2000** (station MAC C8:C9:A3:0E:CB:CB; 1 API device, 3 sensor groups in `lastData`):
   - Outdoor: temp, humidity, wind, rain, pressure, UV, solar (~1 min updates)
   - Indoor console: temp, humidity, feels like, dew point (`tempinf`, `humidityin`, `feelsLikein`, `dewPointin`)
@@ -26,8 +26,8 @@ Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.j
 - **Xiaomi Mi Air Purifiers**:
   - "mom": `zhimi.airpurifier.v7` (older MiIO protocol)
   - "Abdu": `zhimi.airpurifier.vb2` (modern MIoT protocol)
-- **TCL Split ACs** (3 units, all on dashboard via TCL Home cloud API):
-  - "Najat" → Mom label, "Abdu AC" → Abdu label, "Abdullah AC" → Abdullah label — all in the Devices card. Cloud client details in [tcl-ac.md](tcl-ac.md).
+- **TCL Split ACs** (4 units, all on dashboard via TCL Home cloud API):
+  - Stable ID policy maps `DHihohFAAAE` → Mom, `CA5IMhFAAAE` → Abdu, `Cy3aihFAAAE` → Abdullah, and `DlXqDBFAAAE` → guest. Guest is on a separate grid-only electrical line: it supports direct controls and ordinary AC automations, but is filtered out before every ESP-based leveling/calibration context. Cloud client details in [tcl-ac.md](tcl-ac.md).
 - **ESP Power Monitor**: Custom ESP device on home mains, sends voltage + current on two lines (Grid=I1, Generator=I2) via `POST /api/power/ingest` every 5s. Server computes power (W = V × A), buffers in memory, and writes 1-minute median to `power_readings` table. Live endpoint (`GET /api/current/power`) returns `null` if last reading is >15s stale (ESP sends every 5s, so 3 missed = no electricity). Frontend power card shows `0.00 kW / 0 V / 0.0 A` in white when no data (instead of `--`). Full details below in "ESP Power Monitor".
 
 ## System Architecture
@@ -44,7 +44,7 @@ Browser → Cloudflare → Traefik (VPS, existing) → dashboard container (port
   - Supports 2FA (credentials/token cached in persistent volume).
   - Handles both **MiIO** (`get_prop`, `set_power`) and **MIoT** (`get_properties`, `set_properties`) protocols.
   - **MIoT Mappings**: Power (2:2), Fan Level (2:4), Mode (2:5), AQI (3:6), Humidity (3:7), Temperature (3:8), Filter Life (4:3), Buzzer (5:1), LED (6:6), Child Lock (7:1).
-- **TCL Cloud**: see [tcl-ac.md](tcl-ac.md) for the full client (auth chain, AWS IoT shadow, `executeAcAction`, `computeAcDiff`, model-aware filtering, firmware quirks).
+- **TCL Cloud**: see [tcl-ac.md](tcl-ac.md) for the full client (auth chain, AWS IoT shadow, per-unit capability registry, `executeAcAction`, `computeAcDiff`, protocol-aware encoding, firmware quirks).
 - **Automations** (purifier metric rules, AC thermostat hysteresis + range slots, schedules, timers, manual-off locks): see [ac-automations.md](ac-automations.md).
 - **Smart AC Leveling** (current-budget controller, shed/restore, calibration): see [ac-leveling.md](ac-leveling.md).
 - **Separate docker-compose**: Lives at `/opt/home-dashboard/` on the VPS, joins the existing `rag_default` network.
@@ -74,6 +74,7 @@ D:\dev\home\
 │   │   ├── collector.ts    # Collector class (AW polling + Qingping MQTT/cloud + automation loop). Air buffer + storeAirMedian() for 1-min median writes. Public getLatestAir() getter, setLatestPower() setter (receives power data from routes via callback), invalidateAutomationRules() (resets 30s rule cache for immediate reload). Backfill runs in background (non-blocking). Batch inserts for backfill. Prayer time helpers: ensurePrayerTimesForToday(), resolvePrayerMinutes(). Automation methods: checkMetricAutomation (purifier single-threshold), checkAcRangeAutomation (AC hysteresis), checkScheduleAutomation, checkAcTimers. executeAutomationAction routes to xiaomi or tcl based on device_type. Also owns persistent AC manual-off lock state (`ac_manual_off_locks`) and in-memory per-rule+device fan enforcement (`acFanEnforcement` — resolveRangeFan/effectiveAcRangeProfile/updateAcFanTracking/noteUserAcFanChange, plus stripLeveledControls/refreshAcFanBaseline for leveler fan-hold deference).
 │   │   ├── xiaomi-cloud.ts # Wrapper for xmihome, protocol routing, device discovery, auth
 │   │   ├── tcl-cloud.ts    # TCL Home API client (auth chain, AWS IoT shadow, SigV4 signing)
+│   │   ├── ac-capabilities.ts # Stable AC policy + per-live-shadow feature/value/availability validation
 │   │   ├── alert-metrics.ts # Shared metrics catalog (weather/air/power sources + feels-like indoor metrics), getMetricValue (accepts weather, air, power rows), PRAYER_LABELS. Power metrics: voltage, power_grid, power_gen, power_total (computed), current_grid, current_gen.
 │   │   ├── prayer.ts        # Dashboard wrapper around prayer-engine: BAGHDAD_COORDS + "BaghdadYMA" profile, getBaghdadPrayerTimes(), baghdadMinuteOfDay(), baghdadDateKey(), prayerInstant(). Single place the household location/profile live.
 │   │   ├── prayer-engine/   # Standalone, GPS-portable prayer-time engine on astronomy-engine (MIT). index/astro/asr/high-latitude/rounding/methods/sunnah/timezone/types. Own package.json+README (lift-and-publish ready). calibrate.ts (one-off, build-excluded) fits the BaghdadYMA offsets; prayer-engine.test.ts is the ≤1-min regression vs the printed calendar.

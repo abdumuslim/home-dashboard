@@ -79,6 +79,7 @@ async function main(): Promise<void> {
       getStatus: () => collector.leveling().getStatus(),
       onUserPowerOff: (deviceId) => collector.leveling().onUserPowerOff(deviceId),
       onUserPowerOn: (deviceId) => collector.leveling().onUserPowerOn(deviceId),
+      noteUserGenLevel: (deviceId) => collector.noteUserAcGenLevel(deviceId),
       onUserGenLevel: (deviceId, level) => collector.onUserAcGenLevel(deviceId, level),
       updateV2Config: (cfg) => collector.acLeveler2.updateConfig(cfg),
       getJournal: (hours) => collector.acLeveler2.recentJournal(hours),

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { TclCloud, latestReportedAtMs, deviceOnline, SHADOW_STALE_MS, CONTROL_VERIFY_MAX_RESENDS, type AcDevice, type AcAction } from "./tcl-cloud.js";
+import { deriveAcCapabilities } from "./ac-capabilities.js";
 
 // Regression tests for the fan/turbo coupling on non-Najat models (TAC-12CHSD):
 // fan_speed 7 IS turbo:1/windSpeed:0 and fan_speed 1 IS silenceSwitch:1, so a
@@ -8,9 +9,14 @@ import { TclCloud, latestReportedAtMs, deviceOnline, SHADOW_STALE_MS, CONTROL_VE
 // commands every tick (the Abdu AC 5-second beep loop, 2026-06-08).
 
 function acDevice(overrides: Partial<AcDevice>): AcDevice {
+  const model = overrides.model ?? "TAC-12CHSD";
+  const id = overrides.id ?? "ac1";
   return {
-    id: "ac1",
+    id,
     name: "Abdu AC",
+    displayName: "Abdu",
+    displayOrder: 2,
+    levelingEligible: true,
     isOnline: true,
     lastSeenAt: null,
     power: true,
@@ -27,15 +33,96 @@ function acDevice(overrides: Partial<AcDevice>): AcDevice {
     freshAir: false,
     hasFreshAir: false,
     generatorMode: 1,
-    model: "TAC-12CHSD", // non-Najat unless overridden — protocol forks key on this, NOT maxGeneratorLevel
+    model, // non-Najat unless overridden — protocol forks key on this, NOT maxGeneratorLevel
     maxGeneratorLevel: 3,
     tempStep: 1,
     minFanSpeed: 1,
     maxFanSpeed: 7,
     beep: false,
+    capabilities: deriveAcCapabilities(id, model, {
+      powerSwitch: 1,
+      workMode: 1,
+      temperature: 25,
+      windSpeed: 3,
+      silenceSwitch: 0,
+      turbo: 0,
+      ECO: 0,
+      screen: 1,
+      sleep: 0,
+      verticalSwitch: 0,
+      horizontalSwitch: 0,
+      verticalWind: 0,
+      horizontalWind: 0,
+      generatorMode: 1,
+      beepSwitch: 0,
+    }),
     ...overrides,
   };
 }
+
+describe("capability-aware TCL commands", () => {
+  it("publishes an advanced multi-property command through the normal retry path", async () => {
+    const device = acDevice({
+      id: "DlXqDBFAAAE",
+      maxGeneratorLevel: 6,
+      capabilities: deriveAcCapabilities("DlXqDBFAAAE", "TAC-12CHSD", {
+        powerSwitch: 1,
+        workMode: 1,
+        generatorMode: 6,
+        AIECOSwitch: 0,
+      }),
+    });
+    const tcl = tclWithDevice(device);
+    const seam = tcl as unknown as {
+      ensureValidTokens: () => Promise<void>;
+      publishShadowUpdate: (deviceId: string, payload: Record<string, unknown>) => Promise<void>;
+    };
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+    seam.publishShadowUpdate = vi.fn(async () => undefined);
+
+    await tcl.sendControl("DlXqDBFAAAE", "set_ai_eco", 1);
+
+    expect(seam.publishShadowUpdate).toHaveBeenCalledWith("DlXqDBFAAAE", { eightAddHot: 0, AIECOSwitch: 1 });
+  });
+
+  it("validates generator levels against the cached physical device", () => {
+    const guest = acDevice({
+      id: "DlXqDBFAAAE",
+      maxGeneratorLevel: 6,
+      capabilities: deriveAcCapabilities("DlXqDBFAAAE", "TAC-12CHSD", { powerSwitch: 0, generatorMode: 0 }),
+    });
+    const tcl = tclWithDevice(guest);
+
+    expect(tcl.validateControl("DlXqDBFAAAE", "set_generator_mode", 6)).toEqual({ ok: true });
+    expect(tcl.validateControl("missing", "set_generator_mode", 1)).toEqual({
+      ok: false,
+      status: 404,
+      error: "Unknown AC device: missing",
+    });
+  });
+
+  it("refreshes mode-dependent availability before validating a sequential control", async () => {
+    const stale = acDevice({
+      mode: 3,
+      capabilities: deriveAcCapabilities("ac1", "TAC-12CHSD", {
+        powerSwitch: 1, workMode: 3, windSpeed: 3, ECO: 0,
+      }),
+    });
+    const tcl = tclWithDevice(stale);
+    const seam = tcl as unknown as {
+      ensureValidTokens: () => Promise<void>;
+      getThingShadow: (deviceId: string) => Promise<{ reported: Record<string, number>; reportedAt: number | null }>;
+    };
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+    seam.getThingShadow = vi.fn(async () => ({
+      reported: { powerSwitch: 1, workMode: 1, windSpeed: 3, ECO: 0 },
+      reportedAt: null,
+    }));
+
+    await expect(tcl.validateControlLive("ac1", "set_eco", 1)).resolves.toEqual({ ok: true });
+    expect(seam.getThingShadow).toHaveBeenCalledWith("ac1");
+  });
+});
 
 function tclWithDevice(dev: AcDevice): TclCloud {
   const tcl = new TclCloud("user", "pass");
@@ -258,7 +345,7 @@ describe("sendControlVerified (5s × 3 confirm-or-resend)", () => {
       { generatorMode: 2 },
     ]);
     await tcl.sendControlVerified("ac1", "set_generator_mode", 4);
-    expect(sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 4);
+    expect(sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 4, false, true);
     expect(getThingShadow).not.toHaveBeenCalled();
     expect(publishWithRetry).not.toHaveBeenCalled();
   });
@@ -454,6 +541,169 @@ describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
     expect(publishWithRetry).toHaveBeenCalledWith("ac1", { workMode: 1, targetTemperature: 25 });
   });
 
+  it("applies Fan→Cool plus Eco as one mode-aware profile", async () => {
+    const device = acDevice({
+      mode: 3,
+      capabilities: deriveAcCapabilities("ac1", "TAC-12CHSD", {
+        powerSwitch: 1,
+        workMode: 3,
+        windSpeed: 3,
+        ECO: 0,
+      }),
+    });
+    const { tcl, publishWithRetry } = publishingTcl(device);
+
+    await tcl.executeAcAction("ac1", { mode: 1, eco: 1 });
+
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { workMode: 1, ECO: 1 });
+  });
+
+  it("re-sends an ignored verified profile with the same main/fan split", async () => {
+    const device = acDevice({
+      mode: 3,
+      fanSpeed: 3,
+      capabilities: deriveAcCapabilities("ac1", "TAC-12CHSD", {
+        powerSwitch: 1,
+        workMode: 3,
+        windSpeed: 3,
+        silenceSwitch: 0,
+        turbo: 0,
+        ECO: 0,
+      }),
+    });
+    const { tcl, publishWithRetry } = publishingTcl(device);
+    const seam = tcl as unknown as {
+      getThingShadow: unknown;
+      controlVerifyDelay: unknown;
+    };
+    seam.controlVerifyDelay = vi.fn(async () => undefined);
+    seam.getThingShadow = vi.fn()
+      .mockResolvedValueOnce({ reported: { workMode: 3, ECO: 0, windSpeed: 3, silenceSwitch: 0, turbo: 0 }, reportedAt: null })
+      .mockResolvedValueOnce({ reported: { workMode: 3, ECO: 0, windSpeed: 3, silenceSwitch: 0, turbo: 0 }, reportedAt: null })
+      .mockResolvedValueOnce({ reported: { workMode: 1, ECO: 1, windSpeed: 0, silenceSwitch: 0, turbo: 1 }, reportedAt: null });
+
+    await tcl.executeAcActionVerified("ac1", { mode: 1, eco: 1, fan_speed: 7 });
+
+    expect(publishWithRetry).toHaveBeenCalledTimes(4);
+    expect(publishWithRetry).toHaveBeenNthCalledWith(1, "ac1", { workMode: 1, ECO: 1 });
+    expect(publishWithRetry).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
+    expect(publishWithRetry).toHaveBeenNthCalledWith(3, "ac1", { workMode: 1, ECO: 1 });
+    expect(publishWithRetry).toHaveBeenNthCalledWith(4, "ac1", FAN_7);
+  });
+
+  it("lets a newer direct command supersede an in-flight preset verifier", async () => {
+    const { tcl, publishWithRetry } = publishingTcl(acDevice({ mode: 3 }));
+    const delayResolvers: Array<() => void> = [];
+    const seam = tcl as unknown as {
+      getThingShadow: unknown;
+      controlVerifyDelay: unknown;
+      sendControl: unknown;
+    };
+    seam.getThingShadow = vi.fn(async () => ({ reported: { workMode: 3 }, reportedAt: null }));
+    seam.controlVerifyDelay = vi.fn(() => new Promise<void>((resolve) => delayResolvers.push(resolve)));
+    seam.sendControl = vi.fn(async () => undefined);
+
+    const preset = tcl.executeAcActionVerified("ac1", { mode: 1 });
+    while (delayResolvers.length < 1) await Promise.resolve();
+    await tcl.sendControlVerified("ac1", "set_mode", 4);
+    delayResolvers[0]();
+
+    await expect(preset).resolves.toBe("superseded");
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { workMode: 1 });
+  });
+
+  it("keeps stale automation enforcement behind an in-flight manual preset", async () => {
+    const { tcl, publishWithRetry } = publishingTcl(acDevice({ mode: 3 }));
+    const delayResolvers: Array<() => void> = [];
+    const seam = tcl as unknown as {
+      getThingShadow: unknown;
+      controlVerifyDelay: unknown;
+    };
+    seam.getThingShadow = vi.fn()
+      .mockResolvedValueOnce({ reported: { workMode: 3 }, reportedAt: null })
+      .mockResolvedValueOnce({ reported: { workMode: 1 }, reportedAt: null });
+    seam.controlVerifyDelay = vi.fn(() => new Promise<void>((resolve) => delayResolvers.push(resolve)));
+
+    const preset = tcl.executeAcActionVerified("ac1", { mode: 1 });
+    while (delayResolvers.length < 1) await Promise.resolve();
+
+    // The collector may still hold the old automation profile until the route
+    // persists/reloads the successful preset. That background enforcement must
+    // neither cancel the manual intent nor publish the stale mode over it.
+    const staleAutomation = await tcl.executeAcAction(
+      "ac1",
+      { mode: 3 },
+      { suppressWhileManualPresetPending: true },
+    );
+    expect(staleAutomation).toBe("suppressed");
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+
+    delayResolvers[0]();
+    await expect(preset).resolves.toBe("applied");
+    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { workMode: 1 });
+  });
+
+  it("lets an authoritative background action supersede a pending manual preset", async () => {
+    const { tcl, publishWithRetry } = publishingTcl(acDevice({ mode: 3 }));
+    const delayResolvers: Array<() => void> = [];
+    const seam = tcl as unknown as {
+      getThingShadow: unknown;
+      controlVerifyDelay: unknown;
+    };
+    seam.getThingShadow = vi.fn(async () => ({ reported: { workMode: 3 }, reportedAt: null }));
+    seam.controlVerifyDelay = vi.fn(() => new Promise<void>((resolve) => delayResolvers.push(resolve)));
+
+    const preset = tcl.executeAcActionVerified("ac1", { mode: 1 });
+    while (delayResolvers.length < 1) await Promise.resolve();
+
+    const safetyAction = await tcl.executeAcAction("ac1", { mode: 4 });
+    expect(safetyAction).toBe("applied");
+    expect(publishWithRetry).toHaveBeenLastCalledWith("ac1", { workMode: 4 });
+
+    delayResolvers[0]();
+    await expect(preset).resolves.toBe("superseded");
+  });
+
+  it("lets a raw leveler control cancel a pending preset before it can retry", async () => {
+    const { tcl } = publishingTcl(acDevice({ mode: 3 }));
+    const delayResolvers: Array<() => void> = [];
+    const seam = tcl as unknown as {
+      getThingShadow: unknown;
+      controlVerifyDelay: unknown;
+      publishShadowUpdate: unknown;
+      ensureValidTokens: unknown;
+    };
+    seam.getThingShadow = vi.fn(async () => ({ reported: { workMode: 3 }, reportedAt: null }));
+    seam.controlVerifyDelay = vi.fn(() => new Promise<void>((resolve) => delayResolvers.push(resolve)));
+    seam.publishShadowUpdate = vi.fn(async () => undefined);
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+
+    const preset = tcl.executeAcActionVerified("ac1", { mode: 1 });
+    while (delayResolvers.length < 1) await Promise.resolve();
+    await tcl.sendControl("ac1", "set_generator_mode", 1);
+
+    delayResolvers[0]();
+    await expect(preset).resolves.toBe("superseded");
+  });
+
+  it("fails closed when profile execution cannot resolve the physical device", async () => {
+    const tcl = new TclCloud("user", "pass");
+    const seam = tcl as unknown as {
+      ensureDeviceCachePopulated: unknown;
+      publishWithRetry: unknown;
+    };
+    const publishWithRetry = vi.fn(async () => undefined);
+    seam.ensureDeviceCachePopulated = vi.fn(async () => undefined);
+    seam.publishWithRetry = publishWithRetry;
+
+    await expect(tcl.executeAcAction("missing", { mode: 1, temperature: 22, eco: 1 }))
+      .rejects.toThrow("Unknown AC device: missing");
+    expect(publishWithRetry).not.toHaveBeenCalled();
+  });
+
   it("leaves Najat bundled — her fan key is unaffected by this quirk", async () => {
     const { tcl, publishWithRetry } = publishingTcl(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
     await tcl.executeAcAction("ac1", { fan_speed: 5, vertical_swing: 9 });
@@ -500,6 +750,32 @@ describe("restoreLastState fan isolation (TAC-12CHSD)", () => {
     });
     await restore();
     expect(publishShadowUpdate).toHaveBeenNthCalledWith(1, "ac1", { workMode: 1, generatorMode: 3 });
+  });
+
+  it("restores verified advanced settings but not one-shot maintenance actions", async () => {
+    const { publishShadowUpdate, restore } = restorableTcl(acDevice({}), {
+      workMode: 1,
+      AIECOSwitch: 1,
+      softWind: 1,
+      healthy: 1,
+      antiMoldew: 1,
+      lightSense: 1,
+      beepSwitch: 0,
+      eightAddHot: 0,
+      selfClean: 1,
+    });
+    await restore();
+    expect(publishShadowUpdate).toHaveBeenCalledTimes(1);
+    expect(publishShadowUpdate).toHaveBeenCalledWith("ac1", {
+      workMode: 1,
+      AIECOSwitch: 1,
+      softWind: 1,
+      healthy: 1,
+      antiMoldew: 1,
+      lightSense: 1,
+      beepSwitch: 0,
+      eightAddHot: 0,
+    });
   });
 
   it("restores Najat in a single update", async () => {

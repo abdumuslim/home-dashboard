@@ -1,7 +1,7 @@
 import express from "express";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Server } from "node:http";
-import { createRouter, type AcManualOffLockHandlers } from "./routes.js";
+import { acTimers, createRouter, type AcManualOffLockHandlers } from "./routes.js";
 import type { Config } from "./config.js";
 import { signToken, verifyToken } from "./auth.js";
 
@@ -73,13 +73,26 @@ function createLockHandlers(lockedIds: string[] = []) {
   return { handlers, cleared, notified, locked };
 }
 
-function createTclMock() {
+function createTclMock(validation: { ok: true } | { ok: false; status: 400 | 409 | 404; error: string } = { ok: true }) {
   const sent: Array<{ deviceId: string; command: string; value: unknown }> = [];
+  const profiles: Array<{ deviceId: string; action: Record<string, unknown> }> = [];
+  const knownIds = new Set(["DHihohFAAAE", "CA5IMhFAAAE", "Cy3aihFAAAE", "DlXqDBFAAAE"]);
   return {
     sent,
+    profiles,
     cloud: {
       isReady: () => true,
       getDevices: () => [{ id: "DHihohFAAAE", name: "Najat" }],
+      ensureDeviceCachePopulated: async () => undefined,
+      sanitizeAcAction: (deviceId: string, action: Record<string, unknown>) => knownIds.has(deviceId) ? action : null,
+      executeAcAction: async (deviceId: string, action: Record<string, unknown>) => {
+        profiles.push({ deviceId, action });
+      },
+      executeAcActionVerified: async (deviceId: string, action: Record<string, unknown>) => {
+        profiles.push({ deviceId, action });
+        return "applied" as const;
+      },
+      validateControlLive: async () => validation,
       sendControlVerified: async (deviceId: string, command: string, value: unknown) => {
         sent.push({ deviceId, command, value });
       },
@@ -92,6 +105,7 @@ async function startServer(options: {
   locks?: AcManualOffLockHandlers;
   tcl?: ReturnType<typeof createTclMock>["cloud"];
   config?: Config;
+  leveling?: Parameters<typeof createRouter>[9];
 } = {}) {
   const app = express();
   app.use(express.json());
@@ -105,6 +119,7 @@ async function startServer(options: {
     undefined,
     undefined,
     options.locks,
+    options.leveling,
   ));
   const server = await new Promise<Server>((resolve) => {
     const s = app.listen(0, () => resolve(s));
@@ -117,6 +132,7 @@ async function startServer(options: {
 const servers: Server[] = [];
 
 afterEach(async () => {
+  acTimers.clear();
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve, reject) => {
     server.close((err) => err ? reject(err) : resolve());
   })));
@@ -135,8 +151,8 @@ function cookieFor(kind: "user" | "agent"): string {
 const loginCookie = () => cookieFor("user");
 const agentCookie = () => cookieFor("agent");
 
-function control(url: string, headers: Record<string, string>, command: string, value: unknown) {
-  return fetch(`${url}/api/ac/devices/DHihohFAAAE/control`, {
+function control(url: string, headers: Record<string, string>, command: string, value: unknown, deviceId = "DHihohFAAAE") {
+  return fetch(`${url}/api/ac/devices/${deviceId}/control`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify({ command, value }),
@@ -379,5 +395,160 @@ describe("AC control attribution (2026-07-24 'Najat keeps turning back on')", ()
     const ip = (pool.audits()[0].params as string[])[4];
     expect(ip).not.toBe("1.2.3.4");
     expect(ip).not.toBe("9.9.9.9");
+  });
+
+  it("returns the device-aware capability status without sending or auditing", async () => {
+    const pool = createRecordingPool();
+    const tcl = createTclMock({ ok: false, status: 409, error: "Available in Heat mode" });
+    const { server, url } = await startServer({ pool, tcl: tcl.cloud });
+    servers.push(server);
+
+    const resp = await control(url, { Cookie: loginCookie() }, "set_8c_heat", 1);
+
+    expect(resp.status).toBe(409);
+    expect(await resp.json()).toEqual({ error: "Available in Heat mode" });
+    expect(tcl.sent).toEqual([]);
+    expect(pool.audits()).toEqual([]);
+  });
+
+  it("records Self Clean manual-off protection before the cloud send", async () => {
+    const events: string[] = [];
+    const tcl = createTclMock();
+    tcl.cloud.sendControlVerified = async () => { events.push("send"); };
+    const locks = createLockHandlers();
+    locks.handlers.record = async (deviceId) => {
+      events.push("lock");
+      locks.locked.add(deviceId);
+    };
+    const leveling = {
+      getConfig: async () => ({}), updateConfig: async () => ({}), getStatus: () => ({}),
+      onUserPowerOff: async () => { events.push("leveler-off"); },
+      onUserPowerOn: async () => undefined,
+      onUserGenLevel: async (_deviceId: string, level: number) => ({ reverted: false, level }),
+    } as never;
+    const { server, url } = await startServer({ tcl: tcl.cloud, locks: locks.handlers, leveling });
+    servers.push(server);
+
+    const resp = await control(url, { Cookie: loginCookie() }, "set_self_clean", 1);
+
+    expect(resp.status).toBe(200);
+    expect(events).toEqual(["lock", "leveler-off", "send"]);
+    expect(locks.locked.has("DHihohFAAAE")).toBe(true);
+  });
+
+  it("does not call leveling handlers for the ineligible Guest AC", async () => {
+    const tcl = createTclMock();
+    const levelCalls: string[] = [];
+    const notedGenLevels: Array<{ deviceId: string; level: number }> = [];
+    const leveling = {
+      getConfig: async () => ({}), updateConfig: async () => ({}), getStatus: () => ({}),
+      onUserPowerOff: async () => { levelCalls.push("off"); },
+      onUserPowerOn: async () => { levelCalls.push("on"); },
+      noteUserGenLevel: (deviceId: string, level: number) => { notedGenLevels.push({ deviceId, level }); },
+      onUserGenLevel: async (_deviceId: string, level: number) => { levelCalls.push("gen"); return { reverted: false, level }; },
+    } as never;
+    const { server, url } = await startServer({ tcl: tcl.cloud, leveling });
+    servers.push(server);
+
+    expect((await control(url, { Cookie: loginCookie() }, "set_generator_mode", 6, "DlXqDBFAAAE")).status).toBe(200);
+    expect((await control(url, { Cookie: loginCookie() }, "set_power", 0, "DlXqDBFAAAE")).status).toBe(200);
+    expect(levelCalls).toEqual([]);
+    expect(notedGenLevels).toEqual([{ deviceId: "DlXqDBFAAAE", level: 6 }]);
+  });
+
+  it("applies a mode-dependent preset through one server profile operation", async () => {
+    const tcl = createTclMock();
+    const { server, url } = await startServer({ tcl: tcl.cloud });
+    servers.push(server);
+
+    const resp = await fetch(`${url}/api/ac/preset-apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: loginCookie() },
+      body: JSON.stringify({
+        deviceId: "DHihohFAAAE",
+        slot: 2,
+        presetData: { mode: 1, targetTemp: 23, fanSpeed: 5, eco: true, turbo: false, generatorMode: 3 },
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    expect(tcl.sent).toEqual([]);
+    expect(tcl.profiles).toEqual([{
+      deviceId: "DHihohFAAAE",
+      action: { mode: 1, temperature: 23, fan_speed: 5, eco: 1, turbo: 0, generator_mode: 3 },
+    }]);
+  });
+
+  it("rejects a timer for an unknown AC before storing it", async () => {
+    const tcl = createTclMock();
+    const { server, url } = await startServer({ tcl: tcl.cloud });
+    servers.push(server);
+
+    const resp = await fetch(`${url}/api/ac/timer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: loginCookie() },
+      body: JSON.stringify({ deviceId: "missing", action: "on", minutes: 30, preset: { mode: 1, eco: 1 } }),
+    });
+
+    expect(resp.status).toBe(404);
+    expect(acTimers.has("missing")).toBe(false);
+    expect(tcl.profiles).toEqual([]);
+  });
+
+  it("rejects saving a preset for an unknown AC", async () => {
+    const pool = createRecordingPool();
+    const tcl = createTclMock();
+    const { server, url } = await startServer({ pool, tcl: tcl.cloud });
+    servers.push(server);
+
+    const resp = await fetch(`${url}/api/ac/presets/missing/1`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: loginCookie() },
+      body: JSON.stringify({ presetData: { mode: 1, targetTemp: 24, fanSpeed: 3 } }),
+    });
+
+    expect(resp.status).toBe(404);
+    expect(pool.queries.some((query) => query.sql.includes("INSERT INTO ac_presets"))).toBe(false);
+  });
+
+  it("does not persist an older preset request superseded by a newer one", async () => {
+    const pool = createRecordingPool();
+    const tcl = createTclMock();
+    let call = 0;
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => { firstStarted = resolve; });
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    (tcl.cloud as unknown as {
+      executeAcActionVerified: (deviceId: string, action: Record<string, unknown>) => Promise<"applied" | "superseded">;
+    }).executeAcActionVerified = async (deviceId, action) => {
+      tcl.profiles.push({ deviceId, action });
+      call += 1;
+      if (call === 1) {
+        firstStarted();
+        await firstGate;
+        return "superseded";
+      }
+      return "applied";
+    };
+    const { server, url } = await startServer({ pool, tcl: tcl.cloud });
+    servers.push(server);
+    const postPreset = (slot: number, mode: number) => fetch(`${url}/api/ac/preset-apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: loginCookie() },
+      body: JSON.stringify({ deviceId: "DHihohFAAAE", slot, presetData: { mode, targetTemp: 23, fanSpeed: 3 } }),
+    });
+
+    const older = postPreset(1, 1);
+    await firstStartedPromise;
+    const newer = await postPreset(2, 2);
+    releaseFirst();
+    const olderResponse = await older;
+
+    expect(newer.status).toBe(200);
+    expect(olderResponse.status).toBe(409);
+    const updates = pool.queries.filter((query) => query.sql.includes("UPDATE automations SET action_on"));
+    expect(updates).toHaveLength(1);
+    expect(JSON.parse(updates[0].params[0] as string)).toMatchObject({ mode: 2, _preset_slot: 2 });
   });
 });

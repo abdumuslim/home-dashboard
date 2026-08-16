@@ -6,8 +6,9 @@ import type { TimeName } from "./prayer-engine/index.js";
 import type { Config } from "./config.js";
 import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
 import type { XiaomiCloud } from "./xiaomi-cloud.js";
-import type { TclCloud } from "./tcl-cloud.js";
+import type { TclCloud, AcAction } from "./tcl-cloud.js";
 import { MAX_GENERATOR_LEVEL } from "./tcl-cloud.js";
+import { isAcLevelingEligible, maxGeneratorLevelForDevices, validateLevelingDeviceReferences } from "./ac-capabilities.js";
 import type { ForecastResponse } from "./forecast.js";
 import type { AcLevelingConfig, AcAmpModel, AcLevelBoost, AcNeedOverride } from "./ac-leveling.js";
 import type { AcLevelingStatus } from "./ac-leveler.js";
@@ -28,7 +29,7 @@ const log = childLogger("routes");
 export interface AcTimer {
   deviceId: string;
   action: "on" | "off";
-  preset?: Record<string, unknown>;
+  preset?: AcAction;
   fireAt: number;
 }
 
@@ -59,6 +60,8 @@ export interface AcLevelingHandlers {
   getStatus(): AcLevelingStatus;
   onUserPowerOff(deviceId: string): Promise<void>;
   onUserPowerOn(deviceId: string): Promise<void>;
+  /** Records direct user intent even for ACs outside the ESP controller. */
+  noteUserGenLevel?(deviceId: string, level: number): void;
   onUserGenLevel(deviceId: string, level: number): Promise<{ reverted: boolean; level: number }>;
   /** v2 controller extras (absent while only v1 is wired). */
   updateV2Config?(cfg: Record<string, unknown>): Promise<unknown>;
@@ -845,6 +848,18 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   type AutomationBody = MetricAutomationBody | ScheduleAutomationBody;
 
+  async function knownAcDeviceError(deviceIds: string[]): Promise<{ status: 404 | 503; error: string } | null> {
+    const cloud = getTclCloud?.();
+    if (!cloud || !cloud.isReady()) return { status: 503, error: "TCL Cloud not available" };
+    try {
+      await cloud.ensureDeviceCachePopulated();
+      const unknown = deviceIds.find((deviceId) => cloud.sanitizeAcAction(deviceId, {}) == null);
+      return unknown ? { status: 404, error: `Unknown AC device: ${unknown}` } : null;
+    } catch (err) {
+      return { status: 503, error: (err as Error).message };
+    }
+  }
+
   function validateAcProfile(p: unknown): string | null {
     if (!p || typeof p !== "object") return "AC profile required";
     const { mode, temperature, fan_speed } = p as Record<string, number>;
@@ -861,7 +876,12 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         ? getLegacyRangeSlots(body.threshold_low, body.threshold)
         : null
     );
-    return validateRangeSlots(slotsInput, { min: def.min, max: def.max }, createBaghdadPrayerResolver());
+    return validateRangeSlots(
+      slotsInput,
+      { min: def.min, max: def.max },
+      createBaghdadPrayerResolver(),
+      maxGeneratorLevelForDevices(Array.isArray(body.device_ids) ? body.device_ids : []),
+    );
   }
 
   function primaryRangeSlot(slots: AutomationRangeSlot[]): AutomationRangeSlot {
@@ -957,6 +977,10 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const sb = body as ScheduleAutomationBody;
       const err = validateScheduleAutomation(sb);
       if (err) { res.status(400).json({ error: err }); return; }
+      if (sb.device_type === "ac") {
+        const deviceErr = await knownAcDeviceError(sb.device_ids);
+        if (deviceErr) { res.status(deviceErr.status).json({ error: deviceErr.error }); return; }
+      }
 
       const turnOff = sb.turn_off_at_end ?? false;
       const devType = sb.device_type ?? "purifier";
@@ -989,6 +1013,10 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const mb = body as MetricAutomationBody;
       const err = validateMetricAutomation(mb);
       if (err) { res.status(400).json({ error: err }); return; }
+      if (mb.device_type === "ac") {
+        const deviceErr = await knownAcDeviceError(mb.device_ids);
+        if (deviceErr) { res.status(deviceErr.status).json({ error: deviceErr.error }); return; }
+      }
 
       const mins = mb.sustained_minutes ?? 0;
       const devType = mb.device_type ?? "purifier";
@@ -1052,6 +1080,10 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const sb = body as ScheduleAutomationBody;
       const err = validateScheduleAutomation(sb);
       if (err) { res.status(400).json({ error: err }); return; }
+      if (sb.device_type === "ac") {
+        const deviceErr = await knownAcDeviceError(sb.device_ids);
+        if (deviceErr) { res.status(deviceErr.status).json({ error: deviceErr.error }); return; }
+      }
 
       const turnOff = sb.turn_off_at_end ?? false;
       const devType = sb.device_type ?? "purifier";
@@ -1089,6 +1121,10 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const mb = body as MetricAutomationBody;
       const err = validateMetricAutomation(mb);
       if (err) { res.status(400).json({ error: err }); return; }
+      if (mb.device_type === "ac") {
+        const deviceErr = await knownAcDeviceError(mb.device_ids);
+        if (deviceErr) { res.status(deviceErr.status).json({ error: deviceErr.error }); return; }
+      }
 
       const mins = mb.sustained_minutes ?? 0;
       const devType = mb.device_type ?? "purifier";
@@ -1218,8 +1254,6 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
   });
 
-  const ALLOWED_AC_COMMANDS = ["set_power", "set_mode", "set_temperature", "set_fan_speed", "set_eco", "set_screen", "set_sleep", "set_vertical_swing", "set_horizontal_swing", "set_turbo", "set_fresh_air", "set_generator_mode", "set_beep"];
-
   const AC_AUDIT_RETENTION_DAYS = 30;
   let lastAcAuditPruneAt = 0;
 
@@ -1322,17 +1356,16 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
     const id = String(req.params.id);
     const { command, value } = req.body as { command: string; value: unknown };
-    if (!command || !ALLOWED_AC_COMMANDS.includes(command)) {
-      res.status(400).json({ error: `Invalid command. Allowed: ${ALLOWED_AC_COMMANDS.join(", ")}` });
-      return;
-    }
-    // 0 = auto/unrestricted is a valid picker value; levels above the device
-    // max no longer exist (TCL removed Najat's 4–6 in 2026-06)
-    if (command === "set_generator_mode" && (!Number.isInteger(value) || (value as number) < 0 || (value as number) > MAX_GENERATOR_LEVEL)) {
-      res.status(400).json({ error: `generator level must be an integer 0–${MAX_GENERATOR_LEVEL}` });
+    if (!command || typeof command !== "string") {
+      res.status(400).json({ error: "command is required" });
       return;
     }
     try {
+      const validation = await cloud.validateControlLive(id, command, value);
+      if (!validation.ok) {
+        res.status(validation.status).json({ error: validation.error });
+        return;
+      }
       auditAcControl(req, id, command, value);
       // A user touching any AC mid-calibration aborts the run — their intent wins
       acCalibration?.requestAbort("user_control");
@@ -1351,20 +1384,26 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         ? await acManualOffLocks?.clear(id)
         : false;
       if (releasedLock) acManualOffLocks?.notifyLockCleared?.(id, req.authKind ?? "user", clientIp(req));
+      const protectsManualOff = (command === "set_power" && value === 0)
+        || (command === "set_self_clean" && value === 1);
+      if (protectsManualOff) {
+        // Establish intent before the cloud command: a fast shadow poll must
+        // never let an automation or the leveler turn the unit back on.
+        await acManualOffLocks?.record(id, command === "set_self_clean" ? "self_clean" : "ui");
+        if (isAcLevelingEligible(id)) await acLeveling?.onUserPowerOff(id);
+      }
       // Verified send: the firmware (Najat especially) sometimes accepts a
       // command without applying it — the shadow is re-checked every 5s and
       // the command re-sent up to 3 times (gen level/beep/fan-auto excluded).
       await cloud.sendControlVerified(id, command, value);
       if (command === "set_power") {
-        if (value === 0) {
-          // Record the lock first so a leveler restore can never slip in between
-          await acManualOffLocks?.record(id, "ui");
-          await acLeveling?.onUserPowerOff(id);
-        } else if (value === 1) {
+        if (value === 1 && isAcLevelingEligible(id)) {
           await acLeveling?.onUserPowerOn(id);
         }
       } else if (command === "set_generator_mode" && typeof value === "number") {
-        const result = await acLeveling?.onUserGenLevel(id, value);
+        const eligible = isAcLevelingEligible(id);
+        if (!eligible) acLeveling?.noteUserGenLevel?.(id, value);
+        const result = eligible ? await acLeveling?.onUserGenLevel(id, value) : undefined;
         res.json({ ok: true, ...(result?.reverted ? { reverted: true, level: result.level } : {}) });
         return;
       } else if (command === "set_fan_speed" && value === 0) {
@@ -1394,12 +1433,20 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     if (!deviceId || !action || !minutes) { res.status(400).json({ error: "deviceId, action, minutes required" }); return; }
     if (action !== "on" && action !== "off") { res.status(400).json({ error: "action must be 'on' or 'off'" }); return; }
     if (!Number.isInteger(minutes) || minutes < 1 || minutes > 480) { res.status(400).json({ error: "minutes must be 1–480" }); return; }
+    const cloud = getTclCloud?.();
+    if (!cloud || !cloud.isReady()) { res.status(503).json({ error: "TCL Cloud not available" }); return; }
+    await cloud.ensureDeviceCachePopulated();
+    const knownDevice = cloud.sanitizeAcAction(deviceId, {});
+    if (!knownDevice) { res.status(404).json({ error: `Unknown AC device: ${deviceId}` }); return; }
     if (action === "on" && await acManualOffLocks?.isLocked(deviceId)) {
       res.status(409).json({ error: "AC is manually off. Turn it on manually before setting an on timer." });
       return;
     }
+    const safePreset = action === "on" && preset
+      ? cloud.sanitizeAcAction(deviceId, preset as AcAction) ?? undefined
+      : undefined;
     const fireAt = Date.now() + minutes * 60_000;
-    acTimers.set(deviceId, { deviceId, action, preset: action === "on" ? preset : undefined, fireAt });
+    acTimers.set(deviceId, { deviceId, action, preset: safePreset, fireAt });
     res.json({ ok: true, fireAt });
   });
 
@@ -1454,6 +1501,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         if (o.targetFromSetpoint != null && typeof o.targetFromSetpoint !== "boolean") return "needOverride targetFromSetpoint must be boolean";
       }
     }
+    const policyError = validateLevelingDeviceReferences(b as Record<string, unknown>);
+    if (policyError) return policyError;
     return null;
   }
 
@@ -1628,6 +1677,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     if (isNaN(slot) || slot < 1 || slot > 10) { res.status(400).json({ error: "Slot must be 1-10" }); return; }
     const { presetData } = req.body as { presetData: Record<string, unknown> };
     if (!presetData || typeof presetData !== "object") { res.status(400).json({ error: "presetData required" }); return; }
+    const deviceErr = await knownAcDeviceError([deviceId]);
+    if (deviceErr) { res.status(deviceErr.status).json({ error: deviceErr.error }); return; }
     await pool.query(
       `INSERT INTO ac_presets (device_id, slot, data, updated_at) VALUES ($1, $2, $3::jsonb, NOW())
        ON CONFLICT (device_id, slot) DO UPDATE SET data = $3::jsonb, updated_at = NOW()`,
@@ -1638,9 +1689,27 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   // ---------- Preset Sync ----------
 
+  function presetDataToAcAction(presetData: Record<string, unknown>): AcAction {
+    const binary = (value: unknown): unknown => typeof value === "boolean" ? (value ? 1 : 0) : value;
+    return {
+      ...(presetData.mode != null ? { mode: presetData.mode as number } : {}),
+      ...(presetData.targetTemp != null ? { temperature: presetData.targetTemp as number } : {}),
+      ...(presetData.fanSpeed != null ? { fan_speed: presetData.fanSpeed as number } : {}),
+      ...(presetData.eco != null ? { eco: binary(presetData.eco) as number } : {}),
+      ...(presetData.turbo != null ? { turbo: binary(presetData.turbo) as number } : {}),
+      ...(presetData.screen != null ? { screen: binary(presetData.screen) as number } : {}),
+      ...(presetData.verticalSwing != null ? { vertical_swing: presetData.verticalSwing as number } : {}),
+      ...(presetData.horizontalSwing != null ? { horizontal_swing: presetData.horizontalSwing as number } : {}),
+      ...(presetData.freshAir != null ? { fresh_air: binary(presetData.freshAir) as number } : {}),
+      ...(presetData.generatorMode != null ? { generator_mode: presetData.generatorMode as number } : {}),
+    };
+  }
+
   router.post("/api/ac/preset-sync", requireAuth, async (req: Request, res: Response) => {
     const { deviceId, slot, presetData } = req.body as { deviceId: string; slot: number; presetData: Record<string, unknown> };
     if (!deviceId || !slot || !presetData) { res.status(400).json({ error: "deviceId, slot, presetData required" }); return; }
+    const deviceErr = await knownAcDeviceError([deviceId]);
+    if (deviceErr) { res.status(deviceErr.status).json({ error: deviceErr.error }); return; }
 
     await pool.query(
       `INSERT INTO ac_presets (device_id, slot, data, updated_at) VALUES ($1, $2, $3::jsonb, NOW())
@@ -1676,30 +1745,46 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   router.post("/api/ac/preset-apply", requireAuth, async (req: Request, res: Response) => {
     const { deviceId, slot, presetData } = req.body as { deviceId: string; slot: number; presetData: Record<string, unknown> };
-    if (!deviceId || !slot || !presetData) { res.status(400).json({ error: "deviceId, slot, presetData required" }); return; }
+    if (!deviceId || !Number.isInteger(slot) || slot < 1 || slot > 10 || !presetData || typeof presetData !== "object") {
+      res.status(400).json({ error: "deviceId, slot 1–10, and presetData required" });
+      return;
+    }
+    const cloud = getTclCloud?.();
+    if (!cloud || !cloud.isReady()) { res.status(503).json({ error: "TCL Cloud not available" }); return; }
+    try {
+      await cloud.ensureDeviceCachePopulated();
+      const action = cloud.sanitizeAcAction(deviceId, presetDataToAcAction(presetData));
+      if (!action) { res.status(404).json({ error: `Unknown AC device: ${deviceId}` }); return; }
 
-    const actionOn = JSON.stringify({
-      power: 1,
-      mode: presetData.mode,
-      temperature: presetData.targetTemp,
-      fan_speed: presetData.fanSpeed,
-      eco: presetData.eco ? 1 : 0,
-      turbo: presetData.turbo ? 1 : 0,
-      screen: presetData.screen ? 1 : 0,
-      vertical_swing: presetData.verticalSwing,
-      horizontal_swing: presetData.horizontalSwing,
-      fresh_air: presetData.freshAir ? 1 : 0,
-      generator_mode: presetData.generatorMode,
-      _preset_slot: slot,
-    });
+      // One server-side profile avoids mode-dependent validation races such as
+      // Fan→Cool followed immediately by Eco while the shadow still says Fan.
+      acCalibration?.requestAbort("user_control");
+      auditAcControl(req, deviceId, "apply_preset", { slot, action });
+      const delivery = await cloud.executeAcActionVerified(deviceId, action);
+      if (delivery === "superseded") {
+        res.status(409).json({ error: "Preset was superseded by a newer AC control" });
+        return;
+      }
+      if (action.generator_mode != null) {
+        const eligible = isAcLevelingEligible(deviceId);
+        if (!eligible) acLeveling?.noteUserGenLevel?.(deviceId, action.generator_mode);
+        else await acLeveling?.onUserGenLevel(deviceId, action.generator_mode);
+      }
+      if (action.fan_speed === 0) acManualOffLocks?.onUserFanAuto?.(deviceId);
+      else if (action.fan_speed != null || action.turbo != null) acManualOffLocks?.onUserFanChange?.(deviceId);
+      if (action.vertical_swing != null) acManualOffLocks?.onUserSwingChange?.(deviceId);
 
-    const result = await pool.query(
-      `UPDATE automations SET action_on = $1::jsonb
-       WHERE device_type = 'ac' AND enabled = true AND $2 = ANY(device_ids)`,
-      [actionOn, deviceId],
-    );
-    onAutomationRulesChanged?.();
-    res.json({ ok: true, updated: result.rowCount });
+      const actionOn = JSON.stringify({ power: 1, ...action, _preset_slot: slot });
+      const result = await pool.query(
+        `UPDATE automations SET action_on = $1::jsonb
+         WHERE device_type = 'ac' AND enabled = true AND $2 = ANY(device_ids)`,
+        [actionOn, deviceId],
+      );
+      onAutomationRulesChanged?.();
+      res.json({ ok: true, updated: result.rowCount, action });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
   });
 
   return router;

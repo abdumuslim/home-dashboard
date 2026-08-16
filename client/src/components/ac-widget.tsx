@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { Power, Settings, Loader2, X, ChevronUp, ChevronDown, Snowflake, Sun, Wind, Droplets, Zap, Gauge, AirVent, Save, Check, Timer, TimerOff, Volume2, EarOff, Lock } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { AcDevice } from "@/types/ac";
+import type { AcControlCapability, AcDevice, AcFeatureId, AcOption } from "@/types/ac";
 import { VERTICAL_SWING_OPTIONS, HORIZONTAL_SWING_OPTIONS, VerticalIcon, HorizontalIcon } from "@/components/ui/swing-controls";
 
 const MODE_LABELS: Record<number, { label: string; icon: typeof Snowflake }> = {
@@ -32,6 +32,42 @@ const FAN_LABELS: Record<number, string> = {
   0: "A",
   1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7",
 };
+
+const FEATURE_UI: Record<AcFeatureId, { label: string; command: string; section: "Comfort" | "Air" | "Device" }> = {
+  eco: { label: "Eco", command: "set_eco", section: "Comfort" },
+  aiEco: { label: "AI Eco", command: "set_ai_eco", section: "Comfort" },
+  turbo: { label: "Turbo", command: "set_turbo", section: "Comfort" },
+  sleep: { label: "Sleep", command: "set_sleep", section: "Comfort" },
+  gentleBreeze: { label: "Gentle breeze", command: "set_gentle_breeze", section: "Comfort" },
+  eightDegreeHeat: { label: "8°C heating", command: "set_8c_heat", section: "Comfort" },
+  healthy: { label: "Healthy / Ion", command: "set_healthy", section: "Air" },
+  freshAir: { label: "Fresh air", command: "set_fresh_air", section: "Air" },
+  freshAirStrength: { label: "Fresh air strength", command: "set_fresh_air_strength", section: "Air" },
+  drying: { label: "Drying / Anti-mildew", command: "set_drying", section: "Air" },
+  selfClean: { label: "Self clean", command: "set_self_clean", section: "Device" },
+  screen: { label: "Display", command: "set_screen", section: "Device" },
+  lightSense: { label: "Light sensing", command: "set_light_sense", section: "Device" },
+  beep: { label: "Beep", command: "set_beep", section: "Device" },
+};
+
+function supportsCommand(d: AcDevice, command: string, value?: number): boolean {
+  const has = (options: AcOption[]) => value == null ? options.length > 0 : options.some((option) => option.value === value);
+  if (command === "set_mode") return has(d.capabilities.modes);
+  if (command === "set_fan_speed") return has(d.capabilities.fanSpeeds);
+  if (command === "set_vertical_swing") return has(d.capabilities.verticalSwing);
+  if (command === "set_horizontal_swing") return has(d.capabilities.horizontalSwing);
+  if (command === "set_generator_mode") return has(d.capabilities.generatorLevels);
+  if (command === "set_temperature" || command === "set_power") return true;
+  return Object.entries(FEATURE_UI).some(([id, meta]) => meta.command === command && d.capabilities.controls.some((control) => control.id === id));
+}
+
+function effectiveGeneratorLevel(d: AcDevice, storedLevel: number): number | null {
+  const values = d.capabilities.generatorLevels.map((option) => option.value);
+  if (values.length === 0 || !Number.isInteger(storedLevel) || storedLevel < 0) return null;
+  if (values.includes(storedLevel)) return storedLevel;
+  // Firmware can remove upper levels while old presets still carry them.
+  return Math.min(storedLevel, Math.max(...values));
+}
 
 // ---------- Presets ----------
 
@@ -122,7 +158,7 @@ function presetMatchesCurrent(p: PresetData, d: AcDevice): boolean {
     p.mode === d.mode &&
     round(p.targetTemp) === round(d.targetTemp) &&
     p.fanSpeed === d.fanSpeed &&
-    p.generatorMode === d.generatorMode
+    (effectiveGeneratorLevel(d, p.generatorMode) ?? d.generatorMode) === d.generatorMode
   );
 }
 
@@ -247,7 +283,8 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
           <button
             onClick={() => setShowDetail(true)}
             className="flex items-center justify-center w-7 h-7 rounded-full text-dim hover:text-white hover:bg-white/10 transition-colors shrink-0"
-            title="AC settings"
+            title={`${label ?? d.displayName} AC settings`}
+            aria-label={`${label ?? d.displayName} AC settings`}
           >
             <Settings className="w-4 h-4" />
           </button>
@@ -327,28 +364,25 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
   const [phase, setPhase] = useState<"in" | "out">("in");
   const [saveMode, setSaveMode] = useState(false);
   const [applyingPreset, setApplyingPreset] = useState<number | null>(null);
+  const [presetError, setPresetError] = useState("");
   const [presets, setPresets] = useState<PresetSlots>({ ...EMPTY_PRESETS });
 
   const applyPreset = async (slot: number, sv: PresetData) => {
     setApplyingPreset(slot);
+    setPresetError("");
     try {
-      // Mode first — firmware may reset fan speed on mode change
-      if (sv.mode !== d.mode) try { await onControl("set_mode", sv.mode); } catch {}
-      if (sv.targetTemp !== d.targetTemp) try { await onControl("set_temperature", sv.targetTemp); } catch {}
-      if (sv.eco !== d.eco) try { await onControl("set_eco", sv.eco ? 1 : 0); } catch {}
-      if (sv.screen !== d.screen) try { await onControl("set_screen", sv.screen ? 1 : 0); } catch {}
-      if (sv.verticalSwing !== d.verticalSwing) try { await onControl("set_vertical_swing", sv.verticalSwing); } catch {}
-      if (sv.horizontalSwing !== d.horizontalSwing) try { await onControl("set_horizontal_swing", sv.horizontalSwing); } catch {}
-      if (sv.freshAir !== d.freshAir) try { await onControl("set_fresh_air", sv.freshAir ? 1 : 0); } catch {}
-      if (sv.generatorMode !== d.generatorMode) try { await onControl("set_generator_mode", sv.generatorMode); } catch {}
-      // Fan speed last — after mode change processed by firmware
-      if (sv.fanSpeed !== d.fanSpeed) try { await onControl("set_fan_speed", sv.fanSpeed); } catch {}
-      if (sv.turbo !== d.turbo) try { await onControl("set_turbo", sv.turbo ? 1 : 0); } catch {}
-      fetch("/api/ac/preset-apply", {
+      const generatorMode = effectiveGeneratorLevel(d, sv.generatorMode);
+      const response = await fetch("/api/ac/preset-apply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceId: d.id, slot, presetData: sv }),
-      }).catch(() => {});
+        body: JSON.stringify({ deviceId: d.id, slot, presetData: generatorMode == null ? sv : { ...sv, generatorMode } }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { error?: string };
+        throw new Error(payload.error ?? "Failed to apply preset");
+      }
+    } catch (err) {
+      setPresetError((err as Error).message || "Failed to apply preset");
     } finally {
       setApplyingPreset(null);
     }
@@ -393,7 +427,7 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
         <div className="flex items-center justify-between px-5 py-3 border-b border-white/10">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full" style={{ backgroundColor: offline ? "#7a8ba8" : isOn ? colors.accent : "#71717a" }} />
-            <h2 className="text-base font-medium text-text">{d.name}</h2>
+            <h2 className="text-base font-medium text-text">{d.displayName}</h2>
             <span className="text-xs text-dim">{offline ? "offline" : isOn ? "on" : "off"}</span>
           </div>
           <div className="flex items-center gap-1">
@@ -422,7 +456,7 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
           {/* Temperature control */}
           <div className="flex items-center justify-center gap-6">
             <button
-              onClick={() => send("set_temperature", Math.max(16, +(d.targetTemp - (d.tempStep || 1)).toFixed(1)))}
+              onClick={() => send("set_temperature", Math.max(d.capabilities.temperature.min, +(d.targetTemp - d.capabilities.temperature.step).toFixed(1)))}
               disabled={offline || !isOn}
               className="p-2 rounded-xl bg-white/5 hover:bg-white/10 text-dim hover:text-white transition-colors disabled:opacity-30"
             >
@@ -435,7 +469,7 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
               <span className="text-xs text-dim mt-1">Target</span>
             </div>
             <button
-              onClick={() => send("set_temperature", Math.min(36, +(d.targetTemp + (d.tempStep || 1)).toFixed(1)))}
+              onClick={() => send("set_temperature", Math.min(d.capabilities.temperature.max, +(d.targetTemp + d.capabilities.temperature.step).toFixed(1)))}
               disabled={offline || !isOn}
               className="p-2 rounded-xl bg-white/5 hover:bg-white/10 text-dim hover:text-white transition-colors disabled:opacity-30"
             >
@@ -524,18 +558,20 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                     <button
                       onClick={async () => {
                         if (turnOnTimerBlocked) return;
-                        const preset = timerAction === "on" && timerPreset != null && presets[timerPreset]
+                        const savedPreset = timerPreset == null ? null : presets[timerPreset];
+                        const timerGeneratorMode = savedPreset == null ? null : effectiveGeneratorLevel(d, savedPreset.generatorMode);
+                        const preset = timerAction === "on" && savedPreset
                           ? {
-                              mode: presets[timerPreset]!.mode,
-                              temperature: presets[timerPreset]!.targetTemp,
-                              fan_speed: presets[timerPreset]!.fanSpeed,
-                              eco: presets[timerPreset]!.eco ? 1 : 0,
-                              turbo: presets[timerPreset]!.turbo ? 1 : 0,
-                              screen: presets[timerPreset]!.screen ? 1 : 0,
-                              vertical_swing: presets[timerPreset]!.verticalSwing,
-                              horizontal_swing: presets[timerPreset]!.horizontalSwing,
-                              fresh_air: presets[timerPreset]!.freshAir ? 1 : 0,
-                              generator_mode: presets[timerPreset]!.generatorMode,
+                              ...(supportsCommand(d, "set_mode", savedPreset.mode) ? { mode: savedPreset.mode } : {}),
+                              temperature: savedPreset.targetTemp,
+                              ...(supportsCommand(d, "set_fan_speed", savedPreset.fanSpeed) ? { fan_speed: savedPreset.fanSpeed } : {}),
+                              ...(supportsCommand(d, "set_eco") ? { eco: savedPreset.eco ? 1 : 0 } : {}),
+                              ...(supportsCommand(d, "set_turbo") ? { turbo: savedPreset.turbo ? 1 : 0 } : {}),
+                              ...(supportsCommand(d, "set_screen") ? { screen: savedPreset.screen ? 1 : 0 } : {}),
+                              ...(supportsCommand(d, "set_vertical_swing", savedPreset.verticalSwing) ? { vertical_swing: savedPreset.verticalSwing } : {}),
+                              ...(supportsCommand(d, "set_horizontal_swing", savedPreset.horizontalSwing) ? { horizontal_swing: savedPreset.horizontalSwing } : {}),
+                              ...(supportsCommand(d, "set_fresh_air") ? { fresh_air: savedPreset.freshAir ? 1 : 0 } : {}),
+                              ...(timerGeneratorMode != null ? { generator_mode: timerGeneratorMode } : {}),
                             }
                           : undefined;
                         await onSetTimer?.(timerAction, timerMinutes, preset);
@@ -556,109 +592,110 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
           )}
 
           {/* Mode selector */}
-          {isOn && !offline && (
-            <>
+          <>
+              {d.capabilities.modes.length > 0 && (
               <div>
                 <span className="text-xs text-dim mb-1.5 block">Mode</span>
-                <div className="grid grid-cols-5 gap-1.5">
-                  {([0, 1, 2, 3, 4] as const).map((m) => {
-                    const info = MODE_LABELS[m] ?? MODE_LABELS[0];
+                <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${d.capabilities.modes.length}, minmax(0, 1fr))` }}>
+                  {d.capabilities.modes.map((option) => {
+                    const m = option.value;
+                    const info = MODE_LABELS[m] ?? { label: option.label, icon: Gauge };
                     const Icon = info.icon;
                     const mc = getModeColors(m);
                     return (
                       <button
                         key={m}
                         onClick={() => send("set_mode", m)}
+                        disabled={offline || !isOn}
                         className={cn(
-                          "flex flex-col items-center gap-1 px-2 py-2 rounded-lg text-xs border transition-colors",
+                          "flex flex-col items-center gap-1 px-2 py-2 rounded-lg text-xs border transition-colors disabled:opacity-35 disabled:cursor-not-allowed",
                           d.mode !== m && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
                         )}
                         style={d.mode === m ? { borderColor: mc.border, backgroundColor: mc.bg, color: mc.text } : undefined}
                       >
                         <Icon className="w-4 h-4" />
-                        <span className="text-[0.65rem]">{info.label}</span>
+                        <span className="text-[0.65rem]">{option.label}</span>
                       </button>
                     );
                   })}
                 </div>
               </div>
+              )}
 
               {/* Fan speed selector */}
-              <div>
+              {d.capabilities.fanSpeeds.length > 0 && <div>
                 <span className="text-xs text-dim mb-1.5 block">Fan Speed</span>
-                <div className="flex gap-1.5">
-                  {[0, ...Array.from({ length: (d.maxFanSpeed || 7) - (d.minFanSpeed || 1) + 1 }, (_, i) => i + (d.minFanSpeed || 1))].map((s) => {
+                <div className="flex gap-1.5 flex-wrap">
+                  {d.capabilities.fanSpeeds.map((option) => {
+                    const s = option.value;
                     return (
                       <button
                         key={s}
                         onClick={() => send("set_fan_speed", s)}
+                        disabled={offline || !isOn}
+                        title={option.label}
                         className={cn(
-                          "flex-1 py-1.5 rounded-lg text-xs border transition-colors",
+                          "min-w-9 flex-1 py-1.5 rounded-lg text-xs border transition-colors disabled:opacity-35 disabled:cursor-not-allowed",
                           d.fanSpeed !== s && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
                         )}
                         style={d.fanSpeed === s ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
                       >
-                        {d.model !== "TAC-24CHSA" && s === 1
+                        {option.label === "Silent"
                           ? <EarOff className="w-3 h-3 mx-auto" />
-                          : d.model !== "TAC-24CHSA" && s >= 2
-                            ? `${s - 1}`
-                            : (FAN_LABELS[s] ?? `${s}`)}
+                          : option.label === "Auto" ? "A" : option.label === "Max" ? "Max" : option.label}
                       </button>
                     );
                   })}
                 </div>
-              </div>
+              </div>}
 
               {/* Vertical swing */}
-              <SwingSelector
+              {d.capabilities.verticalSwing.length > 0 && <SwingSelector
                 label="Vertical"
                 value={d.verticalSwing}
                 onChange={(v) => send("set_vertical_swing", v)}
                 axis="vertical"
+                values={d.capabilities.verticalSwing}
+                disabled={offline || !isOn}
                 colors={colors}
-              />
+              />}
 
               {/* Horizontal swing */}
-              <SwingSelector
+              {d.capabilities.horizontalSwing.length > 0 && <SwingSelector
                 label="Horizontal"
                 value={d.horizontalSwing}
                 onChange={(v) => send("set_horizontal_swing", v)}
                 axis="horizontal"
+                values={d.capabilities.horizontalSwing}
+                disabled={offline || !isOn}
                 colors={colors}
-              />
+              />}
 
-              {/* Toggles */}
-              <div className="grid grid-cols-3 gap-1.5">
-                <AcToggle label="ECO" value={d.eco} onChange={(v) => send("set_eco", v ? 1 : 0)} colors={colors} />
-                <AcToggle label="Turbo" value={d.turbo} onChange={(v) => send("set_turbo", v ? 1 : 0)} icon={<Zap className="w-3 h-3" />} colors={colors} />
-                <AcToggle label="Screen" value={d.screen} onChange={(v) => send("set_screen", v ? 1 : 0)} colors={colors} />
-                <AcToggle label="Beep" value={d.beep} onChange={(v) => send("set_beep", v ? 1 : 0)} icon={<Volume2 className="w-3 h-3" />} colors={colors} />
-                {d.hasFreshAir && (
-                  <AcToggle label="Fresh" value={d.freshAir} onChange={(v) => send("set_fresh_air", v ? 1 : 0)} icon={<AirVent className="w-3 h-3" />} colors={colors} />
-                )}
-              </div>
+              <CapabilitySections controls={d.capabilities.controls} send={send} offline={offline} colors={colors} />
 
               {/* Generator mode */}
-              <div>
+              {d.capabilities.generatorLevels.length > 0 && <div>
                 <span className="text-[0.65rem] text-dim uppercase tracking-wider mb-1.5 block">Generator</span>
                 <div className="flex gap-1.5 flex-wrap">
-                  {[0, ...Array.from({ length: d.maxGeneratorLevel }, (_, i) => i + 1)].map((lvl) => {
+                  {d.capabilities.generatorLevels.map((option) => {
+                    const lvl = option.value;
                     return (
                       <button
                         key={lvl}
                         onClick={() => send("set_generator_mode", lvl)}
+                        disabled={offline || !isOn}
                         className={cn(
-                          "px-2.5 py-1.5 rounded-lg text-xs border transition-colors",
+                          "px-2.5 py-1.5 rounded-lg text-xs border transition-colors disabled:opacity-35 disabled:cursor-not-allowed",
                           d.generatorMode !== lvl && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
                         )}
                         style={d.generatorMode === lvl ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
                       >
-                        {lvl === 0 ? "OFF" : lvl}
+                        {option.label === "Off" ? "OFF" : `L${option.label}`}
                       </button>
                     );
                   })}
                 </div>
-              </div>
+              </div>}
 
               {/* Presets */}
               <div>
@@ -747,9 +784,9 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
                     );
                   })}
                 </div>
+                {presetError && <p role="alert" className="mt-1.5 text-[0.65rem] text-red-400">{presetError}</p>}
               </div>
             </>
-          )}
 
           {offline && (
             <p className="text-sm text-dim text-center py-2">
@@ -768,16 +805,103 @@ function AcDetailOverlay({ device: d, onControl, onClose, timer, onSetTimer, onC
   );
 }
 
+function featureIcon(id: AcFeatureId): React.ReactNode {
+  switch (id) {
+    case "turbo": return <Zap className="w-3 h-3" />;
+    case "healthy":
+    case "freshAir":
+    case "freshAirStrength": return <AirVent className="w-3 h-3" />;
+    case "drying": return <Droplets className="w-3 h-3" />;
+    case "beep": return <Volume2 className="w-3 h-3" />;
+    case "gentleBreeze": return <Wind className="w-3 h-3" />;
+    case "eightDegreeHeat": return <Sun className="w-3 h-3" />;
+    default: return <Gauge className="w-3 h-3" />;
+  }
+}
+
+function CapabilitySections({ controls, send, offline, colors }: {
+  controls: AcControlCapability[];
+  send: (command: string, value: unknown) => void;
+  offline: boolean;
+  colors: { toggleBg: string; toggleDot: string; border: string; bg: string; text: string };
+}) {
+  return (
+    <>
+      {(["Comfort", "Air", "Device"] as const).map((section) => {
+        const sectionControls = controls.filter((control) => FEATURE_UI[control.id].section === section);
+        if (sectionControls.length === 0) return null;
+        return (
+          <div key={section}>
+            <span className="text-[0.65rem] text-dim uppercase tracking-wider mb-1.5 block">{section}</span>
+            <div className="grid grid-cols-2 gap-1.5">
+              {sectionControls.map((control) => {
+                const meta = FEATURE_UI[control.id];
+                const disabled = offline || !control.available;
+                const title = disabled ? (offline ? "Device is offline" : control.unavailableReason) : undefined;
+                if (control.kind === "select") {
+                  return (
+                    <label key={control.id} className={cn("flex flex-col gap-1 rounded-lg bg-white/5 px-2.5 py-2", disabled && "opacity-40")} title={title}>
+                      <span className="text-[0.65rem] text-dim flex items-center gap-1">{featureIcon(control.id)}{meta.label}</span>
+                      <select
+                        value={control.value ?? 0}
+                        onChange={(event) => send(meta.command, Number(event.target.value))}
+                        disabled={disabled}
+                        className="w-full rounded-md border border-white/10 bg-[#171920] px-2 py-1 text-xs text-text disabled:cursor-not-allowed"
+                      >
+                        {(control.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                      </select>
+                    </label>
+                  );
+                }
+                if (control.kind === "action") {
+                  const active = control.value === 1;
+                  return (
+                    <button
+                      key={control.id}
+                      onClick={() => send(meta.command, active ? 0 : 1)}
+                      disabled={disabled}
+                      title={title}
+                      className="col-span-2 flex items-center justify-center gap-1.5 rounded-lg border px-3 py-2 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                      style={{ borderColor: colors.border, backgroundColor: colors.bg, color: colors.text }}
+                    >
+                      <Settings className="w-3.5 h-3.5" /> {active ? "Stop self clean" : "Start self clean"}
+                    </button>
+                  );
+                }
+                return (
+                  <AcToggle
+                    key={control.id}
+                    label={meta.label}
+                    value={control.value === 1}
+                    onChange={(value) => send(meta.command, value ? 1 : 0)}
+                    icon={featureIcon(control.id)}
+                    disabled={disabled}
+                    title={title}
+                    colors={colors}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 // ---------- Swing Selector ----------
 
-function SwingSelector({ label, value, onChange, axis, colors }: {
+function SwingSelector({ label, value, onChange, axis, values, disabled, colors }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
   axis: "vertical" | "horizontal";
+  values: AcOption[];
+  disabled?: boolean;
   colors: { accent: string; border: string; bg: string; text: string };
 }) {
-  const options = axis === "vertical" ? VERTICAL_SWING_OPTIONS : HORIZONTAL_SWING_OPTIONS;
+  const allowed = new Set(values.map((option) => option.value));
+  const options = (axis === "vertical" ? VERTICAL_SWING_OPTIONS : HORIZONTAL_SWING_OPTIONS).filter((option) => allowed.has(option.value));
   const swingOpts = options.filter(o => o.type === "swing");
   const fixOpts = options.filter(o => o.type === "fix");
   const IconComponent = axis === "vertical" ? VerticalIcon : HorizontalIcon;
@@ -787,8 +911,9 @@ function SwingSelector({ label, value, onChange, axis, colors }: {
       <button
         key={o.value}
         onClick={() => onChange(o.value)}
+        disabled={disabled}
         className={cn(
-          "flex items-center justify-center w-8 h-8 rounded-lg border transition-colors",
+          "flex items-center justify-center w-8 h-8 rounded-lg border transition-colors disabled:opacity-35 disabled:cursor-not-allowed",
           value !== o.value && "border-white/10 bg-white/5 text-dim hover:text-text hover:border-white/20",
         )}
         style={value === o.value ? { borderColor: colors.border, backgroundColor: colors.bg, color: colors.text } : undefined}
@@ -811,18 +936,20 @@ function SwingSelector({ label, value, onChange, axis, colors }: {
   );
 }
 
-function AcToggle({ label, value, onChange, icon, disabled, colors }: {
+function AcToggle({ label, value, onChange, icon, disabled, title, colors }: {
   label: string;
   value: boolean;
   onChange: (v: boolean) => void;
   icon?: React.ReactNode;
   disabled?: boolean;
+  title?: string;
   colors: { toggleBg: string; toggleDot: string };
 }) {
   return (
     <button
       onClick={() => onChange(!value)}
       disabled={disabled}
+      title={title}
       className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-40"
     >
       <span className="text-xs text-dim flex items-center gap-1">{icon}{label}</span>

@@ -10,7 +10,7 @@ timestamp: 2026-07-27
 <!-- Tier-3 agent doc. Loaded on demand via CLAUDE.md / AGENTS.md routing table. -->
 # TCL AC Cloud Integration (tcl-cloud.ts)
 
-**TL;DR:** Three TCL split ACs ("Najat", "Abdu AC", "Abdullah AC") are controlled through a reverse-engineered TCL Home cloud client in `server/src/tcl-cloud.ts`. Auth is a 4-step chain ending in temporary AWS credentials; device state is read from the AWS IoT Shadow (manual SigV4 GET works), but control MUST publish via the `@aws-sdk/client-iot-data-plane` SDK (manual SigV4 publish fails with 403). Two AC hardware models have different shadow property names and two firmware quirks that force split shadow updates. TCL's `isOnline` flag is unreliable — the shadow fetch is the real connectivity test.
+**TL;DR:** Four TCL split ACs (Mom, Abdu, Abdullah, guest) are controlled through a reverse-engineered TCL Home cloud client in `server/src/tcl-cloud.ts`. Auth is a 4-step chain ending in temporary AWS credentials; device state is read from the AWS IoT Shadow (manual SigV4 GET works), but control MUST publish via the `@aws-sdk/client-iot-data-plane` SDK (manual SigV4 publish fails with 403). `ac-capabilities.ts` derives each physical unit's UI/validation contract from its own live shadow and TCL capability list. Protocol families still select wire encodings, never visible features. TCL's `isOnline` flag is unreliable — the shadow fetch is the real connectivity test.
 
 Related docs: automation/range/hysteresis logic → [ac-automations.md](ac-automations.md); Smart AC Leveling (generator-mode budget controller) → [ac-leveling.md](ac-leveling.md); AC widget UI, presets UI, visual design → [frontend.md](frontend.md).
 
@@ -103,12 +103,17 @@ Najat's firmware routinely ACCEPTS a command (IoT publish OK) and never applies 
 - **Critical gotcha (found 2026-05-01):** the 403 retry sets `tokenData = null` BEFORE calling `ensureValidTokens()`. If the re-auth fails (network blip, TCL server down), `tokenData` stays null → `isReady()` returns false **permanently** → all AC automations silently stop forever with zero log output.
 - **Auto-recovery:** the collector attempts `tclCloud.init()` every 60s whenever `isReady()` is false.
 
-### Allowed commands (`ALLOWED_AC_COMMANDS` in `server/src/routes.ts`)
-`set_power`, `set_mode`, `set_temperature`, `set_fan_speed`, `set_eco`, `set_screen`, `set_sleep`, `set_vertical_swing`, `set_horizontal_swing`, `set_turbo`, `set_fresh_air`, `set_generator_mode`.
+### Per-unit capability registry and control validation
 
-The backend resolves property names per device model (e.g., `set_fan_speed` → `windSpeed7Gear` for Najat, `windSpeed` for Abdu/Abdullah).
+`ac-capabilities.ts` is the authority for the controls exposed by `/api/ac/devices` and accepted by `POST /api/ac/devices/:id/control`. Property presence in that unit's live raw shadow (plus the TCL capability list for the few encoded families) proves support; product marketing/model names alone never do. The registry supplies modes, temperature bounds/step, exact fan/swing/generator options, advanced controls, current value, and mode/power availability. Unsupported controls are omitted. Known but temporarily incompatible controls remain present with `available:false` and a reason.
 
-### Abdu/Abdullah fan-speed command mapping
+The route populates the device cache before validation and returns 404 for an unknown device, 400 for an unknown/unsupported command or invalid value, and 409 for a supported feature that is currently unavailable. Accepted families include the legacy commands plus AI Eco, Gentle Breeze/Soft Wind, Healthy/Ion, Fresh Air strength, Drying/Anti-mildew, Self Clean, light sensing, and 8°C heating. The backend then resolves the verified command to the exact per-protocol payload.
+
+Starting Self Clean first records the same persistent manual-off protection as an explicit user OFF, then sends `{powerSwitch:0,selfClean:1}`. This prevents normal automations or leveling from powering the room back on during maintenance. Self Clean is intentionally absent from saved state and presets.
+
+Stable policy is keyed by TCL ID: Mom `DHihohFAAAE` order 1, Abdu `CA5IMhFAAAE` order 2, Abdullah `Cy3aihFAAAE` order 3, guest `DlXqDBFAAAE` order 4. Guest allows generator values 0–6; the other three allow 0–3.
+
+### TAC-12CHSD fan-speed command mapping (Abdu/Abdullah)
 - Level 1 sends `{silenceSwitch:1, turbo:0, windSpeed:0}`.
 - Level 7 sends `{turbo:1, silenceSwitch:0, windSpeed:0}`.
 - Other levels send `{windSpeed:N, silenceSwitch:0, turbo:0}`.
@@ -120,29 +125,30 @@ The backend resolves property names per device model (e.g., `set_fan_speed` → 
 - `executeAcAction` with power=1 + profile does NOT use `sendControl`/`restoreLastState` — it directly publishes power-on via `publishWithRetry`, waits 3s, then sends the automation's profile. This prevents last-state vs automation-profile conflicts.
 - `executeAcAction` with power=1 but NO profile (e.g., a timer without a preset) falls back to `sendControl("set_power", 1)`, which restores last state.
 - Saved props per model:
-  - Najat: `workMode, targetTemperature, screen, sleep, verticalWind, horizontalWind, verticalDirection, horizontalDirection, generatorMode, windSpeed7Gear, newWindSwitch`
-  - Others: `workMode, targetTemperature, screen, sleep, verticalSwitch, horizontalSwitch, verticalDirection, horizontalDirection, generatorMode, windSpeed, ECO, turbo, silenceSwitch`
+  - CHSA-family: `workMode, targetTemperature, screen, sleep, verticalWind, horizontalWind, verticalDirection, horizontalDirection, generatorMode, windSpeed7Gear, newWindSwitch, newWindAutoSwitch, newWindStrength, ECO, AIECOSwitch, turbo, softWind, healthy, antiMoldew, lightSense, beepSwitch, eightAddHot`
+  - CHSD-family: `workMode, targetTemperature, screen, sleep, verticalSwitch, horizontalSwitch, verticalDirection, horizontalDirection, generatorMode, windSpeed, ECO, turbo, silenceSwitch, AIECOSwitch, softWind, healthy, newWindSwitch, newWindAutoSwitch, newWindStrength, antiMoldew, lightSense, beepSwitch, eightAddHot`
+- One-shot maintenance actions such as Self Clean are never saved or restored automatically.
 
 ## AC Models & Shadow Properties
 
 > **⚠ Capacity correction (2026-07-23):** the `model` strings below are PROTOCOL-FAMILY labels inferred from shadow properties — their capacity digits are WRONG for this household. Nameplate reality (user-verified + meter evidence): **Abdu = 2-ton** (advertised 4–8A; calibration fan sweep hit 7.94A; likely a TAC-24-class CHSD unit), **Abdullah & Najat = 1-ton** (2–6A; never observed above ~4.5A). Najat's "TAC-24CHSA" label just means she speaks the CHSA protocol (7-gear fan, `autoGeneratorMode`). All protocol forks stay keyed on the `model` field (correct for BEHAVIOR); never use it to infer capacity/amps — capacity lives in the leveling amp models and `ac_leveling_costs`.
 
-Two AC hardware models with different shadow properties. Detection: presence of `autoGeneratorMode` in the shadow → Najat (TAC-24CHSA); absence → Abdu/Abdullah (TAC-12CHSD). The result is stored as an explicit `model: "TAC-24CHSA" | "TAC-12CHSD"` field on `AcDevice` (server + client) — **all protocol forks (`isNajatModel()`, client fan labels) key on `model`, never on `maxGeneratorLevel`** (they used to check `=== 6`, which broke when TCL changed the level count in 2026-06).
+Two broad protocol families have different wire property names. Detection: presence of `autoGeneratorMode` in the shadow → TAC-24CHSA encoding; absence → TAC-12CHSD encoding. The `model` field remains on `AcDevice` for compatibility and protocol forks only. **Never use it to decide UI features or physical capacity.** The client renders only `AcDevice.capabilities`, derived from that individual live shadow.
 
 ### Common properties (shadow `state.reported`)
 | Property | Type | Values |
 |----------|------|--------|
 | `powerSwitch` | int | 0=off, 1=on |
-| `targetTemperature` | int/float | 16–36 (Najat: 0.5 step, others: 1 step) |
+| `targetTemperature` | int/float | 16–36 (CHSA: 0.5 step, CHSD: 1 step) |
 | `currentTemperature` | float | Current room temp |
 | `workMode` | int | 0=Auto, 1=Cool, 2=Dehumid, 3=Fan, 4=Heat |
 | `screen` | int | 0/1 |
 | `sleep` | int | 0=off, 1=standard, 2=elderly, 3=child |
 | `verticalDirection` | int | 0–13 (swing direction/fixed position) |
 | `horizontalDirection` | int | 0–13 (swing direction/fixed position) |
-| `generatorMode` | int | 0=off, 1–3=level (ALL models since 2026-06 — TCL removed Najat's 4–6, see Generator mode) |
+| `generatorMode` | int | 0=off; Mom/Abdu/Abdullah allow 1–3; guest allows 1–6 |
 
-### Najat-specific (TAC-24CHSA, detected by `autoGeneratorMode` in shadow)
+### TAC-24CHSA-specific (Mom/guest, detected by `autoGeneratorMode` in shadow)
 | Property | Type | Values |
 |----------|------|--------|
 | `windSpeed7Gear` | int | 0=auto, 1–7 fan levels |
@@ -151,7 +157,7 @@ Two AC hardware models with different shadow properties. Detection: presence of 
 | `newWindSwitch` | int | 0/1 (fresh air) |
 | `autoGeneratorMode` | int | 0/1 |
 
-### Abdu/Abdullah-specific (TAC-12CHSD)
+### TAC-12CHSD-specific (Abdu/Abdullah)
 | Property | Type | Values |
 |----------|------|--------|
 | `windSpeed` | int | 0=auto, 2–6 fan levels (raw values 1 and 7 act as auto, NOT silent/max — silent/max go through `silenceSwitch`/`turbo`) |
@@ -162,21 +168,21 @@ Two AC hardware models with different shadow properties. Detection: presence of 
 | `silenceSwitch` | int | 0/1 (used as "silent" fan speed level 1) |
 
 ### Generator mode
-- `generatorMode`: 0=off, 1–3=level. Limits the unit's power consumption for generator use (per-unit current cap). TCL's documented mapping: L1=30%, L2=50%, L3=70% of rated current.
-- **`maxGeneratorLevel` is 3 for ALL models since 2026-06** (`MAX_GENERATOR_LEVEL` export in tcl-cloud.ts). Najat (TAC-24CHSA) historically had 6 levels; TCL removed 4–6 via firmware/app update — the cloud still ACCEPTS `set_generator_mode` 4–6 but the firmware never applies them (shadow keeps the old value; verified live 2026-06-11: L3 confirms in ~1s, L4–L6 time out every send budget, and the TCL app no longer shows them).
-- **Clamp defense (`clampGeneratorMode`)**: every gen-level publish path (sendControl, profile payloads, computeAcDiff desired, restoreLastState) clamps to the device max, preserving 0 — a stored preset/profile with a removed level can never cause the 5s diff re-enforcement to re-send forever. The control route validates 0–3; `onUserGenLevel` clamps the intent too (stale cached clients).
+- `generatorMode` limits that physical unit's power consumption. Mom/Abdu/Abdullah expose Off + L1–L3. Guest exposes Off + L1–L6 from its device policy and verified shadow support.
+- **Clamp defense (`clampGeneratorMode`)**: every gen-level publish path (sendControl, profile payloads, computeAcDiff desired, restoreLastState) clamps to the selected device's policy maximum, preserving 0. Direct controls are validated against the exact per-device option list before publish. Mixed-device range automations validate against the lowest maximum among their targets.
+- **Guest electrical isolation:** `levelingEligible:false` is applied before building the controller device context. Guest is excluded from priority/config maps, amp models, calibration, learned costs, ESP residual/running sets, observed-state callbacks, and every leveling command callback. Leveling/configuration and calibration APIs reject explicit Guest references. Direct control and non-leveling automation remain available. No UI badge is shown.
 - Generator-mode UI (Zap icon, level buttons) → [frontend.md](frontend.md); the Smart AC Leveling controller that drives these levels → [ac-leveling.md](ac-leveling.md).
 
 ## Firmware Quirks (both discovered 2026-05-10)
 
-### Najat (TAC-24CHSA) — power + profile quirk
+### TAC-24CHSA (Mom/guest) — power + profile quirk
 Discovered 2026-05-10 when debugging "mom AC trigger not updating state."
 - **Problem:** When `executeAcAction` sends `{ powerSwitch: 1, workMode: 1, targetTemperature: 26, ... }` as a single shadow update, Najat powers on but physically ignores the profile settings — while the shadow REPORTS them as applied (deceptive).
 - **Fix:** Two-step in `executeAcAction`: publish `{ powerSwitch: 1 }` alone → wait 3 seconds for the AC to fully boot → publish the profile as a separate shadow update.
 - **Why:** Firmware applies defaults/last-state during boot, ignoring settings received during the boot sequence.
 - Verified: the atomic (single-update) approach works for Abdu (TAC-12CHSD) but fails for Najat.
 
-### Abdu/Abdullah (TAC-12CHSD) — the fan block must travel ALONE
+### TAC-12CHSD (Abdu/Abdullah) — the fan block must travel ALONE
 Discovered 2026-05-10 when debugging "abdu ac not taking fan speed"; **widened 2026-07-27** — the conflict is not `workMode`-specific.
 - **Problem:** when fan-speed properties (`windSpeed`/`silenceSwitch`/`turbo`) share a shadow update with **any** other property, the device applies the other property, internally resets the blower, and ignores the fan values in that payload. The shadow reports them as applied (same deceptive pattern as Najat), so `computeAcDiff()` sees no diff and **never retries** — the unit stays at the wrong fan indefinitely while the dashboard reads the commanded value.
 - **Fix (payload split):** `splitFanPayload()` in `tcl-cloud.ts` peels the fan block (`TCL_12CHSD_FAN_KEYS`) off whenever the payload carries anything else, on non-Najat models. Both publish paths use it — `executeAcAction` (profiles + automation diff re-enforcement) and `restoreLastState` (every manual power-on, whose saved set always carries `workMode` next to the fan). Main payload first → `profileSplitDelay()` (500 ms) → fan alone.
@@ -190,7 +196,7 @@ Both quirks share the same signature: shadow `state.reported` shows the settings
 **How to apply:** When adding new AC firmware integrations or changing `executeAcAction`, never assume all properties can be sent in a single shadow update. Test each property group separately and watch for the "shadow says yes but device says no" pattern.
 
 ### TCL can REMOVE features via OTA (2026-06)
-TCL removed Najat's generator levels 4–6 entirely (firmware + app; see Generator mode above). Pattern: the cloud accepts the command but `state.reported` never moves — same signature as a flaky non-apply, but permanent. There is no bypass: we already publish at the lowest available layer (the same AWS IoT shadow the app uses); the rejection is in the indoor unit's firmware. Treat any "level/value never confirms across days + app UI no longer offers it" as a removal, not a quirk — update `MAX_GENERATOR_LEVEL`/validations and sweep stored presets/profiles for the dead values.
+TCL removed Mom's former generator levels 4–6 entirely (firmware + app), while the newer Guest unit—despite sharing the CHSA wire encoding—currently verifies all six. Generator limits are therefore per physical device, never per protocol family. A removed value has this pattern: the cloud accepts the command but `state.reported` never moves. There is no bypass at the cloud layer; update the per-device policy/validations and clamp stored presets when a level disappears.
 
 ## Key Functions
 
@@ -200,18 +206,20 @@ TCL removed Najat's generator levels 4–6 entirely (firmware + app; see Generat
 ### `executeAcAction(deviceId, action)`
 Automation support added 2026-04-21, model-aware filtering added 2026-04-25, two-step power-on fix 2026-05-10. Used by the automation system and AC timers; profile-only mode enables dead-zone re-enforcement without toggling power.
 
+Manual preset application uses `executeAcActionVerified`: it keeps the same capability filtering and CHSD main/fan split, then confirms the whole desired shadow every 5s. An ignored publish re-sends the identical split profile up to three times. While confirmation is pending, explicitly marked automation profile/drift re-enforcement for that device is suppressed so the collector's cached old profile cannot overwrite or cancel the newer manual one before the route persists and reloads it. Safety leveling, timers, calibration, automation state transitions, and other authoritative actions are never suppressed: they bump the shared generation and cancel the preset verifier. Raw leveler fan/level controls also invalidate a pending verifier before sending, preventing a whole-profile retry from undoing a protective cut. A newer direct UI control or verified preset likewise supersedes the older verifier and prevents its request from updating automation state; an external third-value change also wins. Superseded/final failures are returned to the card UI.
+
 Three modes:
 - `power=0` → off only.
 - `power=1` with profile → sends `{powerSwitch:1}` first, waits 3s for AC boot, then sends the profile as a separate shadow update (Najat firmware quirk above; Najat ignores profile in a combined power-on update).
 - `power=1` without profile → falls back to `sendControl` with `restoreLastState`.
 - `power=undefined` → profile-only (no power command, no restore).
 
-**Model-aware command filtering:**
-- Filters out `set_eco`/`set_turbo` for Najat (no such shadow props).
-- Filters out `set_fresh_air` for non-Najat (no `newWindSwitch`).
-- For non-Najat, **ANY** `set_fan_speed` drops `set_turbo` — the fan block owns `windSpeed`/`silenceSwitch`/`turbo` atomically (7=turbo, 1=silence). Fixed 2026-06-08: a preset's `turbo:0` + resolved fan 7 is self-contradictory on this model (shadow-derived fan 7 *is* `turbo:1`), which alternated `{turbo:0}`/`{fan_speed:7}` re-enforcement diffs every 5s tick, beeping the AC each time. Regression tests in `tcl-cloud.test.ts`. (Earlier behavior dropped `set_turbo` only for fan_speed 1 or 7 — superseded.)
+**Capability-aware command filtering:**
+- Filters every stored preset/timer field through the selected device's current capability set. Two ACs sharing a protocol family may therefore accept different profile fields.
+- Existing stored presets stay backward compatible; unsupported fields are omitted and stale generator levels are clamped to the physical unit's current maximum. Advanced maintenance actions are never added to presets.
+- For CHSD, **ANY** `set_fan_speed` drops `set_turbo` — the fan block owns `windSpeed`/`silenceSwitch`/`turbo` atomically (7=turbo, 1=silence). Fixed 2026-06-08: a preset's `turbo:0` + resolved fan 7 is self-contradictory on this model (shadow-derived fan 7 *is* `turbo:1`), which alternated `{turbo:0}`/`{fan_speed:7}` re-enforcement diffs every 5s tick, beeping the AC each time. Regression tests in `tcl-cloud.test.ts`.
 
-**Profile split (non-Najat):** profiles with both `workMode` and fan speed are sent as two shadow updates (main → 500ms → fan) because the firmware resets fan speed on a mode change.
+**Profile split (CHSD):** profiles with both `workMode` and fan speed are sent as two shadow updates (main → 500ms → fan) because the firmware resets fan speed on a mode change.
 
 ### `publishWithRetry(deviceId, payload)`
 Extracted helper with the retry-on-403 logic (clear creds, re-auth, retry once). Used by `executeAcAction` for both the power-on publish and the profile publish.

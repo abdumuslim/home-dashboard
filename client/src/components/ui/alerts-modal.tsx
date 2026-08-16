@@ -942,12 +942,14 @@ function DeviceCheckboxes({ devices, selectedDevices, setSelectedDevices }: {
   );
 }
 
-function RangeSlotsEditor({ slots, metricDef, conflicts, maxGenLevel, onChange }: {
+function RangeSlotsEditor({ slots, metricDef, conflicts, maxGenLevel, levelingEligible, onChange }: {
   slots: AutomationRangeSlot[];
   metricDef: MetricInfo | null;
   conflicts: Set<string>;
   /** Selected AC's max generator level — bounds the per-slot Gen picker. */
   maxGenLevel: number;
+  /** Whether Smart AC Leveling is allowed to manage this physical AC. */
+  levelingEligible: boolean;
   onChange: (slots: AutomationRangeSlot[]) => void;
 }) {
   const [prayerOffsetDirs, setPrayerOffsetDirs] = useState<Record<string, "before" | "after">>({});
@@ -1170,7 +1172,9 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, maxGenLevel, onChange }
               <span className="text-[10px] text-dim shrink-0">Gen</span>
               <button
                 onClick={() => updateSlot(slot.id, { gen_level: undefined })}
-                title="Auto — Smart AC Leveling picks the level for this range"
+                title={levelingEligible
+                  ? "Auto — Smart AC Leveling picks the level for this range"
+                  : "Auto — keep the preset or direct generator level for this range"}
                 className={cn(
                   "px-1.5 py-0.5 rounded text-[10px] border transition-colors",
                   slot.gen_level == null ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
@@ -1182,7 +1186,9 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, maxGenLevel, onChange }
                 <button
                   key={l}
                   onClick={() => updateSlot(slot.id, { gen_level: l })}
-                  title={`Cap the generator level at L${l} while this range is active — Smart Leveling never raises above it (sent directly when leveling is off)`}
+                  title={levelingEligible
+                    ? `Cap the generator level at L${l} while this range is active — Smart Leveling never raises above it (sent directly when leveling is off)`
+                    : `Set this AC directly to L${l} while this range is active`}
                   className={cn(
                     "flex-1 min-w-0 py-0.5 rounded text-[10px] border transition-colors",
                     slot.gen_level === l ? "border-sky-400/50 bg-sky-400/15 text-sky-300" : "border-white/10 bg-white/5 text-dim hover:text-text",
@@ -1292,6 +1298,8 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const selectedAc = acDevices.find((device) => device.id === selectedAcId);
+  const selectedAcLevelingEligible = selectedAc?.levelingEligible !== false;
 
   const [acPresets, setAcPresets] = useState<Record<number, Record<string, unknown> | null>>({ 1: null, 2: null, 3: null, 4: null, 5: null });
   useEffect(() => {
@@ -1347,7 +1355,12 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
   const buildPayload = (): Record<string, unknown> => {
     const ids = deviceType === "ac" ? [selectedAcId] : Array.from(selectedDevices);
     const devs = deviceType === "ac" ? acDevices : devices;
-    const names = ids.map((id) => devs.find((d) => d.id === id)?.name ?? id);
+    const names = ids.map((id) => {
+      const device = devs.find((candidate) => candidate.id === id);
+      return deviceType === "ac" && device && "displayName" in device
+        ? device.displayName
+        : device?.name ?? id;
+    });
     const acProfile = deviceType === "ac" && presetData ? {
       mode: (presetData as Record<string, unknown>).mode,
       temperature: (presetData as Record<string, unknown>).targetTemp,
@@ -1368,7 +1381,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
       device_ids: ids,
       device_names: names,
       turn_off_at_end: effectiveTurnOff,
-      ...(deviceType === "ac" ? { smart_leveling: smartLeveling } : {}),
+      ...(deviceType === "ac" ? { smart_leveling: selectedAcLevelingEligible ? smartLeveling : false } : {}),
       ...(acProfile ? { ac_profile: acProfile } : {}),
     };
 
@@ -1489,7 +1502,8 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
                 slots={rangeSlots}
                 metricDef={metricDef}
                 conflicts={slotValidation.conflicts}
-                maxGenLevel={acDevices.find((d) => d.id === selectedAcId)?.maxGeneratorLevel || 3}
+                maxGenLevel={selectedAc?.maxGeneratorLevel || 3}
+                levelingEligible={selectedAcLevelingEligible}
                 onChange={setRangeSlots}
               />
               {slotValidation.error && <p className="text-xs text-red-400">{slotValidation.error}</p>}
@@ -1680,7 +1694,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
         </label>
       )}
 
-      {deviceType === "ac" && automationType !== "" && (
+      {deviceType === "ac" && automationType !== "" && selectedAcLevelingEligible && (
         <label className="flex items-center gap-1.5 cursor-pointer text-xs text-dim">
           <span className={cn("w-3.5 h-3.5 rounded border flex items-center justify-center", smartLeveling ? "border-emerald-400 bg-emerald-400/20" : "border-dim")}>
             {smartLeveling && <span className="text-emerald-400 text-[10px]">&#10003;</span>}
@@ -1699,7 +1713,7 @@ function AutomationTriggerForm({ devices, acDevices, editing, onSave, onCancel }
                 {selectedAcId === d.id && <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />}
               </span>
               <input type="radio" name="ac-device" checked={selectedAcId === d.id} onChange={() => { setSelectedAcId(d.id); setSelectedPreset(null); setPresetData(null); }} className="sr-only" />
-              <span className={selectedAcId === d.id ? "text-text" : ""}>{d.name}</span>
+              <span className={selectedAcId === d.id ? "text-text" : ""}>{d.displayName}</span>
             </label>
           ))}
         </div>

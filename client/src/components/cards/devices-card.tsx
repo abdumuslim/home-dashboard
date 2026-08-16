@@ -27,34 +27,32 @@ interface DevicesCardProps {
 
 export const DevicesCard = memo(function DevicesCard({ acs, purifiers }: DevicesCardProps) {
   return (
-    <MetricCard className="p-3 flex flex-col justify-center gap-2 col-span-2 md:col-span-1">
-      {acs.length > 0 && (
-        <div className="flex items-start justify-center gap-3">
-          {acs.map((ac) => (
-            <AcWidget
-              key={ac.device.id}
-              device={ac.device}
-              label={ac.label}
-              onControl={ac.onControl}
-              timer={ac.timer}
-              onSetTimer={ac.onSetTimer}
-              onCancelTimer={ac.onCancelTimer}
-            />
-          ))}
-        </div>
-      )}
-
-      {acs.length > 0 && purifiers.length > 0 && (
-        <div className="h-[1px] w-full bg-white/[0.05]" />
-      )}
-
-      {purifiers.length > 0 && (
-        <div className="flex items-start justify-center gap-3 flex-wrap">
-          {purifiers.map((p) => (
-            <PurifierWidget key={p.device.id} device={p.device} label={p.label} onControl={p.onControl} />
-          ))}
-        </div>
-      )}
+    <MetricCard className="p-3 col-span-2 md:col-span-1 overflow-hidden">
+      <div className="grid grid-cols-[minmax(0,1fr)_1px_minmax(4.25rem,0.58fr)] gap-2.5 items-start">
+        <section className="min-w-0">
+          <div className="grid grid-cols-2 gap-2 place-items-center">
+            {acs.map((ac) => (
+              <AcWidget
+                key={ac.device.id}
+                device={ac.device}
+                label={ac.label}
+                onControl={ac.onControl}
+                timer={ac.timer}
+                onSetTimer={ac.onSetTimer}
+                onCancelTimer={ac.onCancelTimer}
+              />
+            ))}
+          </div>
+        </section>
+        <div className="h-full min-h-28 bg-white/[0.06]" />
+        <section className="min-w-0">
+          <div className="flex flex-col items-center gap-2">
+            {purifiers.map((p) => (
+              <PurifierWidget key={p.device.id} device={p.device} label={p.label} onControl={p.onControl} />
+            ))}
+          </div>
+        </section>
+      </div>
     </MetricCard>
   );
 });

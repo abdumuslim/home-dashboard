@@ -110,9 +110,9 @@ function createCalibrator() {
   };
   const commands: Array<{ deviceId: string; cmd: string; value?: unknown }> = [];
   const devices = [
-    { id: "ac1", name: "Abdullah", power: true, generatorMode: 2, fanSpeed: 4, maxGeneratorLevel: 2 },
-    { id: "ac2", name: "Najat", power: true, generatorMode: 3, fanSpeed: 0, maxGeneratorLevel: 3 },
-    { id: "ac3", name: "Abdu", power: false, generatorMode: 1, fanSpeed: 1, maxGeneratorLevel: 3 },
+    { id: "ac1", name: "Abdullah", power: true, generatorMode: 2, fanSpeed: 4, maxGeneratorLevel: 2, levelingEligible: true },
+    { id: "ac2", name: "Najat", power: true, generatorMode: 3, fanSpeed: 0, maxGeneratorLevel: 3, levelingEligible: true },
+    { id: "ac3", name: "Abdu", power: false, generatorMode: 1, fanSpeed: 1, maxGeneratorLevel: 3, levelingEligible: true },
   ];
   // Firmware quirk simulation (Najat-style): gen levels in `ignoreGenLevels`
   // never apply to the shadow; `genLevelSendsNeeded` applies a level only after
@@ -265,6 +265,26 @@ describe("AcCalibrator state machine", () => {
     expect(cal.isActive()).toBe(false);
     expect(cal.getStatus().phase).toBe("idle");
     expect(cal.getStatus().abortReason).toBeNull();
+  });
+
+  it("rejects Guest before it can enter calibration or saved-state restoration", async () => {
+    const { cal, devices, commands } = createCalibrator();
+    devices.push({
+      id: "DlXqDBFAAAE",
+      name: "guest",
+      power: true,
+      generatorMode: 6,
+      fanSpeed: 3,
+      maxGeneratorLevel: 6,
+      levelingEligible: false,
+    } as (typeof devices)[number]);
+    feedGen(cal, 9, 1);
+
+    const result = await cal.start(["DlXqDBFAAAE"], false);
+
+    expect(result).toEqual({ error: "Device is not eligible for ESP calibration: guest", status: 400 });
+    expect(cal.isActive()).toBe(false);
+    expect(commands).toEqual([]);
   });
 
   it("tests selected ACs one by one with a fresh baseline in between", async () => {

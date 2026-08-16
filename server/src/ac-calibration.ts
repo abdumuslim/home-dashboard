@@ -308,6 +308,12 @@ export class AcCalibrator {
     const devices = tcl.getDevices();
     if (devices.length === 0) return { error: "No AC devices known yet", status: 409 };
     const known = new Map(devices.map((d) => [d.id, d]));
+    const ineligible = [...new Set(deviceIds)]
+      .map((id) => known.get(id))
+      .find((device) => device?.levelingEligible === false);
+    if (ineligible) {
+      return { error: `Device is not eligible for ESP calibration: ${ineligible.displayName ?? ineligible.name}`, status: 400 };
+    }
     const queue = [...new Set(deviceIds)].filter((id) => known.has(id));
     if (queue.length === 0) return { error: "No valid deviceIds", status: 400 };
 
@@ -315,7 +321,7 @@ export class AcCalibrator {
     this.savedStates.clear();
     this.deviceNames.clear();
     this.maxLevels.clear();
-    for (const d of devices) {
+    for (const d of devices.filter((device) => device.levelingEligible !== false)) {
       this.savedStates.set(d.id, { power: d.power, generatorMode: d.generatorMode, fanSpeed: d.fanSpeed });
       this.deviceNames.set(d.id, d.name);
       this.maxLevels.set(d.id, d.maxGeneratorLevel || 3);

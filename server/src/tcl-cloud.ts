@@ -2,6 +2,16 @@ import { createHash, createHmac } from "crypto";
 import { readFile, writeFile } from "fs/promises";
 import { IoTDataPlaneClient, PublishCommand } from "@aws-sdk/client-iot-data-plane";
 import { childLogger } from "./logger.js";
+import {
+  buildAdvancedControlPayload,
+  deriveAcCapabilities,
+  getAcDevicePolicy,
+  supportsAcCommand,
+  validateAcControl,
+  type AcCapabilities,
+  type AcControlValidation,
+  type AcModel as CapabilityAcModel,
+} from "./ac-capabilities.js";
 
 const log = childLogger("tcl");
 
@@ -74,19 +84,33 @@ export interface AcAction {
   generator_mode?: number;
 }
 
+export type AcVerifiedProfileResult = "applied" | "superseded";
+export type AcActionExecutionResult = "applied" | "suppressed";
+
+export interface AcActionExecutionOptions {
+  /** Internal: keep the generation owned by executeAcActionVerified. */
+  preserveProfileIntent?: boolean;
+  /** Only stale automation enforcement may opt into this suppression. */
+  suppressWhileManualPresetPending?: boolean;
+}
+
 /**
  * AC hardware model family — drives protocol differences (fan encoding,
  * swing property names, eco/turbo support, save-props list, temp step).
- * Detected from the shadow: presence of `autoGeneratorMode` → TAC-24CHSA
- * (Najat); absence → TAC-12CHSD (Abdu/Abdullah). Never infer the model from
+ * Detected from the shadow: presence of `autoGeneratorMode` → TAC-24CHSA;
+ * absence → TAC-12CHSD. Never infer the model from
  * maxGeneratorLevel — TCL changes level counts via firmware updates.
  */
-export type AcModel = "TAC-24CHSA" | "TAC-12CHSD";
+export type AcModel = CapabilityAcModel;
 
 export interface AcDevice {
   id: string;
   name: string;
+  displayName: string;
+  displayOrder: number;
   model: AcModel;
+  levelingEligible: boolean;
+  capabilities: AcCapabilities;
   isOnline: boolean;
   /** Epoch ms of the device's last shadow report (null if unknown) — drives "last seen" + the offline check. */
   lastSeenAt: number | null;
@@ -142,12 +166,9 @@ interface PersistedState {
 }
 
 /**
- * Max generator-mode level for ALL models since 2026-06: TCL removed levels
- * 4–6 from the TAC-24CHSA (Najat) via firmware/app update, standardizing on
- * the documented 3-level GEN mode (L1=30%, L2=50%, L3=70% of rated current).
- * The cloud still ACCEPTS set_generator_mode 4–6 but the firmware never
- * applies them (shadow keeps reporting the old value) — hence the clamp in
- * clampGeneratorMode().
+ * Backward-compatible/default maximum for the three ESP-managed ACs. Per-unit
+ * policy is authoritative: Guest is a separate-line TAC-24CHSA unit with six
+ * verified levels, while Mom/Abdu/Abdullah stop at three.
  */
 export const MAX_GENERATOR_LEVEL = 3;
 
@@ -183,15 +204,19 @@ export class TclCloud {
   private static readonly STATE_FILE = "/app/data/ac-last-state.json";
 
   // Properties to save/restore per model type
-  private static readonly SAVE_PROPS_NAJAT = [
+  private static readonly SAVE_PROPS_CHSA = [
     "workMode", "targetTemperature", "screen", "sleep",
     "verticalWind", "horizontalWind", "verticalDirection", "horizontalDirection",
-    "generatorMode", "windSpeed7Gear", "newWindSwitch",
+    "generatorMode", "windSpeed7Gear", "newWindSwitch", "newWindAutoSwitch", "newWindStrength",
+    "ECO", "AIECOSwitch", "turbo", "softWind", "healthy", "antiMoldew",
+    "lightSense", "beepSwitch", "eightAddHot",
   ];
   private static readonly SAVE_PROPS_OTHER = [
     "workMode", "targetTemperature", "screen", "sleep",
     "verticalSwitch", "horizontalSwitch", "verticalDirection", "horizontalDirection",
     "generatorMode", "windSpeed", "ECO", "turbo", "silenceSwitch",
+    "AIECOSwitch", "softWind", "healthy", "newWindSwitch", "newWindAutoSwitch", "newWindStrength",
+    "antiMoldew", "lightSense", "beepSwitch", "eightAddHot",
   ];
 
   constructor(username: string, password: string) {
@@ -233,7 +258,7 @@ export class TclCloud {
     const devices = await this.fetchDevices();
     this.cachedDevices = devices;
     this.deviceCacheTime = Date.now();
-    return devices;
+    return devices.sort((a, b) => a.displayOrder - b.displayOrder);
   }
 
   async ensureDeviceCachePopulated(): Promise<void> {
@@ -268,7 +293,7 @@ export class TclCloud {
     // Non-Najat: fan_speed already encodes turbo (1=silence, 7=turbo) — the
     // derived fan_speed comparison subsumes the turbo flag. Comparing both
     // alternated {turbo:0}/{fan_speed:7} commands forever (beep loop).
-    const skipTurbo = desired.fan_speed != null && !this.isNajatModel(deviceId);
+    const skipTurbo = desired.fan_speed != null && !this.isChsaModel(deviceId);
     // Clamp the desired gen level to the device max BEFORE diffing — a stored
     // profile with a no-longer-supported level (e.g. Najat 6 after TCL removed
     // 4–6) would otherwise diff against the reported level every 5s forever.
@@ -285,9 +310,67 @@ export class TclCloud {
     return Object.keys(diff).length > 0 ? (diff as AcAction) : null;
   }
 
-  private isNajatModel(deviceId: string): boolean {
+  private isChsaModel(deviceId: string): boolean {
     const dev = this.cachedDevices.find(d => d.id === deviceId);
     return dev ? dev.model === "TAC-24CHSA" : false;
+  }
+
+  validateControl(deviceId: string, command: string, value: unknown): AcControlValidation | { ok: false; status: 404; error: string } {
+    const device = this.cachedDevices.find((candidate) => candidate.id === deviceId);
+    if (!device) return { ok: false, status: 404, error: `Unknown AC device: ${deviceId}` };
+    return validateAcControl(device.capabilities, command, value);
+  }
+
+  /**
+   * Capability-filter a stored profile without considering current-mode
+   * availability. A profile may intentionally change Fan→Cool and enable Eco
+   * in the same update; both are supported even though Eco is unavailable in
+   * the pre-command Fan shadow. Unknown devices fail closed.
+   */
+  sanitizeAcAction(deviceId: string, action: AcAction): AcAction | null {
+    const device = this.cachedDevices.find((candidate) => candidate.id === deviceId);
+    if (!device) return null;
+    const safe: AcAction = {};
+    const copy = (key: keyof AcAction, command: string): void => {
+      const value = action[key];
+      if (value != null && supportsAcCommand(device.capabilities, command, value)) {
+        (safe as Record<string, unknown>)[key] = value;
+      }
+    };
+    copy("power", "set_power");
+    copy("mode", "set_mode");
+    copy("temperature", "set_temperature");
+    copy("fan_speed", "set_fan_speed");
+    copy("eco", "set_eco");
+    copy("turbo", "set_turbo");
+    copy("screen", "set_screen");
+    copy("vertical_swing", "set_vertical_swing");
+    copy("horizontal_swing", "set_horizontal_swing");
+    copy("fresh_air", "set_fresh_air");
+    if (action.generator_mode != null && supportsAcCommand(device.capabilities, "set_generator_mode", action.generator_mode)) {
+      safe.generator_mode = this.clampGeneratorMode(deviceId, action.generator_mode);
+    }
+    return safe;
+  }
+
+  /**
+   * Re-read the selected unit before evaluating mode/power availability.
+   * Commands and presets are sequential, so cached capabilities from the
+   * dashboard's 10s poll can otherwise reject Eco immediately after Fan→Cool
+   * or accept a control the physical unit has since made unavailable.
+   */
+  async validateControlLive(
+    deviceId: string,
+    command: string,
+    value: unknown,
+  ): Promise<AcControlValidation | { ok: false; status: 404; error: string }> {
+    await this.ensureDeviceCachePopulated();
+    const device = this.cachedDevices.find((candidate) => candidate.id === deviceId);
+    if (!device) return { ok: false, status: 404, error: `Unknown AC device: ${deviceId}` };
+    await this.ensureValidTokens();
+    const { reported } = await this.getThingShadow(deviceId);
+    device.capabilities = deriveAcCapabilities(deviceId, device.model, reported);
+    return validateAcControl(device.capabilities, command, value);
   }
 
   /**
@@ -303,7 +386,21 @@ export class TclCloud {
     return Math.min(level, max);
   }
 
-  async sendControl(deviceId: string, command: string, value: unknown, skipRestore = false): Promise<void> {
+  async sendControl(
+    deviceId: string,
+    command: string,
+    value: unknown,
+    skipRestore = false,
+    preserveProfileIntent = false,
+  ): Promise<void> {
+    // Raw leveler/calibration controls do not pass through the verified UI
+    // wrapper. If one lands while a manual preset verifier is pending, make it
+    // authoritative: cancel that verifier so it cannot resend the old whole
+    // profile over a protective level/fan cut. Internal sends belonging to the
+    // verified profile opt out explicitly.
+    if (!preserveProfileIntent && this.pendingManualProfiles.has(deviceId)) {
+      this.bumpProfileGeneration(deviceId);
+    }
     await this.ensureValidTokens();
 
     // Handle power-on: restore last saved state
@@ -336,7 +433,7 @@ export class TclCloud {
     if (command === "set_vertical_swing" || command === "set_horizontal_swing") {
       const v = value as number;
       const prefix = command === "set_vertical_swing" ? "vertical" : "horizontal";
-      const switchProp = this.isNajatModel(deviceId) ? `${prefix}Wind` : `${prefix}Switch`;
+      const switchProp = this.isChsaModel(deviceId) ? `${prefix}Wind` : `${prefix}Switch`;
       let desired: Record<string, unknown>;
       if (v === 0) {
         desired = { [switchProp]: 0, [`${prefix}Direction`]: 8 };
@@ -367,10 +464,10 @@ export class TclCloud {
       return;
     }
 
-    const najat = this.isNajatModel(deviceId);
+    const chsa = this.isChsaModel(deviceId);
 
-    // Handle fan speed specially for non-Najat: 1=silent, 7=turbo/max
-    if (command === "set_fan_speed" && !najat) {
+    // Handle fan speed specially for TAC-12CHSD: 1=silent, 7=turbo/max
+    if (command === "set_fan_speed" && !chsa) {
       const v = value as number;
       let desired: Record<string, unknown>;
       if (v === 1) {
@@ -415,13 +512,14 @@ export class TclCloud {
     };
 
     const prop = propMap[command];
-    if (!prop) throw new Error(`Unknown command: ${command}`);
+    const advancedPayload = buildAdvancedControlPayload(command, value);
+    if (!prop && !advancedPayload) throw new Error(`Unknown command: ${command}`);
 
     // Firmware ignores gen levels above the device max — send the clamped value
     if (command === "set_generator_mode" && typeof value === "number") {
       value = this.clampGeneratorMode(deviceId, value);
     }
-    const desired: Record<string, unknown> = { [prop]: value };
+    const desired: Record<string, unknown> = advancedPayload ?? { [prop]: value };
     try {
       await this.publishShadowUpdate(deviceId, desired);
     } catch (err) {
@@ -739,22 +837,32 @@ export class TclCloud {
 
         const powerFromId = (dev.identifiers ?? []).find(i => i.identifier === "powerSwitch");
 
-        // Najat uses different property names than Abdu/Abdullah
-        const isNajatModel = 'autoGeneratorMode' in shadow;
-        const vSwitch = isNajatModel ? shadow.verticalWind : shadow.verticalSwitch;
-        const hSwitch = isNajatModel ? shadow.horizontalWind : shadow.horizontalSwitch;
+        // TAC-24CHSA uses different property names than TAC-12CHSD.
+        const isChsaModel = 'autoGeneratorMode' in shadow;
+        const vSwitch = isChsaModel ? shadow.verticalWind : shadow.verticalSwitch;
+        const hSwitch = isChsaModel ? shadow.horizontalWind : shadow.horizontalSwitch;
 
+        const policy = getAcDevicePolicy(dev.deviceId);
+        const model: AcModel = isChsaModel ? "TAC-24CHSA" : "TAC-12CHSD";
+        const capabilities = deriveAcCapabilities(dev.deviceId, model, shadow);
+        const positiveFanSpeeds = capabilities.fanSpeeds
+          .map((option) => option.value)
+          .filter((value) => value > 0);
         devices.push({
           id: dev.deviceId,
           name: dev.nickName || dev.deviceName || dev.deviceId,
-          model: isNajatModel ? "TAC-24CHSA" : "TAC-12CHSD",
+          displayName: policy.displayName === "AC" ? (dev.nickName || dev.deviceName || dev.deviceId) : policy.displayName,
+          displayOrder: policy.displayOrder,
+          model,
+          levelingEligible: policy.levelingEligible,
+          capabilities,
           isOnline: online,
           lastSeenAt: reportedAt,
           power: shadow.powerSwitch != null ? shadow.powerSwitch === 1 : powerFromId?.value === 1,
           mode: shadow.workMode ?? 0,
           targetTemp: shadow.targetTemperature ?? 24,
           currentTemp: shadow.currentTemperature ?? 0,
-          fanSpeed: isNajatModel
+          fanSpeed: isChsaModel
             ? (shadow.windSpeed7Gear ?? 0)
             : (shadow.silenceSwitch === 1 ? 1 : shadow.turbo === 1 ? 7 : (shadow.windSpeed ?? 0)),
           eco: shadow.ECO === 1,
@@ -770,23 +878,21 @@ export class TclCloud {
           freshAir: shadow.newWindSwitch === 1,
           hasFreshAir: 'newWindSwitch' in shadow,
           generatorMode: shadow.generatorMode ?? 0,
-          // 3 for ALL models since 2026-06 — TCL removed Najat's levels 4–6
-          // (see MAX_GENERATOR_LEVEL). Kept per-device for future divergence.
-          maxGeneratorLevel: MAX_GENERATOR_LEVEL,
-          tempStep: isNajatModel ? 0.5 : 1,
-          minFanSpeed: 1,
-          maxFanSpeed: 7,
+          maxGeneratorLevel: policy.maxGeneratorLevel,
+          tempStep: capabilities.temperature.step,
+          minFanSpeed: positiveFanSpeeds.length > 0 ? Math.min(...positiveFanSpeeds) : 0,
+          maxFanSpeed: Math.max(...capabilities.fanSpeeds.map((option) => option.value), 0),
           beep: shadow.beepSwitch === 1,
         });
 
         // Save state when device is on (for restore on next power-on)
         if (shadow.powerSwitch === 1) {
-          this.saveStateProps(dev.deviceId, shadow, isNajatModel);
+          this.saveStateProps(dev.deviceId, shadow, isChsaModel);
         }
       }
     }
 
-    return devices;
+    return devices.sort((a, b) => a.displayOrder - b.displayOrder);
   }
 
   private async getThingShadow(deviceId: string): Promise<{ reported: Record<string, number>; reportedAt: number | null }> {
@@ -925,8 +1031,8 @@ export class TclCloud {
 
   // ---------- Last State Persistence ----------
 
-  private saveStateProps(deviceId: string, shadow: Record<string, number>, isNajat: boolean): void {
-    const props = isNajat ? TclCloud.SAVE_PROPS_NAJAT : TclCloud.SAVE_PROPS_OTHER;
+  private saveStateProps(deviceId: string, shadow: Record<string, number>, isChsa: boolean): void {
+    const props = isChsa ? TclCloud.SAVE_PROPS_CHSA : TclCloud.SAVE_PROPS_OTHER;
     const state: Record<string, unknown> = {};
     for (const p of props) {
       if (p in shadow) state[p] = shadow[p];
@@ -937,37 +1043,133 @@ export class TclCloud {
     }
   }
 
-  async executeAcAction(deviceId: string, action: AcAction): Promise<void> {
-    if (action.power === 0) {
-      await this.sendControl(deviceId, "set_power", 0);
-      return;
+  async executeAcAction(
+    deviceId: string,
+    action: AcAction,
+    options: AcActionExecutionOptions = {},
+  ): Promise<AcActionExecutionResult> {
+    const { preserveProfileIntent = false, suppressWhileManualPresetPending = false } = options;
+    if (!preserveProfileIntent) {
+      // A verified preset is explicit, newer user intent. Until its shadow is
+      // confirmed and the route reloads the matching automation profile, the
+      // collector can still hold the previous rule for one tick. Suppress that
+      // stale background enforcement instead of letting it cancel or overwrite
+      // the pending manual profile. Direct UI controls use sendControlVerified,
+      // which still bump the generation and intentionally supersede the preset.
+      if (suppressWhileManualPresetPending && this.pendingManualProfiles.has(deviceId)) {
+        log.info(`[tcl] Background AC action on ${deviceId} suppressed while a manual preset is pending`);
+        return "suppressed";
+      }
+      this.bumpProfileGeneration(deviceId);
+    }
+    await this.ensureDeviceCachePopulated();
+    const safeAction = this.sanitizeAcAction(deviceId, action);
+    if (!safeAction) throw new Error(`Unknown AC device: ${deviceId}`);
+
+    if (safeAction.power === 0) {
+      await this.sendControl(deviceId, "set_power", 0, false, true);
+      return "applied";
     }
 
-    const desired = this.buildProfileShadowPayload(deviceId, action);
+    const desired = this.buildProfileShadowPayload(deviceId, safeAction);
     const hasProfile = Object.keys(desired).length > 0;
 
-    if (action.power === 1) {
+    if (safeAction.power === 1) {
       if (!hasProfile) {
-        await this.sendControl(deviceId, "set_power", 1);
-        return;
+        await this.sendControl(deviceId, "set_power", 1, false, true);
+        return "applied";
       }
       await this.publishWithRetry(deviceId, { powerSwitch: 1 });
       log.info(`[tcl] Power ON sent to device ${deviceId}, waiting for boot`);
       await new Promise(r => setTimeout(r, 3000));
     }
 
-    if (hasProfile) {
-      const { main, fan } = this.splitFanPayload(deviceId, desired);
-      if (fan) {
-        await this.publishWithRetry(deviceId, main);
-        log.info(`[tcl] Profile (main) applied to ${deviceId}: ${JSON.stringify(main)}`);
-        await this.profileSplitDelay();
-        await this.publishWithRetry(deviceId, fan);
-        log.info(`[tcl] Profile (fan) applied to ${deviceId}: ${JSON.stringify(fan)}`);
-      } else {
-        await this.publishWithRetry(deviceId, main);
-        log.info(`[tcl] Profile applied to device ${deviceId}: ${JSON.stringify(main)}`);
+    if (hasProfile) await this.publishAcProfile(deviceId, desired);
+    return "applied";
+  }
+
+  /**
+   * Manual preset delivery with bounded shadow confirmation. Unlike a series
+   * of direct controls, the profile is validated against physical support and
+   * published atomically (with the CHSD fan split), so a Fan→Cool+Eco preset
+   * cannot race current-mode availability. Ignored firmware publishes are
+   * re-sent as the exact same split profile and a final failure is surfaced to
+   * the caller instead of silently reporting success.
+   */
+  async executeAcActionVerified(deviceId: string, action: AcAction): Promise<AcVerifiedProfileResult> {
+    await this.ensureDeviceCachePopulated();
+    const safeAction = this.sanitizeAcAction(deviceId, action);
+    if (!safeAction) throw new Error(`Unknown AC device: ${deviceId}`);
+    const desired = this.buildProfileShadowPayload(deviceId, safeAction);
+    const generation = this.bumpProfileGeneration(deviceId);
+    this.pendingManualProfiles.set(deviceId, generation);
+    try {
+      if (Object.keys(desired).length === 0) {
+        await this.executeAcAction(deviceId, safeAction, { preserveProfileIntent: true });
+        return "applied";
       }
+
+      let pre: Record<string, number> | null = null;
+      try {
+        pre = (await this.getThingShadow(deviceId)).reported;
+      } catch {
+        // Retry confirmation still works; only third-value detection degrades.
+      }
+
+      if (this.profileGenerations.get(deviceId) !== generation) return "superseded";
+      await this.executeAcAction(deviceId, safeAction, { preserveProfileIntent: true });
+      for (let attempt = 1; attempt <= CONTROL_VERIFY_MAX_RESENDS + 1; attempt++) {
+        await this.controlVerifyDelay();
+        if (this.profileGenerations.get(deviceId) !== generation) {
+          log.info(`[tcl] Preset profile on ${deviceId} superseded by a newer profile — verify stopped`);
+          return "superseded";
+        }
+        const reported = (await this.getThingShadow(deviceId)).reported;
+        const mismatched = Object.keys(desired).filter((key) => reported[key] !== desired[key]);
+        if (mismatched.length === 0) {
+          if (attempt > 1) log.info(`[tcl] Preset profile on ${deviceId} confirmed after ${attempt - 1} re-send(s)`);
+          return "applied";
+        }
+        const external = mismatched.some(
+          (key) => pre != null && key in pre && reported[key] !== pre[key],
+        );
+        if (external) {
+          throw new Error(`Preset interrupted by another change (${mismatched.map((key) => `${key}=${reported[key]}`).join(", ")})`);
+        }
+        if (attempt > CONTROL_VERIFY_MAX_RESENDS) {
+          throw new Error(`Preset was not applied after ${CONTROL_VERIFY_MAX_RESENDS} re-sends`);
+        }
+        log.info(`[tcl] Preset profile on ${deviceId} not applied — re-sending (${attempt}/${CONTROL_VERIFY_MAX_RESENDS})`);
+        await this.publishAcProfile(deviceId, desired);
+      }
+      throw new Error("Preset verification ended unexpectedly");
+    } finally {
+      if (this.pendingManualProfiles.get(deviceId) === generation) {
+        this.pendingManualProfiles.delete(deviceId);
+      }
+    }
+  }
+
+  private profileGenerations = new Map<string, number>();
+  private pendingManualProfiles = new Map<string, number>();
+
+  private bumpProfileGeneration(deviceId: string): number {
+    const generation = (this.profileGenerations.get(deviceId) ?? 0) + 1;
+    this.profileGenerations.set(deviceId, generation);
+    return generation;
+  }
+
+  private async publishAcProfile(deviceId: string, desired: Record<string, unknown>): Promise<void> {
+    const { main, fan } = this.splitFanPayload(deviceId, desired);
+    if (fan) {
+      await this.publishWithRetry(deviceId, main);
+      log.info(`[tcl] Profile (main) applied to ${deviceId}: ${JSON.stringify(main)}`);
+      await this.profileSplitDelay();
+      await this.publishWithRetry(deviceId, fan);
+      log.info(`[tcl] Profile (fan) applied to ${deviceId}: ${JSON.stringify(fan)}`);
+    } else {
+      await this.publishWithRetry(deviceId, main);
+      log.info(`[tcl] Profile applied to device ${deviceId}: ${JSON.stringify(main)}`);
     }
   }
 
@@ -989,7 +1191,7 @@ export class TclCloud {
     deviceId: string,
     desired: Record<string, unknown>,
   ): { main: Record<string, unknown>; fan: Record<string, unknown> | null } {
-    if (this.isNajatModel(deviceId)) return { main: desired, fan: null };
+    if (this.isChsaModel(deviceId)) return { main: desired, fan: null };
     const main: Record<string, unknown> = {};
     const fan: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(desired)) {
@@ -1020,13 +1222,13 @@ export class TclCloud {
     if (command === "set_fan_speed" && value === 0) return null;
     if (command === "set_vertical_swing" || command === "set_horizontal_swing") {
       const prefix = command === "set_vertical_swing" ? "vertical" : "horizontal";
-      const switchProp = this.isNajatModel(deviceId) ? `${prefix}Wind` : `${prefix}Switch`;
+      const switchProp = this.isChsaModel(deviceId) ? `${prefix}Wind` : `${prefix}Switch`;
       if (value === 0) return { [switchProp]: 0, [`${prefix}Direction`]: 8 };
       if (value >= 1 && value <= 4) return { [switchProp]: 1, [`${prefix}Direction`]: value };
       if (value >= 9 && value <= 13) return { [switchProp]: 0, [`${prefix}Direction`]: value };
       return null;
     }
-    if (command === "set_fan_speed" && !this.isNajatModel(deviceId)) {
+    if (command === "set_fan_speed" && !this.isChsaModel(deviceId)) {
       if (value === 1) return { windSpeed: 0, silenceSwitch: 1, turbo: 0 };
       if (value === 7) return { windSpeed: 0, silenceSwitch: 0, turbo: 1 };
       return { windSpeed: value, silenceSwitch: 0, turbo: 0 };
@@ -1043,7 +1245,7 @@ export class TclCloud {
       set_fresh_air: "newWindSwitch",
     };
     const prop = propMap[command];
-    return prop ? { [prop]: value } : null;
+    return prop ? { [prop]: value } : buildAdvancedControlPayload(command, value);
   }
 
   /** Test seam for the verify-resend pacing. */
@@ -1064,6 +1266,9 @@ export class TclCloud {
    * manual-intent recording happens.
    */
   async sendControlVerified(deviceId: string, command: string, value: unknown): Promise<void> {
+    // Any newer direct user intent cancels an older whole-profile verifier so
+    // that its retry cannot overwrite this command five seconds later.
+    this.bumpProfileGeneration(deviceId);
     // Claim a generation for this device+command BEFORE the first send — any
     // older verify loop for the same field now sees a newer generation and
     // stops (last-write-wins). Bumped for every call, so even a no-verify
@@ -1081,7 +1286,7 @@ export class TclCloud {
         // No pre-state — verification still runs, external-change detection degrades gracefully.
       }
     }
-    await this.sendControl(deviceId, command, value);
+    await this.sendControl(deviceId, command, value, false, true);
     if (!payload) return;
     // Fire-and-forget — the route responds immediately; kept on a field so
     // tests can await the loop.
@@ -1169,19 +1374,21 @@ export class TclCloud {
   }
 
   private buildProfileShadowPayload(deviceId: string, action: AcAction): Record<string, unknown> {
-    const najat = this.isNajatModel(deviceId);
+    const chsa = this.isChsaModel(deviceId);
+    const capabilities = this.cachedDevices.find((device) => device.id === deviceId)?.capabilities;
+    const supports = (command: string, value: unknown) => capabilities != null && supportsAcCommand(capabilities, command, value);
     const desired: Record<string, unknown> = {};
 
-    if (action.mode != null) {
+    if (action.mode != null && supports("set_mode", action.mode)) {
       desired.workMode = action.mode;
     }
 
-    if (action.temperature != null) {
+    if (action.temperature != null && supports("set_temperature", action.temperature)) {
       desired.targetTemperature = action.temperature;
     }
 
-    if (action.fan_speed != null) {
-      if (najat) {
+    if (action.fan_speed != null && supports("set_fan_speed", action.fan_speed)) {
+      if (chsa) {
         desired.windSpeed7Gear = action.fan_speed;
       } else {
         const v = action.fan_speed;
@@ -1201,23 +1408,23 @@ export class TclCloud {
       }
     }
 
-    if (action.eco != null && !najat) {
+    if (action.eco != null && supports("set_eco", action.eco)) {
       desired.ECO = action.eco;
     }
 
     // Turbo: any fan_speed owns windSpeed/silenceSwitch/turbo atomically —
     // an explicit turbo must never override the fan block (1=silent, 7=turbo)
-    if (action.turbo != null && !najat && action.fan_speed == null) {
+    if (action.turbo != null && action.fan_speed == null && supports("set_turbo", action.turbo)) {
       desired.turbo = action.turbo;
     }
 
-    if (action.screen != null) {
+    if (action.screen != null && supports("set_screen", action.screen)) {
       desired.screen = action.screen;
     }
 
-    if (action.vertical_swing != null) {
+    if (action.vertical_swing != null && supports("set_vertical_swing", action.vertical_swing)) {
       const v = action.vertical_swing;
-      const switchProp = najat ? "verticalWind" : "verticalSwitch";
+      const switchProp = chsa ? "verticalWind" : "verticalSwitch";
       if (v === 0) {
         desired[switchProp] = 0;
         desired.verticalDirection = 8;
@@ -1230,9 +1437,9 @@ export class TclCloud {
       }
     }
 
-    if (action.horizontal_swing != null) {
+    if (action.horizontal_swing != null && supports("set_horizontal_swing", action.horizontal_swing)) {
       const v = action.horizontal_swing;
-      const switchProp = najat ? "horizontalWind" : "horizontalSwitch";
+      const switchProp = chsa ? "horizontalWind" : "horizontalSwitch";
       if (v === 0) {
         desired[switchProp] = 0;
         desired.horizontalDirection = 8;
@@ -1245,11 +1452,11 @@ export class TclCloud {
       }
     }
 
-    if (action.fresh_air != null && najat) {
+    if (action.fresh_air != null && supports("set_fresh_air", action.fresh_air)) {
       desired.newWindSwitch = action.fresh_air;
     }
 
-    if (action.generator_mode != null) {
+    if (action.generator_mode != null && supports("set_generator_mode", action.generator_mode)) {
       // Stored profiles/presets may predate a firmware level-count reduction
       desired.generatorMode = this.clampGeneratorMode(deviceId, action.generator_mode);
     }
@@ -1263,9 +1470,13 @@ export class TclCloud {
     try {
       await new Promise(r => setTimeout(r, 1000));
       // Saved state may predate a firmware level-count reduction
-      const payload = typeof saved.generatorMode === "number"
-        ? { ...saved, generatorMode: this.clampGeneratorMode(deviceId, saved.generatorMode) }
-        : saved;
+      // Defensive migration: old/corrupt state files may contain one-shot
+      // maintenance actions even though saveStateProps never persists them.
+      // They must never restart automatically on the next manual power-on.
+      const { selfClean: _selfClean, ...restorable } = saved;
+      const payload = typeof restorable.generatorMode === "number"
+        ? { ...restorable, generatorMode: this.clampGeneratorMode(deviceId, restorable.generatorMode) }
+        : restorable;
       // The saved set always carries workMode alongside the fan block, so on a
       // TAC-12CHSD this restore would otherwise lose the fan on every power-on.
       const { main, fan } = this.splitFanPayload(deviceId, payload);

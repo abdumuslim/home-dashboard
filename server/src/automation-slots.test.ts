@@ -115,6 +115,20 @@ describe("AC automation range slots", () => {
     expect(validateRangeSlots([slot({ gen_level: 1.5 })], metricBounds, () => null).ok).toBe(false);
   });
 
+  it("accepts Guest-only generator levels through L6", () => {
+    const result = validateRangeSlots([slot({ gen_level: 6 })], metricBounds, () => null, 6);
+
+    expect(result.ok).toBe(true);
+    expect(result.slots?.[0].gen_level).toBe(6);
+  });
+
+  it("uses the least-capable target when an automation mixes AC models", () => {
+    const result = validateRangeSlots([slot({ gen_level: 4 })], metricBounds, () => null, 3);
+
+    expect(result).toMatchObject({ ok: false });
+    expect(result.error).toContain("1–3");
+  });
+
   it("regression: normalizeRangeSlots whitelists gen_level (silently-dropped-field guard)", () => {
     const normalized = normalizeRangeSlots([
       { id: "s1", type: "all_day", threshold_low: 24, threshold: 26, gen_level: 3, unknown_field: 1 },

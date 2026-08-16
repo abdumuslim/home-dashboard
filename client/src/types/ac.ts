@@ -1,11 +1,42 @@
+export interface AcOption {
+  value: number;
+  label: string;
+}
+
+export type AcFeatureId =
+  | "eco" | "aiEco" | "turbo" | "sleep" | "gentleBreeze"
+  | "healthy" | "freshAir" | "freshAirStrength" | "drying"
+  | "selfClean" | "screen" | "lightSense" | "beep" | "eightDegreeHeat";
+
+export interface AcControlCapability {
+  id: AcFeatureId;
+  kind: "toggle" | "select" | "action";
+  value?: number;
+  options?: AcOption[];
+  available: boolean;
+  unavailableReason?: string;
+}
+
+export interface AcCapabilities {
+  modes: AcOption[];
+  temperature: { min: number; max: number; step: number };
+  fanSpeeds: AcOption[];
+  verticalSwing: AcOption[];
+  horizontalSwing: AcOption[];
+  generatorLevels: AcOption[];
+  controls: AcControlCapability[];
+}
+
 export interface AcDevice {
   id: string;
   name: string;
+  displayName: string;
+  displayOrder: number;
+  levelingEligible: boolean;
+  capabilities: AcCapabilities;
   /**
-   * Hardware model family — drives protocol/UI differences (e.g. the
-   * TAC-24CHSA has a true 7-gear fan; TAC-12CHSD maps 1=silent/7=turbo).
-   * Never infer the model from maxGeneratorLevel — TCL changes level counts
-   * via firmware updates (Najat went 6 → 3 in 2026-06).
+   * Protocol encoding family only. UI controls come exclusively from
+   * `capabilities`, which is derived from this physical unit's live shadow.
    */
   model: "TAC-24CHSA" | "TAC-12CHSD";
   isOnline: boolean;

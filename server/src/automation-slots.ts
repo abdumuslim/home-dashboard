@@ -144,6 +144,7 @@ export function validateRangeSlots(
   rawSlots: unknown,
   bounds: { min: number; max: number },
   resolvePrayerMinutes: PrayerResolver,
+  maxGeneratorLevel = MAX_GENERATOR_LEVEL,
 ): RangeSlotValidationResult {
   const slots = normalizeRangeSlots(rawSlots);
   if (!slots) return { ok: false, error: "Range slots are required for AC automations" };
@@ -176,8 +177,8 @@ export function validateRangeSlots(
     }
     // 0 is deliberately rejected — "Auto" is the ABSENT field; level 0 means
     // unrestricted in the TCL protocol, a footgun for a cap.
-    if (slot.gen_level != null && (!Number.isInteger(slot.gen_level) || slot.gen_level < 1 || slot.gen_level > MAX_GENERATOR_LEVEL)) {
-      return { ok: false, error: `${label}: generator level must be an integer 1–${MAX_GENERATOR_LEVEL}` };
+    if (slot.gen_level != null && (!Number.isInteger(slot.gen_level) || slot.gen_level < 1 || slot.gen_level > maxGeneratorLevel)) {
+      return { ok: false, error: `${label}: generator level must be an integer 1–${maxGeneratorLevel}` };
     }
     // Unlike gen_level, 0 (Off) is a valid swing value — absent = preset's swing.
     if (slot.vertical_swing != null && !VALID_VERTICAL_SWING.has(slot.vertical_swing)) {

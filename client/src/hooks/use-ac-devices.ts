@@ -19,6 +19,30 @@ function getOptimisticUpdate(command: string, value: unknown): Partial<AcDevice>
   }
 }
 
+const FEATURE_BY_COMMAND: Record<string, AcDevice["capabilities"]["controls"][number]["id"]> = {
+  set_eco: "eco", set_ai_eco: "aiEco", set_turbo: "turbo", set_sleep: "sleep",
+  set_gentle_breeze: "gentleBreeze", set_healthy: "healthy", set_fresh_air: "freshAir",
+  set_fresh_air_strength: "freshAirStrength", set_drying: "drying", set_self_clean: "selfClean",
+  set_screen: "screen", set_light_sense: "lightSense", set_beep: "beep", set_8c_heat: "eightDegreeHeat",
+};
+
+function optimisticDevice(device: AcDevice, command: string, value: unknown): AcDevice {
+  const base = getOptimisticUpdate(command, value);
+  const feature = FEATURE_BY_COMMAND[command];
+  return {
+    ...device,
+    ...base,
+    ...(feature ? {
+      capabilities: {
+        ...device.capabilities,
+        controls: device.capabilities.controls.map((control) => control.id === feature && typeof value === "number"
+          ? { ...control, value }
+          : control),
+      },
+    } : {}),
+  };
+}
+
 export function useAcDevices(enabled = true) {
   const [devices, setDevices] = useState<AcDevice[]>([]);
   const [available, setAvailable] = useState(false);
@@ -55,14 +79,14 @@ export function useAcDevices(enabled = true) {
   }, [fetchAll, enabled]);
 
   const sendControl = useCallback(async (deviceId: string, command: string, value: unknown): Promise<void> => {
-    const optimistic = getOptimisticUpdate(command, value);
+    const optimistic = getOptimisticUpdate(command, value) || FEATURE_BY_COMMAND[command];
     let snapshot: AcDevice | undefined;
 
     if (optimistic) {
       controlUntil.current = Date.now() + 5000;
       setDevices(prev => {
         snapshot = prev.find(d => d.id === deviceId);
-        return prev.map(d => d.id === deviceId ? { ...d, ...optimistic } : d);
+        return prev.map(d => d.id === deviceId ? optimisticDevice(d, command, value) : d);
       });
     }
 
