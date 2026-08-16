@@ -35,7 +35,7 @@ export function PurifierWidget({ device, onControl, label }: PurifierWidgetProps
   return (
     <>
       <div className={cn(
-        "flex flex-col items-center bg-[#171920]/90 border border-white/[0.05] p-1 rounded-2xl shadow-[0_4px_12px_-4px_rgba(0,0,0,0.5)] backdrop-blur-xl transition-all shrink-0 self-start",
+        "flex w-full min-w-0 flex-col items-center bg-[#171920]/90 border border-white/[0.05] p-1 rounded-2xl shadow-[0_4px_12px_-4px_rgba(0,0,0,0.5)] backdrop-blur-xl transition-all self-start",
         offline ? "opacity-40" : "hover:border-white/10 hover:bg-[#1a1c23]/95"
       )}>
         <span className="text-[0.65rem] text-text/70 font-bold tracking-wider mt-0.5 mb-0.5">
@@ -78,18 +78,18 @@ export function PurifierWidget({ device, onControl, label }: PurifierWidgetProps
           return (
             <div
               className={cn(
-                "flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-colors h-7",
+                "flex h-7 w-full min-w-0 items-center justify-center gap-0.5 px-1 py-1.5 rounded-full transition-colors",
                 isOn ? "shadow-inner" : "bg-white/[0.03]"
               )}
               style={isOn ? { backgroundColor: aqiColor ? `${aqiColor}15` : "rgba(16,185,129,0.15)", color: aqiColor || "#34d399" } : undefined}
             >
-              <Fan className={cn("w-3.5 h-3.5", isOn && "animate-[spin_3s_linear_infinite]")} />
-              <span className="text-[0.7rem] font-bold text-text ml-0.5 tracking-wide flex items-baseline gap-1">
-                {device.aqi} <span className="text-[0.55rem] text-dim font-bold uppercase">AQI</span>
+              <Fan className={cn("w-3 h-3 shrink-0", isOn && "animate-[spin_3s_linear_infinite]")} />
+              <span className="flex min-w-0 items-baseline gap-0.5 text-[0.65rem] font-bold tracking-wide text-text">
+                {device.aqi} <span className="text-[0.48rem] font-bold uppercase text-dim">AQI</span>
               </span>
               {device.filter_life != null && (
                 <span
-                  className="text-[0.6rem] font-bold tabular-nums ml-0.5"
+                  className="shrink-0 text-[0.52rem] font-bold tabular-nums"
                   style={{ color: filterLow ? "#f87171" : "#34d399" }}
                   title={`Filter: ${device.filter_life}%`}
                 >
