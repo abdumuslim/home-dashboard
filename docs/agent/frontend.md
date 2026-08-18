@@ -122,7 +122,7 @@ All metric cards follow a consistent design language established in the Temperat
 
 - No card title and no group titles; the column layout supplies the grouping.
 - Uses a `MetricCard` wrapper with `p-3 overflow-hidden` and an internal three-column grid (AC group, 1px divider, purifier group).
-- AC group: fixed 2×2 grid ordered Mom, Abdu / Abdullah, guest.
+- AC group: fixed 2×2 grid ordered Mom, Abdu / Abdullah, Guest.
 - Purifier group: one vertical column ordered Mom / Abdu.
 - `DevicesCard` exports `AcEntry` and `PurifierEntry` interfaces consumed by `IndoorSection`.
 
@@ -156,8 +156,8 @@ All metric cards follow a consistent design language established in the Temperat
 - Main capsule row 2: two-column layout — left=target temp, right=fan speed + generator indicator.
 - Detail overlay (portal): renders only the selected physical unit's server-provided `capabilities`. Modes, temperature bounds/step, exact fan choices, swing choices, generator levels, and the non-empty Comfort/Air/Device control sections can therefore differ between ACs. A known but mode-incompatible feature stays visible and disabled with its reason; unsupported features are omitted. Guest shows Off plus L1–L6. No grid-only badge is rendered.
 - **Beep off is sticky**: turning the Beep toggle off records a persistent pref (`ac_beep_off` table) that the collector re-enforces whenever the beep comes back on (firmware resets it after AC power-loss restarts); turning it on releases the pref. Server-side enforcement details → [ac-automations.md](ac-automations.md).
-- The client posts the existing `{command,value}` shape, but the server capability registry is the command/value authority. In addition to the legacy controls it can expose AI Eco, Gentle Breeze/Soft Wind, Healthy/Ion, Fresh Air strength, Drying/Anti-mildew, Self Clean, light sensing, and 8°C heating when that physical shadow proves support.
-- **Last state restore**: on power-on, the backend restores all saved properties (mode, temp, fan, swing, etc.) from `/app/data/ac-last-state.json`; state is saved on every shadow poll while the device is on. Details → [tcl-ac.md](tcl-ac.md).
+- The client posts the existing `{command,value}` shape, but the server capability registry is the command/value authority. In addition to the legacy controls it can expose AI Eco, Gentle Breeze/Soft Wind, Healthy/Ion, Fresh Air strength, Drying/Anti-mildew, Self Clean, light sensing, and 8°C heating only when that stable physical ID's verification policy and live cloud shape both support it. Shadow placeholder properties alone are not sufficient (Abdu's false Gentle Breeze/Fresh Air properties are explicitly denied).
+- **Last state restore**: on manual power-on, the backend restores saved properties from `/app/data/ac-last-state.json`. Across a source event, devices without an active system profile freeze and confirm that pre-event state instead of saving reboot defaults; devices with an active automation are initialized from the automation profile. Details → [tcl-ac.md](tcl-ac.md).
 - `model` remains a protocol-encoding label only. It must never decide which controls the expanded card renders; `capabilities` is the sole UI feature authority. Full shadow/property details → [tcl-ac.md](tcl-ac.md).
 
 ### Timer UI
@@ -166,6 +166,12 @@ All metric cards follow a consistent design language established in the Temperat
 - Detail overlay has a timer section with on/off toggle, duration pills (15m–4h), and an optional preset for turn-on timers.
 - `useAcTimers()` hook polls `/api/ac/timers` every 5s. Timer props flow: IndoorSection → DevicesCard → AcWidget → AcDetailOverlay.
 - Timer server semantics (manual-off locks, leveler interaction) → [ac-automations.md](ac-automations.md).
+
+### Guest AC in the automation & leveling UI
+
+Guest is grid-only and never leveling-managed, so the admin UI adapts per selected device:
+- **`alerts-modal.tsx` (AC trigger form):** when the selected AC is not leveling-eligible (`selectedAcLevelingEligible === false`), the "Smart leveling controls generator level" checkbox is **hidden** and the saved rule forces `smart_leveling: false`. The per-slot **Gen** buttons then set the generator level **directly** for that range instead of capping the leveler — the tooltip wording flips accordingly (Auto: "Smart AC Leveling picks the level" → "keep the preset or direct generator level"; L*n*: "Cap the generator level at L*n* … Smart Leveling never raises above it" → "Set this AC directly to L*n*"). The `L1..Lmax` button count comes from the selected AC's `maxGeneratorLevel` (guest → L1–L6).
+- **`ac-leveling-section.tsx` (leveling config):** `seedDraft()` seeds defaults only for loaded `levelingEligible` devices and prunes ONLY ids positively known to be ineligible (`acDevices.filter((d) => !d.levelingEligible)`), so guest never appears in the leveling device list — but absence from the transient `acDevices` list never removes a config entry. The list is EMPTY whenever the TCL cloud is down or still loading, and pruning on absence silently erased calibrated amp models and the priority order on the next save (review-confirmed 2026-08-18); with an empty list nothing is pruned, nothing is seeded, and the Active kill-switch stays usable.
 
 ## Presets UI
 

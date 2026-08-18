@@ -786,4 +786,324 @@ describe("restoreLastState fan isolation (TAC-12CHSD)", () => {
     expect(publishShadowUpdate).toHaveBeenCalledTimes(1);
     expect(publishShadowUpdate).toHaveBeenCalledWith("ac1", { workMode: 1, targetTemperature: 22, windSpeed7Gear: 5 });
   });
+
+  it("freezes Guest's pre-event state and restores it instead of saving reboot defaults", async () => {
+    const guest = acDevice({
+      id: "DlXqDBFAAAE",
+      name: "guest",
+      displayName: "guest",
+      displayOrder: 4,
+      model: "TAC-24CHSA",
+      levelingEligible: false,
+      maxGeneratorLevel: 6,
+    });
+    const tcl = tclWithDevice(guest);
+    const seam = tcl as unknown as {
+      lastState: Record<string, Record<string, unknown>>;
+      publishShadowUpdate: ReturnType<typeof vi.fn>;
+      preparePowerCycleRestore: (deviceId: string) => boolean;
+      saveStateProps: (deviceId: string, shadow: Record<string, number>, isChsa: boolean) => void;
+      maybeRestorePowerCycleState: (
+        deviceId: string,
+        shadow: Record<string, number>,
+        reportedAt: number | null,
+        isChsa: boolean,
+      ) => Promise<boolean>;
+    };
+    seam.lastState = {
+      DlXqDBFAAAE: { workMode: 1, targetTemperature: 22, windSpeed7Gear: 5, generatorMode: 6 },
+    };
+    seam.publishShadowUpdate = vi.fn(async () => undefined);
+
+    expect(seam.preparePowerCycleRestore("DlXqDBFAAAE")).toBe(true);
+    seam.saveStateProps("DlXqDBFAAAE", {
+      powerSwitch: 1,
+      workMode: 1,
+      targetTemperature: 24,
+      windSpeed7Gear: 0,
+      generatorMode: 0,
+    }, true);
+    expect(seam.lastState.DlXqDBFAAAE).toEqual({
+      workMode: 1,
+      targetTemperature: 22,
+      windSpeed7Gear: 5,
+      generatorMode: 6,
+    });
+
+    await expect(seam.maybeRestorePowerCycleState("DlXqDBFAAAE", {
+      powerSwitch: 1,
+      workMode: 1,
+      targetTemperature: 24,
+      windSpeed7Gear: 0,
+      generatorMode: 0,
+    }, Date.now() + 1_000, true)).resolves.toBe(true);
+    expect(seam.publishShadowUpdate).toHaveBeenCalledWith("DlXqDBFAAAE", {
+      workMode: 1,
+      targetTemperature: 22,
+      windSpeed7Gear: 5,
+      generatorMode: 6,
+    });
+  });
+
+  it("does not consume Guest's pending restore from a same-event stale ON shadow", async () => {
+    const guest = acDevice({
+      id: "DlXqDBFAAAE",
+      model: "TAC-24CHSA",
+      levelingEligible: false,
+      maxGeneratorLevel: 6,
+    });
+    const tcl = tclWithDevice(guest);
+    const seam = tcl as unknown as {
+      lastState: Record<string, Record<string, unknown>>;
+      pendingPowerCycleRestores: Map<string, { armedAt: number }>;
+      publishShadowUpdate: ReturnType<typeof vi.fn>;
+      preparePowerCycleRestore: (deviceId: string) => boolean;
+      maybeRestorePowerCycleState: (
+        deviceId: string,
+        shadow: Record<string, number>,
+        reportedAt: number | null,
+        isChsa: boolean,
+      ) => Promise<boolean>;
+    };
+    seam.lastState = { DlXqDBFAAAE: { workMode: 1, targetTemperature: 22, windSpeed7Gear: 5 } };
+    seam.publishShadowUpdate = vi.fn(async () => undefined);
+    seam.preparePowerCycleRestore("DlXqDBFAAAE");
+    const armedAt = seam.pendingPowerCycleRestores.get("DlXqDBFAAAE")!.armedAt;
+
+    await expect(seam.maybeRestorePowerCycleState("DlXqDBFAAAE", {
+      powerSwitch: 1,
+      workMode: 1,
+      targetTemperature: 24,
+      windSpeed7Gear: 0,
+    }, armedAt - 500, true)).resolves.toBe(true);
+
+    expect(seam.publishShadowUpdate).not.toHaveBeenCalled();
+    expect(seam.pendingPowerCycleRestores.has("DlXqDBFAAAE")).toBe(true);
+  });
+
+  it("arms only a verified restore-eligible id, refusing the leveling line and unknown ids", () => {
+    // Restore eligibility is a positive physical-wiring fact. Abdullah is on the
+    // ESP-measured line (the leveler owns his generatorMode/fan across a
+    // changeover) and an unknown future AC has unknown wiring — both are refused
+    // even with saved state. Only guest, positively restore-eligible, arms.
+    const tcl = new TclCloud("user", "pass");
+    const seam = tcl as unknown as {
+      lastState: Record<string, Record<string, unknown>>;
+      pendingPowerCycleRestores: Map<string, unknown>;
+    };
+    seam.lastState = {
+      Cy3aihFAAAE: { workMode: 1, targetTemperature: 22, windSpeed7Gear: 5 },
+      ZZunknownAAAA: { workMode: 1, targetTemperature: 22, windSpeed7Gear: 5 },
+      DlXqDBFAAAE: { workMode: 1, targetTemperature: 22, windSpeed7Gear: 5 },
+    };
+
+    expect(tcl.preparePowerCycleRestore("Cy3aihFAAAE")).toBe(false);
+    expect(seam.pendingPowerCycleRestores.has("Cy3aihFAAAE")).toBe(false);
+
+    expect(tcl.preparePowerCycleRestore("ZZunknownAAAA")).toBe(false);
+    expect(seam.pendingPowerCycleRestores.has("ZZunknownAAAA")).toBe(false);
+
+    expect(tcl.preparePowerCycleRestore("DlXqDBFAAAE")).toBe(true);
+    expect(seam.pendingPowerCycleRestores.has("DlXqDBFAAAE")).toBe(true);
+  });
+
+  it("does not publish a restore a user command cancelled between capture and the send", async () => {
+    const guest = acDevice({
+      id: "DlXqDBFAAAE",
+      model: "TAC-24CHSA",
+      levelingEligible: false,
+      maxGeneratorLevel: 6,
+    });
+    const tcl = tclWithDevice(guest);
+    const seam = tcl as unknown as {
+      lastState: Record<string, Record<string, unknown>>;
+      pendingPowerCycleRestores: Map<string, unknown>;
+      publishRestorableState: ReturnType<typeof vi.fn>;
+      restorableState: (deviceId: string, saved: Record<string, unknown>) => Record<string, unknown>;
+      preparePowerCycleRestore: (deviceId: string) => boolean;
+      maybeRestorePowerCycleState: (
+        deviceId: string,
+        shadow: Record<string, number>,
+        reportedAt: number | null,
+        isChsa: boolean,
+      ) => Promise<boolean>;
+    };
+    seam.lastState = { DlXqDBFAAAE: { workMode: 1, targetTemperature: 22, windSpeed7Gear: 5 } };
+    const publishRestorableState = vi.fn(async () => undefined);
+    seam.publishRestorableState = publishRestorableState;
+
+    expect(seam.preparePowerCycleRestore("DlXqDBFAAAE")).toBe(true);
+    const captured = seam.pendingPowerCycleRestores.get("DlXqDBFAAAE");
+
+    // Simulate a user command deleting the pending mid-tick — after the poll has
+    // captured `pending` but before the network send. The restore must not fire.
+    const realRestorable = seam.restorableState.bind(tcl);
+    seam.restorableState = (deviceId, saved) => {
+      seam.pendingPowerCycleRestores.delete("DlXqDBFAAAE");
+      return realRestorable(deviceId, saved);
+    };
+
+    await expect(seam.maybeRestorePowerCycleState("DlXqDBFAAAE", {
+      powerSwitch: 1,
+      workMode: 1,
+      targetTemperature: 24, // mismatches the saved 22 → would otherwise publish
+      windSpeed7Gear: 0,
+    }, Date.now() + 1_000, true)).resolves.toBe(false);
+
+    expect(publishRestorableState).not.toHaveBeenCalled();
+    // The captured object is stale — the map no longer holds it.
+    expect(seam.pendingPowerCycleRestores.get("DlXqDBFAAAE")).not.toBe(captured);
+  });
+});
+
+// A pending last-state restore holds the frozen pre-event snapshot and freezes
+// state-save. Any NEWER direct user intent (a control or a verified preset)
+// makes that snapshot stale, so the pending must be cancelled — loudly, since a
+// silent cancellation is the next forensic mystery. Background automation
+// enforcement is NOT user intent and must leave the pending alone.
+describe("pending last-state restore yields to newer user intent", () => {
+  function pendingGuestTcl(): {
+    tcl: TclCloud;
+    seam: {
+      pendingPowerCycleRestores: Map<string, unknown>;
+      getThingShadow: unknown;
+      lastControlVerify: Promise<void> | null;
+    };
+  } {
+    const guest = acDevice({
+      id: "DlXqDBFAAAE",
+      model: "TAC-24CHSA",
+      levelingEligible: false,
+      maxGeneratorLevel: 6,
+    });
+    const tcl = tclWithDevice(guest);
+    const seam = tcl as unknown as {
+      lastState: Record<string, Record<string, unknown>>;
+      pendingPowerCycleRestores: Map<string, unknown>;
+      sendControl: unknown;
+      publishWithRetry: unknown;
+      getThingShadow: unknown;
+      controlVerifyDelay: unknown;
+      profileSplitDelay: unknown;
+      ensureDeviceCachePopulated: unknown;
+      lastControlVerify: Promise<void> | null;
+    };
+    seam.lastState = { DlXqDBFAAAE: { workMode: 1, targetTemperature: 22, windSpeed7Gear: 5 } };
+    seam.sendControl = vi.fn(async () => undefined);
+    seam.publishWithRetry = vi.fn(async () => undefined);
+    seam.controlVerifyDelay = vi.fn(async () => undefined);
+    seam.profileSplitDelay = vi.fn(async () => undefined);
+    seam.ensureDeviceCachePopulated = vi.fn(async () => undefined);
+    return { tcl, seam };
+  }
+
+  it("cancels a pending restore on a direct user command (sendControlVerified)", async () => {
+    const { tcl, seam } = pendingGuestTcl();
+    seam.getThingShadow = vi.fn(async () => ({ reported: { windSpeed7Gear: 3 }, reportedAt: null }));
+    expect(tcl.preparePowerCycleRestore("DlXqDBFAAAE")).toBe(true);
+
+    await tcl.sendControlVerified("DlXqDBFAAAE", "set_fan_speed", 3);
+    await seam.lastControlVerify;
+
+    expect(seam.pendingPowerCycleRestores.has("DlXqDBFAAAE")).toBe(false);
+  });
+
+  it("cancels a pending restore on a verified preset (executeAcActionVerified)", async () => {
+    const { tcl, seam } = pendingGuestTcl();
+    seam.getThingShadow = vi.fn(async () => ({ reported: { workMode: 1 }, reportedAt: null }));
+    expect(tcl.preparePowerCycleRestore("DlXqDBFAAAE")).toBe(true);
+
+    await expect(tcl.executeAcActionVerified("DlXqDBFAAAE", { mode: 1 })).resolves.toBe("applied");
+
+    expect(seam.pendingPowerCycleRestores.has("DlXqDBFAAAE")).toBe(false);
+  });
+
+  it("survives background automation enforcement (executeAcAction default options)", async () => {
+    const { tcl, seam } = pendingGuestTcl();
+    expect(tcl.preparePowerCycleRestore("DlXqDBFAAAE")).toBe(true);
+
+    // Background enforcement is not user intent — it must not un-freeze the restore.
+    await tcl.executeAcAction("DlXqDBFAAAE", { mode: 1, temperature: 24, fan_speed: 5 });
+
+    expect(seam.pendingPowerCycleRestores.has("DlXqDBFAAAE")).toBe(true);
+  });
+});
+
+// A stale-AWS-credential 403 on the live pre-read is the exact event five write
+// paths already self-heal from. `validateControlLive` awaited it bare, so that
+// 403 made EVERY AC control 500 until token expiry. It now re-auths and retries
+// the read ONCE, then degrades to the device's cached capabilities — except for
+// Self Clean, which fails closed rather than risk powering off a running AC from
+// a stale cache (its payload sets powerSwitch:0 and the route locks it off).
+describe("validateControlLive re-auth retry and Self Clean fail-closed", () => {
+  it("retries the shadow read after re-auth and validates against the FRESH shadow", async () => {
+    const stale = acDevice({
+      mode: 3,
+      capabilities: deriveAcCapabilities("ac1", "TAC-12CHSD", {
+        powerSwitch: 1, workMode: 3, windSpeed: 3, ECO: 0,
+      }),
+    });
+    const tcl = tclWithDevice(stale);
+    const seam = tcl as unknown as {
+      ensureValidTokens: () => Promise<void>;
+      getThingShadow: ReturnType<typeof vi.fn>;
+    };
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+    const getThingShadow = vi.fn()
+      .mockRejectedValueOnce(new Error("GetThingShadow HTTP 403: Forbidden"))
+      .mockResolvedValueOnce({ reported: { powerSwitch: 1, workMode: 1, windSpeed: 3, ECO: 0 }, reportedAt: null });
+    seam.getThingShadow = getThingShadow;
+
+    // Eco is unavailable in the stale Fan-mode cache but available in the fresh
+    // Cool-mode shadow the retry fetches: an ok verdict proves the retry won.
+    await expect(tcl.validateControlLive("ac1", "set_eco", 1)).resolves.toEqual({ ok: true });
+    expect(getThingShadow).toHaveBeenCalledTimes(2);
+  });
+
+  it("degrades to cached capabilities when both the read and the re-auth retry fail", async () => {
+    const device = acDevice({
+      capabilities: deriveAcCapabilities("ac1", "TAC-12CHSD", {
+        powerSwitch: 1, workMode: 1, windSpeed: 3, ECO: 0,
+      }),
+    });
+    const tcl = tclWithDevice(device);
+    const seam = tcl as unknown as {
+      ensureValidTokens: () => Promise<void>;
+      getThingShadow: ReturnType<typeof vi.fn>;
+    };
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+    const getThingShadow = vi.fn(async () => { throw new Error("GetThingShadow HTTP 403: Forbidden"); });
+    seam.getThingShadow = getThingShadow;
+
+    // Eco is valid against the cached Cool-mode matrix; two failed reads must not
+    // throw or 500 the control.
+    await expect(tcl.validateControlLive("ac1", "set_eco", 1)).resolves.toEqual({ ok: true });
+    expect(getThingShadow).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed for set_self_clean=1 on the degraded path but not when stopping a cycle", async () => {
+    // A clean cycle in progress: powerSwitch off, selfClean on — so the cached
+    // Self Clean control is available to STOP, but starting must never be
+    // authorized from a stale read.
+    const device = acDevice({
+      capabilities: deriveAcCapabilities("ac1", "TAC-12CHSD", {
+        powerSwitch: 0, workMode: 1, selfClean: 1,
+      }),
+    });
+    const tcl = tclWithDevice(device);
+    const seam = tcl as unknown as {
+      ensureValidTokens: () => Promise<void>;
+      getThingShadow: ReturnType<typeof vi.fn>;
+    };
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+    seam.getThingShadow = vi.fn(async () => { throw new Error("GetThingShadow HTTP 403: Forbidden"); });
+
+    await expect(tcl.validateControlLive("ac1", "set_self_clean", 1)).resolves.toEqual({
+      ok: false,
+      status: 503,
+      error: "Cannot verify the AC's live state for Self Clean right now — try again shortly",
+    });
+    // Stopping a running clean cycle is safe even from a stale cache.
+    await expect(tcl.validateControlLive("ac1", "set_self_clean", 0)).resolves.toEqual({ ok: true });
+  });
 });

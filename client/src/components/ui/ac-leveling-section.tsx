@@ -28,11 +28,17 @@ function defaultAmpModel(name: string): { baseAmps: number; stepAmps: number } {
 /** Fill priority/ampModels gaps so every known AC is configurable. */
 function seedDraft(config: AcLevelingConfig, acDevices: AcDevice[]): AcLevelingConfig {
   const eligible = acDevices.filter((device) => device.levelingEligible);
-  const ids = new Set(eligible.map((device) => device.id));
-  const priority = config.priority.filter((id) => ids.has(id));
-  const ampModels = Object.fromEntries(Object.entries(config.ampModels).filter(([id]) => ids.has(id)));
-  const genAmpModels = Object.fromEntries(Object.entries(config.genAmpModels ?? {}).filter(([id]) => ids.has(id)));
-  const levelBoosts = Object.fromEntries(Object.entries(config.levelBoosts ?? {}).filter(([id]) => ids.has(id)));
+  // Prune ONLY ids we can positively see are ineligible (a loaded guest AC).
+  // acDevices is transient — it is EMPTY whenever the TCL cloud is down or still
+  // loading — so absence from it must never mean removal, or opening this section
+  // then and saving would silently erase calibrated amp models and the priority
+  // order. Ids not present in acDevices at all are kept verbatim; when the list is
+  // empty this set is empty, so nothing is pruned and no defaults are seeded.
+  const ineligible = new Set(acDevices.filter((device) => !device.levelingEligible).map((device) => device.id));
+  const priority = config.priority.filter((id) => !ineligible.has(id));
+  const ampModels = Object.fromEntries(Object.entries(config.ampModels).filter(([id]) => !ineligible.has(id)));
+  const genAmpModels = Object.fromEntries(Object.entries(config.genAmpModels ?? {}).filter(([id]) => !ineligible.has(id)));
+  const levelBoosts = Object.fromEntries(Object.entries(config.levelBoosts ?? {}).filter(([id]) => !ineligible.has(id)));
   for (const d of eligible) {
     if (!priority.includes(d.id)) priority.push(d.id);
     if (!ampModels[d.id]) ampModels[d.id] = defaultAmpModel(d.name);

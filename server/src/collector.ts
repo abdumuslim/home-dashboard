@@ -16,7 +16,7 @@ import { computeAutoFanLevel } from "./ac-auto-fan.js";
 import { childLogger } from "./logger.js";
 import { RateGate } from "./rate-gate.js";
 import type { AuthKind } from "./auth.js";
-import { isAcLevelingEligible } from "./ac-capabilities.js";
+import { isAcLevelingEligible, isPowerCycleRestoreEligible } from "./ac-capabilities.js";
 import {
   findActiveRangeSlot,
   getBaghdadMinutes,
@@ -166,10 +166,42 @@ interface AcFanEnforcement {
   lastCommandedFan: number | null; // fan level we last sent (smart-auto hysteresis basis)
   lastFanCommandAt: number;       // ts of our last fan send / baseline adoption
   manual: boolean;                // user changed fan — stop enforcing until slot change or power cycle
+  /** A source/power cycle invalidated the old manual state; ignore the reboot
+   * shadow until the active system fan has been observed or re-commanded. */
+  initializationPending?: boolean;
 }
 
 interface AcSwingOverride {
   slotId: string;                 // range slot active when the user took manual swing control
+}
+
+const AC_PROFILE_TRACKED_FIELDS = [
+  "mode",
+  "temperature",
+  "eco",
+  "screen",
+  "vertical_swing",
+  "horizontal_swing",
+  "fresh_air",
+] as const;
+type AcProfileTrackedField = typeof AC_PROFILE_TRACKED_FIELDS[number];
+const AC_COMMAND_PROFILE_FIELD: Partial<Record<string, AcProfileTrackedField>> = {
+  set_mode: "mode",
+  set_temperature: "temperature",
+  set_eco: "eco",
+  set_screen: "screen",
+  set_vertical_swing: "vertical_swing",
+  set_horizontal_swing: "horizontal_swing",
+  set_fresh_air: "fresh_air",
+};
+
+/** Per-field ownership for an active AC range profile. */
+interface AcProfileEnforcement {
+  slotId: string;
+  desired: Partial<Record<AcProfileTrackedField, number>>;
+  baseline: Partial<Record<AcProfileTrackedField, number>>;
+  lastCommandAt: Partial<Record<AcProfileTrackedField, number>>;
+  manual: Set<AcProfileTrackedField>;
 }
 
 export class Collector {
@@ -249,6 +281,10 @@ export class Collector {
   // A manual UI vertical-swing change suspends swing enforcement until the active
   // slot changes or the AC power-cycles (no shadow-drift detection — UI-driven only).
   private acSwingOverrides = new Map<string, AcSwingOverride>(); // key `${rule.id}:${deviceId}`
+  // Mode/temperature/etc. use the same "system initializes, then manual wins"
+  // contract as fan, but ownership is per field so changing temperature on the
+  // remote does not also surrender mode or swing.
+  private acProfileEnforcement = new Map<string, AcProfileEnforcement>(); // key `${rule.id}:${deviceId}`
   /**
    * Last AC power cycle this process can ATTRIBUTE to something other than the
    * rule that owns the device — a leveler shed/restore or a mains power event.
@@ -494,6 +530,25 @@ export class Collector {
     // rule-owned clear site (2026-08-06).
     for (const dev of this.tclCloud?.getDevices() ?? []) {
       this.notePowerCycle(dev.id, `power event (${kind})`);
+      const hasSystemProfile = this.automationRules.some(
+        (rule) => rule.device_type === "ac" && (rule.device_ids ?? [rule.device_id]).includes(dev.id),
+      );
+      // Last-state recovery belongs to a real source transition on a grid-only
+      // line the leveler does not own. ESP gaps and leveler-only collapses say
+      // nothing about a separate line such as Guest's. The boot/cold-start
+      // "source none → X" event must NEVER arm — it would freeze a stale disk
+      // snapshot and revert a running unit after every deploy. Restore
+      // eligibility is a POSITIVE per-device fact (verified physical wiring),
+      // never inferred from the absence of leveling: an unknown future AC whose
+      // line the leveler may yet own must not be armed on "not leveling-eligible".
+      if (
+        !hasSystemProfile
+        && kind.startsWith("source ")
+        && !kind.startsWith("source none")
+        && isPowerCycleRestoreEligible(dev.id)
+      ) {
+        this.tclCloud?.preparePowerCycleRestore?.(dev.id);
+      }
     }
     log.info(`[collector] Power event (${kind}) — observed AC offs read as power-loss for the next 15 min`);
   }
@@ -523,13 +578,19 @@ export class Collector {
     this.acPowerCycleAt.set(deviceId, Date.now());
     let cleared = false;
     for (const [key, entry] of this.acFanEnforcement) {
-      if (!key.endsWith(`:${deviceId}`) || !entry.manual) continue;
-      this.acFanEnforcement.set(key, { ...entry, manual: false });
-      cleared = true;
+      if (!key.endsWith(`:${deviceId}`)) continue;
+      if (entry.manual) cleared = true;
+      this.acFanEnforcement.set(key, { ...entry, manual: false, initializationPending: true });
     }
     for (const key of this.acSwingOverrides.keys()) {
       if (key.endsWith(`:${deviceId}`)) {
         this.acSwingOverrides.delete(key);
+        cleared = true;
+      }
+    }
+    for (const key of this.acProfileEnforcement.keys()) {
+      if (key.endsWith(`:${deviceId}`)) {
+        this.acProfileEnforcement.delete(key);
         cleared = true;
       }
     }
@@ -1475,6 +1536,7 @@ export class Collector {
   /** Drops fan bookkeeping (incl. a manual override) — call on any AC power cycle the rule owns. */
   private clearAcFanEnforcement(ruleId: number, deviceId: string): void {
     this.acFanEnforcement.delete(this.acFanKey(ruleId, deviceId));
+    this.acProfileEnforcement.delete(this.acFanKey(ruleId, deviceId));
   }
 
   private acSwingKey(ruleId: number, deviceId: string): string {
@@ -1587,10 +1649,97 @@ export class Collector {
       // Non-Najat fan 7 == turbo — enforcing turbo would clobber a manual fan choice
       delete profile.fan_speed;
       delete profile.turbo;
-      return profile;
+    } else {
+      profile.fan_speed = this.resolveRangeFan(rule, slot, deviceId, value);
     }
-    profile.fan_speed = this.resolveRangeFan(rule, slot, deviceId, value);
+    this.updateAcProfileTracking(rule, slot, deviceId, profile, Date.now());
+    const profileTracking = this.acProfileEnforcement.get(this.acFanKey(rule.id, deviceId));
+    for (const field of profileTracking?.manual ?? []) {
+      delete profile[field];
+    }
     return profile;
+  }
+
+  /**
+   * Establish a system baseline, then treat unexplained live-shadow drift as a
+   * physical-remote/manual change. A slot/profile change clears only the fields
+   * whose system intent changed. Power/source boundaries drop the whole entry
+   * in notePowerCycle, causing the system profile to initialize again.
+   */
+  private updateAcProfileTracking(
+    rule: AutomationRule,
+    slot: AutomationRangeSlot,
+    deviceId: string,
+    profile: AcAction,
+    now: number,
+  ): void {
+    const key = this.acFanKey(rule.id, deviceId);
+    let entry = this.acProfileEnforcement.get(key);
+    if (!entry || entry.slotId !== slot.id) {
+      entry = { slotId: slot.id, desired: {}, baseline: {}, lastCommandAt: {}, manual: new Set() };
+      this.acProfileEnforcement.set(key, entry);
+    }
+    const observed = this.tclCloud?.getDeviceState(deviceId);
+    if (!observed) return;
+
+    for (const field of AC_PROFILE_TRACKED_FIELDS) {
+      const desired = profile[field];
+      if (desired == null) {
+        delete entry.desired[field];
+        delete entry.baseline[field];
+        delete entry.lastCommandAt[field];
+        entry.manual.delete(field);
+        continue;
+      }
+      const hadDesired = Object.prototype.hasOwnProperty.call(entry.desired, field);
+      if (hadDesired && entry.desired[field] !== desired) {
+        // A new preset/slot value is a new system decision and therefore a new
+        // initialization boundary for this field.
+        delete entry.baseline[field];
+        delete entry.lastCommandAt[field];
+        entry.manual.delete(field);
+      }
+      entry.desired[field] = desired;
+      if (entry.manual.has(field)) continue;
+
+      const liveValue = observed[field];
+      if (liveValue == null) continue;
+      const baseline = entry.baseline[field];
+      if (baseline == null) {
+        if (liveValue === desired) {
+          entry.baseline[field] = desired;
+          entry.lastCommandAt[field] = now;
+        }
+        continue;
+      }
+      if (liveValue === baseline) continue;
+      if (now - (entry.lastCommandAt[field] ?? 0) < this.AC_FAN_SETTLE_MS) continue;
+      entry.manual.add(field);
+      log.info(`[collector] AC range "${rule.name}": manual ${field} change on ${deviceId} (${baseline} → ${liveValue}), suspending that field until profile or power-source change`);
+    }
+  }
+
+  private noteAcProfileCommanded(
+    rule: AutomationRule,
+    slot: AutomationRangeSlot,
+    deviceId: string,
+    sent: AcAction,
+  ): void {
+    const key = this.acFanKey(rule.id, deviceId);
+    let entry = this.acProfileEnforcement.get(key);
+    if (!entry || entry.slotId !== slot.id) {
+      entry = { slotId: slot.id, desired: {}, baseline: {}, lastCommandAt: {}, manual: new Set() };
+      this.acProfileEnforcement.set(key, entry);
+    }
+    const now = Date.now();
+    for (const field of AC_PROFILE_TRACKED_FIELDS) {
+      const value = sent[field];
+      if (value == null) continue;
+      entry.desired[field] = value;
+      entry.baseline[field] = value;
+      entry.lastCommandAt[field] = now;
+      entry.manual.delete(field);
+    }
   }
 
   /**
@@ -1621,7 +1770,30 @@ export class Collector {
       // else: this tick's diff will command the fan and noteAcFanCommanded creates the baseline
       return;
     }
-    if (observed === entry.lastCommandedFan) return;
+    if (observed === entry.lastCommandedFan) {
+      // A slot whose fan already matches what the firmware restored sends no
+      // diff, so `noteAcFanCommanded` never clears `initializationPending` and
+      // the marker persists indefinitely — swallowing the NEXT genuine remote
+      // fan change (hours later). Clear it here, but ONLY on a FRESH post-cycle
+      // report: right after the cycle the cached shadow still shows pre-event
+      // state that can coincidentally equal the system fan, and clearing on that
+      // stale match would let the real reboot echo (arriving later with
+      // firmware-memory fan) be misread as a manual change — the exact bug this
+      // flag exists to stop. No lastSeenAt → keep the flag.
+      if (entry.initializationPending) {
+        const lastSeenAt = this.tclCloud?.getDevices().find((d) => d.id === deviceId)?.lastSeenAt;
+        const cycleAt = this.acPowerCycleAt.get(deviceId);
+        if (lastSeenAt != null && cycleAt != null && lastSeenAt > cycleAt) {
+          const { initializationPending: _cleared, ...rest } = entry;
+          this.acFanEnforcement.set(key, rest);
+        }
+      }
+      return;
+    }
+    // The first post-cycle shadow is firmware/remote memory, not a new manual
+    // decision. Keep the system fan in the effective profile so this tick
+    // reasserts it; noteAcFanCommanded clears this initialization marker.
+    if (entry.initializationPending) return;
     // Our own just-sent command may not be reflected in the shadow yet
     if (now - entry.lastFanCommandAt < this.AC_FAN_SETTLE_MS) return;
     // Observed fan 0 (built-in auto) is NEVER a manual intent: the firmware
@@ -1635,13 +1807,15 @@ export class Collector {
 
   /** Records the fan we just sent so drift detection has a baseline. */
   private noteAcFanCommanded(rule: AutomationRule, slot: AutomationRangeSlot, deviceId: string, sent: AcAction): void {
-    if (sent.fan_speed == null) return;
-    this.acFanEnforcement.set(this.acFanKey(rule.id, deviceId), {
-      slotId: slot.id,
-      lastCommandedFan: sent.fan_speed,
-      lastFanCommandAt: Date.now(),
-      manual: false,
-    });
+    if (sent.fan_speed != null) {
+      this.acFanEnforcement.set(this.acFanKey(rule.id, deviceId), {
+        slotId: slot.id,
+        lastCommandedFan: sent.fan_speed,
+        lastFanCommandAt: Date.now(),
+        manual: false,
+      });
+    }
+    this.noteAcProfileCommanded(rule, slot, deviceId, sent);
   }
 
   /**
@@ -1740,6 +1914,31 @@ export class Collector {
       if (!slot) continue;
       this.acSwingOverrides.set(this.acSwingKey(rule.id, deviceId), { slotId: slot.id });
       log.info(`[collector] AC ${deviceId}: user vertical-swing change — suspending swing enforcement for rule "${rule.name}" until slot change or power cycle`);
+    }
+  }
+
+  /** Direct dashboard control: record manual ownership immediately rather than
+   * waiting for the next live shadow to drift past the settle window. */
+  noteUserAcProfileChange(deviceId: string, command: string): void {
+    const field = AC_COMMAND_PROFILE_FIELD[command];
+    if (!field) return;
+    for (const rule of this.automationRules) {
+      if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
+      if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
+      const slot = findActiveRangeSlot(
+        rule.range_slots ?? getLegacyRangeSlots(rule.threshold_low, rule.threshold),
+        getBaghdadMinutes(),
+        (prayer, offset) => this.resolvePrayerMinutes(prayer, offset),
+      );
+      if (!slot) continue;
+      const key = this.acFanKey(rule.id, deviceId);
+      let entry = this.acProfileEnforcement.get(key);
+      if (!entry || entry.slotId !== slot.id) {
+        entry = { slotId: slot.id, desired: {}, baseline: {}, lastCommandAt: {}, manual: new Set() };
+        this.acProfileEnforcement.set(key, entry);
+      }
+      entry.manual.add(field);
+      log.info(`[collector] AC ${deviceId}: user ${field} change — suspending that field for rule "${rule.name}"`);
     }
   }
 
@@ -2155,6 +2354,7 @@ export class Collector {
   ): number | null {
     if (slot.vertical_swing == null) return null; // nothing pinned for this slot
     if (this.acSwingOverrideActive(rule.id, dev.id, slot)) return null; // manual wins
+    if (this.acProfileEnforcement.get(this.acFanKey(rule.id, dev.id))?.manual.has("vertical_swing")) return null;
     if (now - (this.acPowerCycleAt.get(dev.id) ?? 0) > this.AC_POWER_CYCLE_RESET_MS) return null;
     return dev.verticalSwing === slot.vertical_swing ? null : slot.vertical_swing;
   }

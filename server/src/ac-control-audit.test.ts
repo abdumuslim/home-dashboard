@@ -397,6 +397,20 @@ describe("AC control attribution (2026-07-24 'Najat keeps turning back on')", ()
     expect(ip).not.toBe("9.9.9.9");
   });
 
+  it("notifies automation ownership immediately for a direct comfort control", async () => {
+    const locks = createLockHandlers();
+    const manual: Array<{ deviceId: string; command: string }> = [];
+    locks.handlers.onUserProfileChange = (deviceId, command) => manual.push({ deviceId, command });
+    const tcl = createTclMock();
+    const { server, url } = await startServer({ tcl: tcl.cloud, locks: locks.handlers });
+    servers.push(server);
+
+    const resp = await control(url, { Cookie: loginCookie() }, "set_temperature", 22, "CA5IMhFAAAE");
+
+    expect(resp.status).toBe(200);
+    expect(manual).toEqual([{ deviceId: "CA5IMhFAAAE", command: "set_temperature" }]);
+  });
+
   it("returns the device-aware capability status without sending or auditing", async () => {
     const pool = createRecordingPool();
     const tcl = createTclMock({ ok: false, status: 409, error: "Available in Heat mode" });

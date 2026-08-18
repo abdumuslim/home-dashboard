@@ -6,6 +6,8 @@ import {
   buildAdvancedControlPayload,
   deriveAcCapabilities,
   getAcDevicePolicy,
+  isAcLevelingEligible,
+  isPowerCycleRestoreEligible,
   supportsAcCommand,
   validateAcControl,
   type AcCapabilities,
@@ -165,6 +167,13 @@ interface PersistedState {
   baseApiUrl?: string;
 }
 
+interface PendingPowerCycleRestore {
+  state: Record<string, unknown>;
+  armedAt: number;
+  attempts: number;
+  lastSentAt: number;
+}
+
 /**
  * Backward-compatible/default maximum for the three ESP-managed ACs. Per-unit
  * policy is authoritative: Guest is a separate-line TAC-24CHSA unit with six
@@ -200,6 +209,7 @@ export class TclCloud {
   private cachedDevices: AcDevice[] = [];
   private deviceCacheTime = 0;
   private lastState: Record<string, Record<string, unknown>> = {};
+  private pendingPowerCycleRestores = new Map<string, PendingPowerCycleRestore>();
 
   private static readonly STATE_FILE = "/app/data/ac-last-state.json";
 
@@ -363,13 +373,44 @@ export class TclCloud {
     deviceId: string,
     command: string,
     value: unknown,
-  ): Promise<AcControlValidation | { ok: false; status: 404; error: string }> {
+  ): Promise<AcControlValidation | { ok: false; status: 404 | 503; error: string }> {
     await this.ensureDeviceCachePopulated();
     const device = this.cachedDevices.find((candidate) => candidate.id === deviceId);
     if (!device) return { ok: false, status: 404, error: `Unknown AC device: ${deviceId}` };
-    await this.ensureValidTokens();
-    const { reported } = await this.getThingShadow(deviceId);
-    device.capabilities = deriveAcCapabilities(deviceId, device.model, reported);
+    // A stale-AWS-credential 403 on this pre-read is the exact event five write
+    // paths self-heal from; awaiting it bare made EVERY control 500 until token
+    // expiry. Try the same self-heal once — reset the credential state, re-auth,
+    // and re-read — before degrading to the device's cached capabilities.
+    let degraded = false;
+    try {
+      await this.ensureValidTokens();
+      const { reported } = await this.getThingShadow(deviceId);
+      device.capabilities = deriveAcCapabilities(deviceId, device.model, reported);
+    } catch {
+      try {
+        this.awsCreds = null;
+        this.tokenExpiry = 0;
+        this.tokenData = null;
+        await this.ensureValidTokens();
+        const { reported } = await this.getThingShadow(deviceId);
+        device.capabilities = deriveAcCapabilities(deviceId, device.model, reported);
+      } catch (retryErr) {
+        degraded = true;
+        log.warn(`[tcl] Live re-read for ${deviceId} failed after re-auth retry (${(retryErr as Error).message}) — validating against cached capabilities`);
+      }
+    }
+    // Self Clean is the one command the cached fallback must NOT authorize: its
+    // advanced payload sets powerSwitch:0 (it shuts the unit down) and the route
+    // records a persistent manual-off lock BEFORE the send, so approving it from
+    // a stale cache can power off a RUNNING AC and lock it off. Fail closed when
+    // we could not verify live state. Stopping a clean cycle (value 0) is safe.
+    if (degraded && command === "set_self_clean" && value === 1) {
+      return {
+        ok: false,
+        status: 503,
+        error: "Cannot verify the AC's live state for Self Clean right now — try again shortly",
+      };
+    }
     return validateAcControl(device.capabilities, command, value);
   }
 
@@ -885,8 +926,25 @@ export class TclCloud {
           beep: shadow.beepSwitch === 1,
         });
 
-        // Save state when device is on (for restore on next power-on)
-        if (shadow.powerSwitch === 1) {
+        // The restore publish is awaited un-caught inside this loop, so one
+        // failed publish would reject fetchDevices for ALL devices. Isolate it:
+        // on error, freeze the save (stateSaveSuppressed=true) — the safe
+        // direction while the restore is in doubt.
+        let stateSaveSuppressed = true;
+        try {
+          stateSaveSuppressed = await this.maybeRestorePowerCycleState(
+            dev.deviceId,
+            shadow,
+            reportedAt,
+            isChsaModel,
+          );
+        } catch (err) {
+          log.warn(`[tcl] Last-state restore for ${dev.deviceId} failed: ${(err as Error).message}`);
+        }
+        // Save state when device is on (for restore on next power-on). A
+        // pending power-cycle restore freezes the pre-event snapshot so reboot
+        // defaults cannot replace the user's last state before it is restored.
+        if (shadow.powerSwitch === 1 && !stateSaveSuppressed) {
           this.saveStateProps(dev.deviceId, shadow, isChsaModel);
         }
       }
@@ -1031,7 +1089,86 @@ export class TclCloud {
 
   // ---------- Last State Persistence ----------
 
+  /** Freeze the last known manual state across an attributed mains event. */
+  preparePowerCycleRestore(deviceId: string): boolean {
+    // Defense in depth for the collector-side gate: last-state restore is
+    // granted per VERIFIED physical wiring (currently guest alone), never
+    // inferred from the absence of other flags. Refusing every non-restore-
+    // eligible id subsumes the leveling case — Smart AC Leveling owns a
+    // leveling-eligible AC's generatorMode/fan and clamps it to floors across a
+    // changeover, so a frozen republish would fight that clamp — and it also
+    // fails closed for unknown future ACs whose line may yet be leveler-owned.
+    if (!isPowerCycleRestoreEligible(deviceId)) {
+      log.warn(`[tcl] Refusing last-state restore for ${deviceId} — not verified restore-eligible physical wiring`);
+      return false;
+    }
+    const saved = this.lastState[deviceId];
+    if (!saved || Object.keys(saved).length === 0) return false;
+    this.pendingPowerCycleRestores.set(deviceId, {
+      state: { ...saved },
+      armedAt: Date.now(),
+      attempts: 0,
+      lastSentAt: 0,
+    });
+    log.info(`[tcl] Armed last-state restore for ${deviceId} after power event`);
+    return true;
+  }
+
+  /**
+   * Returns true while normal state persistence must remain frozen. Restoration
+   * starts only from a post-event ON report, then stays frozen until the
+   * reported shadow confirms the saved values. A bounded resend handles TCL's
+   * occasional accepted-but-ignored publish.
+   */
+  private async maybeRestorePowerCycleState(
+    deviceId: string,
+    shadow: Record<string, number>,
+    reportedAt: number | null,
+    isChsa: boolean,
+  ): Promise<boolean> {
+    const pending = this.pendingPowerCycleRestores.get(deviceId);
+    if (!pending) return false;
+    const now = Date.now();
+    // Waiting for the first post-event ON may legitimately take hours while a
+    // grid-only unit is unpowered on generator. Only bound the confirmation
+    // phase after at least one restore was actually published.
+    if (pending.attempts > 0 && now - pending.lastSentAt > 2 * 60_000) {
+      this.pendingPowerCycleRestores.delete(deviceId);
+      log.warn(`[tcl] Last-state restore for ${deviceId} expired without confirmation`);
+      return false;
+    }
+    if (shadow.powerSwitch !== 1) return true;
+    // AWS metadata is second-resolution. Require a strictly post-event report;
+    // a same-second persisted ON shadow can otherwise consume the restore just
+    // before a grid-only unit actually loses power.
+    if (reportedAt == null || reportedAt <= pending.armedAt) return true;
+
+    const payload = this.restorableState(deviceId, pending.state);
+    const confirmed = Object.entries(payload).every(([key, value]) => shadow[key] === value);
+    if (confirmed) {
+      this.pendingPowerCycleRestores.delete(deviceId);
+      log.info(`[tcl] Last-state restore for ${deviceId} confirmed`);
+      return false;
+    }
+
+    if (pending.attempts <= CONTROL_VERIFY_MAX_RESENDS && now - pending.lastSentAt >= CONTROL_VERIFY_DELAY_MS) {
+      // A user command (control or verified preset) can delete this pending entry
+      // between the early capture above and here. Re-check identity immediately
+      // before the publish so a cancelled restore cannot revert the user's value.
+      // The residual window — a cancellation landing mid-network-call — is healed
+      // by sendControlVerified/executeAcActionVerified's confirm-or-resend loops,
+      // which re-assert the user's value within ~5 s.
+      if (this.pendingPowerCycleRestores.get(deviceId) !== pending) return false;
+      await this.publishRestorableState(deviceId, payload, isChsa);
+      pending.attempts += 1;
+      pending.lastSentAt = now;
+      log.info(`[tcl] Restoring frozen pre-event state for ${deviceId} (attempt ${pending.attempts})`);
+    }
+    return true;
+  }
+
   private saveStateProps(deviceId: string, shadow: Record<string, number>, isChsa: boolean): void {
+    if (this.pendingPowerCycleRestores.has(deviceId)) return;
     const props = isChsa ? TclCloud.SAVE_PROPS_CHSA : TclCloud.SAVE_PROPS_OTHER;
     const state: Record<string, unknown> = {};
     for (const p of props) {
@@ -1098,6 +1235,13 @@ export class TclCloud {
    */
   async executeAcActionVerified(deviceId: string, action: AcAction): Promise<AcVerifiedProfileResult> {
     await this.ensureDeviceCachePopulated();
+    // A verified preset is newer user intent than any frozen last-state
+    // snapshot: cancel a pending restore (un-freezing state-save) before the
+    // first publish so it cannot revert the preset. LOUD by design.
+    if (this.pendingPowerCycleRestores.has(deviceId)) {
+      this.pendingPowerCycleRestores.delete(deviceId);
+      log.info(`[tcl] Pending last-state restore for ${deviceId} cancelled by verified preset`);
+    }
     const safeAction = this.sanitizeAcAction(deviceId, action);
     if (!safeAction) throw new Error(`Unknown AC device: ${deviceId}`);
     const desired = this.buildProfileShadowPayload(deviceId, safeAction);
@@ -1266,6 +1410,15 @@ export class TclCloud {
    * manual-intent recording happens.
    */
   async sendControlVerified(deviceId: string, command: string, value: unknown): Promise<void> {
+    // A newer direct user command makes any pending frozen last-state snapshot
+    // stale: cancel it (which also un-freezes state-save, since the user's new
+    // state is now the one to remember) so the restore cannot revert this write
+    // five seconds later. LOUD by design — a silent cancellation is the next
+    // forensic mystery.
+    if (this.pendingPowerCycleRestores.has(deviceId)) {
+      this.pendingPowerCycleRestores.delete(deviceId);
+      log.info(`[tcl] Pending last-state restore for ${deviceId} cancelled by direct user command`);
+    }
     // Any newer direct user intent cancels an older whole-profile verifier so
     // that its retry cannot overwrite this command five seconds later.
     this.bumpProfileGeneration(deviceId);
@@ -1469,25 +1622,35 @@ export class TclCloud {
     if (!saved || Object.keys(saved).length === 0) return;
     try {
       await new Promise(r => setTimeout(r, 1000));
-      // Saved state may predate a firmware level-count reduction
-      // Defensive migration: old/corrupt state files may contain one-shot
-      // maintenance actions even though saveStateProps never persists them.
-      // They must never restart automatically on the next manual power-on.
-      const { selfClean: _selfClean, ...restorable } = saved;
-      const payload = typeof restorable.generatorMode === "number"
-        ? { ...restorable, generatorMode: this.clampGeneratorMode(deviceId, restorable.generatorMode) }
-        : restorable;
-      // The saved set always carries workMode alongside the fan block, so on a
-      // TAC-12CHSD this restore would otherwise lose the fan on every power-on.
-      const { main, fan } = this.splitFanPayload(deviceId, payload);
-      await this.publishShadowUpdate(deviceId, main);
-      if (fan) {
-        await this.profileSplitDelay();
-        await this.publishShadowUpdate(deviceId, fan);
-      }
+      const payload = this.restorableState(deviceId, saved);
+      await this.publishRestorableState(deviceId, payload, this.isChsaModel(deviceId));
       log.info(`[tcl] Restored last state for device ${deviceId}:`, JSON.stringify(payload));
     } catch (err) {
       log.warn(`[tcl] Failed to restore last state for ${deviceId}:`, (err as Error).message);
+    }
+  }
+
+  private restorableState(deviceId: string, saved: Record<string, unknown>): Record<string, unknown> {
+    // Defensive migration: one-shot maintenance actions must never restart.
+    const { selfClean: _selfClean, ...restorable } = saved;
+    return typeof restorable.generatorMode === "number"
+      ? { ...restorable, generatorMode: this.clampGeneratorMode(deviceId, restorable.generatorMode) }
+      : restorable;
+  }
+
+  private async publishRestorableState(
+    deviceId: string,
+    payload: Record<string, unknown>,
+    isChsa: boolean,
+  ): Promise<void> {
+    // The CHSD fan block must travel alone. Use the explicit current-shadow
+    // family during power-cycle recovery because the cached device can still
+    // describe the pre-event report.
+    const split = isChsa ? { main: payload, fan: null } : this.splitFanPayload(deviceId, payload);
+    await this.publishShadowUpdate(deviceId, split.main);
+    if (split.fan) {
+      await this.profileSplitDelay();
+      await this.publishShadowUpdate(deviceId, split.fan);
     }
   }
 

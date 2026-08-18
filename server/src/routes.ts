@@ -48,6 +48,8 @@ export interface AcManualOffLockHandlers {
   onUserFanAuto?(deviceId: string): void;
   /** UI vertical-swing change — range automations suspend swing enforcement until slot change or power cycle. */
   onUserSwingChange?(deviceId: string): void;
+  /** Other direct comfort controls become per-field manual overrides. */
+  onUserProfileChange?(deviceId: string, command: string): void;
   /** UI beep toggle — beep off becomes a persistent enforced preference, beep on releases it. */
   onUserBeep?(deviceId: string, beepOn: boolean): void;
   /** A commanded power-ON released a manual-off lock — push so a turn-on the user did not make is visible immediately. */
@@ -1392,6 +1394,10 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         await acManualOffLocks?.record(id, command === "set_self_clean" ? "self_clean" : "ui");
         if (isAcLevelingEligible(id)) await acLeveling?.onUserPowerOff(id);
       }
+      // Claim per-field manual ownership before the cloud send. A verified
+      // command may spend 5–20s confirming; the automation loop must not race
+      // in during that window and restore the old system value.
+      acManualOffLocks?.onUserProfileChange?.(id, command);
       // Verified send: the firmware (Najat especially) sometimes accepts a
       // command without applying it — the shadow is re-checked every 5s and
       // the command re-sent up to 3 times (gen level/beep/fan-auto excluded).

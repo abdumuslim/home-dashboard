@@ -156,6 +156,7 @@ function createCollector() {
       actions.push({ deviceId, action });
     }),
     sendControl: vi.fn(async () => undefined),
+    preparePowerCycleRestore: vi.fn(() => true),
     computeAcDiff: vi.fn(() => null as Record<string, unknown> | null),
     getDeviceState: vi.fn(() => null as Record<string, unknown> | null),
   };
@@ -612,6 +613,139 @@ describe("AC range fan enforcement", () => {
 
     expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23 });
     expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+  });
+
+  it("REGRESSION: a pre-changeover manual fan cannot re-arm itself after the source changes", async () => {
+    const { collector, tclCloud } = createCollector();
+    const rule = acFanRule(2);
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 2 });
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule); // establish system fan L2
+
+    collector.noteUserAcFanChange("ac1");
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 5 });
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+
+    collector.notePowerEvent("source grid → gen");
+    vi.advanceTimersByTime(20_000); // old baseline is now past its settle window
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(false);
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", {
+      mode: 1,
+      temperature: 23,
+      fan_speed: 2,
+    });
+  });
+
+  it("respects physical-remote profile changes after initialization, then resets them on a source change", async () => {
+    const { collector, tclCloud } = createCollector();
+    const rule = acFanRule(2);
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue({
+      mode: 1,
+      temperature: 23,
+      fan_speed: 2,
+      eco: 0,
+      screen: 1,
+      vertical_swing: 0,
+      horizontal_swing: 0,
+      fresh_air: 0,
+    });
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule); // adopt the system baseline
+
+    vi.advanceTimersByTime(20_000);
+    tclCloud.getDeviceState.mockReturnValue({
+      mode: 4,
+      temperature: 26,
+      fan_speed: 2,
+      eco: 0,
+      screen: 1,
+      vertical_swing: 0,
+      horizontal_swing: 0,
+      fresh_air: 0,
+    });
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule);
+
+    // The remote's mode and temperature win after the system profile was
+    // initialized; only the still-system-owned fan remains in the profile.
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { fan_speed: 2 });
+
+    collector.notePowerEvent("source grid → gen");
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule);
+
+    // A source boundary starts initialization again, so the active system
+    // profile overrides the remote/firmware remembered state.
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", {
+      mode: 1,
+      temperature: 23,
+      fan_speed: 2,
+    });
+  });
+
+  it("arms previous-state restore only for a restore-eligible AC outside every profile, never the leveling line or an unknown id", () => {
+    const { collector, tclCloud } = createCollector();
+    // The gate is the positive `powerCycleRestoreEligible` — guest alone. Neither
+    // Abdullah (on the ESP-measured line the leveler clamps across a changeover)
+    // nor an unknown-wiring id may arm, both with NO rule. (This file mocks
+    // `isAcLevelingEligible` as `id !== guest`; the real-policy refusal that
+    // distinguishes an unknown id from the leveling line lives in the tcl-cloud
+    // `preparePowerCycleRestore` tests. Here we assert the production intent that
+    // only guest arms.)
+    const abdullah = { id: "Cy3aihFAAAE", power: true };
+    const guest = { id: "DlXqDBFAAAE", power: true };
+    const unknown = { id: "ZZunknownAAAA", power: true };
+    tclCloud.getDevices.mockReturnValue([abdullah, guest, unknown]);
+    (collector as never as { automationRules: unknown[] }).automationRules = [];
+
+    collector.notePowerEvent("source gen → grid");
+    expect(tclCloud.preparePowerCycleRestore).toHaveBeenCalledTimes(1);
+    expect(tclCloud.preparePowerCycleRestore).toHaveBeenCalledWith("DlXqDBFAAAE");
+    expect(tclCloud.preparePowerCycleRestore).not.toHaveBeenCalledWith("ZZunknownAAAA");
+
+    tclCloud.preparePowerCycleRestore.mockClear();
+    collector.notePowerEvent("source grid → gen");
+    expect(tclCloud.preparePowerCycleRestore).toHaveBeenCalledTimes(1);
+    expect(tclCloud.preparePowerCycleRestore).toHaveBeenCalledWith("DlXqDBFAAAE");
+
+    // The boot/cold-start "source none → X" event must NEVER arm: it would freeze
+    // a stale disk snapshot and revert a running unit after every deploy.
+    tclCloud.preparePowerCycleRestore.mockClear();
+    collector.notePowerEvent("source none → grid");
+    expect(tclCloud.preparePowerCycleRestore).not.toHaveBeenCalled();
+
+    // A non-source event (ESP gap / leveler-only collapse) says nothing about a
+    // separate grid-only line and arms nothing.
+    collector.notePowerEvent("ESP gap 23s");
+    expect(tclCloud.preparePowerCycleRestore).not.toHaveBeenCalled();
+  });
+
+  it("respects a direct app profile control immediately without waiting for shadow drift", async () => {
+    const { collector, tclCloud } = createCollector();
+    const rule = acFanRule(2);
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue({ mode: 1, temperature: 23, fan_speed: 2 });
+    setTriggered(collector, 1);
+
+    collector.noteUserAcProfileChange("ac1", "set_temperature");
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, fan_speed: 2 });
   });
 
   it("treats an observed fan 0 as a firmware reset, not a manual change", async () => {
@@ -4098,6 +4232,75 @@ describe("AC fan/swing enforcement sweep (2026-08-06)", () => {
 
     await checkAcEnforce(collector);
     expect(actions).toEqual([]);
+  });
+
+  it("REGRESSION 2026-08-18: a FRESH post-cycle shadow on the system fan clears initializationPending, so a later remote change is caught", async () => {
+    // The common case: the slot fan matches what the firmware restored, so no
+    // diff is ever sent and `noteAcFanCommanded` never clears the flag. Without a
+    // fresh-observation clear the marker persists indefinitely and the NEXT
+    // genuine remote fan change (hours later) is swallowed by the
+    // `initializationPending` guard and silently reverted.
+    const { collector, tclCloud, devices } = enforceSetup({ fanSpeed: 7 }, 7);
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);                 // dead zone (22 < 24 < 25)
+
+    // Adopt the system-fan baseline (observed 7 == slot fan 7 → no diff sent).
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 7 });
+    await checkAcRangeAutomation(collector, enforceRule(7));
+    expect(getFanEnforcement(collector).get("1:ac1")).toMatchObject({ lastCommandedFan: 7, manual: false });
+
+    // A changeover power-cycles her; the entry is frozen `initializationPending`.
+    collector.notePowerEvent("source grid → gen");
+    const cycleAt = Date.now();
+    expect(getFanEnforcement(collector).get("1:ac1")).toHaveProperty("initializationPending", true);
+
+    // The firmware brings the blower back on the SAME system fan (7). A FRESH
+    // shadow (reportedAt strictly after the cycle stamp) confirms it, so the
+    // initialization marker must clear here.
+    vi.advanceTimersByTime(20_000);
+    await setWeatherValue(collector, 24);
+    (devices[0] as { lastSeenAt?: number | null }).lastSeenAt = cycleAt + 5_000;
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 7 });
+    await checkAcRangeAutomation(collector, enforceRule(7));
+    expect((getFanEnforcement(collector).get("1:ac1") as { initializationPending?: boolean } | undefined)?.initializationPending).toBeUndefined();
+
+    // Hours later the user picks fan 5 on the remote — now DETECTED as manual
+    // (on the old code the flag was still set and this change was reverted).
+    vi.advanceTimersByTime(20_000);
+    await setWeatherValue(collector, 24);
+    (devices[0] as { lastSeenAt?: number | null }).lastSeenAt = cycleAt + 25_000;
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 5 });
+    await checkAcRangeAutomation(collector, enforceRule(7));
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+  });
+
+  it("does NOT clear initializationPending on a STALE cached match (the reboot echo can arrive later)", async () => {
+    // Immediately after the cycle the CACHED shadow still shows the pre-event
+    // fan, which can coincidentally equal the system fan. Clearing on that stale
+    // match would let the real reboot echo (arriving later with firmware-memory
+    // fan) be misread as a manual change — the exact bug this flag exists to stop.
+    const { collector, tclCloud, devices } = enforceSetup({ fanSpeed: 7 }, 7);
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 7 });
+    await checkAcRangeAutomation(collector, enforceRule(7));
+
+    collector.notePowerEvent("source grid → gen");
+    const cycleAt = Date.now();
+    expect(getFanEnforcement(collector).get("1:ac1")).toHaveProperty("initializationPending", true);
+
+    // A stale report (lastSeenAt older than the cycle stamp) does NOT clear it.
+    vi.advanceTimersByTime(20_000);
+    await setWeatherValue(collector, 24);
+    (devices[0] as { lastSeenAt?: number | null }).lastSeenAt = cycleAt - 5_000;
+    tclCloud.getDeviceState.mockReturnValue({ fan_speed: 7 });
+    await checkAcRangeAutomation(collector, enforceRule(7));
+    expect(getFanEnforcement(collector).get("1:ac1")).toHaveProperty("initializationPending", true);
+
+    // And with no freshness metadata at all, the flag also stays.
+    (devices[0] as { lastSeenAt?: number | null }).lastSeenAt = null;
+    await checkAcRangeAutomation(collector, enforceRule(7));
+    expect(getFanEnforcement(collector).get("1:ac1")).toHaveProperty("initializationPending", true);
   });
 });
 

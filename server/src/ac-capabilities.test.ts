@@ -3,6 +3,7 @@ import {
   buildAdvancedControlPayload,
   deriveAcCapabilities,
   getAcDevicePolicy,
+  isPowerCycleRestoreEligible,
   maxGeneratorLevelForDevices,
   supportsAcCommand,
   validateLevelingDeviceReferences,
@@ -15,10 +16,11 @@ const GUEST_ID = "DlXqDBFAAAE";
 describe("per-device AC policy", () => {
   it("keeps Guest on six levels and outside the ESP leveling line", () => {
     expect(getAcDevicePolicy(GUEST_ID)).toEqual({
-      displayName: "guest",
+      displayName: "Guest",
       displayOrder: 4,
       maxGeneratorLevel: 6,
       levelingEligible: false,
+      powerCycleRestoreEligible: true,
     });
   });
 
@@ -28,15 +30,26 @@ describe("per-device AC policy", () => {
       getAcDevicePolicy("CA5IMhFAAAE"),
       getAcDevicePolicy("Cy3aihFAAAE"),
     ]).toEqual([
-      { displayName: "Mom", displayOrder: 1, maxGeneratorLevel: 3, levelingEligible: true },
-      { displayName: "Abdu", displayOrder: 2, maxGeneratorLevel: 3, levelingEligible: true },
-      { displayName: "Abdullah", displayOrder: 3, maxGeneratorLevel: 3, levelingEligible: true },
+      { displayName: "Mom", displayOrder: 1, maxGeneratorLevel: 3, levelingEligible: true, powerCycleRestoreEligible: false },
+      { displayName: "Abdu", displayOrder: 2, maxGeneratorLevel: 3, levelingEligible: true, powerCycleRestoreEligible: false },
+      { displayName: "Abdullah", displayOrder: 3, maxGeneratorLevel: 3, levelingEligible: true, powerCycleRestoreEligible: false },
     ]);
   });
 
   it("fails closed for unknown future TCL devices", () => {
     expect(getAcDevicePolicy("new-cloud-device").levelingEligible).toBe(false);
     expect(validateLevelingDeviceReferences({ priority: ["new-cloud-device"] })).toContain("priority");
+  });
+
+  it("grants last-state power-cycle restore only to Guest's verified grid-only wiring", () => {
+    // A positive physical-wiring fact — never inferred from the absence of
+    // leveling. Guest alone is restore-eligible; the ESP-measured units are the
+    // leveler's to clamp, and an unknown future AC must not read as grid-only.
+    expect(isPowerCycleRestoreEligible(GUEST_ID)).toBe(true);
+    expect(isPowerCycleRestoreEligible("DHihohFAAAE")).toBe(false);
+    expect(isPowerCycleRestoreEligible("CA5IMhFAAAE")).toBe(false);
+    expect(isPowerCycleRestoreEligible("Cy3aihFAAAE")).toBe(false);
+    expect(isPowerCycleRestoreEligible("ZZunknownAAAA")).toBe(false);
   });
 
   it("uses the lowest maximum across mixed automation targets", () => {
@@ -83,6 +96,21 @@ describe("shadow-derived AC capabilities", () => {
     expect(guest.controls.map((control) => control.id)).toContain("healthy");
     expect(guest.controls.map((control) => control.id)).not.toContain("freshAir");
     expect(guest.controls.map((control) => control.id)).not.toContain("lightSense");
+  });
+
+  it("does not expose a shadow ghost as a verified physical feature", () => {
+    const abdu = deriveAcCapabilities("CA5IMhFAAAE", "TAC-12CHSD", LIVE_AC_CAPABILITY_SHADOWS.CA5IMhFAAAE);
+    const guest = deriveAcCapabilities(GUEST_ID, "TAC-24CHSA", LIVE_AC_CAPABILITY_SHADOWS[GUEST_ID]);
+
+    // Both shadows contain softWind, but Abdu's physical unit does not have
+    // Gentle Breeze. Guest's exact TAC-24CHSD/MAV specification does.
+    expect(abdu.controls.map((control) => control.id)).not.toContain("gentleBreeze");
+    expect(guest.controls.map((control) => control.id)).toContain("gentleBreeze");
+    expect(validateAcControl(abdu, "set_gentle_breeze", 1)).toEqual({
+      ok: false,
+      status: 400,
+      error: "set_gentle_breeze is not supported by this AC",
+    });
   });
 
   it("loads all four sanitized live capability fixtures", () => {

@@ -45,6 +45,7 @@ export interface AcDevicePolicy {
   displayOrder: number;
   maxGeneratorLevel: number;
   levelingEligible: boolean;
+  powerCycleRestoreEligible: boolean;
 }
 
 const DEFAULT_POLICY: AcDevicePolicy = {
@@ -54,14 +55,52 @@ const DEFAULT_POLICY: AcDevicePolicy = {
   // ESP attribution is a physical wiring fact, so unknown future cloud
   // devices must fail closed until their line is explicitly qualified.
   levelingEligible: false,
+  // Last-state restore is granted per VERIFIED physical wiring, never inferred
+  // from the absence of other flags: an unknown future AC could be on a line the
+  // leveler will own, so "unknown" must not read as "known grid-only" and arm a
+  // frozen republish over it.
+  powerCycleRestoreEligible: false,
 };
 
 const DEVICE_POLICIES: Record<string, AcDevicePolicy> = {
-  DHihohFAAAE: { displayName: "Mom", displayOrder: 1, maxGeneratorLevel: 3, levelingEligible: true },
-  CA5IMhFAAAE: { displayName: "Abdu", displayOrder: 2, maxGeneratorLevel: 3, levelingEligible: true },
-  Cy3aihFAAAE: { displayName: "Abdullah", displayOrder: 3, maxGeneratorLevel: 3, levelingEligible: true },
-  DlXqDBFAAAE: { displayName: "guest", displayOrder: 4, maxGeneratorLevel: 6, levelingEligible: false },
+  DHihohFAAAE: { displayName: "Mom", displayOrder: 1, maxGeneratorLevel: 3, levelingEligible: true, powerCycleRestoreEligible: false },
+  CA5IMhFAAAE: { displayName: "Abdu", displayOrder: 2, maxGeneratorLevel: 3, levelingEligible: true, powerCycleRestoreEligible: false },
+  Cy3aihFAAAE: { displayName: "Abdullah", displayOrder: 3, maxGeneratorLevel: 3, levelingEligible: true, powerCycleRestoreEligible: false },
+  DlXqDBFAAAE: { displayName: "Guest", displayOrder: 4, maxGeneratorLevel: 6, levelingEligible: false, powerCycleRestoreEligible: true },
 };
+
+/**
+ * Shadow schemas are shared across several TCL firmwares and can contain
+ * writable-looking placeholder properties for hardware the physical unit does
+ * not have. Keep the four household units fail-closed at the UI/command
+ * boundary: a property must exist AND the feature must be verified for that
+ * stable device id. Unknown/test devices retain property discovery so protocol
+ * probes and fixtures can still be evaluated without pretending they are one
+ * of these physical units.
+ */
+const VERIFIED_CONTROL_FEATURES: Partial<Record<string, ReadonlySet<AcFeatureId>>> = {
+  DHihohFAAAE: new Set([
+    "aiEco", "sleep", "gentleBreeze", "freshAir", "freshAirStrength", "drying",
+    "selfClean", "screen", "lightSense", "beep", "eightDegreeHeat",
+  ]),
+  CA5IMhFAAAE: new Set([
+    "eco", "turbo", "sleep", "healthy", "drying", "selfClean", "screen",
+    "lightSense", "beep", "eightDegreeHeat",
+  ]),
+  Cy3aihFAAAE: new Set([
+    "eco", "turbo", "sleep", "gentleBreeze", "healthy", "drying", "selfClean",
+    "screen", "lightSense", "beep", "eightDegreeHeat",
+  ]),
+  DlXqDBFAAAE: new Set([
+    "eco", "aiEco", "sleep", "gentleBreeze", "healthy", "drying", "selfClean",
+    "screen", "beep", "eightDegreeHeat",
+  ]),
+};
+
+function verifiedForDevice(deviceId: string, feature: AcFeatureId): boolean {
+  const verified = VERIFIED_CONTROL_FEATURES[deviceId];
+  return verified == null || verified.has(feature);
+}
 
 export function getAcDevicePolicy(deviceId: string): AcDevicePolicy {
   return DEVICE_POLICIES[deviceId] ?? DEFAULT_POLICY;
@@ -69,6 +108,10 @@ export function getAcDevicePolicy(deviceId: string): AcDevicePolicy {
 
 export function isAcLevelingEligible(deviceId: string): boolean {
   return getAcDevicePolicy(deviceId).levelingEligible;
+}
+
+export function isPowerCycleRestoreEligible(deviceId: string): boolean {
+  return getAcDevicePolicy(deviceId).powerCycleRestoreEligible;
 }
 
 export function maxGeneratorLevelForDevices(deviceIds: string[]): number {
@@ -188,14 +231,14 @@ export function deriveAcCapabilities(
     property: string,
     gate: Pick<AcControlCapability, "available" | "unavailableReason"> = { available: true },
   ) => {
-    if (!has(shadow, property)) return;
+    if (!verifiedForDevice(deviceId, id) || !has(shadow, property)) return;
     controls.push({ id, kind: "toggle", value: numberValue(shadow, property), ...gate });
   };
 
   addToggle("eco", "ECO", availability(power && coolOrHeat, "Available in Cool or Heat mode"));
   addToggle("aiEco", "AIECOSwitch", availability(power && coolOrHeat, "Available in Cool or Heat mode"));
   addToggle("turbo", "turbo", availability(power && coolOrHeat, "Available in Cool or Heat mode"));
-  if (has(shadow, "sleep")) {
+  if (verifiedForDevice(deviceId, "sleep") && has(shadow, "sleep")) {
     controls.push({
       id: "sleep",
       kind: "select",
@@ -204,7 +247,7 @@ export function deriveAcCapabilities(
       ...availability(power && mode !== 3, "Unavailable in Fan mode"),
     });
   }
-  if (has(shadow, "softWind") || reportedCapabilities.includes(5)) {
+  if (verifiedForDevice(deviceId, "gentleBreeze") && (has(shadow, "softWind") || reportedCapabilities.includes(5))) {
     const hasWindFeeling = has(shadow, "newWindSwitch") || has(shadow, "newWindStrength");
     controls.push(hasWindFeeling
       ? {
@@ -223,7 +266,7 @@ export function deriveAcCapabilities(
   }
   addToggle("healthy", "healthy", availability(power, "Turn the AC on first"));
   addToggle("freshAir", "newWindSwitch", availability(power && mode !== 2, "Unavailable in Dry mode"));
-  if (has(shadow, "newWindStrength")) {
+  if (verifiedForDevice(deviceId, "freshAirStrength") && has(shadow, "newWindStrength")) {
     controls.push({
       id: "freshAirStrength",
       kind: "select",
@@ -236,7 +279,7 @@ export function deriveAcCapabilities(
     power && (mode === 1 || mode === 2) && numberValue(shadow, "eightAddHot") !== 1,
     "Available in Cool or Dry mode",
   ));
-  if (has(shadow, "selfClean")) {
+  if (verifiedForDevice(deviceId, "selfClean") && has(shadow, "selfClean")) {
     const active = numberValue(shadow, "selfClean") === 1;
     controls.push({
       id: "selfClean",
@@ -248,7 +291,7 @@ export function deriveAcCapabilities(
   addToggle("screen", "screen");
   addToggle("lightSense", "lightSense");
   addToggle("beep", "beepSwitch");
-  if (has(shadow, "eightAddHot") || reportedCapabilities.includes(21)) {
+  if (verifiedForDevice(deviceId, "eightDegreeHeat") && (has(shadow, "eightAddHot") || reportedCapabilities.includes(21))) {
     controls.push({
       id: "eightDegreeHeat",
       kind: "toggle",

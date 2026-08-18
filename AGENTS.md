@@ -4,7 +4,7 @@ Always-loaded (Tier-1) guide for AI agents. This file is deliberately small: dee
 
 ## What this is
 
-Home environmental monitoring + device automation dashboard at **https://home.altijwal.com**. Express 5 (Node/TypeScript) backend + React/Vite/Tailwind v4 frontend, PostgreSQL storage, deployed via Docker on a VPS. It collects weather (Ambient Weather WS-2000), air quality (Qingping CGS2 via MQTT), and mains power (custom ESP monitor), and automates 2 Xiaomi air purifiers and 3 TCL split ACs (cloud APIs), including a closed-loop "Smart AC Leveling" controller that keeps total household current under the active source's breaker limit.
+Home environmental monitoring + device automation dashboard at **https://home.altijwal.com**. Express 5 (Node/TypeScript) backend + React/Vite/Tailwind v4 frontend, PostgreSQL storage, deployed via Docker on a VPS. It collects weather (Ambient Weather WS-2000), air quality (Qingping CGS2 via MQTT), and mains power (custom ESP monitor), and automates 2 Xiaomi air purifiers and 4 TCL split ACs (cloud APIs) — three on the ESP-measured household line plus a grid-only guest unit that Smart AC Leveling never manages — including a closed-loop "Smart AC Leveling" controller that keeps total household current under the active source's breaker limit.
 
 ```
 Browser → Cloudflare → Traefik (VPS) → dashboard container (port 8000) → PostgreSQL (db=home)

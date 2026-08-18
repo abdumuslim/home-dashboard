@@ -65,6 +65,7 @@ async function main(): Promise<void> {
       onUserFanChange: (deviceId) => collector.noteUserAcFanChange(deviceId),
       onUserFanAuto: (deviceId) => collector.noteUserAcFanAuto(deviceId),
       onUserSwingChange: (deviceId) => collector.noteUserAcSwingChange(deviceId),
+      onUserProfileChange: (deviceId, command) => collector.noteUserAcProfileChange(deviceId, command),
       onUserBeep: (deviceId, beepOn) => collector.noteUserAcBeep(deviceId, beepOn),
       notifyLockCleared: (deviceId, authKind, ip) => collector.notifyAcLockCleared(deviceId, authKind, ip),
     },
