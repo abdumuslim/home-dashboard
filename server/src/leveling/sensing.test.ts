@@ -34,6 +34,7 @@ import {
   noteCommandedCut,
   pendingCutCredit,
   refillBucket,
+  resetCalm,
   type CutTrendInput,
 } from "./sensing.js";
 import { DEFAULT_LEVELING_CONFIG_V2, effectiveLimit, type LevelingConfigV2 } from "./config.js";
@@ -814,6 +815,53 @@ describe("calm tracking & view", () => {
     // reading has aged out and the lone 100A spike moves it not at all — which
     // is the whole point of widening the window (2026-08-05).
     expect(meterView(state, now).smoothedAmps).toBe(14.5);
+  });
+});
+
+// The fan path keeps its OWN calm clock (2026-08-09, the 16:22Z gen cycle
+// #11098-#11126). It is maintained EXACTLY in parallel with the main clock on
+// the meter side, and diverges ONLY when a fan-only spend rewinds the main clock
+// while sparing this one — so a fan hold's first gear is not queued behind
+// another hold's fan step ("fans do not queue behind fans").
+describe("fan calm clock (change A, 2026-08-09)", () => {
+  it("fanCalmMs tracks calmMs while only the meter drives calm", () => {
+    const { state, now } = feedGen([12, 12.1, 12, 11.9, 12]);
+    const v = meterView(state, now);
+    expect(v.fanCalmMs).toBe(v.calmMs);
+    expect(v.fanCalmMs).toBe(20_000);
+  });
+
+  it("resetCalm defaults to nulling BOTH anchors (raise/restore/swap/correction)", () => {
+    const { state } = feedGen([12, 12, 12, 12, 12, 12]);
+    expect(state.calmSince).not.toBeNull();
+    expect(state.fanCalmSince).not.toBeNull();
+    const reset = resetCalm(state);
+    expect(reset.calmSince).toBeNull();
+    expect(reset.fanCalmSince).toBeNull();
+  });
+
+  it("a fan-only spend rewinds the MAIN clock but spares the fan clock (invariant 18 vs #11098-#11126)", () => {
+    const { state, now } = feedGen([12, 12, 12, 12, 12, 12]);
+    const reset = resetCalm(state, { fanSpend: true });
+    // Raises still wait — the main clock is reset, so a raise 12s after a fan
+    // restore is still calm-blocked (invariant 18: two fatal raises 12s/17s after
+    // a fan restore).
+    expect(meterView(reset, now).calmMs).toBe(0);
+    // …but the fan path's own clock keeps running, so a peer fan hold's first
+    // gear is not queued behind this spend.
+    expect(meterView(reset, now).fanCalmMs).toBeGreaterThan(0);
+  });
+
+  it("a meter-side calm break nulls BOTH anchors, even a fan clock a spend just spared", () => {
+    const { state, now } = feedGen([12, 12, 12, 12, 12, 12]);
+    const spared = resetCalm(state, { fanSpend: true });
+    expect(spared.fanCalmSince).not.toBeNull();
+    // A sustained ride over the limit breaks calm on the meter side — the spared
+    // fan clock is nulled with the main one (the 2026-08-08 revert cascade
+    // protection is meter-side and unchanged).
+    const over = feedGen([16, 16, 16, 16, 16, 16, 16, 16], { state: spared, startAt: now + 5_000 });
+    expect(over.state.calmSince).toBeNull();
+    expect(over.state.fanCalmSince).toBeNull();
   });
 });
 

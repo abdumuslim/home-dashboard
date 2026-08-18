@@ -516,12 +516,13 @@ export function latchCollapse(
     collapse: { preMedianAmps: opts.preMedianAmps, until: opts.now + POWER_COLLAPSE_MAX_MS },
     derate: collapseDerate(state, opts.source, opts.now),
     calmSince: null,
+    fanCalmSince: null,
   };
 }
 
 /** Release a latch the caller armed, once its own evidence has cleared. */
 export function clearCollapse(state: MeterState): MeterState {
-  return state.collapse == null ? state : { ...state, collapse: null, calmSince: null };
+  return state.collapse == null ? state : { ...state, collapse: null, calmSince: null, fanCalmSince: null };
 }
 
 export function initialMeterState(): MeterState {
@@ -532,6 +533,7 @@ export function initialMeterState(): MeterState {
     overLimitBudget: OVER_LIMIT_BUDGET,
     overLimitReadings: [],
     calmSince: null,
+    fanCalmSince: null,
     calmHoldUntil: 0,
     cliffAnchor: null,
     flickerSamples: 0,
@@ -743,6 +745,7 @@ export function ingestReading(
       overLimitBudget: OVER_LIMIT_BUDGET,
       overLimitReadings: [],
       calmSince: null,
+      fanCalmSince: null,
       calmHoldUntil: 0,
       cliffAnchor: null,
       flickerSamples: 0,
@@ -762,7 +765,7 @@ export function ingestReading(
   }
 
   if (source === "none") {
-    return { state: { ...state, calmSince: null }, events };
+    return { state: { ...state, calmSince: null, fanCalmSince: null }, events };
   }
 
   const measured = source === "grid" ? reading.gridAmps : reading.genAmps;
@@ -957,6 +960,11 @@ export function ingestReading(
   let overLimitBudget = state.overLimitBudget;
   let overLimitReadings = state.overLimitReadings;
   let calmSince = state.calmSince;
+  // Maintained EXACTLY in parallel with `calmSince` on the meter side (2026-08-09):
+  // the fan path's own clock breaks and stamps on the same readings. It diverges
+  // from `calmSince` only through `resetCalm({ fanSpend: true })` in the shell —
+  // never here — so every meter-side break/stamp below mirrors to it verbatim.
+  let fanCalmSince = state.fanCalmSince;
 
   // The bucket and calm are now judged on DIFFERENT yardsticks, deliberately:
   // the bucket still triggers on any raw reading over the limit (a real breach
@@ -1047,6 +1055,7 @@ export function ingestReading(
     // looks exactly like the trough after a room was switched off, and we do
     // not get to spend either one until we know which it was.
     calmSince = null;
+    fanCalmSince = null;
   } else if (smoothed <= limit - config.marginAmps && rawIsSupplyNoise) {
     // The mean now has real headroom under it, so whatever the banked readings
     // recorded is over. Drop them IMMEDIATELY — they are what sizes the deficit
@@ -1061,6 +1070,7 @@ export function ingestReading(
     // once, sized from evidence about the present.
     overLimitReadings = [];
     calmSince = calmSince ?? now;
+    fanCalmSince = fanCalmSince ?? now;
     if (now - calmSince >= CALM_REFILL_MS) {
       // Sustained calm = the over-limit episode is over. Episode-based refill,
       // NOT per-reading: a balanced oscillation must not refill as fast as it
@@ -1075,6 +1085,7 @@ export function ingestReading(
     // Smoothed mean is in the margin band or over the limit — the deliberate
     // near-limit ride. Bucket holds; calm is broken.
     calmSince = null;
+    fanCalmSince = null;
   }
 
   return {
@@ -1085,6 +1096,7 @@ export function ingestReading(
       overLimitBudget,
       overLimitReadings,
       calmSince,
+      fanCalmSince,
       calmHoldUntil,
       cliffAnchor,
       flickerSamples,
@@ -1128,9 +1140,21 @@ export function refillBucket(state: MeterState, points = OVER_LIMIT_BUDGET): Met
   return { ...state, overLimitBudget: points, overLimitReadings: [] };
 }
 
-/** Break calm (e.g. after a command batch: post-command readings are not pre-raise evidence). */
-export function resetCalm(state: MeterState): MeterState {
-  return { ...state, calmSince: null };
+/**
+ * Break calm after a command batch: post-command readings are not pre-raise
+ * evidence. The default nulls BOTH calm anchors — the main clock (raises,
+ * restores, swaps, corrections all wait it out) and the fan path's own clock.
+ *
+ * `{ fanSpend: true }` nulls ONLY the main clock, for a fan-only SPEND (a
+ * restore step). The main clock must still rewind so a level raise cannot land
+ * on the amps the fan just took (invariant 18: two fatal raises 12s/17s after a
+ * fan restore) — but the fan path's own clock is spared so a fan hold's 60s
+ * first gear is not queued behind every OTHER hold's fan step ("fans do not
+ * queue behind fans", 2026-08-09, the 16:22Z gen cycle #11098-#11126). A fan CUT
+ * frees amps and calls neither path — it does not `resetCalm` at all.
+ */
+export function resetCalm(state: MeterState, opts?: { fanSpend?: boolean }): MeterState {
+  return { ...state, calmSince: null, fanCalmSince: opts?.fanSpend ? state.fanCalmSince : null };
 }
 
 /** Derive the pipeline-facing view. `staleMs` is judged by the caller against `now`. */
@@ -1143,6 +1167,8 @@ export function meterView(state: MeterState, now: number): MeterView {
     latestAmps: state.recent.length > 0 ? state.recent[state.recent.length - 1] : 0,
     sampleCount: Math.min(state.recent.length, SMOOTH_WINDOW),
     calmMs: state.calmSince != null && state.collapse == null ? Math.max(0, now - state.calmSince) : 0,
+    fanCalmMs:
+      state.fanCalmSince != null && state.collapse == null ? Math.max(0, now - state.fanCalmSince) : 0,
     smoothedOverMs:
       stale || state.smoothedOverSince == null ? 0 : Math.max(0, now - state.smoothedOverSince),
     overLimitBudget: state.overLimitBudget,

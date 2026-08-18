@@ -5,7 +5,7 @@ import { describe, it, expect } from "vitest";
 import { Scenario, type SimAcSetup } from "./scenario.js";
 import { meterView } from "./sensing.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
-import { FAN_BOUNCE_WINDOW_MS, FAN_RESTORE_AFTER_CUT_MS } from "./fan-trim.js";
+import { FAN_RESTORE_AFTER_CUT_MS } from "./fan-trim.js";
 import type { Command } from "./types.js";
 
 const cfg: LevelingConfigV2 = {
@@ -1569,24 +1569,88 @@ describe("the 2026-07-31 gen trip", () => {
       if (prev !== 0 && curr !== 0 && prev !== curr) reversals++;
     }
     expect(reversals).toBeLessThanOrEqual(3);
-    // Every climb is ≤ 2 gears, EXCEPT at most ONE full swing that STICKS. The
-    // oscillation now parks the fan at 1 via the bounce compounding (2026-08-08 —
-    // reversals collapsed to 1), and the single post-storm recovery is invariant
-    // 60's fast path (2026-08-06, user-approved): a one-command full climb when
-    // spendable is wide. That is told from the 2026-07-31 disease — a full swing
-    // that BOUNCES — by whether it STICKS: no further fan CUT within
-    // FAN_BOUNCE_WINDOW_MS after it. Repeated full swings, or one followed by a
-    // cut, still fail.
+    // Every climb is ≤ 2 gears, EXCEPT at most ONE full swing (a >2-gear jump).
+    // REPEATED full swings up and down are the 2026-07-31 limit cycle
+    // (7→5→3→1→7→1→7→4); a single one is invariant 60's user-approved fast path —
+    // a one-command climb home when the budget is wide. `fullSwings <= 1` is the
+    // guard against the limit cycle and is unchanged.
+    //
+    // Until 2026-08-08 the single swing also had to STICK (no re-cut within the
+    // bounce window). Change A (2026-08-09, the 16:22Z gen cycle #11098-#11126)
+    // deliberately stopped a held fan from queueing behind OTHER holds' fan
+    // restores — the fan path keeps its OWN calm clock across a peer's fan-only
+    // spend ("fans do not queue behind fans"). In THIS pathological
+    // 75s-over/75s-under storm that has a cost the settled real incident does
+    // not: Abdu's first-gear 60s calm, no longer reset by Najat's and Abdullah's
+    // fan restores (dt 305/455/590), can land right on an over-boundary and take
+    // one boundary-timed full swing that bounces. The bounce-compounding ladder
+    // (untouched) then parks the fan — there is NO second full swing, which is
+    // the cycle this test exists to forbid, so the "must stick" assertion is
+    // dropped and `fullSwings <= 1` carries the guarantee.
     let fullSwings = 0;
     for (let i = 1; i < fanCmds.length; i++) {
       if (fanCmds[i].cmd.fan - fanCmds[i - 1].cmd.fan <= 2) continue;
       fullSwings++;
-      expect(fullSwings, "more than one full-swing restore").toBeLessThanOrEqual(1);
-      const reCut = fanCmds
-        .slice(i + 1)
-        .some((e) => e.cmd.reason === "trim" && e.at - fanCmds[i].at < FAN_BOUNCE_WINDOW_MS);
-      expect(reCut, "full-swing restore was re-cut within the bounce window").toBe(false);
+      expect(fullSwings, "more than one full-swing restore (the 2026-07-31 limit cycle)").toBeLessThanOrEqual(1);
     }
+    // A BOUNDED-step limit cycle (7→5→3→1→3→1→3) has zero full swings and can sit
+    // inside 3 reversals, so cap the total restores too: each re-cut doubles the
+    // next after-cut wait (120→240→480s), so bounce compounding cannot fit a
+    // fifth restore into a ~20-min storm. This is the guard the reversal and
+    // full-swing counts alone cannot give (added on independent review).
+    const restores = fanCmds.filter((e) => e.cmd.reason === "trim_restore");
+    expect(restores.length, "a bounded-step limit cycle (7→5→3→1→3→1→3)").toBeLessThanOrEqual(4);
+  });
+});
+
+// 2026-08-09 16:22Z gen cycle (#11098-#11126): Abdu's fan was cut 7→5→4→2→1, a
+// room was shed freeing ~2.3A, and Abdu's fan then did not START climbing for
+// ~9.8 minutes — parked behind a peer's fan restore and an L2→L3 raise that kept
+// resetting the shared calm clock, and behind a flicker-patience reservation
+// that zeroed the fan budget. Changes A/B/C: the fan keeps its own calm clock,
+// a bounded step ships under the reservation, and a pure raise defers to the
+// fan. The cut fan should be FULLY back in a small fraction of that.
+//
+// NOTE: the harness prices a fan gear at 0.05A of physics — barely a ripple on
+// the meter — so this asserts on LATENCY, not amps.
+describe("ACCEPTANCE: a cut fan comes home fast when peers restore/raise (2026-08-09)", () => {
+  const staged = (): Scenario =>
+    new Scenario(
+      cfg,
+      [
+        // Abdullah wants to raise (needDelta 3) — the pure raise change C defers.
+        { ...ABDULLAH, level: 1, minLevel: 1, demandAmps: 2.2, needDelta: 3, fan: 5 },
+        // Abdu carries the deepest fan and stays on (mid need) — the fan we track.
+        { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 2, fan: 7 },
+        // Najat is the least-needed room — the shed victim whose restore reserves.
+        { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 0.4, fan: 5 },
+      ],
+      { nonAcAmps: 3.0, source: "gen", seed: 20260809 },
+    );
+
+  it("fully restores the cut fan within ~150s of the shed, not ~10 minutes", () => {
+    const s = staged();
+    s.advance(120); // settle
+    // A hard overload: fans to their floor, then the coolest room off.
+    s.setNonAc(7.5);
+    const tOver = s.now;
+    s.advance(150);
+    const shed = s.commandsSince(tOver, "power_off");
+    expect(shed.length, "an overload shed a room").toBeGreaterThanOrEqual(1);
+    const shedAt = shed[0].at;
+    // Abdu's fan was cut deep (the fan we track home).
+    expect(s.sim("abdu").fan).toBeLessThan(7);
+    // Relief: the shed freed amps and the house is roomy again.
+    s.setNonAc(1.0);
+    // Advance and find when Abdu's fan is fully home.
+    let restoredAt: number | null = null;
+    for (let i = 0; i < 60 && restoredAt == null; i++) {
+      s.advance(5);
+      if (s.sim("abdu").fan === 7) restoredAt = s.now;
+    }
+    expect(restoredAt, "Abdu's fan climbed all the way back to 7").not.toBeNull();
+    // The whole point: a small fraction of the ~9.8 min the shared clock cost.
+    expect((restoredAt! - shedAt) / 1000).toBeLessThanOrEqual(150);
   });
 });
 

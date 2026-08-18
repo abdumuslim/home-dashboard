@@ -1472,9 +1472,13 @@ export class Scenario {
       }
       this.execute(out);
       this.modeState = noteBatch(this.modeState, { fanOnly: out.fanOnly }, this.now);
-      // Shell parity: a fan-only batch that SPENT (restore) still rewinds calm.
+      // Shell parity (2026-08-09): a non-fan batch rewinds BOTH calm anchors; a
+      // fan-only SPEND (restore) rewinds only the MAIN clock and spares the fan
+      // path's own, so a fan hold's first gear is not queued behind another
+      // hold's fan step. A fan CUT rewinds neither (invariant 18 vs #11098-#11126).
       const spentOnFan = out.commands.some((c) => c.kind === "set_fan" && c.reason === "trim_restore");
-      if (!out.fanOnly || spentOnFan) this.meterState = resetCalm(this.meterState);
+      if (!out.fanOnly) this.meterState = resetCalm(this.meterState);
+      else if (spentOnFan) this.meterState = resetCalm(this.meterState, { fanSpend: true });
       // Shell parity: credit the meter with what this batch took off the line,
       // so a shed's late arrival is not read as a breaker trip. `commandedCutAmps`
       // is the single credit path (invariant 11) — `expectedDeltaAmps` is only

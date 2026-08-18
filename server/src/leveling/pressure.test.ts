@@ -23,6 +23,7 @@ function view(overrides: Partial<MeterView> = {}): MeterView {
     latestAmps: 12,
     sampleCount: 4,
     calmMs: 0,
+    fanCalmMs: 0,
     smoothedOverMs: 0,
     overLimitBudget: 5,
     overLimitReadings: [],

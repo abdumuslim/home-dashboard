@@ -3210,7 +3210,16 @@ export class LevelingControllerV2 {
     if (!sentAny) return;
 
     this.modeState = noteBatch(this.modeState, { fanOnly }, now);
-    if (!fanOnly || spentOnFan) this.meterState = resetCalm(this.meterState);
+    // A non-fan batch (raise/restore/swap/correction) rewinds BOTH calm anchors;
+    // a fan-only SPEND rewinds only the MAIN clock and spares the fan path's own
+    // (2026-08-09, the 16:22Z gen cycle #11098-#11126). The main-clock rewind is
+    // still what keeps a level raise from landing on the amps the fan just took
+    // (invariant 18: two fatal raises 12s/17s after a fan restore); sparing the
+    // fan clock is what stops a fan hold's first gear queueing behind another
+    // hold's fan step. A fan CUT (fanOnly && !spentOnFan) frees amps and rewinds
+    // neither — exactly as before.
+    if (!fanOnly) this.meterState = resetCalm(this.meterState);
+    else if (spentOnFan) this.meterState = resetCalm(this.meterState, { fanSpend: true });
     // Tell the meter what we just took OFF the line. A shed's compressor stops
     // anywhere from seconds to minutes after the send, so the drop arrives as
     // one cliff with nothing tying it to us — and a cliff past the collapse

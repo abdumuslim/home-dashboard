@@ -5,6 +5,7 @@ import {
   FAN_RESTORE_CONTINUE_CALM_MS,
   FAN_RESTORE_GENTLE_CALM_MS,
   FAN_RESTORE_MAX_STEP,
+  FAN_RESTORE_RESEND_MS,
   planFanRestore,
   recordFanCut,
   recordGentleRestoreHold,
@@ -104,18 +105,27 @@ describe("planFanRestore", () => {
     // path got no window for the length of the climb. The long gate decides
     // whether a cut fan may come back AT ALL; once the first gear has proved
     // itself the remaining question is only whether the last one has landed.
-    // 1A of room — a climb, not the generous one-step swing below.
+    // 0.2A/gear against 1A of room — a bounded 1→3 climb, not the fast full swing
+    // (which at the seed price would fit) — so this exercises a genuine second gear.
+    const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
     const cut = cutLongAgo(7);
-    const first = planFanRestore(cut, [ac("a", { fanSpeed: 1 })], opts({ headroomAmps: 1 }));
-    expect(first).not.toBeNull();
+    const first = planFanRestore(cut, [ac("a", { fanSpeed: 1 })], opts({ book, headroomAmps: 1 }));
+    expect(first!.command).toMatchObject({ fan: 1 + FAN_RESTORE_MAX_STEP });
     const climbing = first!.holds;
-    // The next gear goes at the short gate…
+    // The next gear goes at the short gate… but the continuation gate now ALSO
+    // owes its own last-gear spacing (2026-08-09): the fan calm clock survives a
+    // fan-only spend, so `fanCalmMs` no longer rewinds when this hold's own gear
+    // landed — the second gear must be evaluated CONTINUE_CALM_MS after the first
+    // (`first` fired at T, so evaluate at T + CONTINUE_CALM_MS). The shadow has
+    // CONFIRMED the first gear (fanSpeed 3 == lastSetFan 3), so the confirm-or-
+    // resend gate is inert here.
+    const gearNow = T + FAN_RESTORE_CONTINUE_CALM_MS;
     expect(
-      planFanRestore(climbing, [ac("a", { fanSpeed: 3 })], opts({ calmMs: FAN_RESTORE_CONTINUE_CALM_MS, headroomAmps: 1 })),
+      planFanRestore(climbing, [ac("a", { fanSpeed: 3 })], opts({ book, calmMs: FAN_RESTORE_CONTINUE_CALM_MS, headroomAmps: 1, now: gearNow })),
     ).not.toBeNull();
-    // …but not instantly: it still has to see the meter agree.
+    // …but not instantly: it still has to see the meter agree (the calm gate).
     expect(
-      planFanRestore(climbing, [ac("a", { fanSpeed: 3 })], opts({ calmMs: FAN_RESTORE_CONTINUE_CALM_MS - 1, headroomAmps: 1 })),
+      planFanRestore(climbing, [ac("a", { fanSpeed: 3 })], opts({ book, calmMs: FAN_RESTORE_CONTINUE_CALM_MS - 1, headroomAmps: 1, now: gearNow })),
     ).toBeNull();
   });
 
@@ -387,5 +397,69 @@ describe("planFanRestore", () => {
 
   it("skips OFF ACs and ACs without holds", () => {
     expect(planFanRestore(cutLongAgo(6), [ac("a", { on: false }), ac("b")], opts())).toBeNull();
+  });
+
+  // A set_fan shadow can lag minutes on TCL, and the climb reads the OBSERVED
+  // shadow to pick the next gear — so without a plan-level in-flight gate an
+  // unconfirmed step re-emits the SAME command every own-gear tick, re-arming the
+  // fan debit and (via change C) deferring an admissible raise on a phantom step.
+  // Confirm-or-resend holds the climb until FAN_RESTORE_RESEND_MS (2026-08-09).
+  describe("confirm-or-resend gate for an unconfirmed step (2026-08-09)", () => {
+    const midClimb = (lastRestoreAt: number): FanHolds => ({
+      a: {
+        deviceId: "a", originalFan: 6, lastSetFan: 5, heldAt: T - 600_000, fromCut: true,
+        lastCutAt: T - 600_000, climbStartedAt: T - 600_000, lastRestoreAt,
+      },
+    });
+
+    it("does not re-emit while the last step is unconfirmed and inside the resend window", () => {
+      // Commanded fan 5, shadow still at 3 (unconfirmed), last step 30s ago —
+      // past the 20s own-gear gate but short of the 60s resend window.
+      expect(
+        planFanRestore(midClimb(T - 30_000), [ac("a", { fanSpeed: 3 })], opts({ calmMs: FAN_RESTORE_CALM_MS, headroomAmps: 1 })),
+      ).toBeNull();
+    });
+
+    it("resends once the window has elapsed", () => {
+      expect(
+        planFanRestore(midClimb(T - FAN_RESTORE_RESEND_MS), [ac("a", { fanSpeed: 3 })], opts({ calmMs: FAN_RESTORE_CALM_MS, headroomAmps: 1 })),
+      ).not.toBeNull();
+    });
+
+    it("a CONFIRMED shadow climbs the next gear at the ordinary 20s gate", () => {
+      // Shadow caught up to the commanded 5 → not in-flight, so the next gear
+      // (5→6) goes at the own-gear continue gate, not the resend window.
+      expect(
+        planFanRestore(midClimb(T - FAN_RESTORE_CONTINUE_CALM_MS), [ac("a", { fanSpeed: 5 })], opts({ calmMs: FAN_RESTORE_CALM_MS, headroomAmps: 1 })),
+      ).not.toBeNull();
+    });
+  });
+
+  // The fan calm clock now SURVIVES a fan-only spend so a fan hold does not queue
+  // behind another hold's fan step ("fans do not queue behind fans", 2026-08-09).
+  // That decouples `fanCalmMs` from when THIS hold's own last gear landed, so a
+  // continuation gear must ALSO owe its own `lastRestoreAt` spacing — otherwise a
+  // climb could take a gear every tick.
+  describe("continuation gear owes its own last-gear spacing (2026-08-09)", () => {
+    const midClimb = (lastRestoreAt: number): FanHolds => ({
+      a: {
+        deviceId: "a", originalFan: 6, lastSetFan: 3, heldAt: T - 600_000, fromCut: true,
+        lastCutAt: T - 600_000, climbStartedAt: T - 600_000, lastRestoreAt,
+      },
+    });
+
+    it("refuses a gear whose own last gear landed less than the continue gate ago", () => {
+      // calm long satisfied; the ONLY blocker is that this hold's last gear fired
+      // 19s ago, short of FAN_RESTORE_CONTINUE_CALM_MS (20s).
+      expect(
+        planFanRestore(midClimb(T - 19_000), [ac("a", { fanSpeed: 3 })], opts({ calmMs: FAN_RESTORE_CALM_MS, headroomAmps: 1 })),
+      ).toBeNull();
+    });
+
+    it("admits it once the own-gear spacing is met", () => {
+      expect(
+        planFanRestore(midClimb(T - FAN_RESTORE_CONTINUE_CALM_MS), [ac("a", { fanSpeed: 3 })], opts({ calmMs: FAN_RESTORE_CALM_MS, headroomAmps: 1 })),
+      ).not.toBeNull();
+    });
   });
 });

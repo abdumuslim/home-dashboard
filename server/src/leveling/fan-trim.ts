@@ -147,6 +147,22 @@ export const FAN_BOUNCE_WINDOW_MS = 180_000;
 /** Ceiling on the compounded after-cut wait — a bounce ladder must not strand a fan forever. */
 export const FAN_BOUNCE_AFTER_CUT_CAP_MS = 960_000;
 
+/**
+ * Confirm-or-resend window for a fan RESTORE step (2026-08-09, independent
+ * review). A TCL `set_fan` shadow can lag from seconds to minutes before it
+ * confirms, and the climb reads the OBSERVED shadow (`ac.fanSpeed`) to decide the
+ * next gear — so an unconfirmed step re-proposes the SAME command on every
+ * own-gear tick (~20s), each re-arming the fan debit and, via the pure-raise
+ * deferral, standing an admissible raise down for the whole confirm lag on a
+ * PHANTOM step. Mirror the confirm-or-resend the level/demote paths already use:
+ * while our last step is unconfirmed (observed fan still below what we
+ * commanded), hold this hold's climb until the window elapses, then resend once.
+ * The send-side 30s dedupe (`lastFanSent`) only partially hides this — it is
+ * keyed on a `trim`, not a `trim_restore` — and cannot stop the raise deferral,
+ * which is decided in the pure planner.
+ */
+export const FAN_RESTORE_RESEND_MS = 60_000;
+
 export interface FanHold {
   deviceId: string;
   /** Fan to eventually restore (0 = built-in auto). */
@@ -362,104 +378,144 @@ export function planFanRestore(
     // would be sitting on top of. Both hold kinds pay it: a fromCut hold
     // climbing back mid-ramp after a power event is the same physics.
     if (ac.ramping) continue;
-    // The room a restore may actually spend: what the meter shows, less the
-    // wobble the meter is going to show anyway — but the wobble is charged only
-    // to a fromCut hold. The 2026-08-06 13:12Z fan bounce lived entirely on the
+    // First gear decides "may this fan come back at all" — the long anti-bounce
+    // minute for a cut, the shorter GENTLE calm for a pin that was never cut.
+    // Continuation gears only ask "has the last one landed" and pay the short
+    // continue gate regardless of kind. All of it reads the fan path's OWN calm
+    // clock (`opts.calmMs` is `fanCalmMs` at the call site), so a fan hold is not
+    // queued behind another hold's fan step (2026-08-09, #11098-#11126).
+    const firstGearCalm = (hold.fromCut ?? true) ? FAN_RESTORE_CALM_MS : FAN_RESTORE_GENTLE_CALM_MS;
+    const gate = hold.climbStartedAt == null ? firstGearCalm : FAN_RESTORE_CONTINUE_CALM_MS;
+    if (opts.calmMs < gate) continue;
+    // …and a continuation gear also owes its OWN last-gear spacing (2026-08-09).
+    // The fan calm clock now SURVIVES a fan-only spend — that is what stops fans
+    // queueing behind fans — so `fanCalmMs` no longer rewinds when THIS hold's
+    // own last gear landed, which is the "has the last one landed" clock the
+    // continue gate used to ride on the shared reset. Without this a climb could
+    // take a gear every tick. First gears (no climb yet) are unaffected.
+    if (
+      hold.climbStartedAt != null &&
+      opts.now - (hold.lastRestoreAt ?? hold.climbStartedAt) < FAN_RESTORE_CONTINUE_CALM_MS
+    ) {
+      continue;
+    }
+    // Confirm-or-resend (2026-08-09, independent review). `current` below reads
+    // the OBSERVED shadow, so while our last step is unconfirmed (the shadow is
+    // still below what we commanded), a bare own-gear tick would re-emit the same
+    // command every ~20s — re-arming the fan debit and deferring an admissible
+    // raise on a phantom step. Hold the climb until the resend window elapses,
+    // then let it propose again (the resend). First gears (no `lastRestoreAt`)
+    // are unaffected, so a fresh cut still comes back on its own schedule.
+    if (
+      hold.lastRestoreAt != null &&
+      ac.fanSpeed != null &&
+      ac.fanSpeed < hold.lastSetFan &&
+      opts.now - hold.lastRestoreAt < FAN_RESTORE_RESEND_MS
+    ) {
+      continue;
+    }
+    // Propose a step for the budget. Factored into a closure so the gates read
+    // as one statement; the room a restore may actually spend is what the meter
+    // shows, less the wobble the meter is going to show anyway — charged only to
+    // a fromCut hold. The 2026-08-06 13:12Z fan bounce lived entirely on the
     // fromCut side (a reducer's trim handed straight back on a meter dip), which
     // is why the margin stays there; a gentle hold's pin was admission pricing,
     // not overload relief, and charging it the wobble was invariant 58's own
     // admitted regression axis, now user-confirmed (2026-08-08).
-    const spendable = opts.headroomAmps - ((hold.fromCut ?? true) ? opts.flickerMarginAmps : 0);
-    // First gear decides "may this fan come back at all" — the long anti-bounce
-    // minute for a cut, the shorter GENTLE calm for a pin that was never cut.
-    // Continuation gears only ask "has the last one landed" and pay the short
-    // continue gate regardless of kind.
-    const firstGearCalm = (hold.fromCut ?? true) ? FAN_RESTORE_CALM_MS : FAN_RESTORE_GENTLE_CALM_MS;
-    const gate = hold.climbStartedAt == null ? firstGearCalm : FAN_RESTORE_CONTINUE_CALM_MS;
-    if (opts.calmMs < gate) continue;
-    const current = ac.fanSpeed ?? hold.lastSetFan;
-    // What this hold still OWES, priced exactly as the branches below price
-    // their own steps: an auto original is one indivisible 6-gear swing, a
-    // numeric one is the gears that are left. When the room covers the whole of
-    // it with FAN_RESTORE_FAST_MARGIN_AMPS to spare, the gear bound and the long
-    // after-cut wait are guarding against a re-cross that cannot arithmetically
-    // happen — so the climb goes home in one step and owes the short wait.
-    const remainingGears = hold.originalFan === 0 ? 6 : hold.originalFan - current;
-    const swingCost =
-      remainingGears > 0 ? fanTrimSavings(opts.book, ac.deviceId, opts.source, remainingGears, opts.now) : 0;
-    const fast = remainingGears > 0 && spendable >= swingCost + FAN_RESTORE_FAST_MARGIN_AMPS;
-    // A gentle hold never owed the cut wait and its auto original was always one
-    // jump, so "fast" changes nothing for it — the label would over-claim in the
-    // journal. The GATE stays on `fast` either way; only the claim is scoped.
-    const action =
-      fast && hold.fromCut !== false
-        ? `fan restore step (fast: ${swingCost.toFixed(1)}A swing, ${spendable.toFixed(1)}A spendable)`
-        : "fan restore step";
-    // Cut→restore hysteresis. A fan-only batch does not rewind the shared calm
-    // clock, so without this the calm gate let a fan cut come all the way back
-    // ~80s later and the over-limit episode simply repeated. Gentle-restore holds
-    // are exempt: nothing was cut (see FanHold.fromCut).
-    //
-    // COMPOUNDED by consecutive bounces (2026-08-08): each doubles whichever wait
-    // applies (fast or base), capped, so a fan that keeps re-crossing waits longer
-    // each time instead of cascading (2026-07-31). A prior restore that SURVIVED
-    // past FAN_BOUNCE_WINDOW_MS ends the episode — the count resets here, so the
-    // fan is not penalised forever once the line settles.
-    const survivedPriorRestore =
-      hold.lastRestoreAt != null && opts.now - hold.lastRestoreAt >= FAN_BOUNCE_WINDOW_MS;
-    const bounces = survivedPriorRestore ? 0 : hold.bounces ?? 0;
-    const afterCutWait = Math.min(
-      FAN_BOUNCE_AFTER_CUT_CAP_MS,
-      (fast ? FAN_RESTORE_AFTER_CUT_FAST_MS : FAN_RESTORE_AFTER_CUT_MS) * 2 ** bounces,
-    );
-    if ((hold.fromCut ?? true) && opts.now - (hold.lastCutAt ?? hold.heldAt) < afterCutWait) {
-      continue;
-    }
-    if (hold.originalFan === 0) {
-      // Built-in auto: single indivisible jump, costed as a full swing — which
-      // is `swingCost` above, the same 6 gears.
-      if (swingCost <= spendable) {
-        const holds2 = {
-          ...holds,
-          [ac.deviceId]: { ...hold, lastSetFan: 0, climbStartedAt: hold.climbStartedAt ?? opts.now, bounces, lastRestoreAt: opts.now },
-        };
-        return {
-          command: { deviceId: ac.deviceId, kind: "set_fan", fan: 0, reason: "trim_restore" },
-          final: true,
-          holds: holds2,
-          action,
-        };
+    const attempt = (spendable: number): FanRestoreStep | null => {
+      const current = ac.fanSpeed ?? hold.lastSetFan;
+      // What this hold still OWES, priced exactly as the branches below price
+      // their own steps: an auto original is one indivisible 6-gear swing, a
+      // numeric one is the gears that are left. When the room covers the whole of
+      // it with FAN_RESTORE_FAST_MARGIN_AMPS to spare, the gear bound and the long
+      // after-cut wait are guarding against a re-cross that cannot arithmetically
+      // happen — so the climb goes home in one step and owes the short wait.
+      const remainingGears = hold.originalFan === 0 ? 6 : hold.originalFan - current;
+      const swingCost =
+        remainingGears > 0 ? fanTrimSavings(opts.book, ac.deviceId, opts.source, remainingGears, opts.now) : 0;
+      const fast = remainingGears > 0 && spendable >= swingCost + FAN_RESTORE_FAST_MARGIN_AMPS;
+      // A gentle hold never owed the cut wait and its auto original was always one
+      // jump, so "fast" changes nothing for it — the label would over-claim in the
+      // journal. The GATE stays on `fast` either way; only the claim is scoped.
+      const action =
+        fast && hold.fromCut !== false
+          ? `fan restore step (fast: ${swingCost.toFixed(1)}A swing, ${spendable.toFixed(1)}A spendable)`
+          : "fan restore step";
+      // Cut→restore hysteresis. A fan-only batch does not rewind the shared calm
+      // clock, so without this the calm gate let a fan cut come all the way back
+      // ~80s later and the over-limit episode simply repeated. Gentle-restore holds
+      // are exempt: nothing was cut (see FanHold.fromCut).
+      //
+      // COMPOUNDED by consecutive bounces (2026-08-08): each doubles whichever wait
+      // applies (fast or base), capped, so a fan that keeps re-crossing waits longer
+      // each time instead of cascading (2026-07-31). A prior restore that SURVIVED
+      // past FAN_BOUNCE_WINDOW_MS ends the episode — the count resets here, so the
+      // fan is not penalised forever once the line settles.
+      const survivedPriorRestore =
+        hold.lastRestoreAt != null && opts.now - hold.lastRestoreAt >= FAN_BOUNCE_WINDOW_MS;
+      const bounces = survivedPriorRestore ? 0 : hold.bounces ?? 0;
+      const afterCutWait = Math.min(
+        FAN_BOUNCE_AFTER_CUT_CAP_MS,
+        (fast ? FAN_RESTORE_AFTER_CUT_FAST_MS : FAN_RESTORE_AFTER_CUT_MS) * 2 ** bounces,
+      );
+      if ((hold.fromCut ?? true) && opts.now - (hold.lastCutAt ?? hold.heldAt) < afterCutWait) {
+        return null;
       }
-      continue;
-    }
-    if (current >= hold.originalFan) continue; // already there; reconciler confirms & releases
-    // Highest target whose cumulative step cost fits, BOUNDED to a few gears —
-    // the bound is what makes this a climb rather than a swing (the unbounded
-    // search always reached originalFan, because a 6-gear swing prices at ~0.9A).
-    // A generous budget lifts the bound and the search collapses to its first
-    // candidate, since `swingCost` is what made it generous in the first place:
-    // one command home, not the same walk spread over batches and minutes.
-    const reach = fast ? hold.originalFan : Math.min(hold.originalFan, current + FAN_RESTORE_MAX_STEP);
-    let target = current;
-    for (let candidate = reach; candidate > current; candidate--) {
-      const cost = fanTrimSavings(opts.book, ac.deviceId, opts.source, candidate - current, opts.now);
-      if (cost <= spendable) {
-        target = candidate;
-        break;
+      if (hold.originalFan === 0) {
+        // Built-in auto: single indivisible jump, costed as a full swing — which
+        // is `swingCost` above, the same 6 gears.
+        if (swingCost <= spendable) {
+          const holds2 = {
+            ...holds,
+            [ac.deviceId]: { ...hold, lastSetFan: 0, climbStartedAt: hold.climbStartedAt ?? opts.now, bounces, lastRestoreAt: opts.now },
+          };
+          return {
+            command: { deviceId: ac.deviceId, kind: "set_fan", fan: 0, reason: "trim_restore" },
+            final: true,
+            holds: holds2,
+            action,
+          };
+        }
+        return null;
       }
-    }
-    if (target === current) continue; // not even one step fits
-    const final = target === hold.originalFan;
-    const holds2 = {
-      ...holds,
-      [ac.deviceId]: { ...hold, lastSetFan: target, climbStartedAt: hold.climbStartedAt ?? opts.now, bounces, lastRestoreAt: opts.now },
+      if (current >= hold.originalFan) return null; // already there; reconciler confirms & releases
+      // Highest target whose cumulative step cost fits, BOUNDED to a few gears —
+      // the bound is what makes this a climb rather than a swing (the unbounded
+      // search always reached originalFan, because a 6-gear swing prices at ~0.9A).
+      // A generous budget lifts the bound and the search collapses to its first
+      // candidate, since `swingCost` is what made it generous in the first place:
+      // one command home, not the same walk spread over batches and minutes.
+      const reach = fast ? hold.originalFan : Math.min(hold.originalFan, current + FAN_RESTORE_MAX_STEP);
+      let target = current;
+      for (let candidate = reach; candidate > current; candidate--) {
+        const cost = fanTrimSavings(opts.book, ac.deviceId, opts.source, candidate - current, opts.now);
+        if (cost <= spendable) {
+          target = candidate;
+          break;
+        }
+      }
+      if (target === current) return null; // not even one step fits
+      const final = target === hold.originalFan;
+      const holds2 = {
+        ...holds,
+        [ac.deviceId]: { ...hold, lastSetFan: target, climbStartedAt: hold.climbStartedAt ?? opts.now, bounces, lastRestoreAt: opts.now },
+      };
+      return {
+        command: { deviceId: ac.deviceId, kind: "set_fan", fan: target, reason: "trim_restore" },
+        final,
+        holds: holds2,
+        action,
+      };
     };
-    return {
-      command: { deviceId: ac.deviceId, kind: "set_fan", fan: target, reason: "trim_restore" },
-      final,
-      holds: holds2,
-      action,
-    };
+
+    // The caller has ALREADY subtracted any shed-restore reservation from
+    // `opts.headroomAmps`, and a fan restore may never spend those amps — not
+    // even a single gear (2026-08-09, re-affirmed after independent review: while
+    // a restore is in its send→confirm window the commanded compressor has no
+    // ramp debit yet, so the reservation is the ONLY protection of the margin it
+    // is about to land on). Here we only net the supply wobble on top.
+    const step = attempt(opts.headroomAmps - ((hold.fromCut ?? true) ? opts.flickerMarginAmps : 0));
+    if (step != null) return step;
   }
   return null;
 }

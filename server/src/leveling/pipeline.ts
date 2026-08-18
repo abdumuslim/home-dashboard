@@ -713,6 +713,79 @@ export function plan(input: PlanInput): PlanOutput {
       // flicker-refused this tick via `flickerRefused` below.
       flickerRefusedSince: input.flickerRefusedSince,
     });
+
+    // A held fan may climb one sweet-spot step, but never into amps reserved for a
+    // pending shed restore (raises were parked; a fan restore must not spend that
+    // headroom either) and never into amps a ramping compressor is already
+    // committed to. Two fan restores 12s apart rode exactly that phantom budget
+    // into the 2026-07-26 trip (Najat 1→7 at 10:28:00, Abdu →auto at 10:28:12,
+    // both while Abdu was still ramping).
+    //
+    // Re-affirmed 2026-08-09 after independent review: during a restore's
+    // send→confirm window the commanded compressor has no ramp debit yet, so the
+    // reservation is the ONLY protection of those amps — even a one-gear step may
+    // not ride it. Evaluated UP FRONT (before the raise batch ships) so the pure
+    // raise below can defer to it (change C), and reading the fan path's OWN calm
+    // clock (`fanCalmMs` — a fan hold does not queue behind another hold's fan
+    // step, 2026-08-09, the 16:22Z gen cycle #11098-#11126).
+    const fanStep = planFanRestore(input.fanHolds, acs, {
+      calmMs: meter.fanCalmMs,
+      headroomAmps: pressure.headroomAmps - raisePlan.reservedAmps - rampDebit,
+      // …and never into the wobble of the supply itself. A house riding the
+      // limit with every level at its floor has only the fan left, so the
+      // restore lands right back inside the flicker band that trimmed it —
+      // live 2026-08-06, one fan commanded 10× in 22 minutes (see
+      // planFanRestore). The MARGIN statistic (largest event) — a fan must
+      // survive the biggest spike (2026-08-08). 0 on a quiet line, unchanged there.
+      flickerMarginAmps: meter.flickerMarginAmps,
+      book,
+      source,
+      now,
+    });
+    // C (2026-08-09, #11098-#11126): the restore side is the reduction ladder's
+    // INVERSE — a shed comes back before a fan, a fan before a level raise (off is
+    // worse than any level; a fan is cheaper per comfort than a compressor level).
+    // A PURE level raise stands down THIS tick for a fan step it would otherwise
+    // starve: live, Abdu's fan sat at 1 for ~10 min behind Abdullah's restore and
+    // an L2→L3 raise while the meter idled ~2A under the limit. Restores, swaps,
+    // funded rebalances and correction-bearing ticks are NEVER preempted — those
+    // are off-relief or safety, not a raise we can afford to wait a tick for. The
+    // raise re-arms next tick and waits its ordinary calm: the fan's spend rewinds
+    // the MAIN clock, and the fan debit needs those seconds to absorb anyway
+    // (invariant 12's "a fan restore waits behind a fresh raise" is the ramp-debit
+    // direction, unchanged).
+    const pureRaise =
+      raisePlan.commands.length > 0 &&
+      !raisePlan.isTurnOn &&
+      raisePlan.swap == null &&
+      raisePlan.fundingDonors.length === 0 &&
+      corrections.commands.length === 0;
+    if (pureRaise && fanStep != null) {
+      const raiseSummary = raisePlan.commands
+        .map((c) => (c.kind === "set_level" ? `${c.deviceId}→L${c.level}` : c.deviceId))
+        .join(", ");
+      return {
+        commands: [fanStep.command],
+        expectedDeltaAmps: 0,
+        commandedCutAmps: 0,
+        compareAfter: now + GRADE_FAN_MS,
+        // LOUD: a silent preemption is the next forensic mystery. Name the raise
+        // that stood down beside the fan step that displaced it.
+        decisions: [
+          ...raisePlan.decisions,
+          { at: now, deviceId: raisePlan.commands[0].deviceId, action: "raise deferred to fan restore", detail: raiseSummary },
+          { at: now, deviceId: fanStep.command.deviceId, action: fanStep.action },
+        ],
+        reason: "fan_restore",
+        severity: null,
+        requiredAmps: null,
+        fanHolds: fanStep.holds,
+        attempts: [],
+        fanOnly: true,
+        flickerRefused: raisePlan.flickerRefused,
+      };
+    }
+
     if (raisePlan.commands.length > 0 || corrections.commands.length > 0) {
       // A gentle restore (power_on carrying a pinned fan) records a fan hold so
       // the range automation can't slam the fan back up before the room settles.
@@ -788,26 +861,12 @@ export function plan(input: PlanInput): PlanOutput {
       }
       raisePlan.decisions.push(...demotes.decisions);
     }
-    // A held fan may climb one sweet-spot step, but never
-    // into amps reserved for a pending shed restore (raises were parked; a fan
-    // restore must not spend that headroom either) and never into amps a
-    // ramping compressor is already committed to. Two fan restores 12s apart
-    // rode exactly that phantom budget into the 2026-07-26 trip (Najat 1→7 at
-    // 10:28:00, Abdu →auto at 10:28:12, both while Abdu was still ramping).
-    const fanStep = planFanRestore(input.fanHolds, acs, {
-      calmMs: meter.calmMs,
-      headroomAmps: pressure.headroomAmps - raisePlan.reservedAmps - rampDebit,
-      // …and never into the wobble of the supply itself. A house riding the
-      // limit with every level at its floor has only the fan left, so the
-      // restore lands right back inside the flicker band that trimmed it —
-      // live 2026-08-06, one fan commanded 10× in 22 minutes (see
-      // planFanRestore). The MARGIN statistic (largest event) — a fan must
-      // survive the biggest spike (2026-08-08). 0 on a quiet line, unchanged there.
-      flickerMarginAmps: meter.flickerMarginAmps,
-      book,
-      source,
-      now,
-    });
+    // The fan step was evaluated UP FRONT (see change C, after planRaise). It
+    // ships here only after the raise phase produced nothing AND the idle demotes
+    // were parked: reclaiming a satisfied room's dormant compressor levels is
+    // strictly better than spending headroom on a fan, so a demote still wins the
+    // tick where both are possible — only a PURE raise defers to the fan, never a
+    // demote (2026-08-09).
     if (fanStep != null) {
       return {
         commands: [fanStep.command],

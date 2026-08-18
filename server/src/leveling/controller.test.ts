@@ -1373,6 +1373,72 @@ describe("LevelingControllerV2 — ramp absorption ratchet", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The fan calm clock survives a fan-only spend at the SHELL (2026-08-09, the
+// 16:22Z gen cycle #11098-#11126). controller.ts rewinds BOTH calm anchors for a
+// non-fan batch and only the MAIN anchor for a fan-only SPEND. scenario.ts
+// MIRRORS this line — so a harness test cannot prove the real shell does it; the
+// guard belongs here. A fan restore that lands must leave the main calm clock
+// reset (a raise 12s later still waits — invariant 18) and the fan clock intact.
+// ---------------------------------------------------------------------------
+
+describe("LevelingControllerV2 — a fan-only restore spend spares the fan calm clock", () => {
+  it("resets the main calm anchor but not the fan one when a gentle restore lands", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-09T16:22:00Z"));
+      const mock = createMockPool();
+      mock.configById.set(2, {
+        controller: "v2",
+        enabled: true,
+        genLimitAmps: 15,
+        marginAmps: 0.1,
+        fanTrimEnabled: true,
+        genAmpModels: { a: { baseAmps: 2, stepAmps: 2 } },
+      });
+      // A gentle fan hold pinned to 1 on a past restore — it climbs back to auto
+      // once the line is calm, as a FAN-ONLY spend.
+      mock.fanHolds.set("a", { original_fan: 0, last_set_fan: 1 });
+      const controller = new LevelingControllerV2(mock.pool, {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never,
+      });
+      await controller.ensureLoaded();
+      expect(controller.hasFanHold("a")).toBe(true);
+
+      const ctx = [
+        { device: acDevice("a", true, 1), managed: true, needTier: "mild" as const, needDelta: 0, slotGenCap: null },
+      ];
+      const meterState = () =>
+        (controller as unknown as { meterState: { calmSince: number | null; fanCalmSince: number | null } }).meterState;
+
+      // Drive a long, roomy, calm gen line (6A against a 15A limit) past FLOORS
+      // until the held fan climbs home and releases — that landing tick is the
+      // fan-only spend whose calm-reset we are pinning.
+      let flip = 1;
+      let restored = false;
+      for (let i = 0; i < 240 && !restored; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: 6 + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx, 30);
+        if (!controller.hasFanHold("a")) restored = true;
+      }
+      expect(restored, "the gentle fan hold climbed home within the window").toBe(true);
+
+      // The landing tick's `resetCalm({ fanSpend: true })` fired: the MAIN clock
+      // is reset (a raise still owes its calm — invariant 18)…
+      expect(meterState().calmSince).toBeNull();
+      // …but the fan path's own clock is spared, so a peer fan hold's first gear
+      // would not be queued behind this spend.
+      expect(meterState().fanCalmSince).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The 2026-07-30 gen turn-on (live 05:51:07 Baghdad, 15A gen). Najat had been
 // driven to L3 by the grid full start, switched off, and came back on 33
 // minutes into a gen session — long past FLOORS. The TCL restored

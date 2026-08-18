@@ -474,6 +474,10 @@ receiver on together, 69), the ramp early release (via the imported
 so `controller.test.ts` is their only net: the flicker-patience anchor lifecycle
 (`flickerRefusedSince` — the stamp, the drop-on-unrefused, the non-raise-tick
 guard, the source-change clear; invariant 68) and `maybeReleaseRampEarly` itself.
+**2026-08-09:** `scenario.ts` also mirrors the split `resetCalm` (the `fanSpend`
+option — a fan-only spend rewinds only the MAIN clock, 71), while the
+`fanCalmSince` lifecycle guard (the fan clock survives a fan spend) stays
+`controller.test.ts`-only.
 
 **Added 2026-08-03 (midday) after the top-priority room sat 20 min at a level its compressor will not run at:**
 36. **A level that does not cool is an off — in BOTH directions.** A comfort
@@ -1085,7 +1089,8 @@ guard, the source-change clear; invariant 68) and `maybeReleaseRampEarly` itself
     instead of the full `FAN_RESTORE_CALM_MS` minute (it was never CUT, so there is
     no bounce to guard). And with 70's early ramp release the fan clears its own
     self-skip (59) once the compressor plateaus, so it now returns ~60–95 s after a
-    landed restore instead of 240 s-plus.
+    landed restore instead of 240 s-plus. See 71 for the 2026-08-09 restore-side
+    inversion (fans no longer queue behind fans or lose their tick to a pure raise).
 61. **Inside the gap the configured priority breaks a shed tie — anchored on the
     thermometer's own pick, NEVER pairwise.** 14:38:11Z the reducer shed
     Abdullah — priority #1, real need 4.0 °C — because Abdu ranked **0.05 °C**
@@ -1365,6 +1370,73 @@ guard, the source-change clear; invariant 68) and `maybeReleaseRampEarly` itself
     (credit and total are 0), so no protection is lost; it may only ever make the
     window SHORTER. Learning windows, calm durations, pacing, and the shed-trough
     bars are untouched.
+
+**Added 2026-08-09 after Abdu's fan sat at speed 1 for ~10 minutes with ~2A idle (the 16:22Z gen cycle, journal #11098–#11126):**
+71. **The restore side is the reduction ladder's INVERSE: shed restores ≫ fan
+    restores ≫ level raises — and fans do not queue behind fans.** The ladder cuts
+    levels → fans → sub-floor → a room off (24–29); coming back it must climb
+    those rungs top-down — off is worse than any level, a fan is cheaper per
+    comfort than a compressor level — and a fan hold must never wait behind
+    ANOTHER hold's fan step. Abdu's fan was cut 7→5→4→2→1, a room shed freed
+    ~2.3 A, and his fan then did not START climbing for ~9.8 min while the meter
+    idled ~2 A under the limit: parked behind Abdullah's fan restore and an L2→L3
+    raise that kept resetting the shared calm clock, and behind a flicker-patience
+    reservation (68) that zeroed the fan budget.
+    (a) **The fan path keeps its OWN calm clock.** `MeterState.fanCalmSince` /
+    `MeterView.fanCalmMs` run EXACTLY parallel to `calmSince`/`calmMs` — the same
+    reading breaks and stamps both — and diverge only through
+    `resetCalm({ fanSpend: true })`: a fan-only restore SPEND rewinds the MAIN
+    clock (invariant 18's protection is untouched — two fatal raises 12 s/17 s
+    after a fan restore still cannot land on the amps the fan just took) but SPARES
+    the fan clock, so a fan hold's 60 s first gear no longer counts down behind
+    every other hold's fan step. Live cost of the shared clock: Abdullah's fan
+    restore (16:31:33) and his L2→L3 raise (16:32:08) kept rewinding the clock
+    Abdu's first gear was on, and the raise took the freed amps. A CONTINUATION
+    gear now also owes its OWN last-gear spacing via `hold.lastRestoreAt` (the
+    shared reset used to supply "has the last gear landed" implicitly; without it a
+    climb would take a gear every tick). A fan CUT rewinds NEITHER clock — it frees
+    amps.
+    (b) **A PURE level-raise batch stands down ONE tick for an admissible fan
+    step** — journalled LOUD as `raise deferred to fan restore`, naming the raise
+    that yielded and the fan that displaced it (a silent preemption is the next
+    forensic mystery). "Pure" = a raise with NO restore, swap, funding donor or
+    correction: those are off-relief or safety and are NEVER preempted. The fan
+    step is evaluated UP FRONT (before the raise batch ships) so the raise can see
+    it. Starvation is bounded — a climb ends, and (c) stops the raise being
+    deferred to a phantom step forever.
+    (c) **`FAN_RESTORE_RESEND_MS` (60 s) confirm-or-resend.** A TCL `set_fan`
+    shadow can lag seconds to minutes, and the climb reads the OBSERVED shadow
+    (`ac.fanSpeed`) to pick the next gear — so an unconfirmed step used to
+    re-propose the SAME command every own-gear tick (~20 s), each re-arming the fan
+    debit and, via (b), standing an admissible raise down on a step that had not
+    moved. While our last step is unconfirmed (observed fan below what we
+    commanded) the climb holds until this window elapses, then resends once.
+    Mirrors the level/demote confirm-or-resend; the send-side 30 s `lastFanSent`
+    dedupe cannot cover it (keyed on `trim`, not `trim_restore`, and it cannot stop
+    the pure-planner raise deferral).
+    (d) ⚠️ **A live shed-restore reservation parks even a ONE-GEAR fan step** —
+    re-affirmed 2026-08-09, now as an explicit rule. A bounded carve-out (a single
+    gear under the reservation) was BUILT and REMOVED the same day on independent
+    review (Codex, FIX-FIRST): during a restore's send→confirm window
+    (5.8 s–13 min observed) the commanded compressor has NO ramp debit yet, so the
+    reservation is the ONLY protection of those amps — a carved gear could push the
+    reserved room's BARE fit into failure, silently deleting its flicker-patience
+    anchor (68), and a fan resetting a shed room's 120 s patience clock inverts
+    THIS invariant's own ordering. It was near-worthless in the birth incident
+    anyway: flicker + ramp debits had already consumed the carved budget in every
+    window.
+    (e) **Harness/tests.** `scenario.ts` mirrors the split `resetCalm` (the
+    `fanSpend` option); the `fanCalmSince` lifecycle guard lives in
+    `controller.test.ts` (shell-side, the only net for `meterState`). The
+    2026-07-31 anti-cascade scenario DROPPED its "a single full swing must STICK"
+    clause — a deliberate consequence of (a): with the fan no longer queued behind
+    peers' restores, one boundary-timed full-swing bounce can now occur in a
+    pathological 75 s over/75 s under storm and converges via the (untouched)
+    bounce-compounding ladder (67, one rung down) — and GAINED a `trim_restore ≤ 4`
+    count cap, because a bounded-step limit cycle (7→5→3→1→3→1→3: zero full swings,
+    exactly 3 reversals) was invisible to the fullSwings/reversals guards. A new
+    acceptance scenario pins a cut fan fully home within 150 s of a shed (live it
+    took ~9.8 min).
 
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket

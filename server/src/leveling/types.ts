@@ -92,6 +92,18 @@ export interface MeterState {
   /** Timestamp when the current uninterrupted genuine-headroom stretch began, or null. */
   calmSince: number | null;
   /**
+   * The fan path's OWN calm anchor, maintained EXACTLY in parallel with
+   * `calmSince` by every meter-side break/stamp — but spared by a fan-only SPEND
+   * (see `resetCalm({ fanSpend: true })`). A fan restore rewinds the main clock
+   * so a level raise cannot land on the amps the fan just took (invariant 18: two
+   * fatal raises 12s/17s after a fan restore), yet a fan hold's own 60s first
+   * gear must NOT then wait behind every OTHER hold's fan step — "fans do not
+   * queue behind fans" (2026-08-09, the 16:22Z gen cycle #11098-#11126, where
+   * Abdullah's restore + raise repeatedly reset the shared clock Abdu's first
+   * gear was counting down). In-memory only, like `calmSince`.
+   */
+  fanCalmSince: number | null;
+  /**
    * Calm stand-down after an unexplained collapse-shaped fall (see the
    * `unexplained_fall` event). A trough we cannot explain is not headroom: live
    * 2026-08-02 17:40 a real break left a 5.9A residual that read as PERFECT
@@ -182,6 +194,15 @@ export interface MeterView {
   sampleCount: number;
   /** Milliseconds of uninterrupted genuine headroom (SMOOTHED ≤ limit − margin). */
   calmMs: number;
+  /**
+   * The same clock as `calmMs`, computed from the fan path's own anchor
+   * (`MeterState.fanCalmSince`). Identical to `calmMs` everywhere EXCEPT across a
+   * fan-only spend, which rewinds `calmMs` (raises must still wait — invariant
+   * 18) but leaves this one running so a fan hold's first gear is not queued
+   * behind another hold's fan step (2026-08-09, #11098-#11126). `planFanRestore`
+   * reads this; every other spender reads `calmMs`.
+   */
+  fanCalmMs: number;
   /**
    * Milliseconds the SMOOTHED mean has sat continuously over the effective
    * limit (0 when it is not). Severity escalates on this clock as well as on

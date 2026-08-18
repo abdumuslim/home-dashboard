@@ -58,12 +58,13 @@ function ac(id: string, overrides: Partial<AcView> = {}): AcView {
 }
 
 function meter(overrides: Partial<MeterView> = {}): MeterView {
-  return {
+  const merged: MeterView = {
     source: "gen",
     smoothedAmps: 12,
     latestAmps: 12,
     sampleCount: 4,
     calmMs: 0,
+    fanCalmMs: 0,
     smoothedOverMs: 0,
     overLimitBudget: 5,
     overLimitReadings: [],
@@ -78,6 +79,11 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     commandedCutAgeMs: 0,
     ...overrides,
   };
+  // The fan path reads its OWN calm clock; default it to the main clock so a
+  // test that sets only `calmMs` keeps meaning "the line has been calm this
+  // long" for both — they diverge only after a fan-only spend (2026-08-09).
+  if (overrides.fanCalmMs === undefined) merged.fanCalmMs = merged.calmMs;
+  return merged;
 }
 
 /** Bucket empty with these over-limit readings → assessPressure returns "over". */
@@ -584,6 +590,100 @@ describe("idle demote precedence in the calm branch", () => {
   });
 });
 
+// The restore side is the reduction ladder's INVERSE (2026-08-09, the 16:22Z
+// gen cycle #11098-#11126): a shed comes back before a fan, a fan before a level
+// raise. A PURE level raise defers a tick to an admissible fan step; restores,
+// swaps, funded rebalances and correction-bearing ticks are off-relief or safety
+// and are never preempted.
+describe("change C: a pure level raise defers to an admissible fan step (2026-08-09)", () => {
+  const gentleHold = (id: string) => ({ [id]: { deviceId: id, originalFan: 0, lastSetFan: 1, heldAt: T - 600_000 } });
+
+  it("ships the fan and journals the deferred raise, naming both", () => {
+    const out = run(
+      [ac("a", { currentLevel: 1, needDelta: 2 }), ac("b", { currentLevel: 1, fanSpeed: 1, needDelta: 0 })],
+      meter({ smoothedAmps: 6, calmMs: 600_000 }),
+      { fanHolds: gentleHold("b") },
+    );
+    expect(out.reason).toBe("fan_restore");
+    expect(out.commands).toEqual([{ deviceId: "b", kind: "set_fan", fan: 0, reason: "trim_restore" }]);
+    // LOUD: a silent preemption is the next forensic mystery — the deferred raise
+    // is named beside the fan that displaced it.
+    expect(out.decisions.some((d) => d.action === "raise deferred to fan restore" && d.deviceId === "a")).toBe(true);
+  });
+
+  it("control: with no admissible fan, the same raise ships normally", () => {
+    const out = run(
+      [ac("a", { currentLevel: 1, needDelta: 2 }), ac("b", { currentLevel: 1, fanSpeed: 1, needDelta: 0 })],
+      meter({ smoothedAmps: 6, calmMs: 600_000 }),
+    );
+    expect(out.reason).toBe("raise");
+    expect(out.commands.some((c) => c.kind === "set_level" && c.deviceId === "a")).toBe(true);
+    expect(out.decisions.some((d) => d.action === "raise deferred to fan restore")).toBe(false);
+  });
+
+  it("does NOT preempt a restore-bearing tick — off is worse than any level", () => {
+    const out = run(
+      [ac("a", { on: false, shed: true, currentLevel: 1, needDelta: 5 }), ac("c", { currentLevel: 1, fanSpeed: 1, needDelta: 0 })],
+      meter({ smoothedAmps: 6, calmMs: 600_000 }),
+      { fanHolds: gentleHold("c") },
+    );
+    expect(out.reason).toBe("restore");
+    expect(out.commands.some((c) => c.kind === "power_on" && c.deviceId === "a")).toBe(true);
+    expect(out.decisions.some((d) => d.action === "raise deferred to fan restore")).toBe(false);
+  });
+
+  it("does NOT preempt a correction-bearing tick — corrections are safety", () => {
+    const out = run(
+      [ac("a", { currentLevel: 0 }), ac("b", { currentLevel: 1, fanSpeed: 1, needDelta: 0 })],
+      meter({ smoothedAmps: 6, calmMs: 600_000 }),
+      { fanHolds: gentleHold("b") },
+    );
+    // "a" at level 0 → the never-level-0 correction re-caps it and shares the
+    // batch, so the fan path cannot preempt this tick.
+    expect(out.commands.some((c) => c.kind === "set_level" && c.deviceId === "a")).toBe(true);
+    expect(out.decisions.some((d) => d.action === "raise deferred to fan restore")).toBe(false);
+  });
+});
+
+describe("a live restore reservation is the sole guard of its amps (2026-08-09)", () => {
+  it("parks even a one-gear fan step — awaiting-confirm amps have no ramp debit", () => {
+    // b's restore is feasible but calm-gated, so it reserves amps and parks the
+    // raise phase. During its send→confirm window the commanded compressor has no
+    // ramp debit yet, so the reservation is the ONLY protection of the margin it
+    // is about to land on — the fan budget subtracts it whole and even a single
+    // gear may not ride it (independent review reverted an earlier carve-out).
+    const out = run(
+      [
+        ac("a", { currentLevel: 3, needDelta: 0.2, satisfiedForMs: 300_000, fanSpeed: 1 }),
+        ac("b", { on: false, shed: true, currentLevel: 1, needDelta: 5 }),
+        ac("c", { currentLevel: 1, fanSpeed: 1, needDelta: 0 }),
+      ],
+      meter({ smoothedAmps: 13.5, calmMs: 1_000, fanCalmMs: 600_000 }),
+      { fanHolds: { c: { deviceId: "c", originalFan: 6, lastSetFan: 1, heldAt: T - 600_000, lastCutAt: T - 600_000, fromCut: true } } },
+    );
+    expect(out.commands.some((c) => c.kind === "set_fan")).toBe(false);
+    expect(out.decisions.some((d) => d.blockedBy === "restore reservation")).toBe(true);
+  });
+
+  it("an admissible pure raise ships normally while a fan hold is awaiting confirm (2026-08-09)", () => {
+    // Change C must not defer a raise to a PHANTOM fan step: b's last restore
+    // step is unconfirmed (shadow 3 < commanded 5) and inside the resend window,
+    // so `planFanRestore` returns nothing and the pure raise is free to ship.
+    const out = run(
+      [ac("a", { currentLevel: 1, needDelta: 2 }), ac("b", { currentLevel: 3, fanSpeed: 3, needDelta: 0 })],
+      meter({ smoothedAmps: 6, calmMs: 600_000 }),
+      {
+        fanHolds: {
+          b: { deviceId: "b", originalFan: 6, lastSetFan: 5, heldAt: T - 600_000, fromCut: true, lastCutAt: T - 600_000, climbStartedAt: T - 600_000, lastRestoreAt: T - 30_000 },
+        },
+      },
+    );
+    expect(out.reason).toBe("raise");
+    expect(out.commands.some((c) => c.kind === "set_level" && c.deviceId === "a")).toBe(true);
+    expect(out.decisions.some((d) => d.action === "raise deferred to fan restore")).toBe(false);
+  });
+});
+
 // The clamp lives in invariantCorrections, so it must reach the batch from
 // every non-COLLAPSED branch — which is the whole point of putting it there.
 // A gen turn-on is over-limit by definition on a 15A line, so the branch that
@@ -743,5 +843,17 @@ describe("proactive shed: the donor's power_off ships with the receiver's on", (
     // amps go to the ordinary raise phase (`cool` L1→L2 here). The trade is a
     // comfort optimisation and it waits; a batch that never grades would cost
     // the cost book and the compressor evidence permanently.
+  });
+
+  it("a SWAP tick is not preempted by an admissible fan step (2026-08-09)", () => {
+    // Change C defers only a PURE raise; a swap (`raisePlan.swap != null`) is a
+    // room coming back from OFF and is never stood down for a fan. `mid` carries
+    // a fan hold that would otherwise ship — the trade still arms.
+    const out = run([hot(), mid(), cool()], calm(), {
+      config: swapCfg,
+      fanHolds: { b: { deviceId: "b", originalFan: 0, lastSetFan: 1, heldAt: T - 600_000 } },
+    });
+    expect(out.swap).toEqual({ donorId: "c", receiverId: "a" });
+    expect(out.decisions.some((d) => d.action === "raise deferred to fan restore")).toBe(false);
   });
 });
