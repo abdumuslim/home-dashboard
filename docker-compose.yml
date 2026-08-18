@@ -39,10 +39,29 @@ services:
       - traefik.http.routers.home.entrypoints=web,websecure
       - traefik.http.services.home.loadbalancer.server.port=8000
 
+  tuya-bridge:
+    build: ./tuya-bridge
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
+    # Deliberately NOT env_file: .env — the bridge talks to Tuya's cloud and must
+    # not hold the dashboard's unrelated secrets. ${VARS} interpolate from .env.
+    environment:
+      - TARGET_URL=http://dashboard:8000/api/power/tuya-ingest
+      - TUYA_DEVICE_ID=${TUYA_DEVICE_ID}
+      - TUYA_INGEST_TOKEN=${TUYA_INGEST_TOKEN}
+    volumes:
+      - tuya_bridge_data:/data
+    depends_on:
+      - dashboard
+    networks:
+      - rag_default
+
 volumes:
   mosquitto_data:
   mosquitto_log:
   dashboard_data:
+  tuya_bridge_data:
 
 networks:
   rag_default:

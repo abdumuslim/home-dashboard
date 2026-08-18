@@ -55,3 +55,5 @@ home-dashboard-plan.md
 test.md
 docs/conversation.jsonl
 .migration-backup/
+
+__pycache__/

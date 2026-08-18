@@ -1,0 +1,4 @@
+tuya-device-sharing-sdk
+requests
+cryptography
+paho-mqtt

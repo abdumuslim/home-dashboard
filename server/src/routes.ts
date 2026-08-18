@@ -15,6 +15,7 @@ import type { AcLevelingStatus } from "./ac-leveler.js";
 import type { AcCalibrationStatus, CalibrationResultRow, CalibrationFit } from "./ac-calibration.js";
 import { PowerStatsService } from "./power-stats-service.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession, clientIp, type AuthKind } from "./auth.js";
+import { registerTuyaPowerRoutes } from "./tuya-power.js";
 import { childLogger } from "./logger.js";
 import { computeChangedKeys } from "./leveling-config-audit.js";
 import {
@@ -551,6 +552,12 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
     res.json({ ok: true });
   });
+
+  // ---------- Power Ingest (Tuya SHADOW feed) ----------
+  // Fully isolated from the ESP path above: never touches latestPower/powerBuffer
+  // and never calls onPowerIngest (see tuya-power.ts). Registered here so it runs
+  // after the auth middleware and its GET can use requireAuth.
+  registerTuyaPowerRoutes(router, pool, config);
 
   // ---------- Push Notifications ----------
 

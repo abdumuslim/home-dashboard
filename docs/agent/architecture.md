@@ -157,6 +157,22 @@ Discovered 2026-03-14 by logging the raw MQTT payload to check for charging stat
 - Table `power_readings` (ts, voltage, current_1, current_2, power_1, power_2) — see [database.md](database.md).
 - Writes 1-minute medians (not raw values) — `powerBuffer` accumulates ingest readings, `median()` in `routes.ts` computes a per-field median every 60s.
 
+**Tuya SHADOW feed (P2 of the ESP-replacement, added 2026-08-18):**
+- A second, fully ISOLATED power feed from a ZheerHome/Tuya QS-WIFI-S04-CT02 2-clamp meter:
+  compose service `tuya-bridge` (`tuya-bridge/`, Python) subscribes to Tuya Sharing-SDK cloud-MQTT
+  pushes (~2.6 s fixed cadence per clamp), decodes the binary phase DPs, and POSTs ESP-shaped
+  `{v, i1, i2}` to `POST /api/power/tuya-ingest` over the compose network.
+- The route (`server/src/tuya-power.ts`) requires `Authorization: Bearer $TUYA_INGEST_TOKEN`
+  (fail-closed 503 when the env var is unset), keeps its own in-memory latest + 60 s median
+  buffer, and writes ONLY `tuya_power_readings` (same shape as `power_readings`).
+- **Isolation is a hard invariant:** the shadow feed never calls `onPowerIngest`, never touches
+  `latestPower`/`powerBuffer`/`power_readings` — the leveling controller's ESP-gap strain
+  detection (invariant 47) and flicker statistics key off the single ESP stream. Pinned by the
+  "SHADOW feed isolation" regression in `tuya-power.test.ts`.
+- Observability: `GET /api/power/tuya` (auth) → `{ latest, staleSeconds, ingestCount }`.
+- The ESP stays authoritative for everything; the shadow feed exists for the P3 side-by-side
+  comparison and the future P4 promotion decision (design in the project memory / ops doc).
+
 **Alert integration (added 2026-04-24):**
 - 6 power metrics in `alert-metrics.ts` with `source: "power"`, `group: "Power"`: `voltage` (V), `power_grid`/`power_gen` (W, via dbColumn power_1/power_2), `power_total` (W, computed sum), `current_grid`/`current_gen` (A, via dbColumn current_1/current_2).
 - Data plumbing: routes→collector via `onPowerIngest` callback (opposite of the air getter direction). `createRouter()` accepts the callback and calls it on each ingest. Collector stores the data as `latestPowerRow`/`latestPowerTs` via `setLatestPower()`.

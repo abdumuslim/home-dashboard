@@ -273,6 +273,18 @@ const MIGRATIONS: string[] = [
     enabled_after  BOOLEAN
   )`,
   "CREATE INDEX IF NOT EXISTS ac_leveling_config_audit_at_brin ON ac_leveling_config_audit USING BRIN (at)",
+  // Tuya SHADOW power feed (ZheerHome QS-WIFI-CT02 ESP-replacement, P2). Mirrors
+  // power_readings exactly but is written ONLY by POST /api/power/tuya-ingest —
+  // kept isolated from the ESP stream the leveling controller keys off of.
+  `CREATE TABLE IF NOT EXISTS tuya_power_readings (
+    ts          TIMESTAMPTZ PRIMARY KEY,
+    voltage     REAL NOT NULL,
+    current_1   REAL NOT NULL,
+    current_2   REAL NOT NULL,
+    power_1     REAL NOT NULL,
+    power_2     REAL NOT NULL
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_tuya_power_ts_brin ON tuya_power_readings USING BRIN (ts)",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {
