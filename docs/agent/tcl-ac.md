@@ -203,6 +203,8 @@ Discovered 2026-05-10 when debugging "abdu ac not taking fan speed"; **widened 2
 ### Common pattern — "shadow says yes but device says no"
 Both quirks share the same signature: shadow `state.reported` shows the settings as applied (the device acknowledges), but the physical AC ignores them. `computeAcDiff()` sees no difference because the reported state looks correct. The mitigation in both cases is to split the conflicting properties into separate shadow updates with a delay.
 
+A **third face** of the same lie: a command sent while the unit is still booting after a power cycle can be echoed into `reported` without ever being physically applied (2026-08-18 — a range re-enforcement's `fan_speed:7` landed 25 s into a post-changeover reboot, reported `turbo=1`, and ran quiet for ~29 min). No split helps here — the unit simply isn't listening yet — so the collector holds background range enforcement for that device until its first fresh post-event shadow report ([ac-automations.md](ac-automations.md) → "Boot hold-off after a changeover").
+
 **How to apply:** When adding new AC firmware integrations or changing `executeAcAction`, never assume all properties can be sent in a single shadow update. Test each property group separately and watch for the "shadow says yes but device says no" pattern.
 
 ### TCL can REMOVE features via OTA (2026-06)

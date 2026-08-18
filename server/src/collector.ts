@@ -294,6 +294,22 @@ export class Collector {
    */
   private acPowerCycleAt = new Map<string, number>();
   private readonly AC_POWER_CYCLE_RESET_MS = 15 * 60_000;
+  /**
+   * Subset of `acPowerCycleAt`: only the cycles caused by a REAL source
+   * transition (a grid↔gen changeover), which physically reboots the AC. A boot
+   * ("source none → X" = only the server restarted) and an ESP gap do NOT
+   * power-cycle the units, so they are excluded. This is the edge the
+   * post-changeover boot hold-off gates on — `acPowerCycleAt` keeps its broader
+   * semantics for its many other consumers (see `holdRangeEnforcementForBoot`,
+   * 2026-08-18).
+   */
+  private acSourceCycleAt = new Map<string, number>();
+  /** Last source-cycle stamp a boot hold-off was logged for, per device — so the hold logs once per episode, not once per tick. */
+  private acBootHoldLoggedAt = new Map<string, number>();
+  // A changeover-rebooted TCL unit takes ~30–90s to reboot + rejoin WiFi +
+  // re-shadow; hold background range enforcement at most this long (still well
+  // under the 5-min automation cooldowns) before letting sends resume anyway.
+  private readonly BOOT_HOLDOFF_MAX_MS = 4 * 60_000;
   /** Devices seen shed on the previous sweep — for leveler shed EDGE detection. */
   private acShedSeen = new Set<string>();
   // Fan/swing enforcement sweep (beep-style): per-device resend cooldown so a
@@ -576,6 +592,14 @@ export class Collector {
    */
   private notePowerCycle(deviceId: string, reason: string): void {
     this.acPowerCycleAt.set(deviceId, Date.now());
+    // Only a REAL source transition physically reboots the AC (a "source none → X"
+    // boot restarts only the server; an ESP gap / leveler cycle says nothing
+    // about a mains changeover), so only those reasons arm the post-changeover
+    // boot hold-off. Gate on this dedicated map — `acPowerCycleAt`'s semantics
+    // must stay untouched for its many other consumers (2026-08-18).
+    if (reason.includes("source ") && !reason.includes("source none")) {
+      this.acSourceCycleAt.set(deviceId, Date.now());
+    }
     let cleared = false;
     for (const [key, entry] of this.acFanEnforcement) {
       if (!key.endsWith(`:${deviceId}`)) continue;
@@ -2006,7 +2030,7 @@ export class Collector {
                 this.clearAcSwingOverride(rule.id, did);  // and swing intent resets
                 const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
                 const diff = this.tclCloud!.computeAcDiff(did, this.stripLeveledControls(rule, profileOnly, did));
-                if (diff) {
+                if (diff && !this.holdRangeEnforcementForBoot(did)) {
                   log.info(`[collector] AC range "${rule.name}": device ${did} is ON while locked, adopting with diff: ${JSON.stringify(diff)}`);
                   const execution = await this.tclCloud!.executeAcAction(did, diff, {
                     suppressWhileManualPresetPending: true,
@@ -2082,7 +2106,7 @@ export class Collector {
                 this.updateAcFanTracking(rule, activeSlot, did, value, now);
                 const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
                 const diff = this.tclCloud!.computeAcDiff(did, this.stripLeveledControls(rule, profileOnly, did));
-                if (diff) {
+                if (diff && !this.holdRangeEnforcementForBoot(did)) {
                   log.info(`[collector] AC range "${rule.name}": device ${did} is ON in dead zone (${rule.metric}=${value}), adopting with diff: ${JSON.stringify(diff)}`);
                   const execution = await this.tclCloud!.executeAcAction(did, diff, {
                     suppressWhileManualPresetPending: true,
@@ -2166,7 +2190,7 @@ export class Collector {
             this.updateAcFanTracking(rule, activeSlot, did, value, now);
             const { power: _p, ...profileOnly } = this.effectiveAcRangeProfile(rule, activeSlot, did, value);
             const diff = this.tclCloud!.computeAcDiff(did, this.stripLeveledControls(rule, profileOnly, did));
-            if (diff) {
+            if (diff && !this.holdRangeEnforcementForBoot(did)) {
               log.info(`[collector] AC range "${rule.name}": re-enforcing diff for ${did}: ${JSON.stringify(diff)}`);
               const execution = await this.tclCloud!.executeAcAction(did, diff, {
                 suppressWhileManualPresetPending: true,
@@ -2277,6 +2301,44 @@ export class Collector {
     }
   }
 
+  /**
+   * Post-changeover boot hold-off (2026-08-18): true when a BACKGROUND range
+   * enforcement send must be SKIPPED this tick because the unit is still booting
+   * after a real source transition power-cycled it — retried next tick.
+   *
+   * A gen→grid changeover at 14:28:20Z power-cycled the ESP-line ACs; 25 s later
+   * the range diff re-enforcement landed `{fan_speed:7, vertical_swing:10,
+   * horizontal_swing:11}` on CA5IMhFAAAE, still booting. The firmware ECHOED it
+   * into the shadow (reported turbo=1, so `computeAcDiff` saw "no diff" forever)
+   * but never physically applied it — the fan ran quiet until the user hand-
+   * cycled 7→6→7 at 14:57Z. The lying shadow makes `sendControlVerified` /
+   * confirm-or-resend / the enforcement sweep all blind by construction (hard
+   * rule 5b adjacent: the shadow near a power event is NOT the device), so the
+   * only server-side lever is to stop commanding a unit while it boots. The unit
+   * must therefore PROVE it finished booting — its first fresh post-event shadow
+   * report — before background enforcement commands it, capped at
+   * `BOOT_HOLDOFF_MAX_MS` so nothing blocks forever.
+   *
+   * Freshness bar (`lastSeenAt == null || lastSeenAt <= cycleAt`) mirrors the
+   * `initializationPending` clear in `updateAcFanTracking`. Scope: only real
+   * source transitions arm this (`acSourceCycleAt`). NOT gated elsewhere: user
+   * commands, timers, schedule/metric turn-ONs (power:1 wakes the unit; the 3s
+   * boot delay + profile path already orders that), leveler commands (their own
+   * physics), and the manual preset path. Logged once per device per episode.
+   */
+  private holdRangeEnforcementForBoot(deviceId: string): boolean {
+    const cycleAt = this.acSourceCycleAt.get(deviceId);
+    if (cycleAt == null) return false;
+    if (Date.now() - cycleAt >= this.BOOT_HOLDOFF_MAX_MS) return false; // capped — sends resume even if the shadow stays silent
+    const lastSeenAt = this.tclCloud?.getDevices().find((d) => d.id === deviceId)?.lastSeenAt ?? null;
+    if (lastSeenAt != null && lastSeenAt > cycleAt) return false; // reported fresh post-event → boot finished, enforce
+    if (this.acBootHoldLoggedAt.get(deviceId) !== cycleAt) {
+      this.acBootHoldLoggedAt.set(deviceId, cycleAt);
+      log.info(`[collector] AC ${deviceId}: holding range enforcement — unit is booting after a changeover (shadow not fresh yet)`);
+    }
+    return true;
+  }
+
   /** One device of `checkAcRangeEnforcement` — gates, then at most one re-assert per channel. */
   private async enforceAcFanSwing(
     rule: AutomationRule,
@@ -2306,6 +2368,10 @@ export class Collector {
     if (now - (this.acRangeOffAt.get(deviceId) ?? 0) < this.AC_OFF_REFIRE_GRACE_MS) return;
     if (now - (this.lastServerAcOnAt.get(deviceId) ?? 0) < this.AC_FAN_SETTLE_MS) return;
     if (now - (this.acEnforceLastSent.get(deviceId) ?? 0) < this.AC_ENFORCE_RESEND_COOLDOWN_MS) return;
+    // A command into a unit still booting after a changeover is echoed into the
+    // shadow but never applied — the lying shadow blinds every verify path, so
+    // hold until it reports fresh post-event (2026-08-18; holdRangeEnforcementForBoot).
+    if (this.holdRangeEnforcementForBoot(deviceId)) return;
 
     const fan = this.driftedRangeFan(rule, slot, dev, value, now);
     const swing = this.driftedRangeSwing(rule, slot, dev, now);

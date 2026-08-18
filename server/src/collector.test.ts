@@ -919,6 +919,90 @@ describe("AC range fan enforcement", () => {
   });
 });
 
+describe("AC range enforcement boot hold-off after a changeover (2026-08-18)", () => {
+  beforeEach(() => {
+    acTimers.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-20T04:30:00.000Z")); // 07:30 Baghdad — morning slot active
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // A unit already ON in the morning dead zone (22–25), whose triggered
+  // re-enforcement diff carries the slot fan — the exact site that landed
+  // {fan_speed:7,…} on CA5IMhFAAAE 25 s into its post-changeover reboot.
+  // `computeAcDiff` is forced non-null so the send actually attempts; the only
+  // thing that can hold it back is the boot hold-off. `lastSeenAt` is the
+  // freshness proxy the hold reads: <= the cycle stamp = "shadow not fresh yet".
+  function bootingSetup(lastSeenAt: number | null) {
+    const ctx = createCollector();
+    const rule = acFanRule(2); // morning slot pins fan 2
+    (ctx.collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    const dev = { id: "ac1", name: "Mom", power: true, lastSeenAt };
+    ctx.tclCloud.getDevices.mockReturnValue([dev]);
+    ctx.tclCloud.fetchDevicesLive.mockResolvedValue([dev] as never);
+    ctx.tclCloud.getDeviceState.mockReturnValue({ fan_speed: 2 });
+    ctx.tclCloud.computeAcDiff.mockReturnValue({ fan_speed: 2 });
+    setTriggered(ctx.collector, 1);
+    return { ...ctx, rule, dev };
+  }
+
+  it("REGRESSION 2026-08-18: no range enforcement into a booting unit — a changeover-lagged shadow swallowed fan 7 physically", async () => {
+    const { collector, actions, rule, dev } = bootingSetup(Date.now() - 60_000);
+    await setWeatherValue(collector, 24);
+
+    // The gen→grid changeover power-cycles the ESP-line unit. Its shadow still
+    // lags at the PRE-event report (lastSeenAt < the cycle stamp), so a command
+    // sent now would be echoed into reported without ever being applied — the
+    // lying shadow that made every diff/verify path blind on 2026-08-18.
+    collector.notePowerEvent("source grid → gen");
+    const cycleAt = Date.now();
+    await checkAcRangeAutomation(collector, rule);
+    expect(actions).toEqual([]); // held — the unit has not proven it finished booting
+
+    // The unit re-shadows fresh post-event → it has finished booting → enforce.
+    vi.advanceTimersByTime(30_000);
+    dev.lastSeenAt = cycleAt + 10_000;
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule);
+    expect(actions).toEqual([{ deviceId: "ac1", action: { fan_speed: 2 } }]);
+  });
+
+  it("caps the hold at 4 minutes even if the shadow never reports fresh (nothing blocks forever)", async () => {
+    const { collector, actions, rule } = bootingSetup(Date.now() - 60_000);
+    await setWeatherValue(collector, 24);
+
+    collector.notePowerEvent("source grid → gen");
+    await checkAcRangeAutomation(collector, rule);
+    expect(actions).toEqual([]); // held while the shadow is stale and we're inside the cap
+
+    // 4 min + 1 s later, lastSeenAt STILL stale — past the cap the send proceeds.
+    vi.advanceTimersByTime(4 * 60_000 + 1_000);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule);
+    expect(actions).toEqual([{ deviceId: "ac1", action: { fan_speed: 2 } }]);
+  });
+
+  it("only a real source transition engages the hold — a boot and an ESP gap enforce immediately", async () => {
+    // Boot ("source none → X") restarts only the server; an ESP gap says nothing
+    // about the units. Neither power-cycles the ACs, so holding after them would
+    // add lag for nothing — the send goes out this tick even with a stale shadow.
+    const boot = bootingSetup(Date.now() - 60_000);
+    await setWeatherValue(boot.collector, 24);
+    boot.collector.notePowerEvent("source none → grid");
+    await checkAcRangeAutomation(boot.collector, boot.rule);
+    expect(boot.actions).toEqual([{ deviceId: "ac1", action: { fan_speed: 2 } }]);
+
+    const espGap = bootingSetup(Date.now() - 60_000);
+    await setWeatherValue(espGap.collector, 24);
+    espGap.collector.notePowerEvent("ESP gap 23s");
+    await checkAcRangeAutomation(espGap.collector, espGap.rule);
+    expect(espGap.actions).toEqual([{ deviceId: "ac1", action: { fan_speed: 2 } }]);
+  });
+});
+
 async function checkAcLeveling(collector: Collector) {
   // Through the serialized wrapper, NOT the private checkAcLeveling directly:
   // severe readings fed via setLatestPower fire the urgent-leveling dep, and a
@@ -4277,8 +4361,8 @@ describe("AC fan/swing enforcement sweep (2026-08-06)", () => {
     expect(actions).toEqual([]);
   });
 
-  it("re-asserts a drifted slot swing only inside the post-power-cycle window", async () => {
-    const { collector, actions } = enforceSetup({ verticalSwing: 1 }, 7, 9);
+  it("re-asserts a drifted slot swing only inside the post-power-cycle window, once the unit reports fresh", async () => {
+    const { collector, actions, devices } = enforceSetup({ verticalSwing: 1 }, 7, 9);
     await setWeatherValue(collector, 24);
 
     // Mid-session drift with no power event: swing has no drift detection by
@@ -4286,8 +4370,17 @@ describe("AC fan/swing enforcement sweep (2026-08-06)", () => {
     await checkAcEnforce(collector);
     expect(actions).toEqual([]);
 
-    // After a changeover the same difference IS a firmware reset.
+    // After a changeover the same difference IS a firmware reset — but the boot
+    // hold-off (2026-08-18) first waits for the rebooted unit to report fresh, so
+    // the re-assert isn't swallowed by a still-booting shadow (as fan 7 was).
     collector.notePowerEvent("source grid → gen");
+    const cycleAt = Date.now();
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]); // held — the unit has not reported fresh post-event yet
+
+    // Its first fresh post-event shadow proves the boot finished → re-assert.
+    vi.advanceTimersByTime(20_000);
+    (devices[0] as { lastSeenAt?: number | null }).lastSeenAt = cycleAt + 15_000;
     await checkAcEnforce(collector);
     expect(actions).toEqual([{ deviceId: "ac1", action: { vertical_swing: 9 } }]);
   });
