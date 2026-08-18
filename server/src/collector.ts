@@ -1714,6 +1714,19 @@ export class Collector {
       }
       if (liveValue === baseline) continue;
       if (now - (entry.lastCommandAt[field] ?? 0) < this.AC_FAN_SETTLE_MS) continue;
+      // A power cycle's swing reset arrives through the lagging shadow seconds to
+      // minutes late — past the 15s settle window, so it reads as drift — and TCL
+      // firmware zeroes swing on a power-loss restart (same class as the beep
+      // reset). Inside the 15-min post-cycle window (the same window `driftedRangeSwing`
+      // trusts) a difference is a firmware reset, not a hand: leave the field
+      // system-owned so the ordinary diff re-asserts the slot value within a tick
+      // and the device self-heals. Live 2026-08-18: a grid→gen changeover flagged
+      // "manual" swing on BOTH ACs within 5s, twice (08:33 and 10:22Z) — a firmware
+      // reset is not two synchronized hands (hard rule 5b class). Accepted trade-off
+      // (as the fan tracker and swing sweep already document): a GENUINE remote change
+      // inside this window is overridden by the system profile. The dashboard hook
+      // `noteUserAcProfileChange` stays ungated — a REST command is attributable.
+      if (now - (this.acPowerCycleAt.get(deviceId) ?? 0) < this.AC_POWER_CYCLE_RESET_MS) continue;
       entry.manual.add(field);
       log.info(`[collector] AC range "${rule.name}": manual ${field} change on ${deviceId} (${baseline} → ${liveValue}), suspending that field until profile or power-source change`);
     }

@@ -462,6 +462,10 @@ function getFanEnforcement(collector: Collector) {
   return (collector as never as { acFanEnforcement: Map<string, { manual: boolean }> }).acFanEnforcement;
 }
 
+function getProfileEnforcement(collector: Collector) {
+  return (collector as never as { acProfileEnforcement: Map<string, { manual: Set<string> }> }).acProfileEnforcement;
+}
+
 describe("AC range dead-zone adoption + turn-off re-fire (regressions)", () => {
   beforeEach(() => {
     acTimers.clear();
@@ -694,6 +698,71 @@ describe("AC range fan enforcement", () => {
       temperature: 23,
       fan_speed: 2,
     });
+  });
+
+  // A slot that pins vertical_swing and a device already sitting on it — the
+  // shape of the 2026-08-18 changeover incident (both ESP-line ACs reset to 0).
+  function swingProfileRule() {
+    return {
+      ...acFanRule(2),
+      range_slots: [
+        { id: "morning", type: "window", start_mode: "exact", start_time: "06:00", end_mode: "exact", end_time: "10:00", threshold_low: 22, threshold: 25, fan_speed: 2, vertical_swing: 9 },
+        { id: "default", type: "all_day", threshold_low: 20, threshold: 28 },
+      ] satisfies AutomationRangeSlot[],
+    };
+  }
+  const swingShadow = (vertical_swing: number) => ({ mode: 1, temperature: 23, fan_speed: 2, vertical_swing });
+
+  it("REGRESSION 2026-08-18: a changeover's swing reset arriving through the lagging shadow is not a manual change", async () => {
+    const { collector, tclCloud } = createCollector();
+    const rule = swingProfileRule();
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue(swingShadow(9));
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24); // morning dead zone (22–25) → adopt the profile
+    await checkAcRangeAutomation(collector, rule); // baseline: vertical_swing 9
+
+    // A grid→gen changeover power-cycles every ESP-line AC. notePowerCycle drops
+    // the profile entry; the very next tick re-adopts a baseline from the shadow,
+    // which still lags at the PRE-restart value (9) — live === desired.
+    collector.notePowerEvent("source grid → gen");
+    await checkAcRangeAutomation(collector, rule); // baseline re-adopted from the lagging shadow (9)
+
+    // ~20s later — past the 15s settle window, inside the 15-min power-cycle
+    // window — the firmware's swing reset finally surfaces through the shadow as 0.
+    vi.advanceTimersByTime(20_000);
+    tclCloud.getDeviceState.mockReturnValue(swingShadow(0));
+    await checkAcRangeAutomation(collector, rule);
+
+    // A firmware reset is not a hand: the field stays system-owned and this tick
+    // re-asserts the slot's swing rather than surrendering it (2026-08-18: both
+    // ACs flagged "manual" swing within 5s of the changeover, twice).
+    expect(getProfileEnforcement(collector).get("1:ac1")?.manual.has("vertical_swing")).toBe(false);
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 2, vertical_swing: 9 });
+  });
+
+  it("still marks a genuine remote swing change manual when no power cycle is recent (contract preserved)", async () => {
+    const { collector, tclCloud } = createCollector();
+    const rule = swingProfileRule();
+    (collector as never as { automationRules: unknown[] }).automationRules = [rule];
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", power: true }]);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", power: true }]);
+    tclCloud.getDeviceState.mockReturnValue(swingShadow(9));
+
+    setTriggered(collector, 1);
+    await setWeatherValue(collector, 24);
+    await checkAcRangeAutomation(collector, rule); // baseline: vertical_swing 9
+
+    // No power event in the last 15 min — the drift is a real remote change while on.
+    vi.advanceTimersByTime(20_000);
+    tclCloud.getDeviceState.mockReturnValue(swingShadow(0));
+    await checkAcRangeAutomation(collector, rule);
+
+    expect(getProfileEnforcement(collector).get("1:ac1")?.manual.has("vertical_swing")).toBe(true);
+    expect(tclCloud.computeAcDiff).toHaveBeenLastCalledWith("ac1", { mode: 1, temperature: 23, fan_speed: 2 });
   });
 
   it("arms previous-state restore only for a restore-eligible AC outside every profile, never the leveling line or an unknown id", () => {
