@@ -2664,6 +2664,21 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
   exactly when the #1 room is off, and the literal form breaks the 2026-07-27 fixture where Najat
   inherits the top slot, the same conflation invariant 10 paid for on 2026-07-28.
   (See "2026-08-06 (evening) — the wobble is a margin".)
+- **2026-08-19 (manual caps still die at grid entry) — RE-AFFIRMED, asked and answered:** the
+  2026-06-09 decision (a changeover **onto Grid** clears `manualCap`/`manualTarget` — a gen-fitted cap
+  is obsolete on Grid's budget; caps are KEPT Grid→Gen) produced exactly its designed outcome on the
+  morning of 2026-08-19 and the user, shown the trace, chose to KEEP it. Sequence: 02:08Z manual gen
+  reduction → cap L1 on Abdu (on gen) · 02:19Z gen→grid entry cleared the cap and GRID_FULL lifted him
+  to L3 · 04:24Z grid→gen re-entry clamped FLOORS L1, then the raise path legitimately took him to L2
+  at 04:27Z (no cap existed) · two real breaks (04:33Z collapse latched, derated, froze — all correct)
+  left him at L2 · 04:38Z the user re-capped L1 by hand and asked "is this a bug from the recent
+  changes?". It was not — v2's clear site is `controller.ts` `event.to === "grid"` (the v1 decision
+  carried over verbatim). Offered gen-scoped caps (dormant on grid, re-applied at gen entry) and
+  cap-everywhere; **the user chose "keep as-is" for BOTH `manualCap` and `manualTarget`: a grid
+  interlude releases manual level intent, and re-capping after it is the expected manual step.** So:
+  an AC found above a previously-capped level after a grid interlude + gen re-entry is the system
+  working as designed — check the journal for the `grid_full` lift and the post-entry raise before
+  calling it a regression.
 
 ## Gotchas & test notes
 
