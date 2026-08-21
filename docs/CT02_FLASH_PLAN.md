@@ -30,7 +30,36 @@ skip. Update the CURRENT STEP line after every completed step. Device identity, 
 DP table, and the P0–P2 history: `docs/agent/operations.md` → "Tuya / ZheerHome CT02"
 (local-only/gitignored) and the project auto-memory.
 
-## ⟦CURRENT STEP: F3 STAGE-1 WRITE IN PROGRESS — paused 2026-08-21 (user stepped away). Factory firmware STILL INTACT (nothing written/erased yet). Resume: fix A9 jumper → non-destructive `-i` → power-cycle → patched write. Full recipe in the F3-STAGE-1 block below.⟧
+## ⟦CURRENT STEP: **F4 SUBSTANTIALLY PASSED 2026-08-21 late evening — FACTORY CALIBRATION CONFIRMED, NO TRIM NEEDED (KU/KIA/KIB stay 1.0).** Clamp A (on Abdu's-AC line, the P1 placement) validated across the range: idle 0.18 A, full grid-level compressor **plateau 4.14 A vs the stock-firmware P1 log's 4.27–4.53 A p25–p75 on the SAME conductor** — within day-to-day variance. Clamp B correctly reads 0.000 (its conductor was zero in the P1 era too — NOT a fault); **B's live-load spot-check is the one F4 residual** (move clamp B onto a live conductor once, watch it read). Voltage 215 V / 49.56 Hz grid — plausible; no independent reference exists (ESP's voltage field is unused/always 0) — optional later: multimeter → trim KU. 0 RX errors all session. ⚠ 2026-08-21 lesson: a wrong 40× KIA trim was applied for ~2 min from misidentifying clamp A's conductor (coincidental ratio-tracking vs the ESP) — REVERTED; **always confirm clamp placement with the user before trimming.** NEXT = **F5: server integration** — MQTT feed (device topic `ln882hC25E1088`, broker = our VPS mosquitto; EXTEND the mosquitto passwd-regen recipe or deploys silently kill the feed!), server-side subscriber → shadow-ingest path, tests + implementer/Codex review per policy, ≥48 h side-by-side vs ESP. Then F6 (clamps→mains, promotion detector).⟧
+
+## ⟦F3-STAGE-2 RECORD (2026-08-21) — custom driver build, review, OTA, bring-up⟧
+
+- **Driver:** NEW `src/driver/drv_hlw8112_uart.c` in OpenBK7231T_App (+ gate `ENABLE_DRIVER_HLW8112UART`
+  in the `PLATFORM_LN882H` block, table entry `"HLW8112"`, prototypes in `drv_local.h`, source listed in
+  `platforms/obk_main.cmake`, 9-bit-word-when-parity fix in `hal_uart_ln882h.c`). **Transport = OpenBeken's
+  existing generic UART (UART2 peripheral, already pinned PA2/PA3)** — NOT UART1 (its IRQ symbol is owned by
+  the SDK's `serial_hw.c`; UART2-on-the-same-pads is electrically identical). Protocol: 9600 **8E1** (works),
+  runtime-overridable `startDriver HLW8112 [baud] [parity 0/1/2]`; frames `[0xA5][reg…][~sum]` per datasheet;
+  init SYSCON=0x0F04, EMUCON=0x0003, HFConst=0x1103, EMUCON2=0x03FF; coefficients 0x70–0x77 validated against
+  0x6F checksum. Energy accumulation is **RAM-only on LN882H** (flash-vars API absent — documented in the
+  driver + MANIFEST). Trim commands mirror the SPI driver (`HLW8112_SetResistorGain`, `clear_energy`).
+- **Review trail:** Fable review + **Codex gpt-5.6-sol xhigh ×2** — round 1 FIX-FIRST (5 findings, all fixed:
+  clear-on-read energy commit-per-read, dead PF/apparent channels removed, restore-once-per-boot, trim
+  validation, parity-3 9N1 edge), round 2 all RESOLVED + 1 new (baud=0 div-by-zero → clamped). Build green.
+- **Build recipe (WSL Ubuntu 24.04, works):** repo `D:\dev\ct02-obk\OpenBK7231T_App` (+ `sdk/OpenLN882H`
+  submodule), CI-pinned gcc-arm 10.3-2021.10 in `~/toolchains` (WSL), `apt: build-essential cmake srecord`;
+  `make APP_VERSION=<v> APP_NAME=OpenLN882H VARIANT=default OpenLN882H` → `output/<v>/OpenLN882H_<v>.bin`
+  + `_OTA.bin`. Spec + staging in `D:\dev\ct02-obk\` (`HLW8112_UART_IMPLEMENTATION_SPEC.md`, `staging/`).
+  Big TLS downloads flake on Windows (git/IWR die mid-pack) — **use curl.exe with `--retry`, or WSL-side.**
+- **OTA (proven):** `curl --data-binary @<..._OTA.bin> http://192.168.51.164/api/ota` (200 + `{"size":N}`)
+  → `curl -X POST http://192.168.51.164/api/reboot` → back in ~10 s. Safe Mode (5 failed boots) fences the
+  driver and reopens the web server — OTA is the recovery path too; the UART rig is retired to undo-only.
+- **⚠ Bench gotcha (cost ~1 h):** the **HLW8112 is powered from the mains-side supply only** — on stick-USB
+  bench power the WL2S runs but the meter chip is DEAD (all reads time out). Meter bring-up/tests need the
+  unit on mains (wireless-only then: NEVER PC-wired while mains-connected). Also: the status **LED glows dim
+  under OpenBeken** — the stock LED pin isn't configured yet (floating GPIO); assign the pin role in the web
+  UI later if wanted.
+- Startup command set + reboot-verified: `startcmd: "startDriver HLW8112"`.
 
 ## ⟦RESUME CHECKPOINT — F3 Stage-1 validation flash (2026-08-21)⟧
 
@@ -40,20 +69,28 @@ with the custom HLW8112 driver. Image for stage 1: **`C:\Users\Abdu\.tuya-ct02\f
 expected (no driver yet). **Nothing has been erased or written — factory firmware intact; backup1.bin
 is still a valid restore.**
 
-**⚠ TOOL BUG FOUND + FIXED (do not lose this):** `SharpLN882HTool.exe -wf` hard-codes
-`change_baudrate(921600)` for the write, and **this CH340↔LN882H link cannot hold 921600** (reads
-worked at 460800; 921600 hangs the RAM-loader re-sync). Fix = **binary-patched copy
-`C:\Users\Abdu\.tuya-ct02\tools\SharpLN882HTool\SharpLN882HTool_460k.exe`** (patched the ldc.i4 at
-file-offset 0x10B2 from 921600→460800; read-case constant @0x151F left intact; assembly verified to
-load). **USE `SharpLN882HTool_460k.exe` FOR THE WRITE, not the stock exe.** Patch scripts:
-`<scratchpad>\patch_baud.py` / `do_patch.py`.
+**⚠ TOOL BUG — ROOT CAUSE REVISED 2026-08-21 (the 460k patch was NOT enough; do not lose this):**
+`SharpLN882HTool.exe -wf` hard-codes `change_baudrate(921600)`, and the earlier diagnosis ("link
+can't hold 921600, 460800 is fine") was WRONG — a 460800-patched copy (`SharpLN882HTool_460k.exe`)
+hung at the exact same re-sync. Source reading (github openshwprojects/SharpLN882HTool,
+`LN882HFlasher.cs`) showed why: **the successful F2 reads never exercise the loader's `baudrate`
+command at all** (`read_flash_to_file` bakes the baud into the dumper RAMCODE bytes before upload),
+while the write path sends `baudrate <n>\r\n` and **immediately** reassigns `_port.BaudRate` — on
+this CH340 the switch clobbers the command tail still in the TX FIFO, so the loader stays at 115200
+while the host moves, deadlocking at ANY target speed. **Fix = don't change baud at all:
+`SharpLN882HTool_115k.exe`** (stock exe, write-path ldc.i4 @0x10B1 operand → 115200; bytes
+0x10B3/0x10B4 = C2 01; only 2 bytes differ from stock). `change_baudrate(115200)` is then harmless
+whether or not the loader parses the command — both sides stay at 115200. Write of the 735 KB image
+takes ~2 min. **USE `SharpLN882HTool_115k.exe` FOR ALL WRITES** (`_460k.exe` is dead, kept only as
+provenance). Reads may keep using stock `-rf 460800`.
 
 **Last blocker when paused:** the patched write stalled at the *initial* boot-ROM sync (chip not
 answering "version") — i.e. the chip was NOT in download mode → **A9→GND jumper likely worked loose
 during power-cycling.** (Every prior run — 2×`-i`, 2 reads, and the 1st write attempt — connected
 first try, so the rig/wiring/pins are all proven; this is just the removable A9 clip.)
 
-**RESUME STEPS (user physically present, rig still wired):**
+**RESUME STEPS — ✅ EXECUTED 2026-08-21 (steps 1–5 done; write succeeded via `_115k.exe`, not
+`_460k.exe` — see revised tool-bug note above). Only step 6 (first boot) remains:**
 1. **Re-seat the A9→GND jumper** so it solidly connects the `A9` pad to a `GND` pad.
 2. Power-cycle: unplug stick from USB, 5 s, replug (A9 grounded).
 3. **Non-destructive confirm:** run `SharpLN882HTool_460k.exe -p COM3 -i` (or the stock exe — `-i`
@@ -349,16 +386,16 @@ restore would also try to re-upgrade itself).
       open-firmware config (and whether a wire must move to UART2).
 - **GATE F2→F3:** backup double-read-verified + dual-clamp mechanism understood.
 
-## F3 — Flash & first boot
+## F3 — Flash & first boot — ✅ COMPLETE 2026-08-21 (see F3-STAGE-2 RECORD at top)
 
-- [ ] **CLAUDE:** build/choose the image (OpenBeken app or compiled ESPHome) per F2 findings.
-- [ ] **ABDU:** put the chip in bootloader mode on cue (brief CEN-to-GND / power-cycle while
-      the tool polls); stay wired.
-- [ ] **CLAUDE:** write the firmware; verify the boot log over serial.
-- [ ] **ABDU:** join the device's setup AP from a phone/PC and enter home Wi-Fi credentials
-      (credentials are yours to type).
-- [ ] **CLAUDE:** confirm it's on the LAN and telemetry is visible (web UI / local API).
-- **GATE F3→F4:** flashed unit on Wi-Fi reporting SOMETHING.
+- [x] **CLAUDE:** ~~build/choose the image~~ staged: stock OpenBeken 1.18.302 first (validation), then
+      custom `hlwdev3` with `drv_hlw8112_uart` (built in WSL, delivered via OTA).
+- [x] **ABDU:** bootloader mode via A9→GND jumper; UART write with `SharpLN882HTool_115k.exe`.
+- [x] **CLAUDE:** firmware written (`Flash done!`); stage-2 via OTA (no rig).
+- [x] **ABDU:** joined `OpenLN882H_C25E1088` AP, set home Wi-Fi → `192.168.51.164`.
+- [x] **CLAUDE:** telemetry LIVE — coefficients valid, 207–213 V / 49.5 Hz on grid; driver
+      auto-starts (`startcmd`), reboot-verified.
+- **GATE F3→F4:** ✅ PASSED — flashed unit on Wi-Fi reporting real mains telemetry.
 
 ## F4 — Dual-clamp validation & calibration (THE project gate)
 
