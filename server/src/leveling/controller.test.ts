@@ -2148,7 +2148,14 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
-      const { mock, controller, run } = setup({ hotLevel: 1 });
+      // A boost is CONFIGURED for HOT (FIX C, 2026-08-26): the learned hold only
+      // refines the threshold of a DECLARED low-level failure. Its 50°C threshold
+      // is dormant at 41°C, so it does not raise HOT off L1 on its own, and the
+      // hand raise is still what arms the hold.
+      const { mock, controller, run } = setup({
+        hotLevel: 1,
+        levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 50 } },
+      });
       await controller.ensureLoaded();
       // Settle so the reconciler has a CONFIRMED L1 to raise off. Near the
       // limit on purpose: with headroom the leveler would buy the level itself
@@ -2245,7 +2252,13 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-08-06T06:30:00Z"));
-      const { mock, controller, run, observeHotAt } = setup({ hotLevel: 1 });
+      // A boost is CONFIGURED for HOT (FIX C, 2026-08-26), dormant at 43°C (50°C
+      // threshold), so it neither raises HOT itself nor blocks the observed hand
+      // raise from arming the learned hold.
+      const { mock, controller, run, observeHotAt } = setup({
+        hotLevel: 1,
+        levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 50 } },
+      });
       await controller.ensureLoaded();
       // The FIRST reading is itself a power event (source none → gen), so the
       // control has to outlast the window: ~17 min of unbroken 15 s readings,
@@ -2269,8 +2282,13 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
     try {
       vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
       // Exercised through the MANUAL raise now that the watch no longer arms
-      // anything: the guard belongs to `noteLevelHold`, so any armer proves it.
-      const { mock, controller, run } = setup({ hotLevel: 1 });
+      // anything: the guard belongs to `noteLevelHold`, so any armer proves it. A
+      // boost is CONFIGURED for HOT (FIX C, 2026-08-26) so the raise reaches
+      // `noteLevelHold` at all — it then declines because the outdoor feed is stale.
+      const { mock, controller, run } = setup({
+        hotLevel: 1,
+        levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 50 } },
+      });
       await controller.ensureLoaded();
       await run(14.6, 6, null);
 
@@ -2278,6 +2296,81 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
       await run(14.6, 1, null);
 
       expect(mock.levelHolds.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX C (2026-08-26): the hand-raise armers refine the outdoor threshold of a
+  // room whose low-level failure the user DECLARED via a configured levelBoost.
+  // For a boost-less room a hand raise off L1 is a comfort choice, not compressor
+  // evidence: live 13:45Z a household member raised Najat (no boost) L1→3 with fan
+  // 7 from the dashboard, and the old armer minted a false 6h min-L2 hold that
+  // admitted her at L2 on the 14:02:49Z gen entry (journal #20044).
+  // -------------------------------------------------------------------------
+  it("FIX C: a hand raise off L1 arms the hold WHEN a level boost is configured", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-26T13:00:00Z"));
+      // Boost configured but dormant at 41°C (50°C threshold), so it does not raise
+      // HOT itself — the hand raise is what arms the learned hold.
+      const { mock, controller, run } = setup({
+        hotLevel: 1,
+        levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 50 } },
+      });
+      await controller.ensureLoaded();
+      await run(14.6, 6, 41);
+
+      await controller.onUserGenLevel(HOT, 2);
+      await run(14.6, 1, 41);
+
+      expect(mock.levelHolds.get(HOT)).toMatchObject({ level: 1, outdoorC: 41 });
+      expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.minLevel).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("FIX C: the same hand raise arms NOTHING for a room with no configured boost (2026-08-26 Najat)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-26T13:45:00Z"));
+      const { mock, controller, run } = setup({ hotLevel: 1 });
+      await controller.ensureLoaded();
+      await run(14.6, 6, 41);
+
+      await controller.onUserGenLevel(HOT, 2);
+      await run(14.6, 1, 41);
+
+      // A comfort tap, not non-cooling evidence: no hold, and the floor stays L1.
+      expect(mock.levelHolds.size).toBe(0);
+      const status = controller.getStatus().acs.find((a) => a.deviceId === HOT);
+      expect(status?.levelHold ?? null).toBeNull();
+      expect(status?.minLevel).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("FIX C: an observed external raise off L1 arms nothing for a boost-less room", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-26T13:00:00Z"));
+      const { mock, controller, run, observeHotAt } = setup({ hotLevel: 1 });
+      await controller.ensureLoaded();
+      // Outlast the boot source-change power-event window (~17 min of 15s
+      // readings), so the ONLY reason nothing arms is the missing boost, not the
+      // firmware-restore guard.
+      await run(14.6, 68, 43, 15_000);
+
+      observeHotAt(2);
+      await run(14.6, 1, 43, 15_000);
+
+      expect(mock.levelHolds.size).toBe(0);
+      const status = controller.getStatus().acs.find((a) => a.deviceId === HOT);
+      expect(status?.levelHold ?? null).toBeNull();
+      expect(status?.minLevel).toBe(1);
     } finally {
       vi.useRealTimers();
     }

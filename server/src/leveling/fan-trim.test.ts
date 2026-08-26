@@ -6,6 +6,7 @@ import {
   FAN_RESTORE_GENTLE_CALM_MS,
   FAN_RESTORE_MAX_STEP,
   FAN_RESTORE_RESEND_MS,
+  noteEscalation,
   planFanRestore,
   recordFanCut,
   recordGentleRestoreHold,
@@ -460,6 +461,97 @@ describe("planFanRestore", () => {
       expect(
         planFanRestore(midClimb(T - FAN_RESTORE_CONTINUE_CALM_MS), [ac("a", { fanSpeed: 3 })], opts({ calmMs: FAN_RESTORE_CALM_MS, headroomAmps: 1 })),
       ).not.toBeNull();
+    });
+  });
+
+  // FIX B (2026-08-26): the reduction ladder is levels → fans → sub-floor → off,
+  // so a batch that cut a level or shed a room escalated PAST the fan. A held fan
+  // whose episode escalated is no longer the binding relief, so its first gear
+  // owes only the 30s gentle calm and (with no bounce on record) skips the
+  // after-cut wait. Live: a fan cut to 1 at 14:28:12Z, a room shed 10s later
+  // freeing ~2.3A, and the fan then sat at 1 until 14:36:37Z (user: "the fan speed
+  // should be back right after any other reduction, no need to wait any time").
+  describe("a fan comes home right after a deeper cut (FIX B, 2026-08-26)", () => {
+    it("noteEscalation stamps every hold and returns the same object when empty", () => {
+      const empty: FanHolds = {};
+      expect(noteEscalation(empty, T)).toBe(empty);
+      const cut = recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - 10_000);
+      const stamped = noteEscalation(cut, T);
+      expect(stamped.a.escalatedAt).toBe(T);
+    });
+
+    it("an escalated hold with bounces 0 comes home on the 30s gentle calm with no after-cut wait", () => {
+      const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
+      // A fromCut hold cut 10s ago (well inside the 120s after-cut wait), escalated
+      // in the same batch (escalatedAt == lastCutAt).
+      const cut = recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - 10_000);
+      const escalated = noteEscalation(cut, T - 10_000);
+      const step = planFanRestore(
+        escalated,
+        [ac("a", { fanSpeed: 1 })],
+        opts({ book, calmMs: FAN_RESTORE_GENTLE_CALM_MS, headroomAmps: 5 }),
+      );
+      expect(step).not.toBeNull();
+      // LOUD: the escalation is what admitted it now, so the action says so.
+      expect(step!.action).toContain("after deeper cut");
+      // Without the escalation the identical fresh cut at 30s calm still owes the
+      // full 60s first-gear minute, so it refuses: byte-identical to before.
+      const plain: FanHolds = { a: { ...escalated.a, escalatedAt: undefined } };
+      expect(
+        planFanRestore(plain, [ac("a", { fanSpeed: 1 })], opts({ book, calmMs: FAN_RESTORE_GENTLE_CALM_MS, headroomAmps: 5 })),
+      ).toBeNull();
+    });
+
+    it("an escalated hold with a bounce on record still owes the full compounded wait", () => {
+      const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
+      // One bounce doubles the base 120s wait to 240s. A proven bouncer keeps its
+      // net even when escalated (SETTLE, don't bounce), so a cut 10s ago is held.
+      const bounced: FanHolds = {
+        a: {
+          deviceId: "a", originalFan: 7, lastSetFan: 1, heldAt: T - 300_000, fromCut: true,
+          lastCutAt: T - 10_000, bounces: 1, escalatedAt: T - 10_000,
+        },
+      };
+      expect(
+        planFanRestore(bounced, [ac("a", { fanSpeed: 1 })], opts({ book, calmMs: FAN_RESTORE_CALM_MS, headroomAmps: 1 })),
+      ).toBeNull();
+      // Drop the bounce and the after-cut wait is skipped: it comes home.
+      const unbounced: FanHolds = { a: { ...bounced.a, bounces: 0 } };
+      expect(
+        planFanRestore(unbounced, [ac("a", { fanSpeed: 1 })], opts({ book, calmMs: FAN_RESTORE_CALM_MS, headroomAmps: 1 })),
+      ).not.toBeNull();
+    });
+
+    it("a fresh cut after the escalation restores the full gates (escalatedAt does not carry forward)", () => {
+      const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
+      const escalated: FanHolds = {
+        a: {
+          deviceId: "a", originalFan: 7, lastSetFan: 1, heldAt: T - 300_000, fromCut: true,
+          lastCutAt: T - 200_000, bounces: 0, escalatedAt: T - 200_000,
+        },
+      };
+      // A brand-new cut lands AFTER the escalation; recordFanCut drops escalatedAt.
+      const recut = recordFanCut(escalated, ac("a", { fanSpeed: 1 }), 1, T - 10_000);
+      expect(recut.a.escalatedAt).toBeUndefined();
+      // So the fresh cut owes the full 60s first-gear minute again: 30s calm refuses.
+      expect(
+        planFanRestore(recut, [ac("a", { fanSpeed: 1 })], opts({ book, calmMs: FAN_RESTORE_GENTLE_CALM_MS, headroomAmps: 5 })),
+      ).toBeNull();
+    });
+
+    it("an escalation OLDER than the last cut does not relax the gates (byte-identical to non-escalated)", () => {
+      const book = updateCost({}, "a", "gen", "fan:step", 0.2, T);
+      // escalatedAt (200s ago) predates lastCutAt (10s ago), so the reducer did NOT
+      // go past THIS fan since the cut: not escalated. Owes the 60s minute.
+      const stale: FanHolds = {
+        a: {
+          deviceId: "a", originalFan: 7, lastSetFan: 1, heldAt: T - 300_000, fromCut: true,
+          lastCutAt: T - 10_000, bounces: 0, escalatedAt: T - 200_000,
+        },
+      };
+      expect(
+        planFanRestore(stale, [ac("a", { fanSpeed: 1 })], opts({ book, calmMs: FAN_RESTORE_GENTLE_CALM_MS, headroomAmps: 5 })),
+      ).toBeNull();
     });
   });
 });

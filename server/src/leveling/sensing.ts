@@ -967,8 +967,9 @@ export function ingestReading(
   let fanCalmSince = state.fanCalmSince;
 
   // The bucket and calm are now judged on DIFFERENT yardsticks, deliberately:
-  // the bucket still triggers on any raw reading over the limit (a real breach
-  // must not wait for the median), while calm — the thing that decides whether
+  // the bucket drains on a raw reading over the limit that the flicker estimator
+  // does NOT classify as pure supply noise (a real breach must not wait for the
+  // median), while calm — the thing that decides whether
   // the episode is over — follows the smoothed mean. Live 2026-08-02 they were
   // the same yardstick and the generator's ~±1A flicker made the bucket a
   // one-way ratchet: every spike drained it and broke the calm that refills it,
@@ -1015,25 +1016,42 @@ export function ingestReading(
     // over, its overshoot classifies the drain directly and undiscounted, so a
     // genuine overload drains exactly as fast as it did before.
     const effOver = Math.max(measured - limit - flicker, smoothedOver);
-    const drain =
-      effOver > OVER_LIMIT_SEVERE_AMPS
-        ? OVER_LIMIT_DRAIN_SEVERE
-        : effOver > OVER_LIMIT_MODERATE_AMPS
-          ? OVER_LIMIT_DRAIN_MODERATE
-          : OVER_LIMIT_DRAIN_MILD;
-    overLimitBudget = Math.max(0, overLimitBudget - drain);
-    overLimitReadings = [...overLimitReadings, measured].slice(-RECENT_RING);
-    if (overLimitBudget <= 0) {
-      // Re-fires on every over-limit reading while empty (a failed act retries);
-      // the controller shell coalesces urgent evaluations.
-      // The raw path keeps its own discount (`isSevereOverReading`) rather than
-      // a mean-is-over gate: a genuine step-up must still be able to classify
-      // severe before the 8-wide median has caught up with it, which is the
-      // whole reason the bucket reads raw readings at all.
-      const severe =
-        smoothedOver > OVER_LIMIT_SEVERE_AMPS ||
-        overLimitReadings.some((r) => isSevereOverReading(r, limit, flicker));
-      events.push({ kind: "bucket_empty", severity: severe ? "severe" : "mild" });
+    // A reading whose effOver is ≤ 0 is inside the measured flicker band AND the
+    // mean is at or under the limit: by the estimator's own classification it is
+    // supply noise, so it may neither drain the bucket nor bank as evidence. Live
+    // 2026-08-26 (hard rule 5d), gen at a 15A limit with ±0.4–1.1A flicker: the
+    // drain used to floor at OVER_LIMIT_DRAIN_MILD for these, so every raw spike
+    // took a point while the margin-band ride never let calm refill, and the
+    // bucket ratcheted empty with the SMOOTHED mean sitting at 15.0, so
+    // reductions and a room shed fired at a displayed ~14.8A (journal
+    // #20062/#20066). The
+    // gate cannot slow a real breach: a genuine step reads as LOW flicker (it does
+    // not revert), so measured − limit still clears it; once the MEAN is over,
+    // smoothedOver > 0 keeps effOver > 0 undiscounted; and with flicker 0 (a quiet
+    // line, or a ring under FLICKER_MIN_SAMPLES after a boot or source change)
+    // effOver = max(measured − limit, smoothedOver) > 0 whenever measured > limit,
+    // so a fresh ring is never more permissive than the old code.
+    if (effOver > 0) {
+      const drain =
+        effOver > OVER_LIMIT_SEVERE_AMPS
+          ? OVER_LIMIT_DRAIN_SEVERE
+          : effOver > OVER_LIMIT_MODERATE_AMPS
+            ? OVER_LIMIT_DRAIN_MODERATE
+            : OVER_LIMIT_DRAIN_MILD;
+      overLimitBudget = Math.max(0, overLimitBudget - drain);
+      overLimitReadings = [...overLimitReadings, measured].slice(-RECENT_RING);
+      if (overLimitBudget <= 0) {
+        // Re-fires on every over-limit reading while empty (a failed act retries);
+        // the controller shell coalesces urgent evaluations.
+        // The raw path keeps its own discount (`isSevereOverReading`) rather than
+        // a mean-is-over gate: a genuine step-up must still be able to classify
+        // severe before the 8-wide median has caught up with it, which is the
+        // whole reason the bucket reads raw readings at all.
+        const severe =
+          smoothedOver > OVER_LIMIT_SEVERE_AMPS ||
+          overLimitReadings.some((r) => isSevereOverReading(r, limit, flicker));
+        events.push({ kind: "bucket_empty", severity: severe ? "severe" : "mild" });
+      }
     }
   }
 

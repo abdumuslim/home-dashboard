@@ -281,6 +281,59 @@ describe("flicker-aware bucket & calm (the 2026-08-02 ratchet)", () => {
     const breach = ingestReading(primed.state, { gridAmps: 0, genAmps: 19 }, cfg, primed.now + 5_000);
     expect(before - breach.state.overLimitBudget).toBe(OVER_LIMIT_DRAIN_SEVERE);
   });
+
+  // 2026-08-26 (hard rule 5d): a reading whose effOver is ≤ 0 (raw inside the
+  // measured flicker band AND the mean at or under the limit) is the estimator's
+  // own verdict of supply noise, and must neither drain nor bank. Before the gate
+  // it drained the mild rung, so every raw spike took a point while the near-limit
+  // ride never let calm refill; the bucket ratcheted empty and reductions and a
+  // room shed fired at a displayed ~14.8A (journal #20062/#20066).
+  it("a raw spike inside an established flicker band drains nothing and banks nothing", () => {
+    // Flicker seats at 1.0A with the mean at 13A, well under the 15A limit. The
+    // spike at 15.8 is inside the band (15.8 ≤ 15 + 1.0) and the mean stays under,
+    // so effOver ≤ 0.
+    const primed = feedGen([13, 13, 14, 13, 13, 14, 13, 13]);
+    expect(flickerAmps(primed.state)).toBe(1);
+    expect(primed.state.overLimitBudget).toBe(OVER_LIMIT_BUDGET);
+    const spike = ingestReading(primed.state, { gridAmps: 0, genAmps: 15.8 }, cfg, primed.now + 5_000);
+    expect(spike.state.overLimitBudget).toBe(OVER_LIMIT_BUDGET);
+    expect(spike.state.overLimitReadings).toHaveLength(0);
+    expect(spike.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(0);
+  });
+
+  it("a raw reading inside the flicker band still drains once the MEAN is over (the mean is the truth)", () => {
+    // Same flicker band, but the mean now sits just over the 15A limit, so
+    // smoothedOver > 0 keeps effOver > 0 and the reading at 15.5 (inside the band)
+    // drains anyway. The raw discount can never hide the mean itself.
+    const primed = feedGen([14.55, 15.55, 14.55, 15.55, 14.55, 15.55, 14.55, 15.55]);
+    const fresh = { ...primed.state, overLimitBudget: OVER_LIMIT_BUDGET, overLimitReadings: [] };
+    const at = primed.now + 5_000;
+    const spike = ingestReading(fresh, { gridAmps: 0, genAmps: 15.5 }, cfg, at);
+    expect(meterView(spike.state, at).smoothedAmps).toBeGreaterThan(15);
+    expect(spike.state.overLimitBudget).toBeLessThan(OVER_LIMIT_BUDGET);
+  });
+
+  it("a fresh ring under FLICKER_MIN_SAMPLES drains on a raw over-limit reading, exactly as before", () => {
+    // Flicker is 0 until the ring seats (a boot, a source change, a post-collapse
+    // window), so effOver = max(measured − limit, smoothedOver) and any raw reading
+    // over the limit still drains: the gate is never more permissive than the old
+    // code.
+    const fresh = feedGen([16.5, 16.6, 16.7]);
+    expect(fresh.state.recent.length).toBeLessThan(FLICKER_MIN_SAMPLES);
+    expect(flickerAmps(fresh.state)).toBe(0);
+    expect(fresh.state.overLimitBudget).toBeLessThan(OVER_LIMIT_BUDGET);
+  });
+
+  it("a genuine step far over the limit drains severe on the first reading, gate or no gate", () => {
+    // Low flicker (~0.3A), then a real load step to 19A: measured − limit is 4A,
+    // clear of the severe rung by margin, so the noise gate never touches it.
+    const primed = feedGen([12, 12.3, 12, 12.3, 12, 12.3, 12, 12.3]);
+    expect(flickerAmps(primed.state)).toBeGreaterThan(0);
+    expect(flickerAmps(primed.state)).toBeLessThan(0.5);
+    const before = primed.state.overLimitBudget;
+    const breach = ingestReading(primed.state, { gridAmps: 0, genAmps: 19 }, cfg, primed.now + 5_000);
+    expect(before - breach.state.overLimitBudget).toBe(OVER_LIMIT_DRAIN_SEVERE);
+  });
 });
 
 describe("leaky bucket", () => {

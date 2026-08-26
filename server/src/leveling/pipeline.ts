@@ -17,7 +17,7 @@ import { assessPressure } from "./pressure.js";
 import { cutTrendOf, OVER_LIMIT_BUDGET } from "./sensing.js";
 import { planReduction, SHED_NEED_GAP_C } from "./reduce.js";
 import { invariantCorrections, planRaise, rampDebitAmps, type SwapDecision } from "./raise.js";
-import { planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
+import { noteEscalation, planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
 import { ceilOf, floorOf } from "./needs.js";
 import { planIdleDemotes } from "./demote.js";
 import { attemptedWithin, canAttempt, RESTORE_CONFIRM_WAIT_MS, type PacingState } from "./pacing.js";
@@ -340,6 +340,20 @@ export function plan(input: PlanInput): PlanOutput {
     }
     for (const deviceId of reduction.toShed) {
       commands.push({ deviceId, kind: "power_off", reason: "shed" });
+    }
+    // FIX B (2026-08-26): a batch that cut a LEVEL or SHED a room escalated PAST
+    // the fan (deeper relief than any fan trim; the reduction ladder is levels →
+    // fans → sub-floor → off), so stamp every fan hold's `escalatedAt`, letting a
+    // held fan come home on the 30s gentle calm without the anti-bounce after-cut
+    // wait (see planFanRestore / noteEscalation). Live: a fan cut to 1 at
+    // 14:28:12Z, a room shed at 14:28:22Z freeing 2.3A, and the fan then sat at 1
+    // until 14:36:37Z behind the doubled after-cut wait (user: "the fan speed
+    // should be back right after any other reduction, no need to wait any time").
+    // Deliberately NOT for a fan-only trim batch (the fan IS the relief there and
+    // the anti-bounce gates must stand), nor for the FLOORS/recovery-admission,
+    // demote, or correction paths.
+    if (Object.keys(reduction.desiredLevels).length > 0 || reduction.toShed.length > 0) {
+      fanHolds = noteEscalation(fanHolds, now);
     }
     // FLOORS mode additionally re-asserts floors on anything the reducer kept above.
     if (mode === "FLOORS") {

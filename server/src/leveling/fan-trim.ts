@@ -220,6 +220,16 @@ export interface FanHold {
    * against, and the clock the survive-past-window reset reads. In-memory only.
    */
   lastRestoreAt?: number;
+  /**
+   * When this hold's episode last escalated PAST the fan: a batch that cut a
+   * LEVEL or SHED a room, stamped on every hold by `noteEscalation` from the
+   * pipeline's over_* reduce branch (FIX B, 2026-08-26). It relaxes the restore
+   * gates (the 30s gentle first-gear calm, and no after-cut wait when unbounced)
+   * only while it is at least as recent as `lastCutAt`, so a fresh cut afterwards
+   * re-earns the full anti-bounce ladder. In-memory only, like `lastCutAt`: a
+   * restart loses it and the fan simply owes its full gates, the safe direction.
+   */
+  escalatedAt?: number;
 }
 
 export type FanHolds = Readonly<Record<string, FanHold>>;
@@ -248,8 +258,30 @@ export function recordFanCut(holds: FanHolds, ac: AcView, target: number, now: n
       bounces: bounced ? (existing?.bounces ?? 0) + 1 : 0,
       // Consumed — the next restore step re-stamps it.
       lastRestoreAt: undefined,
+      // A fresh cut re-earns the full anti-bounce gates: the prior escalation is
+      // dropped, and only a NEW escalation in this or a later batch relaxes them
+      // again (FIX B, 2026-08-26).
+      escalatedAt: undefined,
     },
   };
+}
+
+/**
+ * Stamp `escalatedAt = now` on every hold: the batch that just ran cut a LEVEL
+ * or SHED a room, so the episode escalated PAST the fan trim (the reduction
+ * ladder is levels → fans → sub-floor → off). The held fan is no longer the
+ * binding relief, so it may come home on the 30s gentle calm without the
+ * anti-bounce after-cut wait (see `planFanRestore`, FIX B, 2026-08-26). Returns
+ * the SAME object when there are no holds, so a batch with nothing held allocates
+ * nothing. In-memory only, like `lastCutAt`: a restart loses it and the next
+ * restore simply owes its full gates, the safe direction.
+ */
+export function noteEscalation(holds: FanHolds, now: number): FanHolds {
+  const ids = Object.keys(holds);
+  if (ids.length === 0) return holds;
+  const next: Record<string, FanHold> = {};
+  for (const id of ids) next[id] = { ...holds[id], escalatedAt: now };
+  return next;
 }
 
 /**
@@ -378,13 +410,23 @@ export function planFanRestore(
     // would be sitting on top of. Both hold kinds pay it: a fromCut hold
     // climbing back mid-ramp after a power event is the same physics.
     if (ac.ramping) continue;
+    // FIX B (2026-08-26): did this hold's episode escalate PAST the fan? A batch
+    // that cut a level or shed a room stamps `escalatedAt` on every hold (see
+    // noteEscalation). It counts only while it is at least as recent as the last
+    // cut, so a fresh cut afterwards (which does NOT carry escalatedAt forward)
+    // re-earns the full gates. An escalated fromCut hold owes only the 30s gentle
+    // calm for its first gear: the reducer answered "may this fan come back at
+    // all" by going past fans, so the fan was not the problem.
+    const escalated = hold.escalatedAt != null && hold.escalatedAt >= (hold.lastCutAt ?? hold.heldAt);
     // First gear decides "may this fan come back at all" — the long anti-bounce
-    // minute for a cut, the shorter GENTLE calm for a pin that was never cut.
+    // minute for a cut, the shorter GENTLE calm for a pin that was never cut, and
+    // that same gentle calm for a cut whose episode escalated past it.
     // Continuation gears only ask "has the last one landed" and pay the short
     // continue gate regardless of kind. All of it reads the fan path's OWN calm
     // clock (`opts.calmMs` is `fanCalmMs` at the call site), so a fan hold is not
     // queued behind another hold's fan step (2026-08-09, #11098-#11126).
-    const firstGearCalm = (hold.fromCut ?? true) ? FAN_RESTORE_CALM_MS : FAN_RESTORE_GENTLE_CALM_MS;
+    const firstGearCalm =
+      (hold.fromCut ?? true) && !escalated ? FAN_RESTORE_CALM_MS : FAN_RESTORE_GENTLE_CALM_MS;
     const gate = hold.climbStartedAt == null ? firstGearCalm : FAN_RESTORE_CONTINUE_CALM_MS;
     if (opts.calmMs < gate) continue;
     // …and a continuation gear also owes its OWN last-gear spacing (2026-08-09).
@@ -434,13 +476,6 @@ export function planFanRestore(
       const swingCost =
         remainingGears > 0 ? fanTrimSavings(opts.book, ac.deviceId, opts.source, remainingGears, opts.now) : 0;
       const fast = remainingGears > 0 && spendable >= swingCost + FAN_RESTORE_FAST_MARGIN_AMPS;
-      // A gentle hold never owed the cut wait and its auto original was always one
-      // jump, so "fast" changes nothing for it — the label would over-claim in the
-      // journal. The GATE stays on `fast` either way; only the claim is scoped.
-      const action =
-        fast && hold.fromCut !== false
-          ? `fan restore step (fast: ${swingCost.toFixed(1)}A swing, ${spendable.toFixed(1)}A spendable)`
-          : "fan restore step";
       // Cut→restore hysteresis. A fan-only batch does not rewind the shared calm
       // clock, so without this the calm gate let a fan cut come all the way back
       // ~80s later and the over-limit episode simply repeated. Gentle-restore holds
@@ -458,9 +493,37 @@ export function planFanRestore(
         FAN_BOUNCE_AFTER_CUT_CAP_MS,
         (fast ? FAN_RESTORE_AFTER_CUT_FAST_MS : FAN_RESTORE_AFTER_CUT_MS) * 2 ** bounces,
       );
-      if ((hold.fromCut ?? true) && opts.now - (hold.lastCutAt ?? hold.heldAt) < afterCutWait) {
+      // FIX B (2026-08-26): an escalated hold with NO bounce on record skips the
+      // after-cut wait entirely. The reduction ladder is levels → fans → sub-floor
+      // → off, so a batch that cut a level or shed a room escalated past the fan;
+      // the fan is no longer the binding relief and the deeper cut freed far more
+      // than the fan costs (a full 1→7 swing grades ~0.64A). The anti-bounce time
+      // gates exist for fan-only oscillation. A proven bouncer (bounces ≥ 1) keeps
+      // the full compounded ladder even when escalated: SETTLE, don't bounce
+      // (2026-07-31; the 2026-08-06 13:12Z bounce house, both repeat offenders).
+      // Live 2026-08-26: a fan cut to 1 at 14:28:12Z, a room shed 10s later freeing
+      // ~2.3A, and the fan then sat at 1 until 14:36:37Z behind the doubled
+      // after-cut wait (user: "the fan speed should be back right after any other
+      // reduction, no need to wait any time").
+      const withinAfterCutWait =
+        (hold.fromCut ?? true) && opts.now - (hold.lastCutAt ?? hold.heldAt) < afterCutWait;
+      const skipAfterCutWait = escalated && bounces === 0;
+      if (withinAfterCutWait && !skipAfterCutWait) {
         return null;
       }
+      // A gentle hold never owed the cut wait and its auto original was always one
+      // jump, so "fast" changes nothing for it — the label would over-claim in the
+      // journal. The GATE stays on `fast` either way; only the claim is scoped.
+      // "(after deeper cut)" is appended when the escalation is what admitted this
+      // step now (the 30s gentle calm in place of the minute, or the skipped
+      // after-cut wait), because a silent fast return is the next forensic mystery.
+      const escalatedAdmission =
+        (escalated && (hold.fromCut ?? true) && hold.climbStartedAt == null && opts.calmMs < FAN_RESTORE_CALM_MS) ||
+        (skipAfterCutWait && withinAfterCutWait);
+      const action =
+        (fast && hold.fromCut !== false
+          ? `fan restore step (fast: ${swingCost.toFixed(1)}A swing, ${spendable.toFixed(1)}A spendable)`
+          : "fan restore step") + (escalatedAdmission ? " (after deeper cut)" : "");
       if (hold.originalFan === 0) {
         // Built-in auto: single indivisible jump, costed as a full swing — which
         // is `swingCost` above, the same 6 gears.

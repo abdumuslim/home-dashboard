@@ -1454,8 +1454,26 @@ export class LevelingControllerV2 {
     // which is precisely the state the hold exists to stop the ladder choosing
     // on its own. The pin itself wins for as long as it stands (invariant 42) —
     // the hold is what survives him clearing it.
+    //
+    // ⚠ ONLY for a room with a CONFIGURED levelBoost (FIX C, 2026-08-26). The
+    // learned hold refines the outdoor threshold (below its `outdoorAtLeastC`) of
+    // a low-level failure the user has DECLARED via a boost (Abdullah); it does
+    // not diagnose a new disease from a comfort tap. For a boost-less room a hand
+    // raise off L1 is a comfort choice, not compressor evidence: live 2026-08-26
+    // 13:45Z a household member raised Najat (no boost) L1→3 with fan 7 from the
+    // dashboard, and it minted a false 6h min-L2 hold that admitted her at L2 on
+    // the 14:02:49Z gen entry (journal #20044). The off-drop armer stays unscoped:
+    // a graded lone off measuring about a fan against a 2A model is meter
+    // evidence, and applies to any room.
     if (confirmed === 1 && target > 1) {
-      await this.noteLevelHold(deviceId, 1, this.freshOutdoorC(now), now, "user raised the room off L1 by hand");
+      if (this.config.levelBoosts[deviceId] != null) {
+        await this.noteLevelHold(deviceId, 1, this.freshOutdoorC(now), now, "user raised the room off L1 by hand");
+      } else {
+        const name = this.deviceNames.get(deviceId) ?? deviceId;
+        log.info(
+          `[leveler2] ${name}: raised off L1 by hand, but no level boost is configured for this room: a comfort raise, not non-cooling evidence`,
+        );
+      }
     }
     // Increment: hard pin unless the METER says it would breach the breaker.
     const view = meterView(this.meterState, now);
@@ -2228,6 +2246,15 @@ export class LevelingControllerV2 {
           // ⚠ Only the ARMER is guarded. The dashboard path (`onUserGenLevel`)
           // is an authenticated REST command with a person behind it, so it is
           // attributable no matter what the line is doing.
+          //
+          // …and ONLY for a room with a CONFIGURED levelBoost (FIX C, 2026-08-26),
+          // exactly like the dashboard path: the learned hold refines the outdoor
+          // threshold (below its `outdoorAtLeastC`) of a low-level failure the user
+          // has DECLARED via a boost (Abdullah); it does not diagnose a new disease
+          // from a comfort tap. For a boost-less room an observed raise off L1 is a
+          // comfort choice (live 2026-08-26 13:45Z Najat L1→3, journal #20044), so
+          // it is logged and arms nothing. The off-drop armer stays unscoped: its
+          // graded lone off is meter evidence, and applies to any room.
           if (wasConfirmedAt === 1 && result.level > 1) {
             if (this.inPowerEventWindow(now)) {
               log.info(
@@ -2236,8 +2263,12 @@ export class LevelingControllerV2 {
                   `(${Math.round((now - this.lastPowerEventAt) / 1000)}s) — firmware restore, ` +
                   `not a human raise; no hold`,
               );
-            } else {
+            } else if (this.config.levelBoosts[device.id] != null) {
               await this.noteLevelHold(device.id, 1, outdoorTempC, now, "raised off L1 externally");
+            } else {
+              log.info(
+                `[leveler2] ${device.name}: raised off L1 externally, but no level boost is configured for this room: a comfort raise, not non-cooling evidence`,
+              );
             }
           }
         }
@@ -3595,6 +3626,13 @@ export class LevelingControllerV2 {
     );
     // …and that is one of R14's triggers — and since 2026-08-06 one of only
     // three, the thermometer watch having stopped being evidence at all.
+    //
+    // Deliberately UNSCOPED, unlike the hand-raise armers (FIX C, 2026-08-26): a
+    // graded lone off that moved the meter by about a fan against a 2A level model
+    // is METER evidence the compressor was not running, and that is true of any
+    // room whether or not a levelBoost is configured. The hand-raise armers gate
+    // on a configured boost because a comfort tap is a preference and not
+    // evidence; this measurement is evidence, so it applies everywhere.
     if (level === 1) {
       void this.noteLevelHold(deviceId, 1, this.freshOutdoorC(now), now, `off-drop of only ${dropAmps.toFixed(1)}A at L1`);
     }

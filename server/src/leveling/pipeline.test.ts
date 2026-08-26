@@ -857,3 +857,49 @@ describe("proactive shed: the donor's power_off ships with the receiver's on", (
     expect(out.decisions.some((d) => d.action === "raise deferred to fan restore")).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// FIX B (2026-08-26): the reduction ladder is levels → fans → sub-floor → off, so
+// a batch that cut a LEVEL or SHED a room escalated PAST the fan. `noteEscalation`
+// stamps every fan hold so a held fan can come home on the 30s gentle calm without
+// the anti-bounce after-cut wait. A fan-only trim batch does NOT stamp: the fan IS
+// the relief there and the anti-bounce gates must stand.
+// ---------------------------------------------------------------------------
+
+describe("a reduce batch escalates past the fan (FIX B, 2026-08-26)", () => {
+  const peerHold = () => ({
+    c: { deviceId: "c", originalFan: 6, lastSetFan: 1, heldAt: T - 600_000, lastCutAt: T - 600_000, fromCut: true },
+  });
+
+  it("a batch that cuts a level stamps escalatedAt on an existing fan hold", () => {
+    const acs = [ac("a", { currentLevel: 2, needDelta: 2 }), ac("b", { currentLevel: 2, needDelta: 0.3 })];
+    const out = run(acs, overMeter([15.6], 15.4), { fanHolds: peerHold() });
+    expect(out.reason).toMatch(/^over/);
+    expect(out.commands.some((cmd) => cmd.kind === "set_level")).toBe(true);
+    expect(out.fanHolds.c.escalatedAt).toBe(T);
+  });
+
+  it("a batch that sheds a room stamps escalatedAt on an existing fan hold", () => {
+    // Rooms already at their floor with the fan at 1: the only relief left is a
+    // shed, which is deeper than any fan trim.
+    const acs = [
+      ac("a", { currentLevel: 1, fanSpeed: 1, needDelta: 2 }),
+      ac("b", { currentLevel: 1, fanSpeed: 1, needDelta: 0.3 }),
+    ];
+    const out = run(acs, overMeter([16.5], 16.5), { fanHolds: peerHold() });
+    expect(out.commands.some((cmd) => cmd.kind === "power_off")).toBe(true);
+    expect(out.fanHolds.c.escalatedAt).toBe(T);
+  });
+
+  it("a fan-only trim batch does NOT stamp escalatedAt", () => {
+    // A room at its floor L1 with a high fan: the reducer trims the fan and cuts no
+    // level and sheds no room, so the fan IS the relief and the anti-bounce gates
+    // must stand. The peer hold is left untouched.
+    const acs = [ac("a", { currentLevel: 1, fanSpeed: 5, needDelta: 0.3 })];
+    const out = run(acs, overMeter([15.4], 15.2), { fanHolds: peerHold() });
+    expect(out.commands.some((cmd) => cmd.kind === "set_fan" && cmd.reason === "trim")).toBe(true);
+    expect(out.commands.some((cmd) => cmd.kind === "set_level")).toBe(false);
+    expect(out.commands.some((cmd) => cmd.kind === "power_off")).toBe(false);
+    expect(out.fanHolds.c.escalatedAt).toBeUndefined();
+  });
+});
