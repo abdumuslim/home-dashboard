@@ -383,6 +383,11 @@ export class Collector {
     return this.latestAirRow;
   }
 
+  /** Read-only view of the newest ESP reading, for observability (diagnostics.ts). */
+  getLatestPower(): Record<string, unknown> | null {
+    return this.latestPowerRow;
+  }
+
   setLatestPower(data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }): void {
     this.latestPowerRow = data as unknown as Record<string, unknown>;
     this.latestPowerTs = new Date(data.ts);

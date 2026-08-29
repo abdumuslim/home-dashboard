@@ -3,6 +3,8 @@ import { createPool, initDb } from "./database.js";
 import { Collector } from "./collector.js";
 import { ForecastService } from "./forecast.js";
 import { createRouter } from "./routes.js";
+import { Ct02Feed } from "./ct02-feed.js";
+import { registerDiagnosticsRoutes } from "./diagnostics.js";
 import { childLogger } from "./logger.js";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
@@ -30,6 +32,18 @@ async function main(): Promise<void> {
   const biasPath = path.resolve(__dirname, "..", "bias-data", "bias-table.json");
   const forecastService = new ForecastService(biasPath);
   forecastService.init();
+
+  // CT02 open-firmware meter feed — its own MQTT connection, in-memory only,
+  // deliberately isolated from the ESP/leveller path (see ct02-feed.ts).
+  const ct02Feed = config.ct02TopicBase
+    ? new Ct02Feed({
+        brokerUrl: config.mqttBrokerUrl,
+        username: config.mqttUsername,
+        password: config.mqttPassword,
+        topicBase: config.ct02TopicBase,
+      })
+    : null;
+  ct02Feed?.start();
 
   // Create Express app
   const app = express();
@@ -96,6 +110,22 @@ async function main(): Promise<void> {
     () => collector.getLoopAgeMs(),
   ));
 
+  // ---------- Sensor diagnostics (temporary, read-only) ----------
+  // Mounted on its own router AFTER the API router so the auth middleware
+  // registered in there has already run — requireAuth then sees req.authenticated.
+  // If that ordering is ever broken the failure is a 401, not an exposure.
+  // Must stay BEFORE express.static/the SPA catch-all, which would otherwise
+  // answer GET /diag with the React app.
+  const diagRouter = express.Router();
+  registerDiagnosticsRoutes(diagRouter, {
+    pool,
+    ct02: ct02Feed,
+    getLatestAir: () => collector.getLatestAir(),
+    getLatestPower: () => collector.getLatestPower(),
+    getLoopAgeMs: () => collector.getLoopAgeMs(),
+  });
+  app.use(diagRouter);
+
   // Serve static files from ../static (relative to dist/ or src/)
   const staticDir = path.resolve(__dirname, "..", "static");
   app.use(express.static(staticDir));
@@ -115,6 +145,7 @@ async function main(): Promise<void> {
     log.info("[index] Shutting down...");
     collector.stop();
     forecastService.stop();
+    ct02Feed?.stop();
     pool.end().then(() => {
       log.info("[index] Database pool closed");
       process.exit(0);

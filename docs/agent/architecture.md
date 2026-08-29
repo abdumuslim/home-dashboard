@@ -173,6 +173,28 @@ Discovered 2026-03-14 by logging the raw MQTT payload to check for charging stat
 - The ESP stays authoritative for everything; the shadow feed exists for the P3 side-by-side
   comparison and the future P4 promotion decision (design in the project memory / ops doc).
 
+**CT02 open-firmware feed + sensor diagnostics page (2026-08-23):**
+- The same CT02, now reflashed with OpenBeken + our custom HLW8112 UART driver
+  (`docs/CT02_FLASH_PLAN.md`), publishes directly to our Mosquitto broker — the Tuya cloud path
+  above is superseded by it. `server/src/ct02-feed.ts` holds a SECOND MQTT client (client id
+  `home-dashboard-ct02-*`, distinct from the collector's Qingping client or the broker would kick
+  one of the two into a reconnect loop), decodes `ln882hC25E1088/<channelIndex>/get` raw integers
+  into SI units, and keeps a 30-minute in-memory ring buffer.
+- **Same isolation invariant as the shadow feed, and stricter:** it writes NO table at all, never
+  calls `onPowerIngest`, and never touches `latestPower`. It is observability only.
+- **The device publishes on change only.** A channel pinned at an exact zero — which is precisely
+  the port-B fault being chased — therefore goes permanently silent and looks identical to a dead
+  feed. The device flag `OBK_FLAG_MQTT_BROADCASTSELFSTATEPERMINUTE` (flag 2) is enabled so every
+  channel is rebroadcast each minute; the diagnostics verdict treats a port that has missed three
+  of those heartbeats as *stale* and refuses to judge, rather than reporting its last value as
+  current (AGENTS.md hard rule 5b — never conclude from readings older than the event).
+- `GET /api/diag` (auth-gated, `server/src/diagnostics.ts`) aggregates every feed: CT02 snapshot,
+  live ESP reading, live Qingping air, newest stored weather/air/power/tuya rows, and 60-s-cached
+  table counts. `GET /diag` serves a self-contained page (`server/src/diag-page.ts`, shipped as a
+  string because the Dockerfile copies only `dist/`). Both are registered on a separate router
+  mounted in `index.ts` AFTER the API router (so the auth middleware has run) and BEFORE
+  `express.static` (or the SPA catch-all would answer `/diag` with the React app).
+
 **Alert integration (added 2026-04-24):**
 - 6 power metrics in `alert-metrics.ts` with `source: "power"`, `group: "Power"`: `voltage` (V), `power_grid`/`power_gen` (W, via dbColumn power_1/power_2), `power_total` (W, computed sum), `current_grid`/`current_gen` (A, via dbColumn current_1/current_2).
 - Data plumbing: routes→collector via `onPowerIngest` callback (opposite of the air getter direction). `createRouter()` accepts the callback and calls it on each ingest. Collector stores the data as `latestPowerRow`/`latestPowerTs` via `setLatestPower()`.

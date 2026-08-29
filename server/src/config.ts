@@ -24,6 +24,8 @@ export interface Config {
   hermesApiToken: string;
   /** Bearer token for the Tuya SHADOW power feed (POST /api/power/tuya-ingest). Empty = feed disabled (503, fail closed). Optional so existing Config literals stay valid. */
   tuyaIngestToken?: string;
+  /** MQTT client id / topic base of the flashed CT02 power meter. Empty = its diagnostics feed stays off. */
+  ct02TopicBase?: string;
   /** Escape hatch: false = an OBSERVED (un-commanded) AC off never records a manual-off lock. */
   observedOffLocks: boolean;
 }
@@ -51,5 +53,6 @@ export const config: Config = {
   adminPassword: process.env.ADMIN_PASSWORD ?? "",
   hermesApiToken: process.env.HERMES_API_TOKEN ?? "",
   tuyaIngestToken: process.env.TUYA_INGEST_TOKEN ?? "",
+  ct02TopicBase: process.env.CT02_MQTT_TOPIC ?? "",
   observedOffLocks: process.env.OBSERVED_OFF_LOCKS !== "false",
 };
