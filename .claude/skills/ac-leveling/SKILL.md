@@ -1465,6 +1465,15 @@ until 2026-07-31.)
 
 ## Hardware truth (2026-07-23, user-verified)
 
+**Meter (2026-08-29): the CT02 clamped on the mains is THE household meter now; the ESP is retired.**
+It feeds the same ingest path (`ct02-feed.ts` → `createRouter().ingestPower`, flag `CT02_POWER_METER`),
+so on GRID the measured total now includes the grid-only guest AC (the ESP never saw it); GEN is
+unchanged. The ~1 s stream reaches the controller at **≥ 4 s** (`LEVELER_FORWARD_MIN_GAP_MS`) so the
+reading-count-tuned statistics still hold; a 1 s retune is an open user wish. Changeover-gap
+semantics carry over unchanged (the CT02 power-cycles ~15 s at a changeover and reads like the
+ESP-era blackout gap), and the first real changeover on the new meter is the live watch item. Full
+detail: `docs/CT02_FLASH_PLAN.md` (ESP-SWITCH RECORD 2026-08-29).
+
 Abdu = **2-ton** (≈ 4.1 / 6.5 / ~9 A at L1/2/3). Abdullah & Najat = **1-ton** (≈ 2.2 / 3.9 / 5.3 A).
 ⚠ The registry `model` field is protocol-inference only — **its capacity digits are WRONG** (see
 `docs/agent/tcl-ac.md`).

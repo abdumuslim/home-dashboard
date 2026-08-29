@@ -28,7 +28,7 @@ Home environmental monitoring dashboard at **https://home.altijwal.com**. Node.j
   - "Abdu": `zhimi.airpurifier.vb2` (modern MIoT protocol)
 - **TCL Split ACs** (4 units, all on dashboard via TCL Home cloud API):
   - Stable ID policy maps `DHihohFAAAE` → Mom, `CA5IMhFAAAE` → Abdu, `Cy3aihFAAAE` → Abdullah, and `DlXqDBFAAAE` → guest. Guest is on a separate grid-only electrical line: it supports direct controls and ordinary AC automations, but is filtered out before every ESP-based leveling/calibration context. Cloud client details in [tcl-ac.md](tcl-ac.md).
-- **ESP Power Monitor**: Custom ESP device on home mains, sends voltage + current on two lines (Grid=I1, Generator=I2) via `POST /api/power/ingest` every 5s. Server computes power (W = V × A), buffers in memory, and writes 1-minute median to `power_readings` table. Live endpoint (`GET /api/current/power`) returns `null` if last reading is >15s stale (ESP sends every 5s, so 3 missed = no electricity). Frontend power card shows `0.00 kW / 0 V / 0.0 A` in white when no data (instead of `--`). Full details below in "ESP Power Monitor".
+- **Power Monitor (CT02 on the mains since 2026-08-29; ESP retired)**: the CT02 (OpenBeken HLW8112) publishes voltage + current on two lines (Grid=I1, Generator=I2) over MQTT; `server/src/ct02-feed.ts` feeds it into the former ESP `POST /api/power/ingest` pipeline behind `CT02_POWER_METER`. The device streams at ~1 s; the leveler and alert path are forwarded readings at 4s (see below). Server computes power (W = V × A), buffers in memory, and writes a 1-minute median to `power_readings` table. Live endpoint (`GET /api/current/power`) returns `null` if last reading is >15s stale (the CT02 raw stream updates `latestPower` every ~1s, so >15s = ~15 missed = no electricity). Frontend power card shows `0.00 kW / 0 V / 0.0 A` in white when no data (instead of `--`). Until 2026-08-29 the retired ESP fed the same route over HTTP every 5s. Full details below in "ESP Power Monitor".
 
 ## System Architecture
 
@@ -51,7 +51,7 @@ Browser → Cloudflare → Traefik (VPS, existing) → dashboard container (port
   - Mounts `dashboard_data` volume to `/app/data` for `xiaomi-credentials.json` and `tcl-credentials.json`.
 - **Multi-stage Docker build**: Stage 1 builds client (Vite), Stage 2 builds server (tsc), Stage 3 runs production Node.js
 - **Database**: Uses the existing `rag-postgres-1` container (pgvector:pg16). The `home` database is auto-created on first startup. Full schema in [database.md](database.md).
-- **Push Notifications**: Web Push via VAPID keys (in VPS `.env`). Service worker at `client/public/sw.js` handles push display + click-to-focus. Subscriptions synced to `push_subscriptions` table on page load. **Smart AC Leveling notifications (shed/restore + "AC Calibration finished") are per-device opt-in, OFF by default** — `broadcastPush` only sends to subscriptions with `leveling_notifications = true`; each device toggles it via `GET`/`POST /api/push/leveling` (the "Smart AC Leveling alerts" switch in the Alerts modal). A leveling config **enable-flip** (controller turned OFF/back ON via `PUT /api/ac/leveling`) also pushes to this same audience, sent from the route via `broadcastLevelingPush` — a routes-local mirror of `broadcastPush`, which is private to the Collector and not injected into routes (added 2026-08-07 for the 2026-08-06 silent-disable gap). Sensor/prayer alerts remain per-endpoint via `alert_rules`. Alert metrics span 4 groups: Outdoor (weather), Indoor (weather), Air Quality (Qingping), Power (ESP). Power metrics use 60s staleness threshold (vs 300s for weather/air). Power data flows routes→collector via `onPowerIngest` callback (opposite direction from air data). **Power alerts require 4 consecutive ESP readings** (~20s) meeting the condition before firing (`powerConditionSustained()` in `alert-metrics.ts`, pure + unit-tested; gap >15s between readings breaks the streak; collector buffers last 8 readings in `recentPowerReadings`) — single-spike immunity for fluctuating power. Weather/air alerts still fire on a single reading.
+- **Push Notifications**: Web Push via VAPID keys (in VPS `.env`). Service worker at `client/public/sw.js` handles push display + click-to-focus. Subscriptions synced to `push_subscriptions` table on page load. **Smart AC Leveling notifications (shed/restore + "AC Calibration finished") are per-device opt-in, OFF by default** — `broadcastPush` only sends to subscriptions with `leveling_notifications = true`; each device toggles it via `GET`/`POST /api/push/leveling` (the "Smart AC Leveling alerts" switch in the Alerts modal). A leveling config **enable-flip** (controller turned OFF/back ON via `PUT /api/ac/leveling`) also pushes to this same audience, sent from the route via `broadcastLevelingPush` — a routes-local mirror of `broadcastPush`, which is private to the Collector and not injected into routes (added 2026-08-07 for the 2026-08-06 silent-disable gap). Sensor/prayer alerts remain per-endpoint via `alert_rules`. Alert metrics span 4 groups: Outdoor (weather), Indoor (weather), Air Quality (Qingping), Power (CT02 meter since 2026-08-29, formerly ESP). Power metrics use 60s staleness threshold (vs 300s for weather/air). Power data flows routes→collector via `onPowerIngest` callback (opposite direction from air data). **Power alerts require 4 consecutive forwarded meter readings** (~16s at the 4s leveler-forward cadence; ~20s on the retired ESP's 5s) meeting the condition before firing (`powerConditionSustained()` in `alert-metrics.ts`, pure + unit-tested; gap >15s between readings breaks the streak; collector buffers last 8 readings in `recentPowerReadings`) — single-spike immunity for fluctuating power. Weather/air alerts still fire on a single reading.
 - **Authentication**: Cookie-based JWT auth using HMAC-SHA256 (zero npm deps — uses Node.js `crypto`).
   - `server/src/auth.ts`: `signToken`/`verifyToken`, cookie parsing, `authMiddleware` (sets `req.authenticated` on every request), `requireAuth` guard, login/logout/status handlers, `clientIp()` (Cloudflare `cf-connecting-ip`, else the socket peer; `x-forwarded-for` is deliberately not trusted — client-supplied — and `clientIp` also backs the login rate limiter, which previously bucketed every attempt into Traefik's single peer address).
   - **Caller identity — `req.authKind` (`"user" | "agent"`, added 2026-07-24):** sessions minted by `POST /api/agent/session` carry an `agent: true` JWT claim; a human login does not, and a raw Hermes bearer counts as `agent` too. Before this, an agent session was byte-identical to a human one, so an AC turned on "by the dashboard" could not be attributed (see the 2026-07-24 incident in [ac-automations.md](ac-automations.md)). **Rotating `AUTH_SECRET` is what retires the old untagged 30-day cookies** — without a rotation an existing agent cookie keeps reading as `user` until it expires.
@@ -147,7 +147,23 @@ Discovered 2026-03-14 by logging the raw MQTT payload to check for charging stat
 
 ## ESP Power Monitor
 
-**Device & API contract:**
+**2026-08-29: the CT02 IS the meter now; the ESP is retired.** The household power feed is the CT02
+(OpenBeken HLW8112) MQTT stream, not the ESP. `server/src/ct02-feed.ts` emits
+`{v, i1: current_a, i2: current_b}` into the former ESP pipeline through `createRouter(...).ingestPower`
+(the extracted `ingestPowerReading(v, i1, i2)`), behind env flag `CT02_POWER_METER=true` (which only
+arms when `CT02_MQTT_TOPIC` is set). The ESP's `POST /api/power/ingest` route now returns **409 while
+the flag is on** (single-source invariant: two interleaved meters corrupt the flicker/median
+statistics); flag off = the old ESP behaviour. Cadence is split: `latestPower`, the buffer push and
+the 60 s median DB write run on every accepted reading (~1 s), but the fan-out to `onPowerIngest`
+(leveler + calibrator) is throttled to one per `LEVELER_FORWARD_MIN_GAP_MS` (4000 ms) because the
+leveler's statistics are tuned in reading counts at the ESP's ~5 s cadence. **Voltage is real now**,
+so `power_1`/`power_2` (= v×i1, v×i2) are real apparent power from 2026-08-29; the ESP era always
+sent voltage 0, so those columns in `power_readings` were always 0 until this date (history charts
+show the discontinuity). Clamp mapping on the mains: port A `current_a` = grid (`current_1`), port B
+`current_b` = gen (`current_2`). Full record: `docs/CT02_FLASH_PLAN.md` (ESP-SWITCH RECORD 2026-08-29);
+leveling-semantics note in `docs/agent/ac-leveling.md`.
+
+**Device & API contract (ESP era, and the shape the CT02 feed reuses):**
 - ESP sends `POST /api/power/ingest` with `{ v, i1, i2 }` every 5s.
 - I1 = Grid (indigo `#818cf8`), I2 = Generator (rose `#fb7185`).
 - Backend computes `power_1 = v*i1`, `power_2 = v*i2`; timestamps are assigned server-side.
@@ -172,6 +188,9 @@ Discovered 2026-03-14 by logging the raw MQTT payload to check for charging stat
 - Observability: `GET /api/power/tuya` (auth) → `{ latest, staleSeconds, ingestCount }`.
 - The ESP stays authoritative for everything; the shadow feed exists for the P3 side-by-side
   comparison and the future P4 promotion decision (design in the project memory / ops doc).
+  **(OBSOLETE 2026-08-29: the ESP is retired and the CT02 is the meter, so P3/P4 are dropped; this
+  Tuya cloud-shadow bridge stays deployed but idles because the device is flashed away from the
+  Tuya cloud. See the banner at the top of this section.)**
 
 **CT02 open-firmware feed + sensor diagnostics page (2026-08-23):**
 - The same CT02, now reflashed with OpenBeken + our custom HLW8112 UART driver
@@ -182,15 +201,23 @@ Discovered 2026-03-14 by logging the raw MQTT payload to check for charging stat
   into SI units, and keeps a 30-minute in-memory ring buffer.
 - **Same isolation invariant as the shadow feed, and stricter:** it writes NO table at all, never
   calls `onPowerIngest`, and never touches `latestPower`. It is observability only.
+  **(SUPERSEDED 2026-08-29: `ct02-feed.ts` is now THE meter. It emits into the ESP pipeline via an
+  `onReading` callback to `createRouter().ingestPower` behind `CT02_POWER_METER=true`, so it drives
+  `latestPower`, the median write and `onPowerIngest`; see the banner at the top of this section. The
+  isolation described here was the 2026-08-23 diagnostics-only phase.)**
 - **The device publishes on change only.** A channel pinned at an exact zero — which is precisely
   the port-B fault being chased — therefore goes permanently silent and looks identical to a dead
   feed. The device flag `OBK_FLAG_MQTT_BROADCASTSELFSTATEPERMINUTE` (flag 2) is enabled so every
   channel is rebroadcast each minute; the diagnostics verdict treats a port that has missed three
   of those heartbeats as *stale* and refuses to judge, rather than reporting its last value as
   current (AGENTS.md hard rule 5b — never conclude from readings older than the event).
+  **(CORRECTED 2026-08-29: flag 2's self-state broadcast republishes only the self items and SKIPS
+  unchanged channels, so it did NOT keep the meter channels fresh. Firmware `hlwfix3` instead
+  heartbeats all six instantaneous channels every 1 Hz tick with `FORCE | SILENT`; see
+  `docs/CT02_FLASH_PLAN.md` ESP-SWITCH RECORD 2026-08-29.)**
 - `GET /api/diag` (auth-gated, `server/src/diagnostics.ts`) aggregates every feed: CT02 snapshot,
-  live ESP reading, live Qingping air, newest stored weather/air/power/tuya rows, and 60-s-cached
-  table counts. `GET /diag` serves a self-contained page (`server/src/diag-page.ts`, shipped as a
+  the live meter reading (`latestPower`, CT02-fed since 2026-08-29), live Qingping air, newest stored
+  weather/air/power/tuya rows, and 60-s-cached table counts. `GET /diag` serves a self-contained page (`server/src/diag-page.ts`, shipped as a
   string because the Dockerfile copies only `dist/`). Both are registered on a separate router
   mounted in `index.ts` AFTER the API router (so the auth middleware has run) and BEFORE
   `express.static` (or the SPA catch-all would answer `/diag` with the React app).
@@ -198,8 +225,8 @@ Discovered 2026-03-14 by logging the raw MQTT payload to check for charging stat
 **Alert integration (added 2026-04-24):**
 - 6 power metrics in `alert-metrics.ts` with `source: "power"`, `group: "Power"`: `voltage` (V), `power_grid`/`power_gen` (W, via dbColumn power_1/power_2), `power_total` (W, computed sum), `current_grid`/`current_gen` (A, via dbColumn current_1/current_2).
 - Data plumbing: routes→collector via `onPowerIngest` callback (opposite of the air getter direction). `createRouter()` accepts the callback and calls it on each ingest. Collector stores the data as `latestPowerRow`/`latestPowerTs` via `setLatestPower()`.
-- Staleness: 60s (vs 300s for weather/air) — ESP sends every 5s, so 60s = 12 missed readings.
-- **Sustained gate (added 2026-06-07)**: power alerts fire only after **4 consecutive ESP readings** (~20s) meet the condition — `powerConditionSustained()` in `alert-metrics.ts` (pure, unit-tested in `alert-metrics.test.ts`). A gap >15s between readings breaks the streak (matches the live endpoint's "3 missed = no electricity" rule). Collector buffers the last 8 readings (`recentPowerReadings`, appended in `setLatestPower()`). Resolution stays single-reading (any one in-range reading → idle + 10-min quiet period). Weather/air alerts unchanged (single reading).
+- Staleness: 60s (vs 300s for weather/air): the CT02 meter forwards readings at 4s, so 60s = 15 missed readings (the retired ESP sent every 5s = 12 missed).
+- **Sustained gate (added 2026-06-07)**: power alerts fire only after **4 consecutive forwarded meter readings** (~16s at the 4s forward cadence; ~20s on the retired ESP) meet the condition — `powerConditionSustained()` in `alert-metrics.ts` (pure, unit-tested in `alert-metrics.test.ts`). A gap >15s between readings breaks the streak (matches the live endpoint's ">15s stale = no electricity" rule). Collector buffers the last 8 readings (`recentPowerReadings`, appended in `setLatestPower()`). Resolution stays single-reading (any one in-range reading → idle + 10-min quiet period). Weather/air alerts unchanged (single reading).
 - `power_total` is the only computed metric — handled as a special case in `getMetricValue()` before the generic lookup path.
 - UI: the alerts modal auto-groups by the `group` field, so a "Power" section appears automatically with no UI code changes.
 - Frontend power card layout details live in [frontend.md](frontend.md). Source detection: a line is active when its current > 0.1A; the card flashes only on a source switch.
