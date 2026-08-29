@@ -4,11 +4,15 @@ import {
   CT02_CHANNELS,
   CT02_MAX_TOPICS,
   CT02_MAX_PAYLOAD_CHARS,
+  CT02_METER_MIN_GAP_MS,
+  CT02_METER_CHANNEL_FRESH_MS,
+  CT02_METER_RESUME_GAP_MS,
   assessPorts,
   decodeChannelPayload,
   parseChannelTopic,
   CT02_MAX_OBSERVATIONS,
   type Ct02ChannelState,
+  type Ct02MeterReading,
   type PortObservation,
 } from "./ct02-feed.js";
 
@@ -295,6 +299,234 @@ describe("Ct02Feed.handleMessage", () => {
     const latest = feed.snapshot().history.at(-1)!;
     expect(latest.raw_a).toBe(4140);
     expect(latest.raw_b).toBe(0);
+  });
+});
+
+describe("Ct02Feed meter emission (onReading)", () => {
+  /** Feed wired as the active power meter, capturing every emitted reading. */
+  function makeMeterFeed(startMs = 1_000_000) {
+    let now = startMs;
+    const readings: Ct02MeterReading[] = [];
+    const feed = new Ct02Feed({
+      brokerUrl: "mqtt://test:1883", username: "u", password: "p", topicBase: BASE,
+      now: () => now,
+      onReading: (r) => readings.push(r),
+    });
+    return { feed, readings, advance(ms: number) { now += ms; } };
+  }
+
+  it("does not emit until voltage, current_a and current_b have all been seen", () => {
+    const { feed, readings, advance } = makeMeterFeed();
+    feed.handleMessage(`${BASE}/0/get`, "21160"); // voltage 211.6 V
+    advance(2000);
+    feed.handleMessage(`${BASE}/3/get`, "7");      // grid clamp 0.007 A
+    advance(2000);
+    expect(readings).toHaveLength(0);              // current_b still unseen
+
+    feed.handleMessage(`${BASE}/4/get`, "9144");   // gen clamp 9.144 A -> all three
+    expect(readings).toHaveLength(1);
+  });
+
+  it("maps port A to i1, port B to i2 and voltage to v, with raw integers scaled", () => {
+    const { feed, readings } = makeMeterFeed();
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");
+    feed.handleMessage(`${BASE}/4/get`, "9144");   // raw 9144 -> 9.144
+    expect(readings).toEqual([{ v: 211.6, i1: 0.007, i2: 9.144 }]);
+  });
+
+  it("emits on the current_b message, never on this tick's earlier voltage/current_a", () => {
+    const { feed, readings, advance } = makeMeterFeed();
+    // First full tick establishes all three and emits on its current_b.
+    feed.handleMessage(`${BASE}/0/get`, "22000");
+    feed.handleMessage(`${BASE}/3/get`, "6000");
+    feed.handleMessage(`${BASE}/4/get`, "0");
+    expect(readings).toEqual([{ v: 220, i1: 6, i2: 0 }]);
+
+    // Next tick, a full throttle window later. voltage and current_a arrive
+    // first: emitting on either would pair this tick's voltage with the previous
+    // tick's currents ({v:211.6, i1:6, i2:0}). Only the current_b arrival emits,
+    // as a coherent same-tick snapshot.
+    advance(1000);
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");
+    expect(readings).toHaveLength(1);
+    feed.handleMessage(`${BASE}/4/get`, "9144");
+    expect(readings).toHaveLength(2);
+    expect(readings[1]).toEqual({ v: 211.6, i1: 0.007, i2: 9.144 });
+  });
+
+  it("throttles to one emission per meterMinGapMs under rapid updates", () => {
+    const { feed, readings, advance } = makeMeterFeed();
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");
+    feed.handleMessage(`${BASE}/4/get`, "9144");   // t0: first emission
+    expect(readings).toHaveLength(1);
+
+    for (let i = 0; i < 3; i++) {
+      advance(200);                                // 200ms current_b ticks, inside the 1s window
+      feed.handleMessage(`${BASE}/4/get`, String(9000 + i));
+    }
+    expect(readings).toHaveLength(1);              // all inside the throttle window
+
+    advance(CT02_METER_MIN_GAP_MS);                // now a full gap past the last emit
+    feed.handleMessage(`${BASE}/4/get`, "9200");
+    expect(readings).toHaveLength(2);
+  });
+
+  it("stops emitting when a channel misses two heartbeats, and resumes when it returns", () => {
+    const { feed, readings, advance } = makeMeterFeed();
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");
+    feed.handleMessage(`${BASE}/4/get`, "9144");
+    expect(readings).toHaveLength(1);
+
+    // current_a goes silent past the freshness bar; voltage + current_b keep ticking.
+    advance(CT02_METER_CHANNEL_FRESH_MS + 10_000);
+    feed.handleMessage(`${BASE}/0/get`, "21150");
+    feed.handleMessage(`${BASE}/4/get`, "9000");
+    expect(readings).toHaveLength(1);              // current_a half-dead -> no fiction emitted
+
+    // Next tick current_a is back, so the current_b arrival emits the latest of each.
+    advance(1000);
+    feed.handleMessage(`${BASE}/0/get`, "21150");
+    feed.handleMessage(`${BASE}/3/get`, "8");
+    feed.handleMessage(`${BASE}/4/get`, "9000");
+    expect(readings).toHaveLength(2);
+    expect(readings[1]).toEqual({ v: 211.5, i1: 0.008, i2: 9.0 });
+  });
+
+  it("keeps a flat channel eligible through identical-value heartbeat rebroadcasts", () => {
+    const { feed, readings, advance } = makeMeterFeed();
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");      // flat grid clamp
+    feed.handleMessage(`${BASE}/4/get`, "9144");
+    expect(readings).toHaveLength(1);
+
+    // 60 s heartbeat: the flat clamp rebroadcasts the SAME raw value.
+    advance(60_000);
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");      // identical raw still refreshes updatedAt
+    feed.handleMessage(`${BASE}/4/get`, "9140");
+    expect(readings).toHaveLength(2);
+
+    // Another heartbeat: current_a's value is now 120 s old but still refreshed.
+    advance(60_000);
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");
+    feed.handleMessage(`${BASE}/4/get`, "9140");
+    expect(readings).toHaveLength(3);
+    expect(readings[2].i1).toBeCloseTo(0.007, 6);
+    expect(feed.snapshot().channels.current_a.unchangedFor).toBeGreaterThan(0);
+  });
+
+  it("emits pre-scaled (decimal) payloads without re-dividing them", () => {
+    const { feed, readings } = makeMeterFeed();
+    feed.handleMessage(`${BASE}/0/get`, "211.60");
+    feed.handleMessage(`${BASE}/3/get`, "0.007");
+    feed.handleMessage(`${BASE}/4/get`, "9.144");
+    expect(readings).toEqual([{ v: 211.6, i1: 0.007, i2: 9.144 }]);
+  });
+
+  it("stays a pure diagnostics feed when onReading is not configured", () => {
+    const { feed } = makeFeed(); // no onReading
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");
+    feed.handleMessage(`${BASE}/4/get`, "9144");
+    // No emission path, and the channel state is still decoded for /diag.
+    expect(feed.snapshot().channels.current_b.value).toBeCloseTo(9.144, 6);
+  });
+
+  it("does not mix pre- and post-changeover channels when the device power-cycles", () => {
+    const { feed, readings, advance } = makeMeterFeed();
+    // Steady on grid: A carries load, B (gen) idle.
+    feed.handleMessage(`${BASE}/0/get`, "22000"); // 220.0 V
+    feed.handleMessage(`${BASE}/3/get`, "6000");  // grid clamp 6.0 A
+    feed.handleMessage(`${BASE}/4/get`, "0");     // gen clamp idle
+    expect(readings).toEqual([{ v: 220, i1: 6, i2: 0 }]);
+
+    // Changeover: the CT02 drops off, then reconnects after a 30s silence and
+    // republishes the tick in firmware order. The current_b arrival must emit
+    // this tick's post-changeover values, never its gen current beside the
+    // pre-changeover grid 6 A still sitting in the map.
+    advance(CT02_METER_RESUME_GAP_MS + 15_000);
+    feed.handleMessage(`${BASE}/0/get`, "21160"); // 211.6 V, first back (arms epoch)
+    feed.handleMessage(`${BASE}/3/get`, "7");     // grid clamp 0.007 A, grid now dead
+    expect(readings).toHaveLength(1);             // no emit until current_b
+    feed.handleMessage(`${BASE}/4/get`, "9144");  // gen clamp 9.144 A -> emit
+    expect(readings).toHaveLength(2);
+    // Every value is post-changeover: no phantom grid current on i1.
+    expect(readings[1]).toEqual({ v: 211.6, i1: 0.007, i2: 9.144 });
+  });
+
+  it("never epoch-gates a continuous healthy stream", () => {
+    const { feed, readings, advance } = makeMeterFeed();
+    feed.handleMessage(`${BASE}/0/get`, "22000");
+    feed.handleMessage(`${BASE}/3/get`, "6000");
+    feed.handleMessage(`${BASE}/4/get`, "0");
+    expect(readings).toHaveLength(1);
+
+    // A full tick every 5s, comfortably under the 15s resume gap: the epoch gate
+    // must never arm, so every tick's current_b past the throttle keeps emitting.
+    for (let i = 0; i < 6; i++) {
+      advance(5000);
+      feed.handleMessage(`${BASE}/0/get`, "22000");
+      feed.handleMessage(`${BASE}/3/get`, String(6000 + i));
+      feed.handleMessage(`${BASE}/4/get`, "0");
+    }
+    expect(readings).toHaveLength(7);
+  });
+
+  it("arms a fresh epoch on a <base>/connected message even after a sub-15s outage", () => {
+    const { feed, readings, advance } = makeMeterFeed();
+    feed.handleMessage(`${BASE}/0/get`, "22000");
+    feed.handleMessage(`${BASE}/3/get`, "6000");
+    feed.handleMessage(`${BASE}/4/get`, "0");
+    expect(readings).toHaveLength(1);
+
+    // Device reboots and reconnects after only 5s (under the silence threshold),
+    // publishing its OpenBeken birth message, which arms the epoch.
+    advance(5000);
+    feed.handleMessage(`${BASE}/connected`, "online");
+
+    // If current_b returns before voltage/current_a re-report, they are still
+    // fresh (5s old) but pre-epoch, so the reading is withheld.
+    feed.handleMessage(`${BASE}/4/get`, "9144");
+    expect(readings).toHaveLength(1);
+
+    // A full post-connect tick re-reports all three; current_b then emits.
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");
+    feed.handleMessage(`${BASE}/4/get`, "9144");
+    expect(readings).toHaveLength(2);
+    expect(readings[1]).toEqual({ v: 211.6, i1: 0.007, i2: 9.144 });
+  });
+
+  it("does not emit when a non-meter channel arrives first after a silence", () => {
+    const { feed, readings, advance } = makeMeterFeed();
+    feed.handleMessage(`${BASE}/0/get`, "22000");
+    feed.handleMessage(`${BASE}/3/get`, "6000");
+    feed.handleMessage(`${BASE}/4/get`, "0");
+    expect(readings).toHaveLength(1);
+
+    // 30s silence, then power_a (channel 5, not one of the gated three) is first
+    // back. It must arm the epoch (P1-3), so the pre-gap meter channels cannot
+    // ride through.
+    advance(30_000);
+    feed.handleMessage(`${BASE}/5/get`, "60000"); // power_a, arms the epoch
+    expect(readings).toHaveLength(1);
+
+    // current_b back before voltage/current_a re-report: still fresh but
+    // pre-epoch, so the reading is withheld (no gen current beside the pre-gap grid value).
+    feed.handleMessage(`${BASE}/4/get`, "9144");
+    expect(readings).toHaveLength(1);
+
+    // Full tick re-reports all three; current_b then emits the coherent snapshot.
+    feed.handleMessage(`${BASE}/0/get`, "21160");
+    feed.handleMessage(`${BASE}/3/get`, "7");
+    feed.handleMessage(`${BASE}/4/get`, "9144");
+    expect(readings).toHaveLength(2);
+    expect(readings[1]).toEqual({ v: 211.6, i1: 0.007, i2: 9.144 });
   });
 });
 

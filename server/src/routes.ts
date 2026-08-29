@@ -87,6 +87,17 @@ export function median(arr: number[]): number {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+/**
+ * The leveler/calibrator fan-out cadence: `onPowerIngest` fires at most this
+ * often. Everything else in ingestPowerReading (latestPower, the buffer push,
+ * the 60 s median write) runs on every call. See ingestPowerReading.
+ */
+export const LEVELER_FORWARD_MIN_GAP_MS = 4000;
+
+/** Physical sanity bounds for one ingested power reading; anything outside is rejected as garbage or a forgery. */
+export const POWER_INGEST_MAX_VOLTAGE = 500;
+export const POWER_INGEST_MAX_CURRENT = 200;
+
 const RANGE_MAP: Record<string, string> = {
   "6h": "6 hours",
   "24h": "24 hours",
@@ -126,7 +137,18 @@ function rowToDict(row: Record<string, unknown>): Record<string, unknown> {
   return d;
 }
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers, acCalibration?: AcCalibrationHandlers, getLoopAgeMs?: () => number): Router {
+/** Applies one power reading (line volts, grid amps, gen amps) to the ESP pipeline. */
+export type PowerIngestFn = (v: number, i1: number, i2: number) => void;
+
+/**
+ * The API router, plus a handle onto the power pipeline. `ingestPower` lets the
+ * CT02 feed drive the former ESP path directly when it is the active meter
+ * (index.ts). The router itself is still an ordinary Express middleware, so
+ * `app.use(createRouter(...))` keeps working unchanged.
+ */
+export type ApiRouter = Router & { ingestPower: PowerIngestFn };
+
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers, acCalibration?: AcCalibrationHandlers, getLoopAgeMs?: () => number): ApiRouter {
   const router = Router();
 
   // Health check — before auth middleware, no auth required
@@ -351,6 +373,77 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   let lastPowerSave = 0;
   const POWER_SAVE_INTERVAL = 60_000;
   const powerBuffer: { v: number; i1: number; i2: number }[] = [];
+  let lastLevelerForwardAt = 0;
+  let lastRangeRejectLogAt = 0;
+  const RANGE_REJECT_LOG_INTERVAL = 5 * 60_000;
+
+  // Applies one power reading to the whole ESP pipeline: latestPower (the GET
+  // caches), the leveler/calibrator via onPowerIngest, and the 60 s median DB
+  // write. Shared by the ESP HTTP route below and, when CT02 is the active meter,
+  // by the CT02 feed's synchronous onReading callback (index.ts), so it is void
+  // and the DB write is fire-and-forget with a logged catch: it must never reject
+  // into either caller. current_1 = grid amps, current_2 = generator amps.
+  function ingestPowerReading(v: number, i1: number, i2: number): void {
+    // Physical-range gate. The MQTT meter path bypasses the HTTP route's field
+    // validation, and this value now steers breaker protection, so a forged or
+    // garbage payload must never become the meter: reject with NO state change.
+    const inRange =
+      Number.isFinite(v) && Number.isFinite(i1) && Number.isFinite(i2) &&
+      v >= 0 && v <= POWER_INGEST_MAX_VOLTAGE &&
+      i1 >= 0 && i1 <= POWER_INGEST_MAX_CURRENT &&
+      i2 >= 0 && i2 <= POWER_INGEST_MAX_CURRENT;
+    if (!inRange) {
+      const nowMs = Date.now();
+      if (nowMs - lastRangeRejectLogAt >= RANGE_REJECT_LOG_INTERVAL) {
+        lastRangeRejectLogAt = nowMs;
+        log.warn(`[routes] rejected out-of-range power reading: v=${v} i1=${i1} i2=${i2}`);
+      }
+      return;
+    }
+
+    const p1 = v * i1;
+    const p2 = v * i2;
+    const now = new Date();
+    latestPower = { ts: now.toISOString(), voltage: v, current_1: i1, current_2: i2, power_1: p1, power_2: p2 };
+
+    // Fan out to the leveler/calibrator at the ESP's tuned cadence only. The
+    // controller's statistics are counted in READINGS at the retired ESP's ~5 s
+    // rate (8-wide smoothing median, over-limit drain bucket, headroom streaks,
+    // flicker ring); feeding it the 1 s stream would compress every one of those
+    // windows about 5x, in the spending direction as well as the shedding one.
+    // latestPower, the buffer push and the DB median write run every call; only
+    // this fan-out is throttled. At the ESP's former 5 s cadence it never binds.
+    if (now.getTime() - lastLevelerForwardAt >= LEVELER_FORWARD_MIN_GAP_MS) {
+      lastLevelerForwardAt = now.getTime();
+      onPowerIngest?.(latestPower);
+    }
+    powerBuffer.push({ v, i1, i2 });
+
+    // Persist median of buffered readings to DB every 60 seconds
+    if (now.getTime() - lastPowerSave >= POWER_SAVE_INTERVAL && powerBuffer.length > 0) {
+      lastPowerSave = now.getTime();
+      const medV = median(powerBuffer.map(r => r.v));
+      const medI1 = median(powerBuffer.map(r => r.i1));
+      const medI2 = median(powerBuffer.map(r => r.i2));
+      const medP1 = medV * medI1;
+      const medP2 = medV * medI2;
+      powerBuffer.length = 0;
+      pool.query(
+        `INSERT INTO power_readings (ts, voltage, current_1, current_2, power_1, power_2)
+         VALUES (NOW(), $1, $2, $3, $4, $5)
+         ON CONFLICT (ts) DO NOTHING`,
+        [medV, medI1, medI2, medP1, medP2],
+      ).catch((err) => {
+        log.error("[routes] power_readings insert failed:", err);
+      });
+    }
+  }
+
+  // The ESP has been physically retired; when CT02 is the active meter the HTTP
+  // route below is refused. Throttle the rejection log so a stubborn client
+  // cannot flood the logs (one line per few minutes is enough to notice).
+  let lastEspRejectLogAt = 0;
+  const ESP_REJECT_LOG_INTERVAL = 5 * 60_000;
 
   async function getCurrentPayload() {
     // Use in-memory caches where available, fall back to DB in parallel
@@ -517,7 +610,20 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   // ---------- Power Ingest (ESP) ----------
 
-  router.post("/api/power/ingest", async (req: Request, res: Response) => {
+  router.post("/api/power/ingest", (req: Request, res: Response) => {
+    // CT02 is the household meter now (CT02_POWER_METER=true): refuse the ESP
+    // feed rather than interleaving two meters, which would corrupt the leveler's
+    // flicker and smoothing statistics. Hard refusal, not a merge.
+    if (config?.ct02PowerMeter) {
+      const now = Date.now();
+      if (now - lastEspRejectLogAt >= ESP_REJECT_LOG_INTERVAL) {
+        lastEspRejectLogAt = now;
+        log.warn("[routes] refused ESP power ingest: CT02 is the active meter (CT02_POWER_METER=true)");
+      }
+      res.status(409).json({ error: "ESP feed retired: CT02 is the active meter (CT02_POWER_METER=true)" });
+      return;
+    }
+
     const { v, i1, i2 } = req.body as { v: number; i1: number; i2: number };
     if (typeof v !== "number" || typeof i1 !== "number" || typeof i2 !== "number") {
       res.status(400).json({ error: "Missing or invalid fields: v, i1, i2 (all required, numeric)" });
@@ -527,29 +633,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       res.status(400).json({ error: "Values must be finite numbers" });
       return;
     }
-    const p1 = v * i1;
-    const p2 = v * i2;
-    const now = new Date();
-    latestPower = { ts: now.toISOString(), voltage: v, current_1: i1, current_2: i2, power_1: p1, power_2: p2 };
-    onPowerIngest?.(latestPower);
-    powerBuffer.push({ v, i1, i2 });
-
-    // Persist median of buffered readings to DB every 60 seconds
-    if (now.getTime() - lastPowerSave >= POWER_SAVE_INTERVAL && powerBuffer.length > 0) {
-      lastPowerSave = now.getTime();
-      const medV = median(powerBuffer.map(r => r.v));
-      const medI1 = median(powerBuffer.map(r => r.i1));
-      const medI2 = median(powerBuffer.map(r => r.i2));
-      const medP1 = medV * medI1;
-      const medP2 = medV * medI2;
-      powerBuffer.length = 0;
-      await pool.query(
-        `INSERT INTO power_readings (ts, voltage, current_1, current_2, power_1, power_2)
-         VALUES (NOW(), $1, $2, $3, $4, $5)
-         ON CONFLICT (ts) DO NOTHING`,
-        [medV, medI1, medI2, medP1, medP2],
-      );
-    }
+    ingestPowerReading(v, i1, i2);
     res.json({ ok: true });
   });
 
@@ -1800,5 +1884,5 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
   });
 
-  return router;
+  return Object.assign(router, { ingestPower: ingestPowerReading });
 }

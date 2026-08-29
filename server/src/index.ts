@@ -17,6 +17,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 async function main(): Promise<void> {
+  // A meter flag with no topic base cannot construct a CT02 feed, so it must not
+  // silently refuse the ESP route and leave the system meterless. resolveCt02PowerMeter
+  // already forces the flag off in that case; surface why so it is diagnosable.
+  if (process.env.CT02_POWER_METER === "true" && !config.ct02PowerMeter) {
+    log.error("[index] CT02_POWER_METER=true ignored: CT02_MQTT_TOPIC is unset, so no CT02 meter feed is constructed. The ESP ingest route stays open.");
+  }
+
   // Create database pool and initialize schema
   const pool = await createPool(config.databaseUrl);
   await initDb(pool);
@@ -32,18 +39,6 @@ async function main(): Promise<void> {
   const biasPath = path.resolve(__dirname, "..", "bias-data", "bias-table.json");
   const forecastService = new ForecastService(biasPath);
   forecastService.init();
-
-  // CT02 open-firmware meter feed — its own MQTT connection, in-memory only,
-  // deliberately isolated from the ESP/leveller path (see ct02-feed.ts).
-  const ct02Feed = config.ct02TopicBase
-    ? new Ct02Feed({
-        brokerUrl: config.mqttBrokerUrl,
-        username: config.mqttUsername,
-        password: config.mqttPassword,
-        topicBase: config.ct02TopicBase,
-      })
-    : null;
-  ct02Feed?.start();
 
   // Create Express app
   const app = express();
@@ -61,7 +56,7 @@ async function main(): Promise<void> {
   app.use(express.json());
 
   // Mount API routes
-  app.use(createRouter(
+  const apiRouter = createRouter(
     pool,
     config,
     () => collector.xiaomiCloud,
@@ -108,7 +103,26 @@ async function main(): Promise<void> {
       requestAbort: (reason) => collector.acCalibrator.requestAbort(reason),
     },
     () => collector.getLoopAgeMs(),
-  ));
+  );
+  app.use(apiRouter);
+
+  // CT02 open-firmware meter feed: its own MQTT connection, decoded in memory.
+  // Always a diagnostics feed for /diag; when CT02_POWER_METER is on it is ALSO
+  // the household power meter and drives the former ESP pipeline via onReading
+  // (see ct02-feed.ts). The ESP HTTP route is refused while the flag is on, so
+  // exactly one meter feeds latestPower.
+  const ct02Feed = config.ct02TopicBase
+    ? new Ct02Feed({
+        brokerUrl: config.mqttBrokerUrl,
+        username: config.mqttUsername,
+        password: config.mqttPassword,
+        topicBase: config.ct02TopicBase,
+        onReading: config.ct02PowerMeter
+          ? (r) => apiRouter.ingestPower(r.v, r.i1, r.i2)
+          : undefined,
+      })
+    : null;
+  ct02Feed?.start();
 
   // ---------- Sensor diagnostics (temporary, read-only) ----------
   // Mounted on its own router AFTER the API router so the auth middleware

@@ -26,8 +26,20 @@ export interface Config {
   tuyaIngestToken?: string;
   /** MQTT client id / topic base of the flashed CT02 power meter. Empty = its diagnostics feed stays off. */
   ct02TopicBase?: string;
+  /** When true, the CT02 MQTT feed is the active household power meter and the ESP ingest route is refused (409). Optional so existing Config literals stay valid. */
+  ct02PowerMeter?: boolean;
   /** Escape hatch: false = an OBSERVED (un-commanded) AC off never records a manual-off lock. */
   observedOffLocks: boolean;
+}
+
+/**
+ * The CT02 is the active household meter only when the flag is exactly "true"
+ * AND a topic base is configured. Guarding on the topic avoids a silently
+ * meterless system (refusing the ESP route while constructing no CT02 feed).
+ * Pure so it is unit-testable.
+ */
+export function resolveCt02PowerMeter(flagEnv: string | undefined, topicBase: string): boolean {
+  return flagEnv === "true" && topicBase.length > 0;
 }
 
 export const config: Config = {
@@ -54,5 +66,6 @@ export const config: Config = {
   hermesApiToken: process.env.HERMES_API_TOKEN ?? "",
   tuyaIngestToken: process.env.TUYA_INGEST_TOKEN ?? "",
   ct02TopicBase: process.env.CT02_MQTT_TOPIC ?? "",
+  ct02PowerMeter: resolveCt02PowerMeter(process.env.CT02_POWER_METER, process.env.CT02_MQTT_TOPIC ?? ""),
   observedOffLocks: process.env.OBSERVED_OFF_LOCKS !== "false",
 };

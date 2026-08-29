@@ -7,11 +7,18 @@ const log = childLogger("ct02");
  * CT02 open-firmware power-meter feed (QS-WIFI-S04-CT02 running OpenBeken +
  * our custom `drv_hlw8112_uart` driver — see docs/CT02_FLASH_PLAN.md).
  *
- * DELIBERATELY ISOLATED, exactly like tuya-power.ts: this module owns its own
- * MQTT connection, keeps everything in memory, writes NOTHING to the database
- * and never reaches the ESP power path, `latestPower`, or the AC leveller. The
- * leveller's strain detection and flicker statistics key off the single ESP
- * stream; a second interleaved feed corrupts them. Nothing here may change that.
+ * Two roles, selected by the CT02_POWER_METER flag. Always a diagnostics feed
+ * for `/api/diag` and `/diag`: this module owns its own MQTT connection and
+ * keeps decoded channel state in memory. When CT02_POWER_METER is on it is ALSO
+ * the household power meter. The clamps moved onto the mains and the custom ESP
+ * monitor was physically retired (user decision 2026-08-29), so the earlier
+ * "never reaches the ESP power path, `latestPower`, or the leveller" contract
+ * from the side-by-side era no longer holds. This feed now deliberately drives
+ * the former ESP pipeline through the `onReading` callback (voltage, current_a,
+ * current_b become v, i1, i2). The single-source invariant the leveller's
+ * strain and flicker statistics depend on is preserved not by isolating this
+ * feed but by refusing the ESP HTTP ingest route while the flag is on: exactly
+ * one meter feeds `latestPower` at a time.
  *
  * Transport: the device publishes to our Mosquitto broker as
  * `<topicBase>/<channelIndex>/get` with a RAW INTEGER payload (OpenBeken only
@@ -211,6 +218,51 @@ export const CT02_MAX_PAYLOAD_CHARS = 256;
 /** Per-port observation ring size. At the device's cadence this is many windows deep. */
 export const CT02_MAX_OBSERVATIONS = 600;
 
+/**
+ * Minimum gap between meter emissions when this feed drives the power pipeline.
+ * This is the FAST path: it serves the dashboard power card (which polls at 1 s),
+ * `latestPower` freshness, and the DB median buffer, so it runs at the device's
+ * 1 Hz cadence. The leveler is NOT fed at this rate: routes.ts throttles the
+ * onPowerIngest fan-out separately (LEVELER_FORWARD_MIN_GAP_MS), because the
+ * controller's statistics are tuned in reading counts at the retired ESP's ~5 s
+ * cadence.
+ */
+export const CT02_METER_MIN_GAP_MS = 1000;
+
+/**
+ * A meter channel is only fresh enough to emit if it reported inside this window.
+ * Two 60 s heartbeats plus margin (same spirit as CT02_ASSESS_WINDOW_MS): a
+ * channel that has gone quiet for two rebroadcasts is a half-dead device, and
+ * emitting its last value would feed the leveler fiction. Going silent instead
+ * lets the 15 s downstream staleness bar read it as "no electricity", the safe
+ * direction.
+ */
+export const CT02_METER_CHANNEL_FRESH_MS = 130_000;
+
+/**
+ * A gap this long between ANY device messages means the device dropped off: a
+ * grid/gen changeover power-cycles the CT02 for ~15 s while the pre-changeover
+ * channel values still sit inside the freshness bar above. On reconnect the
+ * first channel to publish would otherwise emit a reading mixing its fresh value
+ * with two pre-changeover ones (e.g. a stale 6 A grid clamp riding along as i1
+ * while i2 is the new gen current), injecting a phantom source transition into
+ * the leveler every changeover. So a gap of at least this long starts a fresh
+ * meter epoch: only channels that report at or after it are eligible again. This
+ * equals the 15 s downstream staleness bar, so by the time the gate can arm the
+ * meter already reads as "no electricity" downstream: it adds no new outage, it
+ * only extends the existing gap by the time every channel takes to re-report
+ * (typically 1 to 3 s, worst case one 60 s heartbeat). A `<base>/connected` birth
+ * message is a second, faster reboot signal (see noteDeviceMessage).
+ */
+export const CT02_METER_RESUME_GAP_MS = 15_000;
+
+/** One power-pipeline reading: grid amps (i1), gen amps (i2), line voltage (v). */
+export interface Ct02MeterReading {
+  v: number;
+  i1: number;
+  i2: number;
+}
+
 export interface Ct02FeedOptions {
   brokerUrl: string;
   username: string;
@@ -224,6 +276,14 @@ export interface Ct02FeedOptions {
   historyLimit?: number;
   /** Minimum gap between retained history samples, ms. Default 1000. */
   historyMinGapMs?: number;
+  /**
+   * When set, this feed IS the household power meter: it emits a mapped reading
+   * (port A = grid = i1, port B = gen = i2, voltage = v) into the former ESP
+   * pipeline. Absent = diagnostics only. See the module header.
+   */
+  onReading?: (r: Ct02MeterReading) => void;
+  /** Minimum gap between meter emissions, ms. Default CT02_METER_MIN_GAP_MS. */
+  meterMinGapMs?: number;
   /** Injectable clock for tests. */
   now?: () => number;
 }
@@ -378,11 +438,19 @@ export function assessPorts(
 
 export class Ct02Feed {
   private client: mqtt.MqttClient | null = null;
-  private readonly opts: Required<Omit<Ct02FeedOptions, "now">> & { now: () => number };
+  private readonly opts:
+    & Required<Omit<Ct02FeedOptions, "now" | "onReading">>
+    & { now: () => number; onReading?: (r: Ct02MeterReading) => void };
   private readonly channels = new Map<string, Ct02ChannelState>();
   private readonly topics = new Map<string, { value: string; updatedAt: number; count: number }>();
   private history: Ct02Sample[] = [];
   private lastHistoryAt = 0;
+  /** Last meter emission time, so the throttle survives across messages. */
+  private lastMeterEmitAt = 0;
+  /** Last time any device message arrived (decoded or not). Feeds the silence-gap epoch reset. */
+  private lastDeviceMsgAt = 0;
+  /** Start of the current meter epoch; channels last updated before it are pre-changeover and never mixed in. */
+  private meterEpochStartAt = 0;
   // Verdict inputs. Appended on EVERY current-channel message, so the chart's
   // throttle can never drop a reading the assessment needed.
   private aObservations: PortObservation[] = [];
@@ -413,7 +481,9 @@ export class Ct02Feed {
       topicBase: options.topicBase,
       historyLimit: options.historyLimit ?? 1800,
       historyMinGapMs: options.historyMinGapMs ?? 1000,
+      meterMinGapMs: options.meterMinGapMs ?? CT02_METER_MIN_GAP_MS,
       now: options.now ?? (() => Date.now()),
+      onReading: options.onReading,
     };
     this.clientId = `home-dashboard-ct02-${this.opts.now()}`;
   }
@@ -513,6 +583,7 @@ export class Ct02Feed {
     const now = this.opts.now();
     this.messageCount++;
     this.lastMessageAt = now;
+    this.noteDeviceMessage(topic, now);
 
     const existing = this.topics.get(topic);
     if (!existing && this.topics.size >= CT02_MAX_TOPICS) {
@@ -576,6 +647,75 @@ export class Ct02Feed {
     });
 
     this.recordSample(now);
+    // Attempt the meter emission ONLY on the current_b message. current_b is the
+    // LAST of the meter trio in the firmware's fixed per-tick publish order
+    // (voltage, frequency, current_a, current_b, then the powers), and hlwfix3
+    // force-publishes all six instantaneous channels every 1 Hz tick, so keying
+    // the emission here makes every reading a coherent same-tick snapshot. Keying
+    // it to any earlier channel lets the 1 s throttle pair this tick's voltage
+    // with the PREVIOUS tick's currents (a systematic 1-tick current skew, worst
+    // exactly at a source transition). Every gate inside (all-three present,
+    // freshness, epoch, throttle) still applies, now evaluated at current_b.
+    if (spec.key === "current_b") {
+      this.maybeEmitReading(now);
+    }
+  }
+
+  /**
+   * Starts a fresh meter epoch on a device reboot or reconnect, so a
+   * post-reconnect reading can never carry a pre-changeover channel value. Two
+   * signals, either sufficient:
+   *   - a message on `<base>/connected`, which OpenBeken republishes at every
+   *     MQTT session start (the primary, fastest reboot signal), and
+   *   - a silence of at least CT02_METER_RESUME_GAP_MS since the last message of
+   *     ANY kind (the belt for a missed birth message and for our own client's
+   *     reconnects).
+   * Runs for EVERY handled message: any topic on the device tree counts as
+   * liveness, and the emission gate keys off the epoch, not off which channel
+   * happened to arrive first. The very first message is not treated as a gap, so
+   * the epoch stays 0 and the all-three-seen gate governs the first emissions.
+   */
+  private noteDeviceMessage(topic: string, now: number): void {
+    const isConnect = topic === `${this.opts.topicBase}/connected`;
+    const longGap = this.lastDeviceMsgAt !== 0 && now - this.lastDeviceMsgAt >= CT02_METER_RESUME_GAP_MS;
+    if (isConnect || longGap) {
+      this.meterEpochStartAt = now;
+    }
+    this.lastDeviceMsgAt = now;
+  }
+
+  /**
+   * When configured as the power meter, emits one mapped reading into the ESP
+   * pipeline. Gated on all three of voltage, current_a and current_b being fresh
+   * (a half-dead device that stopped reporting one channel goes silent rather
+   * than feeding a stale value forward) AND all three having reported within the
+   * current meter epoch (so a changeover reconnect never mixes a fresh channel
+   * with two pre-changeover ones), and throttled to one emission per
+   * meterMinGapMs (the 1 s fast path; the leveler fan-out is throttled
+   * separately in routes.ts).
+   */
+  private maybeEmitReading(now: number): void {
+    const onReading = this.opts.onReading;
+    if (!onReading) return;
+
+    const voltage = this.channels.get("voltage");
+    const currentA = this.channels.get("current_a");
+    const currentB = this.channels.get("current_b");
+    if (!voltage || !currentA || !currentB) return;
+
+    const fresh = (c: Ct02ChannelState): boolean => now - c.updatedAt <= CT02_METER_CHANNEL_FRESH_MS;
+    if (!fresh(voltage) || !fresh(currentA) || !fresh(currentB)) return;
+
+    // Every channel must have reported within the current meter epoch, so a
+    // post-changeover reading can never carry a pre-changeover channel value.
+    const inEpoch = (c: Ct02ChannelState): boolean => c.updatedAt >= this.meterEpochStartAt;
+    if (!inEpoch(voltage) || !inEpoch(currentA) || !inEpoch(currentB)) return;
+
+    if (now - this.lastMeterEmitAt < this.opts.meterMinGapMs) return;
+    this.lastMeterEmitAt = now;
+
+    // Port A = grid conductor = i1/current_1, port B = generator = i2/current_2.
+    onReading({ v: voltage.value, i1: currentA.value, i2: currentB.value });
   }
 
   /**
