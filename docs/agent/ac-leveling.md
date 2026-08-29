@@ -2416,6 +2416,24 @@ Live 2026-06-09 root cause of "the leveler doesn't specify a level on grid": Naj
 
 ## Per-AC calibration (2026-06-07, `ac-calibration.ts` — `AcCalibrator`)
 
+### 2026-08-19 — CT02 clamp measurement (Abdu)
+
+The Tuya CT02 clamp was on **Abdu's AC circuit only** (pre-P3 position; see `operations.md`), and fed ~29 h of 60 s medians to `tuya_power_readings`. States were labeled from `ac_leveling_journal` executed commands + `ac_control_audit`, then filtered — 6-min settle exclusion after every level/power/source change (2 min after fan), glitch rows dropped (V outside 180–240, P≉V·I, A>11, or above the concurrent ESP household total) — and the dominant cluster per (source, level, fan) was taken. Gross clamp amps, med (p90):
+
+| source | L1 | L2 | L3 | notes |
+|---|---|---|---|---|
+| gen | 4.32 (4.43) | 6.25 (6.39) | 8.12 (8.29) | n=332 / 60 / 38 |
+| grid | 4.31 (4.42) | — | 7.71 (8.24) | n=138 / – / 136; grid L2 never appeared settled in-window |
+
+All-off standby is **0.26 A** (the unit draws this whenever the compressor is off), and the indoor fan STOPS when the compressor idles, so "fan-only" ≈ standby. Fan gears with the compressor pegged at L1 (gen) cost ≈ **+0.03 A/gear** (F1 4.29 / F3 4.33 / F6 4.45) — far below the 0.15 A/gear `fan:step` book value.
+
+- **Config change:** Abdu's `ampModels` AND `genAmpModels` both set to `{baseAmps: 4.2, stepAmps: 1.9}` ⇒ L1 4.2 / L2 6.1 / L3 8.0 — **delta-from-standby** semantics (measured p90 minus the 0.26 A baseline: 4.17 / 6.13 / 8.03), which is what the Σ-model math wants. Was grid `{4.3, 2.5}` ⇒ 9.3 A and gen `{4.1, 2.45}` ⇒ 9.0 A at L3 — L3 over-priced by ~1 A (the old 9.0 also UNDER-booked the house residual by ~0.9 A whenever Abdu ran L3, permissive direction; the correction removes that skew).
+- **`ac_calibration_results` rewritten** for `CA5IMhFAAAE` with the mined per-state values (minus-baseline semantics, real stddev + sample counts, measured voltage): gen level 1/2/3 = 4.06 / 5.99 / 7.86, grid level 1/3 = 4.05 / 7.45, gen fan 1/3/6 = 4.03 / 4.07 / 4.19. The 2026-06-11 gen fan rows for steps 2/4/5/7 were **DELETED** (invariant-6-contaminated — F4 read 7.62 beside re-measured F3/F6 at ~4.1).
+- **Learned costs (`ac_leveling_costs`) left untouched** — `max(model, learned)` semantics keep e.g. `on@L1` 4.93 as the turn-on price.
+- **Cross-validation:** measured L2→L3 step 1.87 A vs learned EWMA `level:2>3` 1.81 A (48 samples); L1→L2 step 1.93 vs learned 2.29 (peak-biased, expected).
+- **Two contamination classes filtered:** CT02 glitch rows (V=0 or 500+, A up to 104), and a REAL second ~6–7 A load sharing the measured circuit in 7–15 min blocks — visible on the clamp but NOT on the ESP household CT, so the clamped circuit is **not exclusively the AC**.
+- **2026-08-28 status note (resolved same evening):** a post-reflash sweep briefly read HALF of every value above on both channels; the cause was the flashed firmware's conversion pipeline, not the clamps, the wiring, or this table (the user verified connections unchanged, and an ESP off-test measured exactly 2.00x the displayed value). Fixed the same night, first via interim trims and then baked into firmware (hlwfix2, `HLW8112UART_PIPELINE_SCALE 2.0`, trims back at their 1/1/1 divider semantics); both channels read true absolute amps (L1 cap ~4.3-4.5 A, matching this table), anchored to the ESP rather than assumed. **The amp model above is CONFIRMED VALID.** Full trail: docs/CT02_FLASH_PLAN.md CURRENT STEP.
+
 User request: "calibration buttons for grid and gen… choose one or more… test one by one and turn off the others." Same deps/tick pattern as the leveler. Measures each AC's REAL draw at every gen level (fan fixed at 3) and optionally every fan speed 1–7 (measured at max gen level, where the per-level current cap bites least). Takes ~10–18 min per AC.
 
 - Runs on the **currently active source** only (physics — you can't choose; run once on grid and once on gen to fill both columns). Gen steps collect **12 samples vs 6 on grid** (fluctuating voltage).

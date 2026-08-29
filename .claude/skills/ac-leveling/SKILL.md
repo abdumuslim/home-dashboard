@@ -1494,8 +1494,15 @@ metric range rule bypasses the override entirely (none active on deploy). Set vi
 ~50 s after the command against a 240 s ramp, so **L2/L3 read low** — invariant 6's bug, in the
 calibrator. Treat them as lower bounds and cross-check against the user's hardware truth above.
 Abdullah's gen model was corrected to base 2.3 / step 1.5 on 2026-08-03 (was 2.3 / 2.5, pricing his
-L3 at 7.3 A — above the 2-ton's measured L3). **Abdu (4.3/2.5 ⇒ 9.3 A at L3) and Najat (2.3/2.0 ⇒
-6.3 A at L3) are still over-priced against the same evidence** — not yet corrected.
+L3 at 7.3 A — above the 2-ton's measured L3). **Abdu's 2026-06-11 numbers are now SUPERSEDED by a
+2026-08-19 CT02 clamp measurement** — the Tuya CT02 clamped directly on his AC circuit fed ~29 h of
+60 s medians, dominant-cluster per (source, level, fan), n=38–332 per level. His gen AND grid models
+are now both `{4.2, 1.9}` ⇒ **4.2 / 6.1 / 8.0 A** at L1/2/3 (delta-from-standby, matching measured
+p90-minus-baseline 4.17 / 6.13 / 8.03), and `ac_calibration_results` now carries his mined per-state
+rows. **Najat (2.3/2.0 ⇒ 6.3 A at L3) is still over-priced against the same evidence — not yet
+corrected.** Two fan findings from the same clamp: a gear costs ≈ **+0.03 A** with the compressor
+pegged (the book `fan:step` 0.15 A/gear is high), and the indoor fan STOPS when the compressor idles,
+so the unit reads its 0.26 A standby ("fan-only" ≈ off).
 ⚠ Do NOT diagnose this from the house-load figure: the residual is `smoothed − modeled draw`, so a
 room drawing less than its model inflates "house" by construction and the reasoning is circular. The
 honest signal is the ATTRIBUTABLE one — a graded lone off's DROP against what the model priced (55).
