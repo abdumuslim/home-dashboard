@@ -29,6 +29,11 @@ export interface AcLevelingConfig {
   /** Levels an AC may be raised per batch on grid/gen (1 = one-step pacing). */
   maxRaiseStepGrid?: number;
   maxRaiseStepGen?: number;
+  /**
+   * Over-limit leaky-bucket capacity in points (4–20, server default 5). Optional:
+   * configs saved before the field existed omit it.
+   */
+  overLimitBudgetPoints?: number;
 }
 
 export type NeedTier = "satisfied" | "mild" | "full";

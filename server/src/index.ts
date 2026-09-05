@@ -88,6 +88,7 @@ async function main(): Promise<void> {
       updateConfig: (cfg) => collector.leveling().updateConfig(cfg as never),
       getStatus: () => collector.leveling().getStatus(),
       onUserPowerOff: (deviceId) => collector.leveling().onUserPowerOff(deviceId),
+      onUserPowerOffSent: (deviceId) => collector.acLeveler2.onUserPowerOffSent(deviceId),
       onUserPowerOn: (deviceId) => collector.leveling().onUserPowerOn(deviceId),
       noteUserGenLevel: (deviceId) => collector.noteUserAcGenLevel(deviceId),
       onUserGenLevel: (deviceId, level) => collector.onUserAcGenLevel(deviceId, level),
@@ -103,6 +104,7 @@ async function main(): Promise<void> {
       requestAbort: (reason) => collector.acCalibrator.requestAbort(reason),
     },
     () => collector.getLoopAgeMs(),
+    () => collector.requestXiaomiRelogin(),
   );
   app.use(apiRouter);
 

@@ -14,6 +14,7 @@ import {
   OVER_LIMIT_BUDGET,
   OVER_LIMIT_BUDGET_AFTER_ACT,
   OVER_LIMIT_DRAIN_SEVERE,
+  applyBucketCapacity,
   PENDING_CUT_MS,
   POWER_COLLAPSE_MAX_MS,
   ESP_GAP_EVENT_MS,
@@ -35,9 +36,16 @@ import {
   pendingCutCredit,
   refillBucket,
   resetCalm,
+  spendableCredit,
   type CutTrendInput,
 } from "./sensing.js";
-import { DEFAULT_LEVELING_CONFIG_V2, effectiveLimit, type LevelingConfigV2 } from "./config.js";
+import {
+  DEFAULT_LEVELING_CONFIG_V2,
+  OVER_LIMIT_BUDGET_MAX,
+  OVER_LIMIT_BUDGET_MIN,
+  effectiveLimit,
+  type LevelingConfigV2,
+} from "./config.js";
 import type { MeterEvent, MeterState } from "./types.js";
 
 const cfg: LevelingConfigV2 = {
@@ -392,7 +400,7 @@ describe("leaky bucket", () => {
   it("refillBucket restores capacity after the controller acted", () => {
     const { state } = feedGen([17, 17.2]);
     expect(state.overLimitBudget).toBe(0);
-    const refilled = refillBucket(state);
+    const refilled = refillBucket(state, OVER_LIMIT_BUDGET);
     expect(refilled.overLimitBudget).toBe(OVER_LIMIT_BUDGET);
     expect(refilled.overLimitReadings).toHaveLength(0);
   });
@@ -444,6 +452,131 @@ describe("leaky bucket", () => {
     // A second one still escalates — the point is a partner, not a veto.
     const two = feedGen([16.5], { state: one.state, startAt: 1_000_000 + 20_000 });
     expect(two.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The capacity is CONFIGURED since 2026-09-05 (`overLimitBudgetPoints`, 4-20).
+// The drains are not: a severe reading (strictly MORE than
+// OVER_LIMIT_SEVERE_AMPS over the limit) still costs 3, a moderate one 2, a mild
+// one 1, and the post-act refill is still a flat OVER_LIMIT_BUDGET_AFTER_ACT.
+// So the knob moves only how long a near-limit ride is tolerated before the
+// first act, which is what the user asked it to move.
+// ---------------------------------------------------------------------------
+describe("configurable bucket capacity", () => {
+  const withCapacity = (points: number): LevelingConfigV2 => ({ ...cfg, overLimitBudgetPoints: points });
+
+  it("capacity 8 empties on the 8th mild reading and on the 3rd severe one, not before", () => {
+    const config = withCapacity(8);
+    // Mild: 0.2-0.4A over on the 15A gen, one point each.
+    const seven = feedGen([15.3, 15.4, 15.2, 15.3, 15.4, 15.2, 15.3], { config });
+    expect(seven.state.overLimitBudget).toBe(1);
+    expect(seven.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(0);
+    const eighth = feedGen([15.4], { state: seven.state, startAt: seven.now + 5_000, config });
+    expect(eighth.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
+
+    // Severe: strictly MORE than 1A over, three points each, so ceil(8/3) = 3.
+    const two = feedGen([17.0, 17.1], { config });
+    expect(two.state.overLimitBudget).toBe(2);
+    expect(two.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(0);
+    const three = feedGen([17.2], { state: two.state, startAt: two.now + 5_000, config });
+    expect(three.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
+  });
+
+  it("capacity 4 empties on the 4th mild reading and on the 2nd severe one", () => {
+    const config = withCapacity(4);
+    const three = feedGen([15.3, 15.4, 15.2], { config });
+    expect(three.state.overLimitBudget).toBe(1);
+    expect(three.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(0);
+    const fourth = feedGen([15.3], { state: three.state, startAt: three.now + 5_000, config });
+    expect(fourth.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
+
+    const one = feedGen([17.0], { config });
+    expect(one.state.overLimitBudget).toBe(1);
+    expect(one.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(0);
+    const second = feedGen([17.1], { state: one.state, startAt: one.now + 5_000, config });
+    expect(second.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
+  });
+
+  it("sustained calm refills to the CONFIGURED capacity, not to the default 5", () => {
+    const config = withCapacity(8);
+    const blip = feedGen([17.0], { config });
+    expect(blip.state.overLimitBudget).toBe(8 - OVER_LIMIT_DRAIN_SEVERE);
+    const calm = feedGen(new Array(8).fill(12), { state: blip.state, startAt: blip.now + 5_000, config });
+    expect(calm.state.overLimitBudget).toBe(8);
+  });
+
+  it("a source change resets the bucket to the configured capacity", () => {
+    const config = withCapacity(8);
+    const onGen = feedGen([17, 17.1], { config });
+    expect(onGen.state.overLimitBudget).toBe(2);
+    const r = ingestReading(onGen.state, { gridAmps: 18, genAmps: 0 }, config, onGen.now + 5_000);
+    expect(r.events.some((e) => e.kind === "source_changed" && e.to === "grid")).toBe(true);
+    expect(r.state.overLimitBudget).toBe(8);
+  });
+
+  it("the post-act refill is 4 whatever the capacity: partial at 8, FULL at 4", () => {
+    const big = withCapacity(8);
+    const small = withCapacity(4);
+    const drained = feedGen([17, 17.1, 17.2], { config: big });
+    expect(drained.state.overLimitBudget).toBe(0);
+
+    // At 8 it is a partial refill, so an under-sized cut still escalates fast.
+    const actedBig = refillBucket(drained.state, OVER_LIMIT_BUDGET_AFTER_ACT);
+    expect(actedBig.overLimitBudget).toBe(4);
+    expect(actedBig.overLimitBudget).toBeLessThan(big.overLimitBudgetPoints);
+    // At the minimum capacity the same refill is a FULL one, which is why the
+    // minimum is 4: one severe reading (3 points) can never empty it alone.
+    const actedSmall = refillBucket(drained.state, OVER_LIMIT_BUDGET_AFTER_ACT);
+    expect(actedSmall.overLimitBudget).toBe(small.overLimitBudgetPoints);
+    const one = feedGen([16.5], { state: actedSmall, startAt: drained.now + 10_000, config: small });
+    expect(one.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(0);
+    const two = feedGen([16.6], { state: one.state, startAt: one.now + 5_000, config: small });
+    expect(two.events.filter((e) => e.kind === "bucket_empty")).toHaveLength(1);
+  });
+
+  describe("applyBucketCapacity", () => {
+    const at = (overLimitBudget: number): MeterState => ({ ...initialMeterState(), overLimitBudget });
+
+    it("preserves spent debt in BOTH directions", () => {
+      // 2 points already spent by this episode's readings: a bigger bucket must
+      // not hand the house a fresh full one mid-overload.
+      expect(applyBucketCapacity(at(3), 5, 8).overLimitBudget).toBe(6);
+      // And a smaller one keeps the same 2 points of debt against the smaller
+      // capacity: 2 left of 4, not a fresh 4 and not an instant 0.
+      expect(applyBucketCapacity(at(6), 8, 4).overLimitBudget).toBe(2);
+    });
+
+    it("clamps at 0 when the episode outspent the new capacity, and fills an untouched bucket", () => {
+      expect(applyBucketCapacity(at(1), 8, 4).overLimitBudget).toBe(0);
+      expect(applyBucketCapacity(at(0), 8, 4).overLimitBudget).toBe(0);
+      // Nothing spent: the bucket is simply full at the new capacity (the boot
+      // transition from the default alias to a configured value).
+      expect(applyBucketCapacity(at(5), 5, 8).overLimitBudget).toBe(8);
+      expect(applyBucketCapacity(at(5), 5, 4).overLimitBudget).toBe(4);
+    });
+
+    it("leaves everything else on the state alone", () => {
+      const banked: MeterState = { ...initialMeterState(), overLimitBudget: 3, overLimitReadings: [16.2], calmSince: 42 };
+      const next = applyBucketCapacity(banked, 5, 8);
+      expect(next.overLimitReadings).toEqual([16.2]);
+      expect(next.calmSince).toBe(42);
+    });
+  });
+
+  // testing.md, hard rule 5c: when a change introduces a threshold, assert the
+  // relationship it must keep with the constants around it. A green suite of
+  // literal readings is what let OVER_LIMIT_BUDGET_AFTER_ACT ship below the
+  // severe drain on 2026-07-31 and double-shed a room within twenty minutes.
+  it("the capacity bounds keep the post-act bucket above a single severe drain", () => {
+    expect(OVER_LIMIT_BUDGET_MIN).toBeGreaterThan(OVER_LIMIT_DRAIN_SEVERE);
+    expect(OVER_LIMIT_BUDGET_AFTER_ACT).toBeLessThanOrEqual(OVER_LIMIT_BUDGET_MIN);
+    expect(OVER_LIMIT_BUDGET_MIN).toBeLessThan(OVER_LIMIT_BUDGET_MAX);
+    expect(DEFAULT_LEVELING_CONFIG_V2.overLimitBudgetPoints).toBeGreaterThanOrEqual(OVER_LIMIT_BUDGET_MIN);
+    expect(DEFAULT_LEVELING_CONFIG_V2.overLimitBudgetPoints).toBeLessThanOrEqual(OVER_LIMIT_BUDGET_MAX);
+    // The default alias sensing still seeds initialMeterState() with IS the
+    // configured default; a divergence would boot every meter at the wrong size.
+    expect(OVER_LIMIT_BUDGET).toBe(DEFAULT_LEVELING_CONFIG_V2.overLimitBudgetPoints);
   });
 });
 
@@ -811,6 +944,96 @@ describe("commanded-cut credit (self-inflicted collapse suppression)", () => {
     const cut = noteCommandedCut(steady.state, 3.1, steady.now);
     const wobbling = feedGen([15.7, 15.6, 15.75, 15.65], { state: cut, startAt: steady.now + 5_000 });
     expect(pendingCutCredit(wobbling.state, wobbling.now)).toBeGreaterThan(0);
+  });
+});
+
+// The SPEND side of the same credit (2026-08-31, user: "when there is a budget
+// because of another AC off or level down, it should act instantly based on
+// prediction"). Everything the demand side keeps, this drops the moment spending
+// it would be a bet rather than a prediction.
+describe("spendableCredit: what a SPENDER may act on", () => {
+  const settled = () => feedGen([12, 12.1, 11.9, 12, 12.1, 11.9, 12, 12]);
+
+  it("is the credit itself for a freeing cut on a quiet line", () => {
+    const s = settled();
+    const off = noteCommandedCut(s.state, 4.5, s.now, { spendable: true });
+    expect(spendableCredit(off, s.now)).toBeCloseTo(4.5, 5);
+    expect(meterView(off, s.now).spendableCreditAmps).toBeCloseTo(4.5, 5);
+  });
+
+  it("is ZERO for a cut the reducer made: those amps belong to the breaker", () => {
+    // The demand side still counts them (do not demand the same amps twice);
+    // spending them answers the reducer's own cut with a raise, which is the
+    // cut → raise → cut cycle the acceptance replay produced.
+    const s = settled();
+    const reduce = noteCommandedCut(s.state, 4.5, s.now);
+    expect(pendingCutCredit(reduce, s.now)).toBeCloseTo(4.5, 5);
+    expect(spendableCredit(reduce, s.now)).toBe(0);
+  });
+
+  it("a reduction landing on top of an off ENDS the spending claim", () => {
+    // One pooled credit, one anchor, one clock: a stacking cut re-bases both, so
+    // the off's amps would get a landing grace they never earned, and the
+    // reducer has just proved the house cannot carry what it is carrying.
+    const s = settled();
+    const off = noteCommandedCut(s.state, 4.5, s.now, { spendable: true });
+    const then = noteCommandedCut(off, 1.5, s.now + 10_000);
+    expect(pendingCutCredit(then, s.now + 10_000)).toBeCloseTo(6.0, 5);
+    expect(spendableCredit(then, s.now + 10_000)).toBe(0);
+  });
+
+  it("…while a second OFF stacks its own amps on the first", () => {
+    const s = settled();
+    const off = noteCommandedCut(s.state, 2.5, s.now, { spendable: true });
+    const both = noteCommandedCut(off, 2.0, s.now + 10_000, { spendable: true });
+    expect(spendableCredit(both, s.now + 10_000)).toBeCloseTo(4.5, 5);
+  });
+
+  it("is ZERO once the cut STALLS: the house is outrunning it", () => {
+    // Past CREDIT_LANDING_GRACE_MS with the meter pinned AT the anchor: invariant
+    // 38's outrun void only catches a RISE, so this is the spend side's own
+    // coverage of the 2026-08-03/04 shape (3.0A commanded, 0.49A delivered in
+    // 91 s). Inside the grace it is `settling` and still spendable, deliberately
+    // (invariant 48: fast actuators are not called liars for physics they have
+    // not had time to deliver).
+    const s = settled();
+    const off = noteCommandedCut(s.state, 4.5, s.now, { spendable: true });
+    const pinned = feedGen([12, 12.1, 11.9, 12, 12.1, 11.9, 12, 12, 12, 12, 12, 12, 12, 12], {
+      state: off,
+      startAt: s.now + 5_000,
+    });
+    expect(pinned.now - s.now).toBeGreaterThan(CREDIT_LANDING_GRACE_MS);
+    expect(cutTrendOf(meterView(pinned.state, pinned.now))).toBe("stalled");
+    expect(pendingCutCredit(pinned.state, pinned.now)).toBeGreaterThan(0);
+    expect(spendableCredit(pinned.state, pinned.now)).toBe(0);
+  });
+
+  it("never counts the part of the fall the meter has ALREADY shown", () => {
+    // `absorbedAmps` ratchets against the median as it stood BEFORE the newest
+    // reading, so for one reading the same amps sit in both `headroomAmps` and
+    // the credit. On the demand side that is harmless; on the spend side it
+    // funded a second raise out of the first one's change.
+    const s = settled();
+    const off = noteCommandedCut(s.state, 4.5, s.now, { spendable: true });
+    const landing = feedGen([9, 9, 9, 9, 9], { state: off, startAt: s.now + 5_000 });
+    const view = meterView(landing.state, landing.now);
+    const shown = 12 - view.smoothedAmps; // what the median has digested so far
+    expect(shown).toBeGreaterThan(0);
+    expect(view.spendableCreditAmps).toBeLessThanOrEqual(4.5 - shown + 1e-9);
+    // …and the demand side is untouched by that cap.
+    expect(view.commandedCutCreditAmps).toBeGreaterThanOrEqual(view.spendableCreditAmps);
+  });
+
+  it("is ZERO on a frozen meter and under a latched collapse", () => {
+    const s = settled();
+    const off = noteCommandedCut(s.state, 4.5, s.now, { spendable: true });
+    // A hung CT repeats its value exactly: no micro-jitter for 60s.
+    const frozen = feedGen(Array(14).fill(12), { state: off, startAt: s.now + 5_000 });
+    expect(frozen.state.frozen).toBe(true);
+    expect(spendableCredit(frozen.state, frozen.now)).toBe(0);
+    // …and a latched collapse is not a line to spend a prediction on.
+    const latched: MeterState = { ...off, collapse: { preMedianAmps: 12, until: s.now + 60_000 } };
+    expect(spendableCredit(latched, s.now)).toBe(0);
   });
 });
 

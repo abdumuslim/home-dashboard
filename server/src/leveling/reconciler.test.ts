@@ -4,12 +4,14 @@ import {
   LEVEL_RESEND_SPACING_MS,
   UNREACHABLE_LEVEL_SENDS,
   UNREACHABLE_SAFETY_EXPIRY_MS,
+  baselineStale,
   clearMarksOnManual,
   clearOnPowerOff,
   clearOnSourceChange,
   confirmFan,
   fanResendDue,
   initialReconcilerState,
+  markRebaseOnPowerCycle,
   noteFanSend,
   noteLevelSend,
   observeLevel,
@@ -244,5 +246,59 @@ describe("unconfirmed levels (physics-envelope pricing)", () => {
 
   it("is empty for an unknown device", () => {
     expect(unconfirmedLevels(initialReconcilerState(), "nobody", T)).toEqual([]);
+  });
+});
+
+// The one-shot re-baseline a power cycle nothing else could attribute leaves
+// behind (2026-09-05). A blackout that changes no source reaches the leveler as
+// a meter gap at most; the unit's own beep-reset fingerprint is what says it
+// restarted, and a TCL comes back AT THE LEVEL IT WAS LAST COMMANDED TO, which
+// in the shadow is character-for-character a hand raise (invariant 56).
+describe("power-cycle rebase marker", () => {
+  it("adopts the next observation even while SETTLING, so a firmware restore is never manual", () => {
+    // A null baseline could not do this job: `observeLevel` returns `none`
+    // during a settle, leaving the device unbased for the whole window.
+    const marked = markRebaseOnPowerCycle(adopted(1), "a");
+    const r = observeLevel(marked, "a", 3, { ...opts, inSettle: true });
+
+    expect(r.result.kind).toBe("adopted");
+    expect(r.state.a.confirmedLevel).toBe(3);
+  });
+
+  it("drops the send bookkeeping for THAT level only, and keeps everything else", () => {
+    let s = adopted(1);
+    s = noteLevelSend(s, "a", 2, T).state; // a demote in flight
+    s = noteLevelSend(s, "a", 3, T).state; // …and a raise, on another level
+    s = noteFanSend(s, "a", 5, T); // …and a fan hold's own send, mid confirm-or-resend
+    s = noteFanSend(s, "a", 5, T + 20_000); // a resend of the same target (fanResends 1)
+    s = markRebaseOnPowerCycle(s, "a");
+    const r = observeLevel(s, "a", 3, opts);
+
+    // The observation proves L3 landed; L2 is still unproven, and over-charging
+    // the envelope is the safe direction (invariant 34).
+    expect(unconfirmedLevels(r.state, "a", T + 1_000)).toEqual([2]);
+    expect(r.state.a.pendingLevel).toBe(3); // a send in flight still lands or resends normally
+    // The FAN half is a different channel entirely: a level observation says
+    // nothing about it, and wiping it would strand a hold with no resend target.
+    expect(r.state.a.pendingFan).toBe(5);
+    expect(r.state.a.fanResends).toBe(1);
+    expect(r.state.a.lastFanSentAt).toBe(T + 20_000);
+  });
+
+  it("is one-shot: the observation after it classifies normally again", () => {
+    const marked = markRebaseOnPowerCycle(adopted(1), "a");
+    const adopt = observeLevel(marked, "a", 2, opts);
+    expect(adopt.result.kind).toBe("adopted");
+
+    const later = observeLevel(adopt.state, "a", 3, opts);
+    expect(later.result).toMatchObject({ kind: "manual", intent: "target", level: 3 });
+  });
+
+  it("baselineStale reports the marker, so a dashboard change in that window reads UNKNOWN", () => {
+    expect(baselineStale(adopted(1), "a")).toBe(false);
+    const marked = markRebaseOnPowerCycle(adopted(1), "a");
+    expect(baselineStale(marked, "a")).toBe(true);
+    expect(baselineStale(observeLevel(marked, "a", 2, opts).state, "a")).toBe(false);
+    expect(baselineStale(initialReconcilerState(), "nobody")).toBe(false);
   });
 });

@@ -2250,3 +2250,197 @@ describe("swapDonorFor: the gap constants must outrank each other (2026-07-31 le
     ).toBeNull();
   });
 });
+
+// 2026-08-31 FUNDED SPEND. `spendableCreditAmps` is budget an off/demote/manual
+// level-down has already freed that the meter has not shown yet. It reaches this
+// planner in exactly two places: subtracted ONCE from the committed meter, and
+// added ONCE to the raise phase's budget. It waives exactly one gate, the
+// calm window, for a candidate whose whole cost it covers with
+// REBALANCE_FUND_MARGIN_AMPS to spare.
+describe("funded spend (2026-08-31)", () => {
+  const shedRoom = (): AcView[] => [ac("a", { needDelta: 2 }), ac("b", { on: false, shed: true, needDelta: 4 })];
+
+  it("a shed restore is judged on the meter the off is taking us to", () => {
+    // 13.4A committed leaves no room for b's 2A return under the 14.9A ceiling.
+    const refused = raise(shedRoom(), { headroomAmps: 1.3, smoothedAmps: 13.4 });
+    expect(refused.commands).toEqual([]);
+    // A 3A off is in flight: the same tick, the same meter, and now it fits.
+    const funded = raise(shedRoom(), {
+      headroomAmps: 1.3,
+      smoothedAmps: 13.4,
+      spendableCreditAmps: 3,
+      cutAnchorAmps: 13.4,
+      commandedCutAmps: 3,
+    });
+    expect(funded.commands).toEqual([
+      { deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 },
+    ]);
+    expect(funded.decisions.find((d) => d.deviceId === "b")?.detail).toContain("funded by in-flight cut");
+  });
+
+  it("…and never below `landingAmps`, so the room's own trough is still disbelieved", () => {
+    // Invariant 41/54: the subtraction converges to the predicted post-cut meter
+    // and `max()` cannot go under it, so a credit cannot buy a room back into
+    // the hole its OWN shed dug. Anchor 16.0 less a 3A cut lands at 13.0; b's 2A
+    // return would be 15.0, over the 14.9 ceiling.
+    const p = raise(shedRoom(), {
+      headroomAmps: 4.8,
+      smoothedAmps: 9.9, // the trough: her draw gone, the survivors mid-cycle
+      spendableCreditAmps: 3,
+      cutAnchorAmps: 16.0,
+      commandedCutAmps: 3,
+    });
+    expect(p.commands.filter((c) => c.kind === "power_on")).toEqual([]);
+    expect(p.decisions.find((d) => d.deviceId === "b")?.blockedBy).toBe("no headroom");
+  });
+
+  it("waives the restore calm window for the candidate the credit covers", () => {
+    const gated = raise(shedRoom(), { calmMs: 0 });
+    expect(gated.commands).toEqual([]);
+    expect(gated.decisions.find((d) => d.deviceId === "b")?.blockedBy).toBe("calm");
+    const funded = raise(shedRoom(), {
+      calmMs: 0,
+      spendableCreditAmps: 3,
+      cutAnchorAmps: 12.1,
+      commandedCutAmps: 3,
+    });
+    expect(funded.commands.map((c) => c.kind)).toEqual(["power_on"]);
+  });
+
+  it("does NOT waive the calm window when the credit falls short of cost + margin", () => {
+    // 2A restore against a 2.4A credit: 2.4 − 0.5 < 2.0, so this is an ordinary
+    // calm-gated candidate and it reserves its amps like any other.
+    const p = raise(shedRoom(), {
+      calmMs: 0,
+      spendableCreditAmps: 2.4,
+      cutAnchorAmps: 12.1,
+      commandedCutAmps: 2.4,
+    });
+    expect(p.commands).toEqual([]);
+    expect(p.decisions.find((d) => d.deviceId === "b")?.blockedBy).toBe("calm");
+    expect(p.reservedAmps).toBeGreaterThan(0);
+  });
+
+  it("a level raise spends the credit ONCE, not once per candidate", () => {
+    // Two rooms, each a 2A step, and a 3A credit on a meter with no room of its
+    // own. The first takes it; the second must not take it again.
+    const two = [ac("a", { needDelta: 4 }), ac("b", { needDelta: 3 })];
+    const p = raise(two, {
+      headroomAmps: 0,
+      smoothedAmps: 14.7,
+      source: "grid", // gen ships one raise per batch anyway; grid is the honest test
+      limitAmps: 27,
+      spendableCreditAmps: 3,
+      cutAnchorAmps: 14.7,
+      commandedCutAmps: 3,
+    });
+    expect(p.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+  });
+
+  it("waives the raise calm window, and says so in the journal", () => {
+    const gated = raise([ac("a", { needDelta: 4 })], { calmMs: 0 });
+    expect(gated.decisions.find((d) => d.deviceId === "a")?.blockedBy).toBe("calm");
+    const funded = raise([ac("a", { needDelta: 4 })], {
+      calmMs: 0,
+      spendableCreditAmps: 3,
+      cutAnchorAmps: 12.1,
+      commandedCutAmps: 3,
+    });
+    expect(funded.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+    expect(funded.decisions.find((d) => d.deviceId === "a")?.detail).toContain("funded by in-flight cut");
+  });
+
+  it("the physics envelope still vetoes a funded raise (invariant 16 is the safety net)", () => {
+    // Two rooms at L3 model 6A each on a 15A gen: the end-state is over the cap
+    // ceiling whatever the meter or the credit says.
+    const p = raise([ac("a", { currentLevel: 2, needDelta: 4 }), ac("b", { currentLevel: 3 })], {
+      calmMs: 0,
+      headroomAmps: 0,
+      smoothedAmps: 14.7,
+      spendableCreditAmps: 5,
+      cutAnchorAmps: 14.7,
+      commandedCutAmps: 5,
+      nonAcAmps: 4,
+    });
+    expect(p.commands).toEqual([]);
+    expect(p.decisions.some((d) => d.blockedBy === "physics envelope")).toBe(true);
+  });
+
+  it("fundedOnly (the SETTLING lane) ships ONLY what the credit covers", () => {
+    // A wide-open budget and a fully calm line: the ordinary lane raises, the
+    // funded lane refuses unless the credit itself pays for the step.
+    const wide = { headroomAmps: 6, smoothedAmps: 8.7 } as const;
+    expect(raise([ac("a", { needDelta: 4 })], wide).commands).toHaveLength(1);
+    const blocked = raise([ac("a", { needDelta: 4 })], { ...wide, fundedOnly: true });
+    expect(blocked.commands).toEqual([]);
+    expect(blocked.decisions.find((d) => d.deviceId === "a")?.blockedBy).toBe("settle window");
+    const funded = raise([ac("a", { needDelta: 4 })], {
+      ...wide,
+      fundedOnly: true,
+      spendableCreditAmps: 3,
+      cutAnchorAmps: 8.7,
+      commandedCutAmps: 3,
+    });
+    expect(funded.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 2 }]);
+  });
+
+  it("fundedOnly blocks an unfunded shed restore with the settle window, not the meter", () => {
+    const wide = { headroomAmps: 6, smoothedAmps: 8.7, fundedOnly: true } as const;
+    const p = raise(shedRoom(), wide);
+    expect(p.commands).toEqual([]);
+    expect(p.decisions.find((d) => d.deviceId === "b")?.blockedBy).toBe("settle window");
+  });
+
+  it("fundedOnly plans NO funding demote: the lane spends a credit, it does not make one", () => {
+    // Independent review, 2026-08-31: the envelope-blocked trade (invariant 69)
+    // runs BEFORE the lane's own guard and `continue`s past it, so a demote+raise
+    // could ship inside a settle window, the lane's contract violated by the one
+    // branch that plans a second cut.
+    //
+    // `a` is hot and wants L2 (2A); the meter has nothing (headroom 0) and the
+    // credit covers only 1A, so the step is NOT funded. `b` is satisfied at L2
+    // and would happily hand its level over.
+    const hot = ac("a", { currentLevel: 1, needDelta: 6, rankNeedDelta: 6 });
+    const satisfied = ac("b", { currentLevel: 2, needDelta: 0.1, rankNeedDelta: 0.1 });
+    const tight = {
+      headroomAmps: 0,
+      smoothedAmps: 14.7,
+      spendableCreditAmps: 1,
+      cutAnchorAmps: 14.7,
+      commandedCutAmps: 1,
+    } as const;
+    // Outside the lane the trade is exactly as it was: the peer is demoted.
+    const trading = raise([hot, satisfied], tight);
+    expect(trading.commands.some((c) => c.kind === "set_level" && c.deviceId === "b")).toBe(true);
+    // Inside it, NOTHING ships.
+    const lane = raise([hot, satisfied], { ...tight, fundedOnly: true });
+    expect(lane.commands).toEqual([]);
+    expect(lane.fundingDonors).toEqual([]);
+    expect(lane.decisions.find((d) => d.deviceId === "a")?.blockedBy).toBe("settle window");
+  });
+
+  it("the floor-recovery YIELD sees the credit too, so a needier stranded room still outranks a restore", () => {
+    // Independent review, 2026-08-31: `floorRecoveryFits` read the bare meter
+    // while the restore admission read the credit-adjusted one, so a funded
+    // budget could buy back a LESS needy shed room while a room stranded below
+    // its active comfort floor (invariant 36) went on waiting: the yield test
+    // and the admission asking two different questions about one house.
+    //
+    // `s` sits at L1 under an active L2 floor and is the needier room; `b` is
+    // shed and milder. No visible headroom, 3A of freed-but-unmetered credit.
+    const stranded = ac("s", { currentLevel: 1, minLevel: 2, needDelta: 6, rankNeedDelta: 6 });
+    const milderShed = ac("b", { on: false, shed: true, needDelta: 3, rankNeedDelta: 3 });
+    const p = raise([stranded, milderShed], {
+      headroomAmps: 0,
+      smoothedAmps: 14.7,
+      spendableCreditAmps: 3,
+      cutAnchorAmps: 14.7,
+      commandedCutAmps: 3,
+    });
+    // The restore yields and reserves NOTHING, so the raise phase can buy the
+    // floor back, the same ordering an unfunded house would have taken.
+    expect(p.commands.some((c) => c.kind === "power_on")).toBe(false);
+    expect(p.decisions.find((d) => d.deviceId === "b")?.blockedBy).toBe("floor recovery");
+    expect(p.reservedAmps).toBe(0);
+  });
+});

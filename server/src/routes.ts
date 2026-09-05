@@ -18,6 +18,7 @@ import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAut
 import { registerTuyaPowerRoutes } from "./tuya-power.js";
 import { childLogger } from "./logger.js";
 import { computeChangedKeys } from "./leveling-config-audit.js";
+import { isLevelingV2Key, OVER_LIMIT_BUDGET_MAX, OVER_LIMIT_BUDGET_MIN } from "./leveling/config.js";
 import {
   createBaghdadPrayerResolver,
   getLegacyRangeSlots,
@@ -62,6 +63,14 @@ export interface AcLevelingHandlers {
   updateConfig(cfg: AcLevelingConfig): Promise<unknown>;
   getStatus(): AcLevelingStatus;
   onUserPowerOff(deviceId: string): Promise<void>;
+  /**
+   * The cloud ACCEPTED the off we told the leveler about before sending it.
+   * `onUserPowerOff` records intent first (a fast shadow poll must not turn the
+   * unit back on), and only this hook prices the freed budget a peer may be
+   * admitted against, so a send that throws credits nothing (2026-08-31).
+   * Optional: only the v2 controller has budget to promote.
+   */
+  onUserPowerOffSent?(deviceId: string): void;
   onUserPowerOn(deviceId: string): Promise<void>;
   /** Records direct user intent even for ACs outside the ESP controller. */
   noteUserGenLevel?(deviceId: string, level: number): void;
@@ -97,6 +106,30 @@ export const LEVELER_FORWARD_MIN_GAP_MS = 4000;
 /** Physical sanity bounds for one ingested power reading; anything outside is rejected as garbage or a forgery. */
 export const POWER_INGEST_MAX_VOLTAGE = 500;
 export const POWER_INGEST_MAX_CURRENT = 200;
+
+/**
+ * Cooldown for POST /api/xiaomi/relogin. Mirrors the in-memory login limiter in
+ * auth.ts, but the protected resource is the single Xiaomi ACCOUNT rather than the
+ * caller, so the window is GLOBAL, not per-IP: every accepted call deletes the
+ * credentials file and buys one fresh login. Sustained login volume is what makes
+ * Xiaomi answer with a captcha, and a captcha needs a human at a terminal, so the
+ * one-click retry button must not be able to outrun the collector's backoff ladder.
+ */
+const XIAOMI_RELOGIN_COOLDOWN_MS = 60_000;
+let lastXiaomiReloginAt = 0;
+
+// Periodic cleanup of the expired stamp (every 60s), matching the login limiter.
+// Trivial here because the state is one timestamp, not a per-IP map that grows.
+setInterval(() => {
+  if (lastXiaomiReloginAt && Date.now() - lastXiaomiReloginAt >= XIAOMI_RELOGIN_COOLDOWN_MS) {
+    lastXiaomiReloginAt = 0;
+  }
+}, XIAOMI_RELOGIN_COOLDOWN_MS);
+
+/** Test-only: clear the Xiaomi re-login cooldown between cases. */
+export function resetXiaomiReloginCooldownForTests(): void {
+  lastXiaomiReloginAt = 0;
+}
 
 const RANGE_MAP: Record<string, string> = {
   "6h": "6 hours",
@@ -148,7 +181,7 @@ export type PowerIngestFn = (v: number, i1: number, i2: number) => void;
  */
 export type ApiRouter = Router & { ingestPower: PowerIngestFn };
 
-export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers, acCalibration?: AcCalibrationHandlers, getLoopAgeMs?: () => number): ApiRouter {
+export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers, acCalibration?: AcCalibrationHandlers, getLoopAgeMs?: () => number, onXiaomiRelogin?: () => void): ApiRouter {
   const router = Router();
 
   // Health check — before auth middleware, no auth required
@@ -319,17 +352,26 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
     const xiaomi = getXiaomiCloud?.();
     const purifiers = await (async () => {
-      if (!xiaomi) return { devices: [], available: false };
+      // Mirrors the AC branch below: a cloud that is not authenticated reads as
+      // unavailable, never as "available with zero purifiers", which is what
+      // Hermes was told for the 1h25m of the 2026-08-31 auth wedge.
+      if (!xiaomi || !xiaomi.isReady()) {
+        return { devices: [], available: false, authStatus: xiaomi?.getAuthStatus().status ?? "not_configured" };
+      }
       try {
         return {
           devices: await xiaomi.fetchDevicesLive(),
-          available: true,
+          // Re-read after the fetch: a 401 raised by the props loop is swallowed
+          // inside fetchDevicesLive, so the status is the only witness to it.
+          available: xiaomi.isReady(),
+          authStatus: xiaomi.getAuthStatus().status,
           region: xiaomi.getRegion(),
         };
       } catch (err) {
         return {
           devices: xiaomi.getDevices(),
-          available: true,
+          available: false,
+          authStatus: xiaomi.getAuthStatus().status,
           region: xiaomi.getRegion(),
           error: (err as Error).message,
         };
@@ -857,19 +899,71 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     res.json(result);
   });
 
+  // Supported recovery button: drop the session so the collector's re-auth pass
+  // logs in again. Replaces the "POST a control command to force a 401" trick
+  // that was the only way out of the 2026-08-31 wedge. Held to one accepted call
+  // per XIAOMI_RELOGIN_COOLDOWN_MS across all callers, and refused outright while
+  // the session is healthy: dropping a working session recovers nothing, and one
+  // accepted call per minute against a healthy cloud is a 60 logins/hour storm of
+  // its own. Only a genuinely wedged session can spend the cooldown, so the worst
+  // case is one login per minute while a human keeps pressing at a session that
+  // stays broken, and none at all the moment it recovers.
+  router.post("/api/xiaomi/relogin", requireAuth, async (_req: Request, res: Response) => {
+    const cloud = getXiaomiCloud?.();
+    if (!cloud) {
+      res.status(503).json({ error: "Xiaomi Cloud not available" });
+      return;
+    }
+    if (cloud.isReady()) {
+      // Checked BEFORE the cooldown is stamped, so a refusal costs nothing: the
+      // next press, once something is actually wrong, is still accepted.
+      log.info("[routes] Xiaomi re-login refused: session is already authenticated");
+      res.status(409).json({ error: "Xiaomi sign-in is already healthy, nothing to recover." });
+      return;
+    }
+    const waitMs = XIAOMI_RELOGIN_COOLDOWN_MS - (Date.now() - lastXiaomiReloginAt);
+    if (waitMs > 0) {
+      const waitSecs = Math.ceil(waitMs / 1000);
+      log.warn(`[routes] Xiaomi re-login refused: cooldown active, ${waitSecs}s remaining`);
+      res.status(429).json({
+        error: `Sign-in retry already requested. Next retry allowed in ${waitSecs}s.`,
+        retryAfterMs: waitMs,
+      });
+      return;
+    }
+    // Stamped BEFORE the await: invalidateAuth() is async, so a double-click would
+    // otherwise land two logins inside the window.
+    lastXiaomiReloginAt = Date.now();
+    await cloud.invalidateAuth();
+    // Hand it to the collector: mid-ladder it can be sitting on a 15-minute rung,
+    // and {ok:true} followed by a quarter of an hour of nothing is the lie this
+    // endpoint exists to end. Cleared here, the next collect tick (~5s) logs in.
+    onXiaomiRelogin?.();
+    res.json({ ok: true });
+  });
+
   // ---------- Devices (Xiaomi Cloud) ----------
 
   router.get("/api/devices", requireAuth, async (_req: Request, res: Response) => {
     const cloud = getXiaomiCloud?.();
     if (!cloud) {
-      res.json({ devices: [], available: false });
+      res.json({ devices: [], available: false, authStatus: "not_configured" });
       return;
     }
     try {
       const devices = await cloud.fetchDevicesLive();
-      res.json({ devices, available: true, region: cloud.getRegion() });
+      res.json({ devices, available: cloud.isReady(), authStatus: cloud.getAuthStatus().status, region: cloud.getRegion() });
     } catch (err) {
-      res.json({ devices: cloud.getDevices(), available: true, region: cloud.getRegion(), error: (err as Error).message });
+      // A dead token now rejects here instead of resolving with []. Serve the
+      // last-known devices flagged unavailable so the client marks its tiles
+      // stale rather than blanking them on a recoverable auth failure.
+      res.json({
+        devices: cloud.getDevices(),
+        available: false,
+        authStatus: cloud.getAuthStatus().status,
+        region: cloud.getRegion(),
+        error: (err as Error).message,
+      });
     }
   });
 
@@ -1483,6 +1577,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         // Establish intent before the cloud command: a fast shadow poll must
         // never let an automation or the leveler turn the unit back on.
         await acManualOffLocks?.record(id, command === "set_self_clean" ? "self_clean" : "ui");
+        // Intent only: the budget this off frees is priced after the cloud has
+        // accepted the send (`onUserPowerOffSent` below), never here.
         if (isAcLevelingEligible(id)) await acLeveling?.onUserPowerOff(id);
       }
       // Claim per-field manual ownership before the cloud send. A verified
@@ -1493,6 +1589,11 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       // command without applying it — the shadow is re-checked every 5s and
       // the command re-sent up to 3 times (gen level/beep/fan-auto excluded).
       await cloud.sendControlVerified(id, command, value);
+      // The publish was ACCEPTED (the shadow verify loop it starts is
+      // fire-and-forget), so this is the earliest honest moment to price the
+      // budget this off frees: early enough to keep the whole latency win, late
+      // enough that a refused send can never fund a peer's spend (2026-08-31).
+      if (protectsManualOff && isAcLevelingEligible(id)) acLeveling?.onUserPowerOffSent?.(id);
       if (command === "set_power") {
         if (value === 1 && isAcLevelingEligible(id)) {
           await acLeveling?.onUserPowerOn(id);
@@ -1514,6 +1615,9 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       }
       res.json({ ok: true });
     } catch (err) {
+      // Nothing to unwind on the leveler side: the off's budget is priced only
+      // after the send is accepted. The manual-off LOCK deliberately stays (the
+      // user's intent was off, and the 500 tells them the command failed).
       res.status(500).json({ error: (err as Error).message });
     }
   });
@@ -1603,6 +1707,37 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     return null;
   }
 
+  /**
+   * The v2-owned fields (row 2), validated in ONE place. Only keys the body
+   * actually carries are checked, so a stale tab whose draft predates a deploy
+   * omits the key and row 2 keeps its stored value; an explicit `null` is a
+   * value, not an omission, and is refused, because the merge would sanitize it
+   * back to the default behind a 200.
+   */
+  function validateLevelingV2Config(b: Record<string, unknown>): string | null {
+    const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(b, key);
+    if (has("controller") && b.controller !== "v1" && b.controller !== "shadow" && b.controller !== "v2") {
+      return "controller must be v1|shadow|v2";
+    }
+    for (const key of ["fanTrimEnabled", "fundedSpend"]) {
+      if (has(key) && typeof b[key] !== "boolean") return `${key} must be a boolean`;
+    }
+    const inRange = (key: string, min: number, max: number): boolean => {
+      const v = b[key];
+      return typeof v === "number" && isFinite(v) && v >= min && v <= max;
+    };
+    if (has("restingBufferAmps") && !inRange("restingBufferAmps", 0, 10)) return "invalid v2 leveling field";
+    if (has("raiseCalmSeconds") && !inRange("raiseCalmSeconds", 5, 600)) return "invalid v2 leveling field";
+    if (has("restoreCalmSeconds") && !inRange("restoreCalmSeconds", 5, 600)) return "invalid v2 leveling field";
+    if (has("overLimitBudgetPoints")) {
+      const v = b.overLimitBudgetPoints;
+      if (!Number.isInteger(v) || (v as number) < OVER_LIMIT_BUDGET_MIN || (v as number) > OVER_LIMIT_BUDGET_MAX) {
+        return `overLimitBudgetPoints must be an integer ${OVER_LIMIT_BUDGET_MIN}–${OVER_LIMIT_BUDGET_MAX}`;
+      }
+    }
+    return null;
+  }
+
   router.get("/api/ac/leveling", requireAuth, async (_req: Request, res: Response) => {
     if (!acLeveling) { res.status(503).json({ error: "Smart AC leveling not available" }); return; }
     try {
@@ -1618,6 +1753,17 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     const body = req.body as Partial<AcLevelingConfig>;
     const validationError = validateLevelingConfig(body);
     if (validationError) { res.status(400).json({ error: validationError }); return; }
+    const v2Body = req.body as Record<string, unknown>;
+    // Checked HERE, before a single write. A kill switch that reports 200 and
+    // stays ON is worse than no kill switch (`mergeLevelingConfigV2` takes only a
+    // real boolean and silently restores the default for anything else), but
+    // rejecting it AFTER `updateConfig` had persisted the base row was worse
+    // still: a body carrying a changed generator limit and `"fundedSpend":"false"`
+    // moved a breaker-critical limit and then answered 400, so the caller believes
+    // the whole request was refused (review, 2026-08-31). The same reasoning covers
+    // every v2 field, so they are all validated here, ahead of BOTH writes.
+    const v2Error = validateLevelingV2Config(v2Body);
+    if (v2Error) { res.status(400).json({ error: v2Error }); return; }
     try {
       // Read the pre-save config BEFORE we persist so the audit's before-image and
       // the enabled transition reflect the real prior state (2026-08-06: a dashboard
@@ -1626,7 +1772,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       const prevConfig = (await acLeveling.getConfig().catch(() => ({}))) as Record<string, unknown>;
       const enabledBefore = prevConfig.enabled === true ? true : prevConfig.enabled === false ? false : null;
       const enabledAfter = body.enabled === true;
-      const config = await acLeveling.updateConfig({
+      let config = await acLeveling.updateConfig({
         enabled: body.enabled === true,
         gridLimitAmps: body.gridLimitAmps as number,
         genLimitAmps: body.genLimitAmps as number,
@@ -1648,24 +1794,18 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         maxRaiseStepGen: (body.maxRaiseStepGen as number) ?? 1,
       });
       // Forward v2-owned fields (controller flag, resting buffer, calm gates,
-      // fan trim) to the v2 controller's own config row when present.
-      const v2Body = req.body as Record<string, unknown>;
-      const v2Keys = ["controller", "restingBufferAmps", "raiseCalmSeconds", "restoreCalmSeconds", "fanTrimEnabled"];
-      if (acLeveling.updateV2Config && v2Keys.some((k) => k in v2Body)) {
-        const flavor = v2Body.controller;
-        if (flavor != null && flavor !== "v1" && flavor !== "shadow" && flavor !== "v2") {
-          res.status(400).json({ error: "controller must be v1|shadow|v2" });
-          return;
-        }
-        const num = (key: string, min: number, max: number): boolean => {
-          const v = v2Body[key];
-          return v == null || (typeof v === "number" && v >= min && v <= max);
-        };
-        if (!num("restingBufferAmps", 0, 10) || !num("raiseCalmSeconds", 5, 600) || !num("restoreCalmSeconds", 5, 600)) {
-          res.status(400).json({ error: "invalid v2 leveling field" });
-          return;
-        }
-        await acLeveling.updateV2Config(Object.fromEntries(v2Keys.filter((k) => k in v2Body).map((k) => [k, v2Body[k]])));
+      // fan trim, funded spend, over-limit budget) to the v2 controller's own
+      // config row when present. The key list is shared with the controller's own
+      // row-1/row-2 split (`LEVELING_V2_CONFIG_KEYS`): a key present in one copy
+      // and missing from the other is dropped silently behind a 200 (invariant
+      // 37's shape). Every value here was validated before the first write.
+      const v2Fields = Object.fromEntries(Object.entries(v2Body).filter(([key]) => isLevelingV2Key(key)));
+      if (acLeveling.updateV2Config && Object.keys(v2Fields).length > 0) {
+        await acLeveling.updateV2Config(v2Fields);
+        // The config captured above predates row 2's write, and the client
+        // installs this response verbatim (use-ac-leveling.ts), so a save would
+        // report the OLD value until the next poll. Re-read the merged view.
+        config = await acLeveling.getConfig();
       }
       // Attribute the save: which top-level keys changed and any enabled flip. Loud
       // like a shed — killing the controller must leave a trail (ac_control_audit did

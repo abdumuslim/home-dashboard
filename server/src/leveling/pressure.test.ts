@@ -33,6 +33,7 @@ function view(overrides: Partial<MeterView> = {}): MeterView {
     flickerMarginAmps: 0,
     derateAmps: 0,
     commandedCutCreditAmps: 0,
+    spendableCreditAmps: 0,
     commandedCutAnchorAmps: 0,
     commandedCutTotalAmps: 0,
     commandedCutAgeMs: 0,

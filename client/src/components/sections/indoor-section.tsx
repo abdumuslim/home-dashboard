@@ -4,7 +4,7 @@ import type { PurifierDevice } from "@/types/automations";
 import type { AcDevice } from "@/types/ac";
 import { IndoorCard } from "@/components/cards/indoor-card";
 import { PowerCard } from "@/components/cards/power-card";
-import { DevicesCard, type AcEntry, type PurifierEntry } from "@/components/cards/devices-card";
+import { DevicesCard, type AcEntry, type PurifierEntry, type PurifierStatus } from "@/components/cards/devices-card";
 import { useAcTimers } from "@/components/ac-widget";
 
 interface IndoorSectionProps {
@@ -14,6 +14,8 @@ interface IndoorSectionProps {
   airHistory: AirReading[];
   openOverlay: OpenOverlayFn;
   devices?: PurifierDevice[];
+  purifiersAvailable?: boolean;
+  purifiersError?: string;
   sendControl?: (deviceId: string, command: string, params: unknown[]) => Promise<void>;
   acDevices?: AcDevice[];
   acSendControl?: (deviceId: string, command: string, value: unknown) => Promise<void>;
@@ -30,7 +32,7 @@ function calcFeelsLike(t: number, rh: number): number {
   return hi;
 }
 
-export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay, devices = [], sendControl, acDevices = [], acSendControl, power, powerHistory = [] }: IndoorSectionProps) {
+export function IndoorSection({ weather, air, weatherHistory, airHistory, openOverlay, devices = [], purifiersAvailable = true, purifiersError, sendControl, acDevices = [], acSendControl, power, powerHistory = [] }: IndoorSectionProps) {
   const kitchenFeelsLike = air?.temperature != null && air?.humidity != null
     ? calcFeelsLike(air.temperature, air.humidity) : undefined;
 
@@ -64,9 +66,14 @@ export function IndoorSection({ weather, air, weatherHistory, airHistory, openOv
     },
   ].filter(Boolean) as PurifierEntry[];
 
+  // Entries still present while the cloud is down are the last-known cache, not live readings
+  const purifierStatus: PurifierStatus = purifiersAvailable
+    ? "live"
+    : purifierEntries.length > 0 ? "stale" : "unavailable";
+
   return (
     <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-      <DevicesCard acs={acEntries} purifiers={purifierEntries} />
+      <DevicesCard acs={acEntries} purifiers={purifierEntries} purifierStatus={purifierStatus} purifierError={purifiersError} />
       <IndoorCard
         title="Mom"
         icon={<Home className="w-full h-full" />}

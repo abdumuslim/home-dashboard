@@ -54,6 +54,15 @@ export interface ReconDevice {
   pendingFan: number | null;
   fanResends: number;
   lastFanSentAt: number;
+  /**
+   * One-shot "this device rebooted, the next shadow IS the truth" marker
+   * (2026-09-05). Set by `markRebaseOnPowerCycle` for a power cycle no source
+   * change reported, e.g. the collector's beep-reset fingerprint. A null
+   * baseline would not do: it returns `none` while the mode is SETTLING, which
+   * leaves the device unbased for the whole settle, and the firmware's own
+   * level restore then reads as a hand on the remote.
+   */
+  adoptNextObservation?: boolean;
 }
 
 export type ReconcilerState = Readonly<Record<string, ReconDevice>>;
@@ -98,6 +107,25 @@ export function observeLevel(
   opts: { inSettle: boolean; collapsed: boolean; maxLevel: number },
 ): { state: ReconcilerState; result: LevelObservation } {
   const d = dev(state, deviceId);
+  if (d.adoptNextObservation === true) {
+    // The unit power-cycled and this is its first word since: whatever it says
+    // IS where the firmware is, even mid-SETTLE. A TCL restores the level it was
+    // last commanded to, so this observation is character-for-character a hand
+    // raise (invariant 56) and must never mint an intent. The send bookkeeping
+    // for THIS level is dropped exactly as the first-adopt branch drops it;
+    // sends of other levels, the pending slot, the fan bookkeeping and the
+    // unreachable marks all survive (invariant 34).
+    return {
+      state: put(state, deviceId, {
+        ...d,
+        confirmedLevel: obs,
+        sendCounts: withoutLevel(d.sendCounts, obs),
+        sentAt: withoutLevel(d.sentAt, obs),
+        adoptNextObservation: false,
+      }),
+      result: { kind: "adopted" },
+    };
+  }
   if (d.confirmedLevel == null) {
     if (opts.inSettle) return { state, result: { kind: "none" } };
     // Adopting proves where the firmware actually is, so a send we were still
@@ -315,6 +343,26 @@ function withoutLevel<T>(map: Record<number, T>, level: number): Record<number, 
   const next = { ...map };
   delete next[level];
   return next;
+}
+
+/**
+ * A device power-cycled without any source change to report it (the collector's
+ * beep-reset fingerprint): arm the one-shot adopt above. Deliberately NOT a
+ * baseline wipe: an unbased device during a settle is exactly how a firmware
+ * restore gets classified as a manual target (2026-09-05).
+ */
+export function markRebaseOnPowerCycle(state: ReconcilerState, deviceId: string): ReconcilerState {
+  return put(state, deviceId, { ...dev(state, deviceId), adoptNextObservation: true });
+}
+
+/**
+ * Is this device's baseline known to be out of date? True exactly while the
+ * rebase marker is pending, i.e. between a power cycle and the first shadow
+ * that follows it. Callers that classify a change against `confirmedLevel` read
+ * it as UNKNOWN in that window instead of comparing with a pre-reboot level.
+ */
+export function baselineStale(state: ReconcilerState, deviceId: string): boolean {
+  return dev(state, deviceId).adoptNextObservation === true;
 }
 
 /** A manual gen change is a user probe — unreachable marks reset (mirrors v1). */

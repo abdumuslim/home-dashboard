@@ -8,8 +8,12 @@ import { getMetricValue, powerConditionSustained, ALERT_METRICS, VALID_PRAYER_NA
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
 import { TclCloud, type AcAction, type AcDevice } from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
-import { AcLeveler, type LevelerDeviceContext } from "./ac-leveler.js";
+import { AcLeveler } from "./ac-leveler.js";
 import { LevelingControllerV2 } from "./leveling/controller.js";
+// The v2 context is a SUPERSET of v1's (it carries `slotKey` too) and v1 accepts
+// it structurally, so the one array the collector builds satisfies both.
+import type { LevelerDeviceContext } from "./leveling/api.js";
+import { powerEventRestartsAcs } from "./leveling/power-events.js";
 import { AcCalibrator } from "./ac-calibration.js";
 import { computeNeedTier, type NeedTier } from "./ac-leveling.js";
 import { computeAutoFanLevel } from "./ac-auto-fan.js";
@@ -255,6 +259,26 @@ export class Collector {
   private lastLevelerDevicesFetch = 0;
   private tclRetryAt = 0;
   private xiaomiRetryAt = 0;
+  /** Consecutive failed Xiaomi re-auths, walking XIAOMI_REAUTH_BACKOFF_MS. A
+   * login that keeps failing must not retry every 60s forever: 60 logins/hour
+   * is exactly what Xiaomi's abuse heuristics answer with a captcha, which then
+   * needs a human. Reset to zero the moment one succeeds. */
+  private xiaomiReauthFailures = 0;
+  private readonly XIAOMI_REAUTH_BACKOFF_MS = [60_000, 5 * 60_000, 15 * 60_000];
+  /** Start of the outstanding Xiaomi init(), 0 when none is in flight. The
+   * ladder above only escalates when init() SETTLES, so an init() that never
+   * settles never escalates and the bottom rung relaunches a full login every
+   * 60s forever. One login attempt at a time closes that, and keeps two of them
+   * from sharing authStatus, the 2FA resolver and the credentials file. */
+  private xiaomiReauthInFlightSince = 0;
+  /** After this long an outstanding init() is written off so a new attempt may
+   * start: the guard must never be able to wedge recovery itself. Worst case
+   * against a permanently hung init() is therefore 6 logins/hour, against 60/hour
+   * unguarded; a login that settles and fails stays on the ladder at 4/hour. */
+  private readonly XIAOMI_REAUTH_INFLIGHT_MAX_MS = 10 * 60_000;
+  /** Id of the newest login attempt. A written-off attempt that settles late must
+   * not stamp its stale verdict over a session a newer login has since fixed. */
+  private xiaomiReauthAttempt = 0;
   private automationRules: AutomationRule[] = [];
   private automationRulesLastFetch = 0;
   private automationState = new Map<number, AutomationState>();
@@ -324,9 +348,15 @@ export class Collector {
   private acBeepOffPrefs = new Set<string>();
   private acBeepPrefsLoaded = false;
   private acBeepLastSent = new Map<string, number>();
+  /** When each beep-off pref was recorded (the UI toggle, or the row's `set_at`
+   * at load). The user's own fresh Beep OFF still reads `beep: true` from the
+   * lagging shadow for a few seconds, and the beep-reset power-cycle
+   * fingerprint must not read his hand as a restart. */
+  private acBeepOffRecordedAt = new Map<string, number>();
   private lastBeepDevicesFetch = 0;
   private readonly AC_BEEP_RESEND_COOLDOWN_MS = 30_000;
   private readonly AC_BEEP_FETCH_INTERVAL_MS = 30_000;
+  private readonly AC_BEEP_PREF_SETTLE_MS = 2 * 60_000;
   /**
    * Power-event context for observed-off classification (2026-07-06): blackouts,
    * changeovers, collapses and gen brownouts turn ACs off, and their shadows can
@@ -539,18 +569,35 @@ export class Collector {
     }
   }
 
-  /** Stamped by the leveler on source changes, collapses, and ESP dropouts. */
-  notePowerEvent(kind: string): void {
-    this.lastPowerEventAt = Date.now();
+  /**
+   * Stamped by the leveler on source changes, collapses, and meter dropouts.
+   * EVERY kind opens the observed-off classification window (hard rule 2); only
+   * the kinds that physically restart the units also power-cycle their intent.
+   *
+   * `now` is the leveler's OWN timestamp for the event (2026-09-05): this
+   * window and the controller's level-jump window judge the same event, so they
+   * are stamped from one clock rather than two `Date.now()` calls a few
+   * milliseconds apart. It defaults for the callers that have no event of their
+   * own (tests, and v1, whose dep signature carries only the kind).
+   */
+  notePowerEvent(kind: string, now: number = Date.now()): void {
+    this.lastPowerEventAt = now;
     // Shadows go stale across power events (ACs restart, firmware republishes
     // late) — force the next leveling tick to fetch live device state.
     this.lastLevelerDevicesFetch = 0;
     // A changeover / collapse / blackout restarts the units themselves: the
     // firmware resets the blower to built-in auto and re-reads swing. That is a
     // power cycle for every managed AC, and none of it passes through a
-    // rule-owned clear site (2026-08-06).
+    // rule-owned clear site (2026-08-06). A bare telemetry gap is NOT that
+    // event: the meter went quiet, the house did not. Live 2026-08-31, a 24s
+    // "ESP gap" across continuous 12.7A of grid current reverted the user's
+    // fan 5 / swing 9; he re-corrected twice and was reverted twice. The
+    // classification window above still stands for every kind; only the per-AC
+    // intent wipe is gated. A blackout that changes no source is caught per
+    // device by the beep-reset fingerprint in `noteBeepResetPowerCycle`.
+    const restartsAcs = powerEventRestartsAcs(kind);
     for (const dev of this.tclCloud?.getDevices() ?? []) {
-      this.notePowerCycle(dev.id, `power event (${kind})`);
+      if (restartsAcs) this.notePowerCycle(dev.id, `power event (${kind})`, now);
       const hasSystemProfile = this.automationRules.some(
         (rule) => rule.device_type === "ac" && (rule.device_ids ?? [rule.device_id]).includes(dev.id),
       );
@@ -571,7 +618,10 @@ export class Collector {
         this.tclCloud?.preparePowerCycleRestore?.(dev.id);
       }
     }
-    log.info(`[collector] Power event (${kind}) — observed AC offs read as power-loss for the next 15 min`);
+    log.info(
+      `[collector] Power event (${kind}) — observed AC offs read as power-loss for the next 15 min`
+      + (restartsAcs ? "" : "; meter telemetry only, AC fan/swing intent kept"),
+    );
   }
 
   /**
@@ -595,15 +645,15 @@ export class Collector {
    * updates on every leveler fan command and what keeps a later drift check from
    * misreading our own send as a manual change.
    */
-  private notePowerCycle(deviceId: string, reason: string): void {
-    this.acPowerCycleAt.set(deviceId, Date.now());
+  private notePowerCycle(deviceId: string, reason: string, now: number = Date.now()): void {
+    this.acPowerCycleAt.set(deviceId, now);
     // Only a REAL source transition physically reboots the AC (a "source none → X"
     // boot restarts only the server; an ESP gap / leveler cycle says nothing
     // about a mains changeover), so only those reasons arm the post-changeover
     // boot hold-off. Gate on this dedicated map — `acPowerCycleAt`'s semantics
     // must stay untouched for its many other consumers (2026-08-18).
     if (reason.includes("source ") && !reason.includes("source none")) {
-      this.acSourceCycleAt.set(deviceId, Date.now());
+      this.acSourceCycleAt.set(deviceId, now);
     }
     let cleared = false;
     for (const [key, entry] of this.acFanEnforcement) {
@@ -771,8 +821,14 @@ export class Collector {
 
   private async ensureAcBeepPrefsLoaded(): Promise<void> {
     if (this.acBeepPrefsLoaded) return;
-    const result = await this.pool.query("SELECT device_id FROM ac_beep_off");
+    const result = await this.pool.query("SELECT device_id, set_at FROM ac_beep_off");
     this.acBeepOffPrefs = new Set(result.rows.map((row) => String(row.device_id)));
+    // `set_at` carries the toggle across a restart: a deploy seconds after the
+    // user's Beep OFF must not let the still-lagging shadow read as a restart.
+    for (const row of result.rows) {
+      const setAt = row.set_at instanceof Date ? row.set_at.getTime() : Date.parse(String(row.set_at));
+      if (Number.isFinite(setAt)) this.acBeepOffRecordedAt.set(String(row.device_id), setAt);
+    }
     this.acBeepPrefsLoaded = true;
   }
 
@@ -789,6 +845,7 @@ export class Collector {
     this.acBeepOffPrefs.add(deviceId);
     // The UI just sent set_beep 0 itself — give the shadow time to reflect it
     this.acBeepLastSent.set(deviceId, Date.now());
+    this.acBeepOffRecordedAt.set(deviceId, Date.now());
     await this.pool.query(
       "INSERT INTO ac_beep_off (device_id) VALUES ($1) ON CONFLICT (device_id) DO NOTHING",
       [deviceId],
@@ -800,10 +857,43 @@ export class Collector {
     await this.ensureAcBeepPrefsLoaded();
     const wasSet = this.acBeepOffPrefs.delete(deviceId);
     this.acBeepLastSent.delete(deviceId);
+    this.acBeepOffRecordedAt.delete(deviceId);
     if (wasSet) {
       await this.pool.query("DELETE FROM ac_beep_off WHERE device_id = $1", [deviceId]);
       log.info(`[collector] AC ${deviceId}: beep-off preference cleared`);
     }
+  }
+
+  /**
+   * The per-device belt for a blackout that changed no source (2026-08-31): the
+   * meter can only report a gap, which is no longer read as a power cycle, but
+   * the firmware DID restart the unit, and it resets `beepSwitch` to ON ONLY on
+   * a power-loss restart (the same fingerprint the observed-off classifier
+   * trusts, and all 3 managed ACs carry an `ac_beep_off` row). So a beep-off AC
+   * seen ON with the buzzer back is the unit's own evidence of a cycle nothing
+   * else could attribute. Two guards, both needed:
+   * - inside `AC_POWER_CYCLE_RESET_MS` of the device's last cycle, stay quiet:
+   *   a lagging shadow echoes `beep: true` for ticks after the restart, and a
+   *   changeover has already noted the cycle;
+   * - inside `AC_BEEP_PREF_SETTLE_MS` of the pref being recorded, stay quiet:
+   *   the user's own fresh Beep OFF also reads true until the shadow catches up.
+   * Known exposure, inherited from the fingerprint: the ~30s after a real
+   * restart in which beep reads true is exactly the window this uses. A unit
+   * that never accepts `set_beep 0` therefore re-notes a cycle every 15 min;
+   * accepted, as the enforcement re-send is already fighting that device.
+   */
+  private noteBeepResetPowerCycle(deviceId: string): void {
+    const now = Date.now();
+    if (now - (this.acPowerCycleAt.get(deviceId) ?? 0) < this.AC_POWER_CYCLE_RESET_MS) return;
+    if (now - (this.acBeepOffRecordedAt.get(deviceId) ?? 0) < this.AC_BEEP_PREF_SETTLE_MS) return;
+    const reason = "beep reset observed (power-loss restart)";
+    this.notePowerCycle(deviceId, reason, now);
+    // …and tell the v2 leveler, which has no other way to learn about this one:
+    // a blackout that changes no source reaches it as an `esp_gap` at most, and
+    // the unit's shadow never showed the off, so its structural OFF→ON flip
+    // never ran (2026-09-05). Straight to `acLeveler2` because this is v2-owned
+    // state and v1 is rollback-only, exactly like the shadow tick below.
+    this.acLeveler2.onDevicePowerCycle(deviceId, reason, now);
   }
 
   /** Re-send set_beep 0 to any beep-off AC observed on with the beep back on. */
@@ -827,6 +917,7 @@ export class Collector {
 
     for (const dev of devices) {
       if (!this.acBeepOffPrefs.has(dev.id) || !dev.power || !dev.beep) continue;
+      this.noteBeepResetPowerCycle(dev.id);
       const lastSent = this.acBeepLastSent.get(dev.id) ?? 0;
       if (Date.now() - lastSent < this.AC_BEEP_RESEND_COOLDOWN_MS) continue;
       try {
@@ -865,7 +956,9 @@ export class Collector {
       },
       // Source change / collapse / ESP dropout — arm the observed-off
       // power-event window so a lagging shadow's OFF isn't read as user intent.
-      onPowerEvent: (kind: string) => this.notePowerEvent(kind),
+      // `now` is optional because v1's dep signature never had it; v2 always
+      // passes its own event timestamp so both windows run off one clock.
+      onPowerEvent: (kind: string, now?: number) => this.notePowerEvent(kind, now),
     };
     this.acLeveler = new AcLeveler(pool, levelerDeps);
     // v2 controller (server/src/leveling/) — selected via the `controller`
@@ -1000,6 +1093,11 @@ export class Collector {
       log.info("[collector] Xiaomi Cloud not configured (MI_EMAIL empty), automations disabled");
       return;
     }
+    // Startup fires this WITHOUT awaiting it (runForever), so the loop is already
+    // ticking while the first login runs: this attempt has to hold the single
+    // login slot too, or the first tick sees a not-yet-ready cloud and launches a
+    // SECOND concurrent login into the same authStatus and 2FA resolver.
+    const attempt = this.beginXiaomiAuthAttempt();
     try {
       this.xiaomiCloud = new XiaomiCloud(
         this.config.miEmail,
@@ -1010,6 +1108,8 @@ export class Collector {
     } catch (err) {
       log.error("[collector] Xiaomi Cloud init failed:", (err as Error).message);
       this.xiaomiCloud = null;
+    } finally {
+      this.endXiaomiAuthAttempt(attempt);
     }
   }
 
@@ -1053,6 +1153,14 @@ export class Collector {
       await this.runStep("alerts", () => this.checkAlerts());
     } catch (err) {
       log.error("[collector] Alert check failed:", err);
+    }
+
+    try {
+      if (this.xiaomiCloud) {
+        await this.runStep("xiaomi-devices", () => this.refreshXiaomiDevices());
+      }
+    } catch (err) {
+      log.warn("[collector] Xiaomi device refresh failed:", (err as Error).message);
     }
 
     try {
@@ -1328,6 +1436,126 @@ export class Collector {
     }
   }
 
+  /**
+   * The server's own eyes on the Xiaomi device list. Deliberately NOT inside
+   * checkAutomations(), which returns early when there are no automation rules:
+   * refreshDevices() had ZERO callers repo-wide, so the only thing that ever hit
+   * /home/device_list was a browser on /api/devices and a dead token could sit
+   * unnoticed for hours (the 2026-08-31 wedge, 1h25m with no purifiers in the
+   * UI). refreshDevices' own 5-minute throttle paces this to ~12 list calls/hour.
+   */
+  private async refreshXiaomiDevices(): Promise<void> {
+    if (!this.xiaomiCloud) return;
+    if (!this.xiaomiCloud.isReady()) {
+      // A wedged session is exactly what this step exists to notice.
+      this.maybeReauthXiaomiCloud();
+      return;
+    }
+    await this.xiaomiCloud.refreshDevices();
+  }
+
+  /** Backoff for the NEXT re-auth attempt: 60s, then 5 min, then 15 min. */
+  private xiaomiReauthDelay(): number {
+    const ladder = this.XIAOMI_REAUTH_BACKOFF_MS;
+    return ladder[Math.min(this.xiaomiReauthFailures, ladder.length - 1)];
+  }
+
+  private noteXiaomiReauthFailure(): void {
+    this.xiaomiReauthFailures++;
+    const delay = this.xiaomiReauthDelay();
+    // The throttle was armed BEFORE the launch, so re-arm it from the escalated
+    // ladder now that we know this attempt failed.
+    this.xiaomiRetryAt = Math.max(this.xiaomiRetryAt, Date.now() + delay);
+    log.warn(`[collector] Xiaomi re-auth failed ${this.xiaomiReauthFailures}x in a row, next attempt in ${Math.round(delay / 1000)}s`);
+  }
+
+  /** Claim the single login slot; the returned id settles it (endXiaomiAuthAttempt). */
+  private beginXiaomiAuthAttempt(): number {
+    this.xiaomiReauthInFlightSince = Date.now();
+    return ++this.xiaomiReauthAttempt;
+  }
+
+  /**
+   * Release the login slot. Returns false when this attempt was already written
+   * off by XIAOMI_REAUTH_INFLIGHT_MAX_MS and a newer one owns the slot: a stale
+   * attempt may neither free a slot it no longer holds nor have its verdict read.
+   */
+  private endXiaomiAuthAttempt(attempt: number): boolean {
+    if (attempt !== this.xiaomiReauthAttempt) return false;
+    this.xiaomiReauthInFlightSince = 0;
+    return true;
+  }
+
+  /**
+   * A human pressed Retry Sign-In (POST /api/xiaomi/relogin has already dropped
+   * the session). Clear the backoff so the next collect tick (~5s) acts on it
+   * rather than sitting out whatever rung the ladder had reached: answering
+   * {ok:true} and then doing nothing for up to 15 minutes would be a lie told in
+   * exactly the situation that endpoint exists for. Deliberately does NOT release
+   * the in-flight slot: one login at a time is what keeps two of them from
+   * sharing authStatus and the credentials file, and the deadline already frees
+   * a genuinely hung attempt.
+   */
+  requestXiaomiRelogin(): void {
+    this.xiaomiRetryAt = 0;
+    this.xiaomiReauthFailures = 0;
+    log.info("[collector] Xiaomi re-login requested, backoff cleared");
+  }
+
+  /**
+   * Record the outcome of one re-auth attempt. Only the attempt that still owns
+   * the login slot may touch the ladder: a written-off attempt settling late must
+   * not stamp a failure over a session a newer login already fixed.
+   */
+  private finishXiaomiReauth(attempt: number, threw: boolean): void {
+    if (!this.endXiaomiAuthAttempt(attempt)) {
+      log.warn(`[collector] Xiaomi re-auth attempt #${attempt} settled after being superseded, verdict ignored`);
+      return;
+    }
+    // init() swallows its own errors, so isReady() is the only honest verdict.
+    if (!threw && this.xiaomiCloud?.isReady()) {
+      this.xiaomiReauthFailures = 0;
+      return;
+    }
+    this.noteXiaomiReauthFailure();
+  }
+
+  private maybeReauthXiaomiCloud(): void {
+    if (!this.xiaomiCloud || this.xiaomiCloud.isReady()) return;
+    const authInfo = this.xiaomiCloud.getAuthStatus();
+    // needs_2fa/needs_captcha park on a human answering POST /api/xiaomi/verify;
+    // retrying there only re-prompts, so that path deliberately stops retrying.
+    if (authInfo.status === "needs_2fa" || authInfo.status === "needs_captcha") return;
+    if (Date.now() < this.xiaomiRetryAt) return;
+    // One login outstanding at a time. The ladder only escalates when init()
+    // SETTLES, so an init() that hangs for a reason the status never reflects
+    // never escalates, and the bottom rung would relaunch a fresh login every
+    // 60s indefinitely: 60 logins/hour is the volume that makes Xiaomi answer
+    // with a captcha, and a captcha needs a human. Written off after
+    // XIAOMI_REAUTH_INFLIGHT_MAX_MS so the guard cannot wedge recovery in turn,
+    // which caps the hung case at 6 logins/hour.
+    if (this.xiaomiReauthInFlightSince && Date.now() - this.xiaomiReauthInFlightSince < this.XIAOMI_REAUTH_INFLIGHT_MAX_MS) return;
+
+    // Fire-and-forget: init() blocks until 2FA/captcha is answered, and its
+    // on2fa/onCaptcha callbacks return promises that only resolve via
+    // POST /api/xiaomi/verify. Awaiting here would freeze the ENTIRE
+    // collection loop (weather, alerts, automations, timers, beep) until
+    // a human submits a code. Mirror the non-blocking startup path
+    // (see initXiaomiCloud call in runForever). Throttle set BEFORE the
+    // launch so a pending 2FA prompt (status not yet flipped) can't be
+    // relaunched on the next tick.
+    this.xiaomiRetryAt = Date.now() + this.xiaomiReauthDelay();
+    const attempt = this.beginXiaomiAuthAttempt();
+    log.warn("[collector] Xiaomi Cloud not ready, attempting re-auth");
+    void this.xiaomiCloud.init().then(
+      () => this.finishXiaomiReauth(attempt, false),
+      (err: unknown) => {
+        log.error("[collector] Xiaomi Cloud re-auth failed:", (err as Error).message);
+        this.finishXiaomiReauth(attempt, true);
+      },
+    );
+  }
+
   private async checkAutomations(): Promise<void> {
     await this.refreshAutomationRules();
     // Load leveler state early so shed guards and gen-strip checks see DB state
@@ -1347,25 +1575,9 @@ export class Collector {
         log.error("[collector] TCL Cloud re-auth failed:", (err as Error).message));
     }
 
-    if (this.xiaomiCloud && !this.xiaomiCloud.isReady()) {
-      const authInfo = this.xiaomiCloud.getAuthStatus();
-      if (authInfo.status !== "needs_2fa" && authInfo.status !== "needs_captcha") {
-        if (Date.now() >= this.xiaomiRetryAt) {
-          // Fire-and-forget: init() blocks until 2FA/captcha is answered — its
-          // on2fa/onCaptcha callbacks return promises that only resolve via
-          // POST /api/xiaomi/verify. Awaiting here would freeze the ENTIRE
-          // collection loop (weather, alerts, automations, timers, beep) until
-          // a human submits a code. Mirror the non-blocking startup path
-          // (see initXiaomiCloud call in runForever). Throttle set BEFORE the
-          // launch so a pending 2FA prompt (status not yet flipped) can't be
-          // relaunched on the next tick.
-          this.xiaomiRetryAt = Date.now() + 60_000;
-          log.warn("[collector] Xiaomi Cloud not ready, attempting re-auth");
-          void this.xiaomiCloud.init().catch((err) =>
-            log.error("[collector] Xiaomi Cloud re-auth failed:", (err as Error).message));
-        }
-      }
-    }
+    // Same ladder as the periodic device step above; the throttle makes the
+    // second caller per tick a no-op.
+    this.maybeReauthXiaomiCloud();
 
     for (const rule of this.automationRules) {
       // Calibration deliberately powers ACs off/on — AC rules must not fight
@@ -2638,8 +2850,28 @@ export class Collector {
    * comfort target (heat mode inverts the comparison). The delta (°C past the
    * satisfied point) orders raises and shed selection. The active slot's
    * gen_level rides along as the leveler's hard cap for this device.
+   *
+   * `slotKey` names the automation regime this device is under, so the leveler
+   * can release a manual pin when it changes (2026-09-05). Three encodings, and
+   * the difference between the last two matters:
+   *  - `"<ruleId>:<slotId>"`  an active slot with a live metric value;
+   *  - `"<ruleId>:inactive"`  every matching rule is out of window: the regime
+   *                           is KNOWN, and it is "off";
+   *  - `null`                 UNKNOWN (no matching rule at all, or an active
+   *                           slot whose metric had no value this tick), which
+   *                           the leveler neither compares nor stores.
+   * The rule id is part of the key because one device can be targeted by more
+   * than one rule (the fan/swing trackers key on `${ruleId}:${deviceId}` for the
+   * same reason).
    */
-  private computeAcNeed(deviceId: string, device: AcDevice): { tier: NeedTier; delta: number; slotGenCap: number | null } {
+  private computeAcNeed(
+    deviceId: string,
+    device: AcDevice,
+  ): { tier: NeedTier; delta: number; slotGenCap: number | null; slotKey: string | null } {
+    /** The first matching rule that is merely out of window: it owns the "inactive" key. */
+    let firstInactiveRuleId: number | null = null;
+    /** A matching rule IS in window but its metric had no value: the regime is unknown. */
+    let sawActiveWithoutValue = false;
     for (const rule of this.automationRules) {
       if (rule.device_type !== "ac" || rule.automation_type !== "metric" || rule.threshold_low == null) continue;
       if (!(rule.device_ids ?? [rule.device_id]).includes(deviceId)) continue;
@@ -2653,16 +2885,24 @@ export class Collector {
         getBaghdadMinutes(),
         (prayer, offset) => this.resolvePrayerMinutes(prayer, offset),
       );
-      if (!slot) continue;
+      if (!slot) {
+        firstInactiveRuleId ??= rule.id;
+        continue;
+      }
       const value = getMetricValue(rule.metric, this.latestWeatherRow, this.latestAirRow, this.latestPowerRow);
-      if (value == null) continue;
+      if (value == null) {
+        sawActiveWithoutValue = true;
+        continue;
+      }
       const isCool = (rule.action_on as Record<string, unknown>).mode === 1;
       const slotGenCap = slot.gen_level ?? null;
+      const slotKey = `${rule.id}:${slot.id}`;
       if (isCool) {
         return {
           tier: computeNeedTier({ kind: "range", value, slotLow: slot.threshold_low, slotHigh: slot.threshold }),
           delta: value - slot.threshold_low,
           slotGenCap,
+          slotKey,
         };
       }
       // Heat: need grows as the value drops below the low limit — negate to reuse the cool mapping
@@ -2670,9 +2910,14 @@ export class Collector {
         tier: computeNeedTier({ kind: "range", value: -value, slotLow: -slot.threshold, slotHigh: -slot.threshold_low }),
         delta: slot.threshold - value,
         slotGenCap,
+        slotKey,
       };
     }
-    if (!device.currentTemp || device.currentTemp <= 0) return { tier: "mild", delta: 1, slotGenCap: null };
+    // No rule governed this tick. A metric gap beats an inactive rule: an active
+    // window whose value is missing says nothing about the regime, and reporting
+    // it as "inactive" would be a boundary the automation never crossed.
+    const slotKey = sawActiveWithoutValue || firstInactiveRuleId == null ? null : `${firstInactiveRuleId}:inactive`;
+    if (!device.currentTemp || device.currentTemp <= 0) return { tier: "mild", delta: 1, slotGenCap: null, slotKey };
     // Per-AC corrections to this room's OWN comfort question (config-driven, no
     // device ids in code). `tempOffsetC` calibrates a thermometer that reads
     // high or low; `targetFromSetpoint` says this occupant's target is what he
@@ -2692,12 +2937,14 @@ export class Collector {
         tier: computeNeedTier({ kind: "comfort", currentTemp: 2 * target - roomTemp, target }),
         delta: target - roomTemp,
         slotGenCap: null,
+        slotKey,
       };
     }
     return {
       tier: computeNeedTier({ kind: "comfort", currentTemp: roomTemp, target }),
       delta: roomTemp - target,
       slotGenCap: null,
+      slotKey,
     };
   }
 
@@ -2800,6 +3047,7 @@ export class Collector {
         needTier: need.tier,
         needDelta: need.delta,
         slotGenCap: need.slotGenCap,
+        slotKey: need.slotKey,
       };
     });
     await this.leveling().tick(ctx, outdoorTempC);

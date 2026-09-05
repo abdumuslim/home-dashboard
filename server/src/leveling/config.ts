@@ -47,6 +47,30 @@ export interface LevelingConfigV2 {
   restoreCalmSeconds: number;
   /** Last-resort fan trim enabled (fans otherwise stay out of the leveling loop). */
   fanTrimEnabled: boolean;
+  /**
+   * Spenders may act on budget a cut has freed but the meter has not shown yet
+   * (`MeterView.spendableCreditAmps`): the shed restore, the level raise and the
+   * fan restore each admit at `cost ≤ credit − REBALANCE_FUND_MARGIN_AMPS` and
+   * waive their calm gate for that one admission (2026-08-31). The kill-switch:
+   * OFF reverts every one of those paths to the meter-only admission they had
+   * before, leaving only the urgent evaluation (which merely shortens the wait to
+   * an ordinary tick).
+   */
+  fundedSpend: boolean;
+  /**
+   * Capacity of the over-limit leaky bucket, in points. A mild over-limit
+   * reading drains 1, a moderate one (more than OVER_LIMIT_MODERATE_AMPS over)
+   * 2, a severe one (strictly MORE than OVER_LIMIT_SEVERE_AMPS over) 3, so the
+   * bucket empties (and the reducer acts) on the N-th mild reading or the
+   * ceil(N/3)-th severe one. Bigger = more tolerance for a near-limit ride,
+   * slower to act; smaller = the reverse.
+   *
+   * The post-act refill is `OVER_LIMIT_BUDGET_AFTER_ACT` (4) regardless of this
+   * value, which at the minimum capacity of 4 is a full refill. That is what
+   * keeps invariant 19 true at every setting: no single severe reading can empty
+   * the post-act bucket by itself.
+   */
+  overLimitBudgetPoints: number;
   comfortTargetC: number;
   nearTargetBandC: number;
   /** Device ids, highest priority first (raise ordering + tiebreaks only). */
@@ -75,6 +99,8 @@ export const DEFAULT_LEVELING_CONFIG_V2: LevelingConfigV2 = {
   raiseCalmSeconds: 30,
   restoreCalmSeconds: 15,
   fanTrimEnabled: true,
+  fundedSpend: true,
+  overLimitBudgetPoints: 5,
   comfortTargetC: 26,
   nearTargetBandC: 0.5,
   priority: [],
@@ -83,6 +109,73 @@ export const DEFAULT_LEVELING_CONFIG_V2: LevelingConfigV2 = {
   levelBoosts: {},
   needOverrides: {},
 };
+
+/**
+ * Floor for `overLimitBudgetPoints`. Four, never less: `OVER_LIMIT_BUDGET_AFTER_ACT`
+ * is a fixed 4 points, so at this capacity the post-act refill is FULL and still
+ * outranks `OVER_LIMIT_DRAIN_SEVERE` (3), so invariant 19 holds by construction
+ * at every admissible setting instead of depending on the operator's arithmetic.
+ * (Shipped below that relationship once, on 2026-07-31, and it double-shed a
+ * room within twenty minutes.)
+ */
+export const OVER_LIMIT_BUDGET_MIN = 4;
+/**
+ * Ceiling. Twenty mild readings is ~1–1.5 minutes of near-limit ride before the
+ * first act, already far past what a hot breaker survives, so anything larger
+ * would be a setting that only looks like protection.
+ */
+export const OVER_LIMIT_BUDGET_MAX = 20;
+
+/**
+ * The keys row 2 owns. ONE list, shared by the controller's row-1/row-2 split
+ * and the API's forwarding filter: a key present in one copy and missing from
+ * the other is dropped silently behind a 200, which is invariant 37's shape
+ * (a dashboard save that changed nothing for weeks).
+ */
+export const LEVELING_V2_CONFIG_KEYS = [
+  "controller",
+  "restingBufferAmps",
+  "raiseCalmSeconds",
+  "restoreCalmSeconds",
+  "fanTrimEnabled",
+  "fundedSpend",
+  "overLimitBudgetPoints",
+] as const;
+
+export type LevelingV2ConfigKey = (typeof LEVELING_V2_CONFIG_KEYS)[number];
+
+/** Fields shared with v1 on row 1; v1's own save path replaces that row wholesale. */
+type LevelingV1SharedKey =
+  | "enabled"
+  | "gridLimitAmps"
+  | "genLimitAmps"
+  | "marginAmps"
+  | "comfortTargetC"
+  | "nearTargetBandC"
+  | "priority"
+  | "ampModels"
+  | "genAmpModels"
+  | "levelBoosts"
+  | "needOverrides";
+
+type AssertNever<T extends never> = T;
+
+/**
+ * Compile-time completeness, not a second runtime list (which would only move
+ * the drift): a new field on `LevelingConfigV2` must be classified as v1-shared
+ * or listed above, or this alias stops being `never` and the constraint fails
+ * right here.
+ */
+export type LevelingV2KeysAreComplete = AssertNever<
+  Exclude<Exclude<keyof LevelingConfigV2, LevelingV1SharedKey>, LevelingV2ConfigKey>
+>;
+
+export const LEVELING_V2_CONFIG_KEY_SET: ReadonlySet<string> = new Set<string>(LEVELING_V2_CONFIG_KEYS);
+
+/** Type guard for filtering a raw `Object.entries` body by row ownership. */
+export function isLevelingV2Key(key: string): key is LevelingV2ConfigKey {
+  return LEVELING_V2_CONFIG_KEY_SET.has(key);
+}
 
 /**
  * Merge a stored JSONB row (v1-era or v2-era, possibly partial) over the v2
@@ -109,6 +202,14 @@ export function mergeLevelingConfigV2(stored: Record<string, unknown> | null | u
     // Clamp restore ≤ raise so restore's gate always opens no later.
     restoreCalmSeconds: Math.min(raiseCalmSeconds, Math.max(5, num(s.restoreCalmSeconds, d.restoreCalmSeconds))),
     fanTrimEnabled: typeof s.fanTrimEnabled === "boolean" ? s.fanTrimEnabled : d.fanTrimEnabled,
+    fundedSpend: typeof s.fundedSpend === "boolean" ? s.fundedSpend : d.fundedSpend,
+    // Whole points only, and clamped: the bucket is compared against integer
+    // drains, and a stored 0 (or a hand-edited 40) would be an operator-set
+    // capacity the safety argument in OVER_LIMIT_BUDGET_MIN no longer covers.
+    overLimitBudgetPoints: Math.min(
+      OVER_LIMIT_BUDGET_MAX,
+      Math.max(OVER_LIMIT_BUDGET_MIN, Math.round(num(s.overLimitBudgetPoints, d.overLimitBudgetPoints))),
+    ),
     comfortTargetC: num(s.comfortTargetC, d.comfortTargetC),
     nearTargetBandC: Math.min(5, Math.max(0, num(s.nearTargetBandC, d.nearTargetBandC))),
     priority: Array.isArray(s.priority) ? s.priority.filter((p): p is string => typeof p === "string") : [],

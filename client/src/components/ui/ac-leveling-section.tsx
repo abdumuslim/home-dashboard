@@ -56,7 +56,9 @@ function seedDraft(config: AcLevelingConfig, acDevices: AcDevice[]): AcLevelingC
   const nearTargetBandC = config.nearTargetBandC ?? 0.5;
   const maxRaiseStepGrid = config.maxRaiseStepGrid ?? 1;
   const maxRaiseStepGen = config.maxRaiseStepGen ?? 1;
-  return { ...config, priority, ampModels, genAmpModels, levelBoosts, raiseBufferAmps, nearTargetBandC, maxRaiseStepGrid, maxRaiseStepGen };
+  // Default 5 (see DEFAULT_LEVELING_CONFIG_V2): the over-limit bucket's capacity.
+  const overLimitBudgetPoints = config.overLimitBudgetPoints ?? 5;
+  return { ...config, priority, ampModels, genAmpModels, levelBoosts, raiseBufferAmps, nearTargetBandC, maxRaiseStepGrid, maxRaiseStepGen, overLimitBudgetPoints };
 }
 
 /**
@@ -95,7 +97,12 @@ function NumericInput({ value, step, min, max, integer, onChange, className, tit
       title={title}
       onChange={(e) => {
         setText(e.target.value);
-        const v = integer ? parseInt(e.target.value, 10) : parseFloat(e.target.value);
+        // An empty (or whitespace-only) field is someone clearing it to retype,
+        // not a zero: `Number("")` is 0, which would commit 0 to the config.
+        if (e.target.value.trim() === "") return;
+        // `Number`, never `parseInt`: parseInt("4.5") is 4, so an out-of-spec
+        // decimal was silently rounded into a valid-looking integer and saved.
+        const v = Number(e.target.value);
         if (!isFinite(v)) return;
         if (integer && !Number.isInteger(v)) return;
         if (min != null && v < min) return;
@@ -108,12 +115,14 @@ function NumericInput({ value, step, min, max, integer, onChange, className, tit
   );
 }
 
-function NumberField({ label, value, step, min, max, onChange }: {
+function NumberField({ label, value, step, min, max, integer, title, onChange }: {
   label: string;
   value: number;
   step?: number;
   min?: number;
   max?: number;
+  integer?: boolean;
+  title?: string;
   onChange: (v: number) => void;
 }) {
   return (
@@ -124,6 +133,8 @@ function NumberField({ label, value, step, min, max, onChange }: {
         step={step}
         min={min}
         max={max}
+        integer={integer}
+        title={title}
         onChange={onChange}
         className="w-full px-2 py-1 rounded-lg bg-white/10 border border-white/10 text-xs text-text focus:outline-none focus:border-cyan/50"
       />
@@ -338,7 +349,7 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
               </span>
             ),
             status.overLimitBudget < status.overLimitBudgetMax && (
-              <span key="over" className="text-amber-400" title="Over-limit leaky bucket — acts when the points run out (a reading >1A over costs 2, within 1A costs 1; sustained headroom refills it)">
+              <span key="over" className="text-amber-400" title="Over-limit leaky bucket: acts when the points run out (a reading over 1A above the limit costs 3, over 0.5A costs 2, otherwise 1; sustained headroom refills it)">
                 over-limit {status.overLimitBudgetMax - status.overLimitBudget}/{status.overLimitBudgetMax} points
               </span>
             ),
@@ -374,17 +385,28 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
       })()}
 
       {/* Limits */}
-      <div className="grid grid-cols-4 gap-2">
+      <div className="grid grid-cols-3 gap-2">
         <NumberField label="Grid limit A" value={draft.gridLimitAmps} onChange={(v) => update({ gridLimitAmps: v })} />
         <NumberField label="Gen limit A" value={draft.genLimitAmps} onChange={(v) => update({ genLimitAmps: v })} />
         <NumberField label="Margin A" step={0.5} value={draft.marginAmps} onChange={(v) => update({ marginAmps: v })} />
         <NumberField label="Raise buffer A" step={0.5} value={draft.raiseBufferAmps} onChange={(v) => update({ raiseBufferAmps: v })} />
         {/* Ranges mirror validateLevelingConfig() in routes.ts — a value the
-            input accepts must be one the API will take. */}
+            input accepts must be one the API will take. The over-limit points
+            range mirrors OVER_LIMIT_BUDGET_MIN/MAX (leveling/config.ts, 4–20). */}
         <NumberField label="Comfort °C" step={0.5} min={16} max={32} value={draft.comfortTargetC} onChange={(v) => update({ comfortTargetC: v })} />
         <NumberField label="Near target °C" step={0.1} min={0} max={5} value={draft.nearTargetBandC ?? 0.5} onChange={(v) => update({ nearTargetBandC: v })} />
         <NumberField label="Grid step" value={draft.maxRaiseStepGrid ?? 1} onChange={(v) => update({ maxRaiseStepGrid: v })} />
         <NumberField label="Gen step" value={draft.maxRaiseStepGen ?? 1} onChange={(v) => update({ maxRaiseStepGen: v })} />
+        <NumberField
+          label="Over-limit pts"
+          min={4}
+          max={20}
+          step={1}
+          integer
+          title="Leaky-bucket capacity: the bucket empties on the N-th mild over-limit reading or the ceil(N/3)-rd severe one; other guards can act sooner"
+          value={draft.overLimitBudgetPoints ?? 5}
+          onChange={(v) => update({ overLimitBudgetPoints: v })}
+        />
       </div>
 
       {/* Priority + per-AC amp model + live state */}

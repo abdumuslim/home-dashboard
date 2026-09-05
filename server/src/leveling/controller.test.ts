@@ -3,8 +3,14 @@ import { LevelingControllerV2, batchLoadDirections } from "./controller.js";
 import type { LevelingDeps } from "./api.js";
 import { SUBFLOOR_WATCH_MS } from "./needs.js";
 import { EXTERNAL_ON_DONOR_SHIELD_MS } from "./raise.js";
-import { noteAttempt, noteFailure, restoreBounces, restoreFailures, type PacingState } from "./pacing.js";
+import { attemptedWithin, noteAttempt, noteFailure, restoreBounces, restoreFailures, type PacingState } from "./pacing.js";
+import { baselineStale, noteFanSend, noteLevelSend, unconfirmedLevels, type ReconcilerState } from "./reconciler.js";
 import { houseLoadAmps, type HouseLoadState } from "./house-load.js";
+import { meterView } from "./sensing.js";
+import { noteBatch, type ModeState } from "./modes.js";
+import { powerEventRestartsAcs } from "./power-events.js";
+import type { FanHolds } from "./fan-trim.js";
+import type { MeterState } from "./types.js";
 
 // Minimal in-memory mock of the Postgres pool the controller talks to. Only the
 // tables the flavor re-sync touches are backed by mutable state; everything else
@@ -140,6 +146,101 @@ describe("LevelingControllerV2 — acting-flavor re-sync", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The over-limit bucket's CAPACITY became config on 2026-09-05 (user: make the
+// over-limit points changeable instead of the fixed 5). Three things live only
+// in the shell: the row-2 routing of the new key, the status figure the card
+// renders it with, and the live migration of a bucket whose capacity changed
+// under it while an episode was in progress.
+// ---------------------------------------------------------------------------
+describe("LevelingControllerV2: configurable over-limit budget", () => {
+  const bucketOf = (c: LevelingControllerV2) =>
+    (c as unknown as { meterState: MeterState }).meterState.overLimitBudget;
+
+  /** Deps whose TCL cloud exists, so `tick` gets past its null-cloud guard. */
+  const actingDeps = (): LevelingDeps => ({
+    ...createDeps(),
+    getTclCloud: () => ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never,
+  });
+
+  const ctxFor = (id: string) => [
+    { device: acDevice(id, true, 1), managed: true, needTier: "full" as const, needDelta: 1, slotGenCap: null, slotKey: null },
+  ];
+
+  it("updateConfig routes overLimitBudgetPoints to row 2 and not to row 1", async () => {
+    const mock = createMockPool();
+    mock.configById.set(1, { genLimitAmps: 15 });
+    mock.configById.set(2, { controller: "v2", enabled: true });
+    const controller = new LevelingControllerV2(mock.pool, createDeps());
+    await controller.ensureLoaded();
+
+    await controller.updateConfig({ overLimitBudgetPoints: 8, genLimitAmps: 14 } as never);
+
+    expect(mock.configById.get(2)).toMatchObject({ overLimitBudgetPoints: 8 });
+    expect(mock.configById.get(1)).toEqual({ genLimitAmps: 14 });
+    expect(mock.configById.get(1)).not.toHaveProperty("overLimitBudgetPoints");
+  });
+
+  it("status.overLimitBudgetMax reflects the configured capacity", async () => {
+    const mock = createGradePool({
+      overLimitBudgetPoints: 8,
+      priority: ["a"],
+      genAmpModels: { a: { baseAmps: 2, stepAmps: 2 } },
+    });
+    const controller = new LevelingControllerV2(mock.pool, actingDeps());
+    await controller.ensureLoaded();
+
+    // Before the first tick the fallback status answers from the loaded config.
+    expect(controller.getStatus().overLimitBudgetMax).toBe(8);
+
+    controller.onPowerReading({ current_1: 0, current_2: 10.2 } as never);
+    await controller.tick(ctxFor("a"), 30);
+
+    const status = controller.getStatus();
+    expect(status.overLimitBudgetMax).toBe(8);
+    // A calm line under the limit: the bucket is full at the CONFIGURED size,
+    // so the card's "over-limit k/N points" hint counts down from 8.
+    expect(status.overLimitBudget).toBe(8);
+  });
+
+  it("a PUT-driven capacity change migrates the LIVE bucket before it resolves", async () => {
+    const mock = createMockPool();
+    mock.configById.set(2, { controller: "v2", enabled: true, genLimitAmps: 15, marginAmps: 0.1, overLimitBudgetPoints: 8 });
+    const controller = new LevelingControllerV2(mock.pool, actingDeps());
+    await controller.ensureLoaded();
+
+    // One severe reading (more than 1A over the 15A gen limit): 3 points spent.
+    // The tick is what caches a status, so the GET below has one to be wrong.
+    controller.onPowerReading({ current_1: 0, current_2: 17 } as never);
+    expect(bucketOf(controller)).toBe(5);
+    await controller.tick(ctxFor("a"), 30);
+    expect(controller.getStatus().overLimitBudgetMax).toBe(8);
+
+    await controller.updateConfig({ overLimitBudgetPoints: 4 } as never);
+
+    // `updateConfig` ends in `reloadConfig`, so the transition is done before the
+    // PUT answers. Spent debt survives the shrink (8 to 4 with 3 already spent),
+    // which is what stops a knob change from forgiving a live episode.
+    expect(bucketOf(controller)).toBe(1);
+
+    // …and the card polls GET between ticks, so the CACHED status has to carry
+    // the new pair immediately. Without another tick:
+    const saved = controller.getStatus();
+    expect(saved.overLimitBudgetMax).toBe(4);
+    expect(saved.overLimitBudget).toBe(1);
+    // The figure the card divides by can never be smaller than the figure it
+    // shows, which is what an un-migrated bucket would have produced.
+    expect(saved.overLimitBudget).toBeLessThanOrEqual(saved.overLimitBudgetMax);
+
+    // The next real tick agrees with it.
+    await controller.tick(ctxFor("a"), 30);
+    const ticked = controller.getStatus();
+    expect(ticked.overLimitBudgetMax).toBe(4);
+    expect(ticked.overLimitBudget).toBe(1);
+    expect(ticked.overLimitBudget).toBeLessThanOrEqual(ticked.overLimitBudgetMax);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Grade-queue integration (2026-07-25). `pendingGrade` used to be a single slot
 // that every new batch overwrote, so on a busy generator episode NOTHING was
 // ever graded: `ac_leveling_costs` still held its 2026-07-23 seeds after ~10
@@ -265,8 +366,8 @@ describe("shed ranking on real temperature (2026-08-04)", () => {
     const dev = (id: string, currentTemp: number | undefined) =>
       ({ ...(acDevice(id, true, 1) as object), currentTemp }) as never;
     const ctx = [
-      { device: dev("cool", opts.coolTemp), managed: true, needTier: "full" as const, needDelta: opts.coolNeed, slotGenCap: null },
-      { device: dev("hot", opts.hotTemp), managed: true, needTier: "full" as const, needDelta: opts.hotNeed, slotGenCap: null },
+      { device: dev("cool", opts.coolTemp), managed: true, needTier: "full" as const, needDelta: opts.coolNeed, slotGenCap: null, slotKey: null },
+      { device: dev("hot", opts.hotTemp), managed: true, needTier: "full" as const, needDelta: opts.hotNeed, slotGenCap: null, slotKey: null },
     ];
     let flip = 1;
     for (let i = 0; i < 10; i++) {
@@ -338,7 +439,7 @@ describe("per-AC need override in buildViews (2026-08-05)", () => {
           now: number,
         ) => Array<{ deviceId: string; roomTempC: number | null; rankNeedDelta: number }>;
       }
-    ).buildViews([{ device, managed: true, needTier: "full", needDelta: 7, slotGenCap: null }], 40, Date.now());
+    ).buildViews([{ device, managed: true, needTier: "full", needDelta: 7, slotGenCap: null, slotKey: null }], 40, Date.now());
 
     expect(views[0].roomTempC).toBe(34);
     // 34 − 25, the shared comfort target. Had `targetFromSetpoint` leaked into
@@ -393,8 +494,8 @@ describe("LevelingControllerV2 — external-ON donor shield", () => {
       const a = { id: "a", name: "a", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const ctx = [
-        { device: a as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
-        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: a as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (steps: number) => {
@@ -486,7 +587,7 @@ describe("LevelingControllerV2 — shed observed-ON vs confirm lag", () => {
       await controller.ensureLoaded();
       const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const ctx = [
-        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (steps: number) => {
@@ -522,7 +623,7 @@ describe("LevelingControllerV2 — shed observed-ON vs confirm lag", () => {
       const controller = new LevelingControllerV2(mock.pool, { ...createDeps(), getTclCloud: tclStub });
       await controller.ensureLoaded();
       const ctx = [
-        { device: acDevice("b", true, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: acDevice("b", true, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       expect(controller.isShed("b")).toBe(true);
       // Past the 60s grace with no off ever seen → clear as external/already-
@@ -593,7 +694,7 @@ describe("LevelingControllerV2 — a restore's own echo is not an external hand 
       const controller = new LevelingControllerV2(mock.pool, { ...createDeps(), getTclCloud: tclStub });
       await controller.ensureLoaded();
       const ctx = [
-        { device: acDevice("b", false, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: acDevice("b", false, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       await bootObservedOff(controller, ctx);
       expect(controller.isShed("b")).toBe(true);
@@ -629,7 +730,7 @@ describe("LevelingControllerV2 — a restore's own echo is not an external hand 
       const controller = new LevelingControllerV2(mock.pool, { ...createDeps(), getTclCloud: tclStub });
       await controller.ensureLoaded();
       const ctx = [
-        { device: acDevice("b", false, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: acDevice("b", false, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       await bootObservedOff(controller, ctx);
       // A bounce stands, but NO restore was attempted — the ON is a genuine hand.
@@ -657,7 +758,7 @@ describe("LevelingControllerV2 — a restore's own echo is not an external hand 
       await controller.ensureLoaded();
       const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const ctx = [
-        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       await bootObservedOff(controller, ctx);
       // OUR restore is in flight; the device-poll reconcile clears the shed as a
@@ -716,7 +817,7 @@ describe("LevelingControllerV2 — a restore→shed round trip is not phantom ho
       await controller.ensureLoaded();
       const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const ctx = [
-        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (genAmps: number, steps: number) => {
@@ -799,7 +900,7 @@ describe("LevelingControllerV2 — grade queue", () => {
       const controller = new LevelingControllerV2(mock.pool, deps);
       await controller.ensureLoaded();
       const ctx = [
-        { device: device as never, managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
+        { device: device as never, managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null, slotKey: null },
       ];
 
       // A live CT always micro-jitters; a bit-identical stream would trip the
@@ -856,8 +957,8 @@ describe("LevelingControllerV2 — grade queue", () => {
       await controller.ensureLoaded();
       // One shed AC with no headroom at all — the restore is blocked every tick.
       const ctx = [
-        { device: acDevice("a", true, 3), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
-        { device: acDevice("b", false, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: acDevice("a", true, 3), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null, slotKey: null },
+        { device: acDevice("b", false, 1), managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       for (let i = 0; i < 40; i++) {
@@ -895,7 +996,7 @@ describe("LevelingControllerV2 — grade queue", () => {
       });
       await controller.ensureLoaded();
       const ctx = [
-        { device: acDevice("a", true, 3), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
+        { device: acDevice("a", true, 3), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       for (let i = 0; i < 6; i++) {
@@ -930,7 +1031,7 @@ describe("LevelingControllerV2 — grade queue", () => {
       });
       await controller.ensureLoaded();
       const ctx = [
-        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
+        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null, slotKey: null },
       ];
       controller.onPowerReading({ current_1: 0, current_2: 8 } as never);
       await controller.tick(ctx, 30);
@@ -982,8 +1083,8 @@ describe("LevelingControllerV2 — shed clears on confirmed ON, not at command s
       const controller = new LevelingControllerV2(mock.pool, deps);
       await controller.ensureLoaded();
       const ctx = [
-        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null },
-        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null, slotKey: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (genAmps: number, steps: number) => {
@@ -1050,7 +1151,7 @@ describe("LevelingControllerV2 — a raise is learned over the whole compressor 
       const controller = new LevelingControllerV2(mock.pool, deps);
       await controller.ensureLoaded();
       const ctx = [
-        { device: device as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: device as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (genAmps: number, steps: number) => {
@@ -1099,7 +1200,7 @@ describe("LevelingControllerV2 — a raise is learned over the whole compressor 
       const controller = new LevelingControllerV2(mock.pool, deps);
       await controller.ensureLoaded();
       const ctx = [
-        { device: device as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: device as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (genAmps: number, steps: number) => {
@@ -1192,7 +1293,7 @@ describe("LevelingControllerV2 — a lone shed's off-drop grades the on-cost", (
       const controller = new LevelingControllerV2(mock.pool, deps);
       await controller.ensureLoaded();
       // needDelta under the near-target band → no raises interfere.
-      const ctx = [{ device: a as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null }];
+      const ctx = [{ device: a as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null, slotKey: null }];
       let flip = 1;
       const run = async (genAmps: number, steps: number) => {
         for (let i = 0; i < steps; i++) {
@@ -1262,8 +1363,8 @@ describe("LevelingControllerV2 — off-drop grade voided while a peer's drop sti
       await controller.ensureLoaded();
       // needDelta under the near-target band → no raises interfere.
       const ctx = [
-        { device: a as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null },
-        { device: b as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null },
+        { device: a as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null, slotKey: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (genAmps: number, steps: number) => {
@@ -1339,8 +1440,8 @@ describe("LevelingControllerV2 — ramp absorption ratchet", () => {
       // "a" is running; "b" is off and will turn on (arming its ramp).
       const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const ctx = [
-        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null },
-        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 2, slotGenCap: null, slotKey: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (genAmps: number, steps: number) => {
@@ -1407,7 +1508,7 @@ describe("LevelingControllerV2 — a fan-only restore spend spares the fan calm 
       expect(controller.hasFanHold("a")).toBe(true);
 
       const ctx = [
-        { device: acDevice("a", true, 1), managed: true, needTier: "mild" as const, needDelta: 0, slotGenCap: null },
+        { device: acDevice("a", true, 1), managed: true, needTier: "mild" as const, needDelta: 0, slotGenCap: null, slotKey: null },
       ];
       const meterState = () =>
         (controller as unknown as { meterState: { calmSince: number | null; fanCalmSince: number | null } }).meterState;
@@ -1500,9 +1601,9 @@ describe("LevelingControllerV2 — a gen turn-on enters at its floor", () => {
     };
     const controller = new LevelingControllerV2(mock.pool, deps);
     const ctx = [
-      { device: abdullah, managed: true, needTier: "full", needDelta: 1.5, slotGenCap: null },
-      { device: abdu, managed: true, needTier: "full", needDelta: 1.6, slotGenCap: null },
-      { device: najat, managed: true, needTier: "mild", needDelta: 0.9, slotGenCap: null },
+      { device: abdullah, managed: true, needTier: "full", needDelta: 1.5, slotGenCap: null, slotKey: null },
+      { device: abdu, managed: true, needTier: "full", needDelta: 1.6, slotGenCap: null, slotKey: null },
+      { device: najat, managed: true, needTier: "mild", needDelta: 0.9, slotGenCap: null, slotKey: null },
     ];
     let flip = 1;
     const run = async (amps: number, steps: number, line: "gen" | "grid" = "gen") => {
@@ -1682,9 +1783,9 @@ describe("LevelingControllerV2 — a turn-off's decay is not house", () => {
 
       const abdullah = { id: "abdullah", name: "abdullah", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const ctx = [
-        { device: abdullah as never, managed: true, needTier: "mild" as const, needDelta: 0.6, slotGenCap: null },
-        { device: acDevice("najat", true, 1), managed: true, needTier: "mild" as const, needDelta: 0.5, slotGenCap: null },
-        { device: acDevice("abdu", true, 1), managed: true, needTier: "full" as const, needDelta: 2.4, slotGenCap: null },
+        { device: abdullah as never, managed: true, needTier: "mild" as const, needDelta: 0.6, slotGenCap: null, slotKey: null },
+        { device: acDevice("najat", true, 1), managed: true, needTier: "mild" as const, needDelta: 0.5, slotGenCap: null, slotKey: null },
+        { device: acDevice("abdu", true, 1), managed: true, needTier: "full" as const, needDelta: 2.4, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (genAmps: number, steps: number) => {
@@ -1767,6 +1868,7 @@ describe("LevelingControllerV2 — a ramp closes on evidence, not on its timer",
       needTier: "full" as const,
       needDelta: [3, 1, 2.5][i],
       slotGenCap: null,
+      slotKey: null,
     }));
     let flip = 1;
     const run = async (amps: number, steps: number, line: "gen" | "grid") => {
@@ -1884,6 +1986,7 @@ describe("LevelingControllerV2 — a session that begins with a dead circuit", (
       needTier: "full" as const,
       needDelta: [3, 1, 2.5][i],
       slotGenCap: null,
+      slotKey: null,
     }));
     let flip = 1;
     /** `dark` stops the shadows reporting — the AC circuit feeds the Wi-Fi modules. */
@@ -1993,6 +2096,7 @@ describe("LevelingControllerV2 — a session that begins with a dead circuit", (
             needTier: "full" as const,
             needDelta: [3, 1, 2.5][i2],
             slotGenCap: null,
+            slotKey: null,
           })) as never,
           30,
         );
@@ -2083,8 +2187,8 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
     // what a TCL does when it power-cycles and restores its last level.
     let hotLevel = opts.hotLevel ?? 2;
     const ctxNow = () => [
-      { device: device(HOT, hotLevel, 32), managed: true, needTier: "full" as const, needDelta: opts.hotNeed ?? 5, slotGenCap: null },
-      { device: device(COOL, 1, 27), managed: true, needTier: "full" as const, needDelta: 1, slotGenCap: null },
+      { device: device(HOT, hotLevel, 32), managed: true, needTier: "full" as const, needDelta: opts.hotNeed ?? 5, slotGenCap: null, slotKey: null },
+      { device: device(COOL, 1, 27), managed: true, needTier: "full" as const, needDelta: 1, slotGenCap: null, slotKey: null },
     ];
     let flip = 1;
     // `gapMs` is the spacing between ESP readings: anything over
@@ -2418,6 +2522,7 @@ describe("LevelingControllerV2 — a room's own shed bars its restore (R9)", () 
       needTier: "full" as const,
       needDelta: need,
       slotGenCap: null,
+      slotKey: null,
     });
     const ctxOf = () => [room("big", 30, 3), room("small", 28, 2)] as never;
     let flip = 1;
@@ -2518,7 +2623,7 @@ describe("LevelingControllerV2 — a fan-sized off-drop says the compressor was 
         }) as never,
     };
     const controller = new LevelingControllerV2(mock.pool, deps);
-    const ctx = [{ device: a as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null }];
+    const ctx = [{ device: a as never, managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null, slotKey: null }];
     let flip = 1;
     const run = async (genAmps: number, steps: number, outdoorC: number | null = 44) => {
       for (let i = 0; i < steps; i++) {
@@ -2642,6 +2747,7 @@ describe("LevelingControllerV2 — a lone raise off L1 REPORTS on the compressor
       needTier: "full" as const,
       needDelta: 3,
       slotGenCap: null,
+      slotKey: null,
     }));
     let flip = 1;
     const run = async (genAmps: number, steps: number, outdoorC: number | null = 44) => {
@@ -2851,6 +2957,7 @@ describe("LevelingControllerV2 — a donor switched off for a hotter room (the s
       needTier: "full" as const,
       needDelta: need,
       slotGenCap: null,
+      slotKey: null,
     });
     const ctxOf = () => [room("mid", 29, 3), room("cool", 26.5, 0.5), room("hot", 28, 2)] as never;
     let flip = 1;
@@ -3063,6 +3170,7 @@ describe("LevelingControllerV2 — flicker-patience anchor lifecycle (2026-08-08
       needTier: "full" as const,
       needDelta: need,
       slotGenCap: null,
+      slotKey: null,
     });
     const ctxOf = () => [room("big", 30, 3), room("small", 28, 2)] as never;
     // A generator that WOBBLES ±0.35A reading-to-reading — a ~0.7A flicker
@@ -3181,8 +3289,8 @@ describe("LevelingControllerV2 — bounce-count lifecycle & off-credit dedup (20
       const a = { id: "a", name: "a", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const b = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const ctx = [
-        { device: a as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
-        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null },
+        { device: a as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (steps: number) => {
@@ -3231,8 +3339,8 @@ describe("LevelingControllerV2 — bounce-count lifecycle & off-credit dedup (20
       const a = { id: "a", name: "a", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
       const b = { id: "b", name: "b", power: true, generatorMode: 2, maxGeneratorLevel: 3, fanSpeed: 1 };
       const ctx = [
-        { device: a as never, managed: true, needTier: "full" as const, needDelta: 6, slotGenCap: null },
-        { device: b as never, managed: true, needTier: "full" as const, needDelta: 6, slotGenCap: null },
+        { device: a as never, managed: true, needTier: "full" as const, needDelta: 6, slotGenCap: null, slotKey: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 6, slotGenCap: null, slotKey: null },
       ];
       let flip = 1;
       const run = async (steps: number) => {
@@ -3309,7 +3417,7 @@ describe("LevelingControllerV2 — amp evidence releases a ramp before its 240s 
     const controller = new LevelingControllerV2(mock.pool, deps);
     // needDelta 0 (satisfied) -> the room never wants a raise, so `rampWindowOpen`
     // is the only thing moving.
-    const ctx = [{ device: a as never, managed: true, needTier: "satisfied" as const, needDelta: 0, slotGenCap: null }];
+    const ctx = [{ device: a as never, managed: true, needTier: "satisfied" as const, needDelta: 0, slotGenCap: null, slotKey: null }];
     let flip = 1;
     const feed = async (genAmps: number) => {
       flip = -flip;
@@ -3417,7 +3525,7 @@ describe("LevelingControllerV2 — the settle window exits early when the batch 
       }) as never,
     };
     const controller = new LevelingControllerV2(mock.pool, deps);
-    const ctx = [{ device: a as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap }];
+    const ctx = [{ device: a as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap, slotKey: null }];
     let flip = 1;
     const feed = async (genAmps: number) => {
       flip = -flip;
@@ -3509,5 +3617,1673 @@ describe("LevelingControllerV2 — the settle window exits early when the batch 
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-31 FUNDED SPEND, shell half (user: "when there is a budget because of
+// another AC off or level down, it should act instantly based on prediction to
+// turn on an offed AC or level it (or its fan) up").
+//
+// Three things live only here, so `scenarios.test.ts` structurally cannot see
+// them: the urgent-evaluation dep (the harness plans every step), the SPENDABLE
+// tag each arming site puts on the credit, and the manual gen level-down credit
+// (`onUserGenLevel` has no harness mirror: `pinLevel` only sets a target).
+// ---------------------------------------------------------------------------
+describe("LevelingControllerV2: funded spend, urgent triggers and the manual level-down credit", () => {
+  const meterOf = (c: LevelingControllerV2) =>
+    (c as unknown as { meterState: { source: string; pendingCut: { amps: number; spendableAmps: number } | null } }).meterState;
+  const meterViewOf = (c: LevelingControllerV2) =>
+    meterView((c as unknown as { meterState: MeterState }).meterState, Date.now());
+  const pacingOf2 = (c: LevelingControllerV2) => (c as unknown as { pacing: PacingState }).pacing;
+  const setPacing2 = (c: LevelingControllerV2, pacing: PacingState) => {
+    (c as unknown as { pacing: PacingState }).pacing = pacing;
+  };
+  const shedBarOf2 = (c: LevelingControllerV2) =>
+    (c as unknown as { shedBar: Map<string, { amps: number }> }).shedBar;
+  const swapOf = (c: LevelingControllerV2) =>
+    (c as unknown as { swap: { donorId: string; receiverId: string } | null }).swap;
+  /**
+   * Drive one batch through the executor. The planner reaches these shapes only
+   * from a live trade or correction; what is under test is the executor's own
+   * send/bookkeeping/abort rules.
+   */
+  const execute = (
+    c: LevelingControllerV2,
+    commands: unknown[],
+    out: {
+      reason: string;
+      commandedCutAmps: number;
+      attempts?: unknown[];
+      swap?: { donorId: string; receiverId: string };
+    },
+  ) =>
+    (
+      c as unknown as {
+        executeAndJournal: (
+          o: unknown, view: unknown, mode: string, now: number, tcl: unknown, acs: unknown[],
+        ) => Promise<void>;
+        deps: LevelingDeps;
+      }
+    ).executeAndJournal(
+      {
+        commands,
+        decisions: [],
+        expectedDeltaAmps: 0,
+        compareAfter: 0,
+        severity: null,
+        requiredAmps: null,
+        fanHolds: {},
+        attempts: out.attempts ?? [],
+        fanOnly: false,
+        ...out,
+      },
+      meterViewOf(c),
+      "NORMAL",
+      Date.now(),
+      (c as unknown as { deps: LevelingDeps }).deps.getTclCloud(),
+      [],
+    );
+
+  /**
+   * `bSatisfied` parks `b` at its comfort target from the start; `bTier` lets a
+   * test flip it mid-run, which is what the idle demote (invariant 8) needs: a
+   * room that was hot enough to earn a level and is then satisfied for the dwell.
+   */
+  function setup(
+    configExtra: Record<string, unknown> = {},
+    opts: { bSatisfied?: boolean; slotCap?: number } = {},
+  ) {
+    // The over-limit bucket has fired `onUrgentLevelingNeeded` since long before
+    // this feature, and it fires from `onPowerReading`, OUTSIDE the tick. Count
+    // the two apart, or "the reduce side asked for a pass" reads as "the batch
+    // announced freed budget".
+    let inTick = false;
+    let urgentInTick = 0;
+    const urgent = vi.fn(() => {
+      if (inTick) urgentInTick++;
+    });
+    const mock = createGradePool({
+      priority: ["a", "b"],
+      genAmpModels: { a: { baseAmps: 4.5, stepAmps: 2.4 }, b: { baseAmps: 2.5, stepAmps: 1.6 } },
+      // `a` sits at a configured comfort floor of L3, so the gen-entry FLOORS
+      // clamp has nothing to send and its shadow confirms where it already is.
+      // Without it the clamp is in flight for the whole test and every level-down
+      // below is correctly refused as "our own demote is already travelling".
+      levelBoosts: { a: { minLevel: 3, outdoorAtLeastC: 0 } },
+      ...configExtra,
+    });
+    const a = { id: "a", name: "a", power: true, generatorMode: 3, maxGeneratorLevel: 3, fanSpeed: 1 };
+    const b = { id: "b", name: "b", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+    // The firmware CONFIRMS what we send (the shadow follows), so a raise the
+    // leveler makes is really at that level on the next tick. Without it every
+    // send stays unconfirmed and nothing downstream of a confirm can be staged.
+    const failing = new Set<string>();
+    const failSendsFor = (id: string) => failing.add(id);
+    /** SQL fragments whose query must throw (a DB wobble after an accepted send). */
+    const failingSql = new Set<string>();
+    const failStore = (kind: "recordShed") => {
+      if (kind === "recordShed") failingSql.add("INSERT INTO ac_leveling_shed");
+    };
+    const poolMock = mock.pool as unknown as { query: (sql: string, params?: unknown[]) => Promise<unknown> };
+    const basePoolQuery = poolMock.query.bind(poolMock);
+    poolMock.query = async (sql: string, params: unknown[] = []) => {
+      for (const fragment of failingSql) {
+        if (sql.includes(fragment)) throw new Error("db refused");
+      }
+      return basePoolQuery(sql, params);
+    };
+    /** Every cloud call the executor actually attempted, in order. */
+    const sent: Array<{ deviceId: string; kind: string }> = [];
+    const tcl = () =>
+      ({
+        sendControl: async (id: string, cmd: string, value: number) => {
+          sent.push({ deviceId: id, kind: cmd });
+          if (failing.has(id)) throw new Error("cloud refused");
+          if (cmd === "set_generator_mode") {
+            if (id === "a") a.generatorMode = value;
+            if (id === "b") b.generatorMode = value;
+          }
+        },
+        executeAcAction: async (id: string, action: { power?: number }) => {
+          sent.push({ deviceId: id, kind: `power_${action.power ?? "?"}` });
+          if (failing.has(id)) throw new Error("cloud refused");
+          if (id === "a") a.power = action.power === 1;
+          if (id === "b") b.power = action.power === 1;
+        },
+      }) as never;
+    const controller = new LevelingControllerV2(mock.pool, {
+      ...createDeps(),
+      getTclCloud: tcl,
+      onUrgentLevelingNeeded: urgent,
+    });
+    let aTier: "full" | "satisfied" = "full";
+    let bTier: "full" | "satisfied" = opts.bSatisfied === true ? "satisfied" : "full";
+    /** Park a room at its comfort target, which is what the idle demote waits for. */
+    const setTiers = (tier: "full" | "satisfied", which: "b" | "both" = "b") => {
+      bTier = tier;
+      if (which === "both") aTier = tier;
+    };
+    let flip = 1;
+    const feed = async (genAmps: number) => {
+      flip = -flip;
+      controller.onPowerReading({ current_1: 0, current_2: genAmps + 0.01 * flip } as never);
+      vi.advanceTimersByTime(5_000);
+      const ctx = [
+        {
+          device: a as never,
+          managed: true,
+          needTier: aTier,
+          needDelta: aTier === "satisfied" ? 0 : 3,
+          slotGenCap: opts.slotCap ?? null,
+          slotKey: null,
+        },
+        {
+          device: b as never,
+          managed: true,
+          needTier: bTier,
+          needDelta: bTier === "satisfied" ? 0 : 3,
+          slotGenCap: opts.slotCap ?? null,
+          slotKey: null,
+        },
+      ];
+      inTick = true;
+      try {
+        await controller.tick(ctx as never, 30);
+      } finally {
+        inTick = false;
+      }
+    };
+    const run = async (genAmps: number, steps: number) => {
+      for (let i = 0; i < steps; i++) await feed(genAmps);
+    };
+    return {
+      controller,
+      urgent,
+      /** Urgent evaluations asked for by a BATCH, not by the over-limit bucket. */
+      urgentFromBatch: () => urgentInTick,
+      resetUrgentFromBatch: () => {
+        urgentInTick = 0;
+      },
+      /** Every urgent evaluation, for the hooks that run outside a tick. */
+      urgentCalls: () => urgent.mock.calls.length,
+      resetUrgentFromCall: () => {
+        urgent.mockClear();
+      },
+      a,
+      b,
+      feed,
+      run,
+      setTiers,
+      failSendsFor,
+      failStore,
+      sent,
+      mock,
+    };
+  }
+
+  it("an OBSERVED off evaluates once: a deduped re-observation frees nothing new", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      const { controller, urgent, a, run } = setup();
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      urgent.mockClear();
+      a.power = false; // a remote, an automation, a hand
+      await run(12.0, 1);
+      expect(urgent).toHaveBeenCalledTimes(1);
+      // The device poll keeps reading the same OFF shadow: `creditRoomOff` dedupes
+      // it, so nothing new is freed and nothing new is evaluated.
+      await run(12.0, 3);
+      expect(urgent, "one physical off, one urgent evaluation").toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an over-limit reduction credits the meter but frees NOTHING a spender may take", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      const { controller, run, urgentFromBatch, resetUrgentFromBatch } = setup();
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      resetUrgentFromBatch();
+      // Push it over: the ladder cuts and credits the meter.
+      await run(16.5, 10);
+      const cut = meterOf(controller).pendingCut!;
+      expect(cut.amps).toBeGreaterThan(0);
+      expect(cut.spendableAmps, "those amps belong to the breaker").toBe(0);
+      // …and the BATCH announces no freed budget: the extra pass could buy
+      // nothing, and a "Budget freed" line seconds after an emergency cut would
+      // tell the next forensic session the opposite of what happened. (The
+      // drained bucket still asks for its own pass, from the ingest side, and that
+      // trigger predates this feature and is untouched.)
+      expect(urgentFromBatch(), "an emergency cut is not a budget-freed event").toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an idle DEMOTE frees spendable budget and evaluates on the spot", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // `b` (no boost) is hot enough to earn a level on a quiet line, and then
+      // satisfied: the "loaded spring" the idle demote reclaims (invariant 8).
+      // An OBSERVED jump could not stage it: the controller reads one as a manual
+      // target, and manual wins, so `ceilOf` would never fall below it.
+      const { controller, b, run, setTiers, urgentFromBatch, resetUrgentFromBatch } = setup();
+      await controller.ensureLoaded();
+      await run(8.0, 20); // calm → the raise path takes b to L2, confirmed
+      expect(b.generatorMode, "b earned a level").toBeGreaterThan(1);
+      setTiers("satisfied");
+      resetUrgentFromBatch();
+      await run(8.0, 40); // past DEMOTE_DWELL_MS (120s) with a quiet line
+      const cut = meterOf(controller).pendingCut;
+      expect(cut, "the idle demote shipped and credited").not.toBeNull();
+      expect(cut!.spendableAmps, "dormant capacity is the spender's to take").toBeGreaterThan(0);
+      expect(urgentFromBatch(), "…and it is evaluated on the spot").toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a manual level-DOWN credits the model delta from the lowest COMMITTED level and evaluates", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      const { controller, urgent, run } = setup();
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      urgent.mockClear();
+      // `a` is confirmed at L3 (model 4.5 + 2×2.4 = 9.3A); pinned to L1 (4.5A)
+      // that is 4.8A of freed budget, priced exactly as `modelCutAmps` prices a
+      // demote: one mechanism, invariant 11.
+      const res = await controller.onUserGenLevel("a", 1);
+      expect(res).toEqual({ reverted: false, level: 1 });
+      const cut = meterOf(controller).pendingCut!;
+      expect(cut.amps).toBeCloseTo(4.8, 5);
+      expect(cut.spendableAmps).toBeCloseTo(4.8, 5);
+      expect(urgent).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a manual level INCREASE arms nothing", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      const { controller, urgent, run } = setup();
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      urgent.mockClear();
+      await controller.onUserGenLevel("b", 2); // b is confirmed at L1
+      expect(meterOf(controller).pendingCut).toBeNull();
+      expect(urgent).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does NOT credit a level our own demote is already taking (one credit path, invariant 11)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      const { controller, run } = setup();
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      // Same tap twice: the first records the send, so the second sees OUR L1
+      // still unconfirmed in `sendCounts` and adds nothing (a repeat tap credits
+      // the same physical fall a second time otherwise).
+      await controller.onUserGenLevel("a", 1);
+      const first = meterOf(controller).pendingCut!.amps;
+      await controller.onUserGenLevel("a", 1);
+      expect(meterOf(controller).pendingCut!.amps).toBeCloseTo(first, 5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a power-off whose send FAILS credits nothing at all", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // The tap has to record intent BEFORE the cloud send (a fast shadow poll
+      // must not turn the unit back on), so it only snapshots the level the off
+      // would free. When the send throws the route never calls the promote hook,
+      // and both halves of the credit stay unarmed: no spender can be funded
+      // against amps still on the line, and the reducer is not discounting a
+      // saving that is not coming either.
+      const { controller, run, urgentCalls, resetUrgentFromCall } = setup();
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      resetUrgentFromCall();
+
+      await controller.onUserPowerOff("a"); // the route's pre-send hook, then the send throws
+
+      expect(meterOf(controller).pendingCut, "nothing credited before the send lands").toBeNull();
+      expect(meterViewOf(controller).spendableCreditAmps).toBe(0);
+      expect(meterViewOf(controller).commandedCutCreditAmps).toBe(0);
+      expect(urgentCalls(), "and nothing evaluated on a send that never left").toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("…and the same off credits + evaluates the moment the cloud ACCEPTS it", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      const { controller, run, urgentCalls, resetUrgentFromCall } = setup();
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      await controller.onUserPowerOff("a");
+      resetUrgentFromCall();
+
+      controller.onUserPowerOffSent("a"); // the route's post-send hook
+
+      const cut = meterOf(controller).pendingCut!;
+      // `a` was confirmed at L3 (model 4.5 + 2×2.4): the whole room's draw.
+      expect(cut.amps).toBeCloseTo(9.3, 5);
+      expect(cut.spendableAmps, "an off frees budget the limit never asked for").toBeCloseTo(9.3, 5);
+      expect(urgentCalls(), "evaluated on the spot").toBeGreaterThan(0);
+      // The snapshot is consumed: a second call cannot credit the same off twice
+      // (the device poll's own re-observation is deduped the same way).
+      controller.onUserPowerOffSent("a");
+      expect(meterOf(controller).pendingCut!.amps).toBeCloseTo(9.3, 5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a PARTIALLY sent batch credits only what actually shipped", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // `sentAny` is a coarse gate: a two-cut batch whose second send throws used
+      // to credit BOTH, telling the meter to expect a fall half of which will
+      // never happen, and, since 2026-08-31, offering a spender amps that are
+      // still on the line.
+      // No boost here, so both rooms enter at their floor, climb on a quiet line,
+      // and are then satisfied: one idle-demote batch carrying TWO cuts.
+      const { controller, a, b, run, setTiers, failSendsFor } = setup({ levelBoosts: {} });
+      await controller.ensureLoaded();
+      await run(6.0, 30);
+      expect(a.generatorMode, "a earned a level").toBeGreaterThan(1);
+      expect(b.generatorMode, "b earned a level").toBeGreaterThan(1);
+      const aFrom = a.generatorMode;
+      setTiers("satisfied", "both");
+      failSendsFor("b"); // the cloud refuses b's demote
+      await run(6.0, 40);
+      const cut = meterOf(controller).pendingCut;
+      expect(cut, "the demote batch shipped").not.toBeNull();
+      // Only a's cut landed. Its model delta is 2.4A per step (4.5 base / 2.4
+      // step); b's 1.6A never left, so it may not be credited.
+      const aOnly = 2.4 * (aFrom - 1);
+      expect(cut!.amps, "only the sent command's price").toBeCloseTo(aOnly, 5);
+      expect(b.generatorMode, "b never moved").toBeGreaterThan(1);
+      // …and no state transition may treat the refused command as shipped.
+      // Invariant 30's own ⚠ ("stamp only donors whose demote was actually
+      // sent"): a room whose demote the cloud refused donated nothing, so it may
+      // not be barred from its own level for the funding cooldown.
+      const funding = (c: LevelingControllerV2) =>
+        (c as unknown as { fundingDemotedAt: Map<string, number> }).fundingDemotedAt;
+      expect(funding(controller).has("b"), "a refused demote is not a donation").toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a failed cut ABORTS the load-adding half of its own batch", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // A batch is one arithmetic (invariants 9/69): the proactive shed's donor
+      // off pays for the receiver's turn-on in the SAME command list. If the
+      // cloud refuses the donor, the budget the receiver was admitted against
+      // does not exist, and repricing the credit after the loop is too late for a
+      // compressor already commanded on.
+      //
+      // Driven through `executeAndJournal` directly: the planner reaches this
+      // shape only from a live trade, and what is under test is the executor's
+      // own dependency rule, not the trade that produced the batch.
+      const { controller, a, b, run, failSendsFor, sent } = setup({ levelBoosts: {} });
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      failSendsFor("a"); // the donor's off is refused
+      sent.length = 0;
+      const batch = [
+        { deviceId: "a", kind: "power_off" as const, reason: "shed" as const },
+        { deviceId: "b", kind: "power_on" as const, level: 1, reason: "restore" as const, fan: 1 },
+      ];
+      await execute(controller, batch, {
+        reason: "proactive_shed",
+        commandedCutAmps: 4.5,
+        attempts: [{ deviceId: "b", kind: "restore" }],
+      });
+      expect(sent.some((c) => c.deviceId === "a"), "the donor off was attempted").toBe(true);
+      expect(
+        sent.some((c) => c.deviceId === "b"),
+        "the receiver's turn-on must NOT ship on budget the refused cut never freed",
+      ).toBe(false);
+      expect(b.power, "…and the device was never told to come on").toBe(true);
+      expect(a.power).toBe(true);
+      // (Nothing shipped at all here, so the executor returns before pacing runs;
+      // the attempt bookkeeping is pinned by the REFUSED-receiver test below,
+      // which is the same claim with one command through.)
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a restore that never SHIPPED is not recorded as an attempt", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // The trade's donor off ships and the receiver's turn-on is refused. An
+      // attempt is a claim that a command is IN FLIGHT: it parks the room behind
+      // `RESTORE_CONFIRM_WAIT_MS`, and `noteSuccess` later resolves it by
+      // clearing the backoff ladder and invariant 22's probe anchor. Recording
+      // one for a command the cloud never took does both halves of the damage.
+      const { controller, run, failSendsFor, sent } = setup({ levelBoosts: {} });
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      // `b` carries real history: one failed restore that bounced.
+      setPacing2(controller, noteFailure(pacingOf2(controller), "b", "restore", Date.now(), true));
+      failSendsFor("b");
+      sent.length = 0;
+      const batch = [
+        { deviceId: "a", kind: "power_off" as const, reason: "shed" as const },
+        { deviceId: "b", kind: "power_on" as const, level: 1, reason: "restore" as const, fan: 1 },
+      ];
+      await execute(controller, batch, {
+        reason: "proactive_shed",
+        commandedCutAmps: 9.3,
+        attempts: [{ deviceId: "b", kind: "restore" }],
+        swap: { donorId: "a", receiverId: "b" },
+      });
+      expect(sent.some((c) => c.deviceId === "b"), "the receiver's send was attempted and refused").toBe(true);
+      expect(
+        attemptedWithin(pacingOf2(controller), "b", "restore", 60_000, Date.now()),
+        "a refused restore is not an attempt",
+      ).toBe(false);
+      // The donor's off DID ship, so it is credited as usual…
+      expect(meterOf(controller).pendingCut?.amps).toBeCloseTo(9.3, 5);
+      // …and the DONOR's reservation still arms: that is the failed-send case the
+      // swap is documented for (SKILL 57/69): the donor's room really is off and
+      // its amps are spoken for until the receiver returns.
+      expect(swapOf(controller)).toMatchObject({ donorId: "a", receiverId: "b" });
+
+      // The other half of the same claim: the grading window must not resolve the
+      // unsent restore later. `journalGrade` calls `noteSuccess` on whatever
+      // attempts its window carries, and that clears the room's real failures,
+      // its bounce count and invariant 22's probe anchor.
+      expect(restoreFailures(pacingOf2(controller), "b")).toBe(1);
+      expect(restoreBounces(pacingOf2(controller), "b")).toBe(1);
+      await run(12.0, 12); // past GRADE_FAN_MS, so the window is due and grades
+      expect(
+        restoreFailures(pacingOf2(controller), "b"),
+        "a command nobody sent may not be graded a success",
+      ).toBe(1);
+      expect(restoreBounces(pacingOf2(controller), "b")).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a refused DONOR off arms no swap reservation and leaves no shed bar", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // The shape that keeps `sentAny` true while the trade itself never happened:
+      // a correction ships, the donor's off is refused, and the receiver's turn-on
+      // is skipped by the abort. Reserving the donor's amps here would park raises
+      // and fan restores for `SWAP_RESERVATION_MS` on a room that is still
+      // running, and a bar off a planned-but-refused off would make that room's
+      // own restore clear a trough that was never dug.
+      const { controller, run, failSendsFor, sent } = setup({ levelBoosts: {} });
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      failSendsFor("a");
+      sent.length = 0;
+      const batch = [
+        { deviceId: "b", kind: "set_level" as const, level: 1 }, // correction, ships
+        { deviceId: "a", kind: "power_off" as const, reason: "shed" as const }, // refused
+        { deviceId: "b", kind: "power_on" as const, level: 1, reason: "restore" as const, fan: 1 },
+      ];
+      await execute(controller, batch, {
+        reason: "proactive_shed",
+        commandedCutAmps: 9.3,
+        attempts: [{ deviceId: "b", kind: "restore" }],
+        swap: { donorId: "a", receiverId: "b" },
+      });
+      expect(sent.some((c) => c.deviceId === "b" && c.kind === "set_generator_mode"), "the correction shipped").toBe(true);
+      expect(swapOf(controller), "no trade is in flight to reserve for").toBeNull();
+      expect(shedBarOf2(controller).has("a"), "a refused off digs no trough").toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the abort never skips a level-0 RECAP: hard rule 5 outranks the batch arithmetic", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // Level 0 is UNRESTRICTED draw, priced as the TOP level everywhere else, so
+      // the never-level-0 correction is a REMOVAL. Read numerically it looks like
+      // 0 → L1 = adding, and the abort would leave a managed AC unrestricted on a
+      // generator: the one state hard rule 5 forbids outright.
+      const { controller, run, failSendsFor, sent } = setup({ levelBoosts: {} });
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      // `b` reads UNRESTRICTED. Set on the reconciler directly: the tick's own
+      // never-level-0 correction would re-cap it before a synthetic batch could
+      // ever see the state this test is about.
+      const recon = (controller as unknown as { recon: Record<string, { confirmedLevel: number | null }> }).recon;
+      (controller as unknown as { recon: unknown }).recon = {
+        ...recon,
+        b: { ...recon.b, confirmedLevel: 0 },
+      };
+      failSendsFor("a");
+      sent.length = 0;
+      const batch = [
+        { deviceId: "a", kind: "set_level" as const, level: 1 },
+        { deviceId: "b", kind: "set_level" as const, level: 1 },
+      ];
+      await execute(controller, batch, { reason: "over_mild", commandedCutAmps: 2.4 });
+      expect(sent.some((c) => c.deviceId === "a"), "the peer cut was attempted").toBe(true);
+      expect(
+        sent.some((c) => c.deviceId === "b"),
+        "the level-0 recap must ship even after a refused cut",
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a bookkeeping failure after an ACCEPTED send still counts the command as sent", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // The cloud took the off; `recordShed`'s INSERT then threw. Classifying
+      // that as a refusal credits nothing, aborts the rest of the batch, and
+      // leaves a real commanded cliff unexplained, which is how a shed we sent
+      // latches a phantom collapse (invariant 5).
+      const { controller, run, sent, failStore } = setup({ levelBoosts: {} });
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      failStore("recordShed");
+      sent.length = 0;
+      const batch = [
+        { deviceId: "a", kind: "power_off" as const, reason: "shed" as const },
+        { deviceId: "b", kind: "power_on" as const, level: 1, reason: "restore" as const, fan: 1 },
+      ];
+      await execute(controller, batch, { reason: "proactive_shed", commandedCutAmps: 9.3 });
+      // Credited: the amps really are leaving the line.
+      expect(meterOf(controller).pendingCut?.amps).toBeCloseTo(9.3, 5);
+      // …and the batch was NOT aborted: the send succeeded, so the receiver ships.
+      expect(sent.some((c) => c.deviceId === "b"), "the accepted off did not abort the batch").toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("…but a failed cut never stops the REST of the cuts (skipping relief is the unsafe direction)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // Both rooms park at L2 (one cuttable step each), so a 2.9A deficit needs
+      // BOTH cuts: `a` alone gives 2.4A. It stays under the 3.0A emergency bar,
+      // so the rung is level cuts and no room is shed.
+      const { controller, a, b, run, failSendsFor } = setup({ levelBoosts: {} }, { slotCap: 2 });
+      await controller.ensureLoaded();
+      await run(6.0, 30); // both rooms climb above their floors
+      expect(a.generatorMode).toBe(2);
+      expect(b.generatorMode).toBe(2);
+      failSendsFor("a"); // the cloud refuses the first cut
+      const bBefore = b.generatorMode;
+      await run(17.8, 20);
+      expect(a.generatorMode, "the refused cut did not land").toBeGreaterThan(1);
+      expect(b.generatorMode, "the other cut still shipped").toBeLessThan(bBefore);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("prices from the LOWEST committed level, so an in-flight demote's portion is not credited twice", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-31T10:00:00Z"));
+      // The shape: `a` confirmed at L3, OUR OWN demote to L2 still in flight (it
+      // credited model(3→2) = 2.4A when that batch shipped), and the user then
+      // pins L1 by hand. Priced at the envelope's worst case the manual credit
+      // would be model(3→1) = 4.8A on top of that: the same 3→2 fall counted
+      // twice, invariant 31's laundering direction. From the lowest COMMITTED
+      // level it is model(2→1) = 2.4A, and the two add up to the true 3→1.
+      const { controller, run } = setup();
+      await controller.ensureLoaded();
+      await run(12.0, 8);
+      const recon = (c: LevelingControllerV2) =>
+        (c as unknown as { recon: Record<string, { confirmedLevel: number | null }> }).recon;
+      expect(recon(controller).a.confirmedLevel, "a is confirmed at L3").toBe(3);
+      // Our demote to L2 goes out and is not confirmed (the firmware lags).
+      (controller as unknown as { recon: unknown }).recon = noteLevelSend(
+        recon(controller) as never,
+        "a",
+        2,
+        Date.now(),
+      ).state;
+      const res = await controller.onUserGenLevel("a", 1);
+      expect(res).toEqual({ reverted: false, level: 1 });
+      const cut = meterOf(controller).pendingCut!;
+      expect(cut.amps, "only the remaining L2→L1 delta").toBeCloseTo(2.4, 5);
+      expect(cut.spendableAmps).toBeCloseTo(2.4, 5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manual intent LIFETIME (2026-09-05, user: "a manual set of the AC level
+// should be reset on the next power cycle or on the next automation range-slot
+// boundary. The same rule should hold for fan speed and swing.").
+//
+// All of it is shell-side and structurally invisible to `scenarios.test.ts`:
+// the harness has no slot keys, no beep-reset fingerprint and no pin release
+// (`pinLevel` is a sim input, not a hook), so this file is the only net.
+// ---------------------------------------------------------------------------
+describe("LevelingControllerV2: manual intent lifetime", () => {
+  /** Every emitted spelling of a power event, against the shared predicate. */
+  describe("the emitter table", () => {
+    it("classifies every kind this controller actually emits", () => {
+      // The five spellings that reach `notePowerEvent`: `source ${from} → ${to}`,
+      // `power collapse on ${source}`, `AC circuit dead on ${source}`,
+      // `ESP gap ${n}s` and `meter frozen`.
+      for (const kind of [
+        "source gen → grid",
+        "source grid → gen",
+        "source gen → none", // a dark house IS a power cycle (both lines read ~0 A)
+        "power collapse on gen",
+        "AC circuit dead on gen",
+      ]) {
+        expect(powerEventRestartsAcs(kind), kind).toBe(true);
+      }
+      for (const kind of ["source none → grid", "source none → gen", "ESP gap 24s", "meter frozen"]) {
+        // A boot restarted the SERVER, and a meter blip says nothing about the
+        // line: since the CT02 switch those arrive routinely (2026-08-31).
+        expect(powerEventRestartsAcs(kind), kind).toBe(false);
+      }
+    });
+  });
+
+  type PinState = {
+    manualCap: Map<string, number>;
+    manualTarget: Map<string, number>;
+    fanExempt: Set<string>;
+    lastSlotKey: Map<string, string>;
+    lastPowerEventAt: number;
+    lastAcRestartAt: number;
+    devicePowerCycleAt: Map<string, number>;
+    powerEventRamp: Map<string, { armedAt: number; heldSince: number | null }>;
+    rampUntil: Map<string, number>;
+    startBaseline: Map<string, { amps: number; until: number }>;
+    externalOnAt: Map<string, number>;
+    pendingGrades: Array<{ contaminated: boolean; direction: string }>;
+    fanHolds: FanHolds;
+    recon: ReconcilerState;
+    meterState: MeterState & { pendingCut: { amps: number; spendableAmps: number } | null };
+    modeState: ModeState;
+    pacing: PacingState;
+    inPowerEventWindow: (now: number, deviceId?: string) => boolean;
+  };
+  const state = (c: LevelingControllerV2) => c as unknown as PinState;
+
+  /** Every `manual intent released` decision the journal carries, in order. */
+  const releases = (journal: Array<Record<string, unknown>>) =>
+    journal.flatMap((row) =>
+      (JSON.parse(String(row.decisions ?? "[]")) as Array<{ action?: string; deviceId?: string; detail?: string }>)
+        .filter((d) => d.action === "manual intent released")
+        .map((d) => ({ ...d, reason: String(row.reason) })),
+    );
+
+  /**
+   * Two managed rooms on a 15 A generator, both at L1, both hot. The amp models
+   * are deliberately expensive (2.5 A a step): at the 13 A these tests feed, no
+   * raise fits, so the ladder is quiet and what moves a level is a hand or an
+   * entry policy, which is exactly what is under test.
+   */
+  function setup(configExtra: Record<string, unknown> = {}, shedIds: string[] = []) {
+    const urgent = vi.fn();
+    const events: Array<{ kind: string; now: number; pinsHeld: number }> = [];
+    const mock = createGradePool(
+      {
+        priority: ["a", "b"],
+        genAmpModels: { a: { baseAmps: 2.5, stepAmps: 2.5 }, b: { baseAmps: 2.5, stepAmps: 2.5 } },
+        gridAmpModels: { a: { baseAmps: 2.5, stepAmps: 2.5 }, b: { baseAmps: 2.5, stepAmps: 2.5 } },
+        // A calm gate no test run is long enough to satisfy: the RAISE phase
+        // stays out of the way (entry policies and hands still act), so what
+        // moves a level here is only what is under test.
+        raiseCalmSeconds: 600,
+        restoreCalmSeconds: 600,
+        ...configExtra,
+      },
+      shedIds,
+    );
+    const a = { id: "a", name: "a", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+    const b = { id: "b", name: "b", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+    const devices = [a, b];
+    const sent: Array<{ deviceId: string; kind: string; value?: number }> = [];
+    const tcl = () =>
+      ({
+        sendControl: async (id: string, cmd: string, value: number) => {
+          sent.push({ deviceId: id, kind: cmd, value });
+          const d = devices.find((x) => x.id === id);
+          if (d == null) return;
+          if (cmd === "set_generator_mode") d.generatorMode = value; // the shadow follows
+          if (cmd === "set_fan_speed") d.fanSpeed = value;
+        },
+        executeAcAction: async (id: string, action: { power?: number }) => {
+          sent.push({ deviceId: id, kind: `power_${action.power ?? "?"}` });
+          const d = devices.find((x) => x.id === id);
+          if (d != null && action.power != null) d.power = action.power === 1;
+        },
+      }) as never;
+    let controller: LevelingControllerV2;
+    controller = new LevelingControllerV2(mock.pool, {
+      ...createDeps(),
+      getTclCloud: tcl,
+      onUrgentLevelingNeeded: urgent,
+      onPowerEvent: (kind: string, now: number) => {
+        // What the collector sees AT the callback: the controller must have
+        // finished its own release before anything outward runs.
+        events.push({ kind, now, pinsHeld: state(controller).manualCap.size + state(controller).manualTarget.size });
+      },
+    });
+    /** Per-device `slotKey` and `slotGenCap` for the next tick's context. */
+    const slotKeys = new Map<string, string | null>([
+      ["a", null],
+      ["b", null],
+    ]);
+    const slotCaps = new Map<string, number | null>();
+    const ctxOf = () =>
+      devices.map((d) => ({
+        device: d as never,
+        managed: true,
+        needTier: "full" as const,
+        needDelta: 3,
+        slotGenCap: slotCaps.get(d.id) ?? null,
+        slotKey: slotKeys.get(d.id) ?? null,
+      }));
+    let flip = 1;
+    const feed = async (amps: number, opts: { grid?: boolean } = {}) => {
+      flip = -flip;
+      const jitter = 0.01 * flip;
+      controller.onPowerReading(
+        (opts.grid === true
+          ? { current_1: amps + jitter, current_2: 0 }
+          : { current_1: 0, current_2: amps + jitter }) as never,
+      );
+      vi.advanceTimersByTime(5_000);
+      await controller.tick(ctxOf(), 30);
+    };
+    const run = async (amps: number, steps: number, opts: { grid?: boolean } = {}) => {
+      for (let i = 0; i < steps; i++) await feed(amps, opts);
+    };
+    return { controller, mock, a, b, devices, sent, feed, run, ctxOf, slotKeys, slotCaps, events, urgent };
+  }
+
+  /** Warm up on gen, then pin `a` UP to L3 by hand (a `manualTarget`). */
+  async function pinnedOnGen(configExtra: Record<string, unknown> = {}) {
+    const s = setup(configExtra);
+    await s.controller.ensureLoaded();
+    await s.run(8.0, 6);
+    const res = await s.controller.onUserGenLevel("a", 3);
+    expect(res, "the pin must stand, or the test is measuring a revert").toEqual({ reverted: false, level: 3 });
+    expect(state(s.controller).manualTarget.get("a")).toBe(3);
+    return s;
+  }
+
+  /**
+   * Warm up, let `a` confirm at L3, then take it DOWN by hand: a reduction is
+   * what mints a `manualCap`, and every other test in this suite pins a target.
+   */
+  async function cappedOnGen(slotKey: string | null = null) {
+    const s = setup();
+    await s.controller.ensureLoaded();
+    if (slotKey != null) {
+      s.slotKeys.set("a", slotKey);
+      s.slotKeys.set("b", slotKey);
+    }
+    await s.run(8.0, 6);
+    await s.controller.onUserGenLevel("a", 3);
+    s.a.generatorMode = 3; // the shadow follows the send the route made
+    await s.feed(8.0);
+    expect(state(s.controller).recon.a.confirmedLevel, "L3 confirmed").toBe(3);
+    const res = await s.controller.onUserGenLevel("a", 1);
+    expect(res).toEqual({ reverted: false, level: 1 });
+    expect(state(s.controller).manualCap.get("a")).toBe(1);
+    expect(state(s.controller).manualTarget.size).toBe(0);
+    return s;
+  }
+
+  // A cap is the other half of "manual wins" (a hand-set CEILING), and it has
+  // the same life as a target: the plan releases all three intents together, so
+  // every edge is asserted on a real cap too.
+  describe("a hand-set CAP lives exactly as long as a target", () => {
+    it("a real changeover releases it, on the changeover's own row", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = await cappedOnGen();
+
+        await s.run(8.0, 3, { grid: true });
+
+        expect(state(s.controller).manualCap.size).toBe(0);
+        const rows = releases(s.mock.journal);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].reason).toBe("source_change");
+        expect(rows[0].detail).toContain("cap L1");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a slot boundary releases it", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = await cappedOnGen("1:A");
+        s.slotKeys.set("a", "1:B");
+
+        await s.feed(8.0);
+
+        expect(state(s.controller).manualCap.size).toBe(0);
+        const rows = releases(s.mock.journal);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].reason).toBe("manual_release");
+        expect(rows[0].detail).toContain("cap L1");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a beep-reset fingerprint releases it", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = await cappedOnGen();
+
+        s.controller.onDevicePowerCycle("a", "beep reset observed (power-loss restart)", Date.now());
+
+        expect(state(s.controller).manualCap.size).toBe(0);
+        const rows = releases(s.mock.journal);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].reason).toBe("manual_release");
+        expect(rows[0].detail).toContain("cap L1");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("an observed off releases it", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = await cappedOnGen();
+
+        s.a.power = false;
+        await s.feed(8.0);
+
+        expect(state(s.controller).manualCap.size).toBe(0);
+        const rows = releases(s.mock.journal);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].detail).toContain("cap L1");
+        expect(rows[0].detail).toContain("power off (observed)");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("power-cycle edge", () => {
+    it("releases the pin on a gen entry AND on a grid entry, journalled on the changeover's own row", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, mock, run } = await pinnedOnGen();
+
+        await run(8.0, 3, { grid: true }); // gen → grid, a REAL changeover
+
+        expect(state(controller).manualTarget.size).toBe(0);
+        const rows = releases(mock.journal);
+        expect(rows).toHaveLength(1);
+        // One row for the whole changeover, not a second one a millisecond later.
+        expect(rows[0].reason).toBe("source_change");
+        expect(rows[0].deviceId).toBe("a");
+        expect(rows[0].detail).toContain("target L3");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("…and the same in the other direction: a grid→gen changeover is not special", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        // The 2026-06-09 decision kept caps across grid→gen; superseded by the
+        // user on 2026-09-05, because that changeover power-cycles the units too.
+        const s = setup();
+        await s.controller.ensureLoaded();
+        await s.run(8.0, 6, { grid: true });
+        await s.controller.onUserGenLevel("a", 3);
+        expect(state(s.controller).manualTarget.get("a")).toBe(3);
+
+        await s.run(8.0, 3);
+
+        expect(state(s.controller).manualTarget.size).toBe(0);
+        expect(releases(s.mock.journal)).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a boot (source none → X) and a bare meter gap release nothing", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, mock, feed, run } = await pinnedOnGen();
+        // The boot event already happened on the first reading above (none → gen)
+        // and the pin was made after it; a gap now must not eat it either.
+        vi.advanceTimersByTime(25_000); // > ESP_GAP_EVENT_MS
+        await feed(8.0);
+        await run(8.0, 2);
+
+        expect(state(controller).manualTarget.get("a")).toBe(3);
+        expect(releases(mock.journal)).toHaveLength(0);
+        // The classification window still opened (hard rule 2), but the RESTART
+        // clock the spend gate reads did not.
+        expect(state(controller).lastPowerEventAt).toBeGreaterThan(0);
+        expect(state(controller).lastAcRestartAt).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a pin made BEFORE the first reading survives the boot event that follows it", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        // The boot delivery ("source none → gen") is the one event that arrives
+        // with intent already on the books after a deploy: the leveler's source
+        // also falls back to "none" after a long meter outage, so this is a live
+        // shape, not just a cold start.
+        const s = setup();
+        await s.controller.ensureLoaded();
+        await s.controller.onUserGenLevel("a", 3); // no baseline yet, so a cap
+        expect(state(s.controller).manualCap.get("a")).toBe(3);
+
+        await s.feed(8.0); // the first reading: none → gen
+
+        expect(state(s.controller).manualCap.get("a"), "only the SERVER restarted").toBe(3);
+        expect(state(s.controller).lastAcRestartAt).toBe(0);
+        expect(releases(s.mock.journal)).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("stamps its own clock and releases BEFORE it calls out, on the timestamp it passes", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, events, run } = await pinnedOnGen();
+        events.length = 0;
+
+        await run(8.0, 3, { grid: true });
+
+        const change = events.find((e) => e.kind.startsWith("source gen"));
+        expect(change, "the changeover reached the collector").toBeDefined();
+        expect(change!.now, "one clock: the stamp is the timestamp handed over").toBe(
+          state(controller).lastPowerEventAt,
+        );
+        expect(change!.pinsHeld, "our own state is finished before anything outward runs").toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a collector that re-enters us from that callback still releases exactly once", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        // The collector's fan/swing wipe runs inside `onPowerEvent`, and its
+        // beep-reset site calls straight back into this controller. A half-done
+        // release would either double-journal or lose the unconfirmed sends.
+        const s = setup();
+        await s.controller.ensureLoaded();
+        await s.run(8.0, 6);
+        await s.controller.onUserGenLevel("a", 3);
+        const inFlight = unconfirmedLevels(state(s.controller).recon, "a", Date.now());
+        expect(inFlight).toContain(3);
+        s.events.length = 0;
+        (s.controller as unknown as { deps: LevelingDeps }).deps.onPowerEvent = (kind: string, now: number) => {
+          s.controller.onDevicePowerCycle("a", `re-entrant (${kind})`, now);
+        };
+
+        await s.run(8.0, 3, { grid: true });
+
+        expect(releases(s.mock.journal)).toHaveLength(1);
+        expect(state(s.controller).manualTarget.size).toBe(0);
+        // Invariant 34: the send the firmware may still be sitting at survives
+        // every re-baseline, or the envelope prices the room light.
+        expect(unconfirmedLevels(state(s.controller).recon, "a", Date.now())).toContain(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("the beep-reset fingerprint is a physical restart", () => {
+    it("does everything the OFF→ON flip does, for a unit whose shadow never showed the off", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, mock, b, run } = await pinnedOnGen();
+        await controller.onUserFanChange("a"); // a fan exemption to release too
+        // A live, SPENDABLE credit from a room switched off at the dashboard.
+        await controller.onUserPowerOff("b");
+        controller.onUserPowerOffSent("b");
+        const armed = state(controller).meterState.pendingCut!;
+        expect(armed.spendableAmps).toBeGreaterThan(0);
+        // An open up-grade, the shape a fresh compressor contaminates.
+        state(controller).pendingGrades = [{ contaminated: false, direction: "up" }];
+        // The boot changeover is not what is under test here: zero the
+        // house-wide clock so the per-device assertions below mean something.
+        state(controller).lastPowerEventAt = 0;
+        const now = Date.now();
+
+        controller.onDevicePowerCycle("a", "beep reset observed (power-loss restart)", now);
+
+        expect(state(controller).manualTarget.size).toBe(0);
+        expect(state(controller).fanExempt.has("a")).toBe(false);
+        expect(releases(mock.journal).map((r) => r.reason)).toEqual(["manual_release"]);
+        // Restart protection outlasts AC_RAMP_MS, so this ramp closes on
+        // evidence rather than on its timer (invariant 44).
+        expect(state(controller).powerEventRamp.has("a")).toBe(true);
+        expect(state(controller).rampUntil.get("a")).toBe(now + 240_000);
+        expect(state(controller).startBaseline.has("a"), "a start window opened").toBe(true);
+        expect(state(controller).externalOnAt.get("a")).toBe(now);
+        expect(state(controller).pendingGrades[0].contaminated).toBe(true);
+        // The demand side survives (the fall still has to explain itself to the
+        // collapse latch); only the spend side dies.
+        const after = state(controller).meterState.pendingCut!;
+        expect(after.amps).toBeCloseTo(armed.amps, 5);
+        expect(after.spendableAmps).toBe(0);
+        // Per-device, and only per-device.
+        expect(state(controller).devicePowerCycleAt.get("a")).toBe(now);
+        expect(state(controller).lastPowerEventAt, "a house-wide clock this is not").toBe(0);
+        expect(state(controller).lastAcRestartAt).toBe(0);
+        expect(state(controller).inPowerEventWindow(now, "a")).toBe(true);
+        expect(state(controller).inPowerEventWindow(now, "b")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the first shadow after it is ADOPTED, even mid-settle, so nothing re-mints the pin", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, a, feed, run } = await pinnedOnGen();
+        await controller.onUserFanChange("a");
+        controller.onDevicePowerCycle("a", "beep reset observed (power-loss restart)", Date.now());
+        // The firmware restores the level it was last commanded to: in the
+        // shadow that is character-for-character a hand raise (the 2026-08-06
+        // 07:01:52Z shape), and it arrives while the last batch is settling.
+        state(controller).modeState = noteBatch(state(controller).modeState, { fanOnly: false }, Date.now());
+        a.generatorMode = 3;
+
+        await feed(8.0);
+
+        expect(state(controller).recon.a.confirmedLevel).toBe(3);
+        expect(state(controller).recon.a.adoptNextObservation).toBeFalsy();
+        expect(state(controller).manualTarget.size, "no re-mint").toBe(0);
+        expect(state(controller).manualCap.size).toBe(0);
+        expect(state(controller).fanExempt.size).toBe(0);
+        await run(8.0, 2);
+        expect(state(controller).manualTarget.size).toBe(0);
+        expect(state(controller).manualCap.size).toBe(0);
+        expect(state(controller).fanExempt.size).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("an observed fan 0 under a live hold releases the hold and mints NO exemption", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, a, feed } = await pinnedOnGen();
+        state(controller).fanHolds = {
+          a: { deviceId: "a", originalFan: 5, lastSetFan: 1, heldAt: Date.now() },
+        };
+        // TCL zeroes the blower on every power-loss restart; no hold ever asks
+        // for 0, so an observed 0 is the firmware, never a hand.
+        a.fanSpeed = 0;
+
+        await feed(8.0);
+
+        expect(controller.hasFanHold("a")).toBe(false);
+        expect(state(controller).fanExempt.has("a"), "one blackout must not bar the room from trimming").toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("…but an observed 0 while OUR set_fan is in flight is shadow LAG, and keeps the hold", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        // The room was on built-in auto when the hold was placed (originalFan 0)
+        // and we sent it fan 1; until that send confirms, a 0 in the shadow is
+        // the old state still being reported, not a restart. Releasing there
+        // would kill a healthy hold on every trim we make to an auto room.
+        const { controller, a, feed } = await pinnedOnGen();
+        state(controller).fanHolds = {
+          a: { deviceId: "a", originalFan: 0, lastSetFan: 1, heldAt: Date.now() },
+        };
+        state(controller).recon = noteFanSend(state(controller).recon, "a", 1, Date.now());
+        a.fanSpeed = 0;
+
+        await feed(8.0); // inside FAN_RESEND_SPACING_MS: nothing to resend yet
+
+        expect(controller.hasFanHold("a"), "the hold survives its own send's lag").toBe(true);
+        expect(state(controller).fanExempt.has("a")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("…and once that send is due for a resend, the resend goes out and the hold still stands", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, a, sent, feed } = await pinnedOnGen();
+        state(controller).fanHolds = {
+          a: { deviceId: "a", originalFan: 0, lastSetFan: 1, heldAt: Date.now() },
+        };
+        state(controller).recon = noteFanSend(state(controller).recon, "a", 1, Date.now() - 20_000);
+        a.fanSpeed = 0;
+        sent.length = 0;
+
+        await feed(8.0); // past the spacing: confirm-or-resend owns this tick
+
+        expect(sent.filter((c) => c.kind === "set_fan_speed" && c.value === 1)).toHaveLength(1);
+        expect(controller.hasFanHold("a")).toBe(true);
+        expect(state(controller).fanExempt.has("a")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a hold that RESTORED a room to built-in auto lands its own 0, and no reset is read into it", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        // `fan-trim` restores an originalFan-0 room with a single `set_fan 0`
+        // (`lastSetFan: 0`), so a 0 in the shadow there is our own command
+        // landing. That hold ends through the restore path, never here.
+        const { controller, a, feed } = await pinnedOnGen();
+        state(controller).fanHolds = {
+          a: { deviceId: "a", originalFan: 0, lastSetFan: 0, heldAt: Date.now() },
+        };
+        a.fanSpeed = 0;
+
+        await feed(8.0);
+
+        expect(controller.hasFanHold("a"), "not released as a power_cycle_reset").toBe(true);
+        expect(state(controller).fanExempt.has("a")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a dashboard change lands as a CAP while the re-baseline is pending, and is classified once it lands", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, a, feed, urgent } = await pinnedOnGen();
+        controller.onDevicePowerCycle("a", "beep reset observed (power-loss restart)", Date.now());
+        const cutBefore = state(controller).meterState.pendingCut;
+        urgent.mockClear();
+
+        // BEFORE the first post-reboot shadow: the baseline is the pre-reboot
+        // level, so it is read as unknown and the conservative branch runs.
+        const first = await controller.onUserGenLevel("a", 2);
+        expect(first).toEqual({ reverted: false, level: 2 });
+        expect(state(controller).manualCap.get("a")).toBe(2);
+        expect(state(controller).manualTarget.size).toBe(0);
+        expect(baselineStale(state(controller).recon, "a"), "the marker outlives the tap").toBe(true);
+        // …and it prices NOTHING: a level-down credit needs a level to count
+        // down FROM, and the only one on the books belongs to a session that
+        // ended when the unit rebooted.
+        expect(state(controller).meterState.pendingCut).toBe(cutBefore);
+        expect(urgent, "nothing was freed, so nothing is evaluated").not.toHaveBeenCalled();
+
+        // The shadow finally reports; the send we recorded lands through the adopt.
+        a.generatorMode = 2;
+        await feed(8.0);
+        expect(baselineStale(state(controller).recon, "a")).toBe(false);
+        expect(state(controller).recon.a.confirmedLevel).toBe(2);
+
+        // …and NOW a raise is classified from the adopted level, as a target.
+        const second = await controller.onUserGenLevel("a", 3);
+        expect(second).toEqual({ reverted: false, level: 3 });
+        expect(state(controller).manualTarget.get("a")).toBe(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("refactor parity: the ordinary OFF→ON flip still arms a TIMED ramp and still withholds the shield", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        // The structural-ON bookkeeping moved into `noteDevicePoweredOn`; the
+        // flip must behave exactly as it did (a power-event ramp here would hold
+        // the raise path open past its window on evidence it never gathered).
+        const s = setup();
+        await s.controller.ensureLoaded();
+        s.a.power = false;
+        await s.run(8.0, 4);
+        s.a.power = true;
+        await s.feed(8.0);
+        const onAt = Date.now();
+
+        expect(state(s.controller).powerEventRamp.has("a"), "a timed ramp, not a power-event one").toBe(false);
+        expect(state(s.controller).rampUntil.get("a")).toBe(onAt + 240_000);
+        expect(state(s.controller).externalOnAt.get("a"), "a bare external ON still shields").toBe(onAt);
+
+        // A room WE restored takes the same flip and must NOT be shielded.
+        const shedRoom = setup({}, ["b"]);
+        await shedRoom.controller.ensureLoaded();
+        shedRoom.b.power = false;
+        await shedRoom.run(8.0, 4);
+        shedRoom.b.power = true;
+        await shedRoom.feed(8.0);
+        expect(shedRoom.controller.isShed("b"), "the restore confirmed").toBe(false);
+        expect(state(shedRoom.controller).externalOnAt.has("b")).toBe(false);
+        expect(state(shedRoom.controller).powerEventRamp.has("b")).toBe(false);
+
+        // …and neither is one whose restore is still in flight (the shed record
+        // was already cleared by the device poll on this same ON).
+        const inFlight = setup();
+        await inFlight.controller.ensureLoaded();
+        inFlight.b.power = false;
+        await inFlight.run(8.0, 4);
+        state(inFlight.controller).pacing = noteAttempt(
+          state(inFlight.controller).pacing,
+          "b",
+          "restore",
+          Date.now(),
+        );
+        inFlight.b.power = true;
+        await inFlight.feed(8.0);
+        expect(state(inFlight.controller).externalOnAt.has("b")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("entry policy after a release", () => {
+    it("a gen entry clamps from the CONFIGURED floor, not from the released pin, and keeps the send charged", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        // Pin L3 on grid with the shadow still at L1 (the send is in flight),
+        // then enter gen. The entry must judge the room by its CONFIGURED floor
+        // and leave it at L1: a released pin is not a floor. The in-flight send
+        // has to survive the re-baseline all the same (invariant 34), or the
+        // envelope prices the room a whole step light.
+        const s = setup();
+        await s.controller.ensureLoaded();
+        s.slotCaps.set("a", 1); // the slot's own hard cap keeps GRID_FULL off it
+        await s.run(8.0, 6, { grid: true });
+        expect(s.a.generatorMode).toBe(1);
+        await s.controller.onUserGenLevel("a", 3);
+        expect(state(s.controller).manualTarget.get("a")).toBe(3);
+        s.slotCaps.delete("a"); // …and the slot stops capping before the entry
+        s.sent.length = 0;
+
+        await s.feed(8.0); // the changeover tick itself
+
+        expect(state(s.controller).manualTarget.size, "gone before the tick planned").toBe(0);
+        expect(unconfirmedLevels(state(s.controller).recon, "a", Date.now())).toContain(3);
+        // What the pipeline was actually handed this tick: no pin, the room's
+        // OWN floor, and the unconfirmed L3 still charged as the worst case the
+        // firmware might be sitting at (invariant 7/34).
+        const view = (
+          s.controller as unknown as {
+            buildViews: (
+              ctx: unknown[],
+              outdoorTempC: number | null,
+              now: number,
+            ) => Array<{ deviceId: string; manualTarget: number | null; minLevel: number; envelopeLevel: number }>;
+          }
+        ).buildViews(s.ctxOf(), 30, Date.now()).find((v) => v.deviceId === "a")!;
+        expect(view.manualTarget).toBeNull();
+        expect(view.minLevel, "judged by the configured floor").toBe(1);
+        expect(view.envelopeLevel).toBe(3);
+        const levels = s.sent.filter((c) => c.kind === "set_generator_mode" && c.deviceId === "a");
+        expect(levels.filter((c) => (c.value ?? 0) > 1), "no level above the floor was commanded").toEqual([]);
+        expect(s.a.generatorMode, "the entry does not honour a pin it just released").toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a grid entry lifts a pin-free room to its ceiling (GRID_FULL)", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, sent, run } = await pinnedOnGen();
+        sent.length = 0;
+
+        await run(8.0, 4, { grid: true });
+
+        expect(state(controller).manualTarget.size).toBe(0);
+        // 30 A of grid: "on grid, start all to full" applies to a room whose pin
+        // the changeover just ended, exactly as it does to any other room.
+        expect(sent.some((c) => c.kind === "set_generator_mode" && (c.value ?? 0) > 1)).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("the restart window gates the SPEND side of an observed off", () => {
+    it("an off inside the window credits the meter but funds nothing, and evaluates nothing", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = setup();
+        await s.controller.ensureLoaded();
+        await s.run(8.0, 6);
+        const changeoverAt = Date.now();
+        await s.run(8.0, 3, { grid: true }); // a REAL changeover: the restart clock
+        expect(state(s.controller).lastAcRestartAt).toBe(changeoverAt);
+        s.urgent.mockClear();
+
+        s.a.power = false; // the automation is about to put it back
+        await s.feed(8.0, { grid: true });
+
+        const cut = state(s.controller).meterState.pendingCut!;
+        expect(cut.amps, "the fall still has to explain itself").toBeGreaterThan(0);
+        expect(cut.spendableAmps, "a power-loss off funds no raise").toBe(0);
+        expect(s.urgent, "and nothing is evaluated on it").not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the same off past the window is spendable again", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = setup();
+        await s.controller.ensureLoaded();
+        await s.run(8.0, 6);
+        // 16 minutes after the restart: the units are long back.
+        state(s.controller).lastAcRestartAt = Date.now() - 16 * 60_000;
+        s.urgent.mockClear();
+
+        s.a.power = false;
+        await s.feed(8.0);
+
+        expect(state(s.controller).meterState.pendingCut!.spendableAmps).toBeGreaterThan(0);
+        expect(s.urgent).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a bare ESP gap leaves it spendable: the gap never stamps the restart clock", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        // The whole point of the second clock: `lastPowerEventAt` is stamped by
+        // every routine CT02 blip, and keying the spend gate on it would switch
+        // funded spend off most of the day.
+        const s = setup();
+        await s.controller.ensureLoaded();
+        await s.run(8.0, 6);
+        vi.advanceTimersByTime(25_000);
+        const gapAt = Date.now();
+        await s.feed(8.0); // "ESP gap 25s"
+        expect(state(s.controller).lastPowerEventAt).toBe(gapAt);
+        expect(state(s.controller).lastAcRestartAt, "a gap says nothing about the line").toBe(0);
+        s.urgent.mockClear();
+
+        s.a.power = false;
+        await s.feed(8.0);
+
+        expect(state(s.controller).meterState.pendingCut!.spendableAmps).toBeGreaterThan(0);
+        expect(s.urgent).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("one room's fingerprint gates that room's off only, never its neighbour's", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = setup();
+        await s.controller.ensureLoaded();
+        await s.run(8.0, 6);
+        s.controller.onDevicePowerCycle("a", "beep reset observed (power-loss restart)", Date.now());
+        s.urgent.mockClear();
+
+        s.a.power = false;
+        s.b.power = false;
+        await s.feed(8.0);
+
+        const cut = state(s.controller).meterState.pendingCut!;
+        // `a` is credited (2.5 A at L1) and `b` is credited AND spendable, so
+        // the pool carries both while only b's amps may be spent.
+        expect(cut.amps).toBeCloseTo(5.0, 5);
+        expect(cut.spendableAmps).toBeCloseTo(2.5, 5);
+        expect(s.urgent, "b's off is ordinary and evaluates on the spot").toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("the range-slot boundary", () => {
+    /** Pin `a`, with the slot regime it was pinned under already stored. */
+    async function pinnedInSlot(key: string) {
+      const s = setup();
+      await s.controller.ensureLoaded();
+      s.slotKeys.set("a", key);
+      s.slotKeys.set("b", key);
+      await s.run(8.0, 6);
+      await s.controller.onUserGenLevel("a", 3);
+      await s.controller.onUserFanChange("a");
+      expect(state(s.controller).manualTarget.get("a")).toBe(3);
+      expect(state(s.controller).lastSlotKey.get("a")).toBe(key);
+      return s;
+    }
+
+    it("A → B releases the pins AND the fan exemption, before the tick plans against the new cap", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = await pinnedInSlot("1:A");
+        s.slotKeys.set("a", "1:B");
+        s.slotCaps.set("a", 2);
+
+        await s.feed(8.0);
+
+        const view = s.controller.getStatus().acs.find((x) => x.deviceId === "a")!;
+        expect(view.manualTarget).toBeNull();
+        expect(view.slotCap, "the same tick already plans against the new slot").toBe(2);
+        expect(state(s.controller).fanExempt.has("a")).toBe(false);
+        const rows = releases(s.mock.journal);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].reason).toBe("manual_release");
+        expect(rows[0].detail).toContain("1:A → 1:B");
+        expect(rows[0].detail).toContain("fan exemption");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("A → unknown → A releases nothing (a one-tick metric gap is not a boundary)", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = await pinnedInSlot("1:A");
+
+        s.slotKeys.set("a", null);
+        await s.feed(8.0);
+        s.slotKeys.set("a", "1:A");
+        await s.feed(8.0);
+
+        expect(state(s.controller).manualTarget.get("a")).toBe(3);
+        expect(releases(s.mock.journal)).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("A → inactive → A releases exactly once", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        // "Inactive" is a KNOWN regime (the rule owes an OFF, not a threshold),
+        // so entering it is a real boundary; coming back finds nothing left.
+        const s = await pinnedInSlot("1:A");
+
+        s.slotKeys.set("a", "1:inactive");
+        await s.feed(8.0);
+        expect(state(s.controller).manualTarget.size).toBe(0);
+        s.slotKeys.set("a", "1:A");
+        await s.feed(8.0);
+
+        expect(releases(s.mock.journal)).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("A → inactive → B releases too", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = await pinnedInSlot("1:A");
+
+        s.slotKeys.set("a", "1:inactive");
+        await s.feed(8.0);
+        s.slotKeys.set("a", "1:B");
+        await s.feed(8.0);
+
+        expect(state(s.controller).manualTarget.size).toBe(0);
+        expect(releases(s.mock.journal)).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("boot → unknown → A does not release: recovering from an unknown regime is not a boundary", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = setup(); // slot keys start null, as they do after a deploy
+        await s.controller.ensureLoaded();
+        await s.run(8.0, 6);
+        await s.controller.onUserGenLevel("a", 3);
+        expect(state(s.controller).lastSlotKey.has("a")).toBe(false);
+
+        s.slotKeys.set("a", "1:A");
+        await s.feed(8.0);
+
+        expect(state(s.controller).manualTarget.get("a"), "a pin made while unknown survives").toBe(3);
+        expect(state(s.controller).lastSlotKey.get("a")).toBe("1:A");
+        expect(releases(s.mock.journal)).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a pin set AFTER the boundary survives until the next one", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const s = await pinnedInSlot("1:A");
+        s.slotKeys.set("a", "1:B");
+        await s.feed(8.0);
+        expect(state(s.controller).manualTarget.size).toBe(0);
+
+        await s.controller.onUserGenLevel("a", 3); // he pins again, under B
+        await s.feed(8.0);
+        expect(state(s.controller).manualTarget.get("a")).toBe(3);
+
+        s.slotKeys.set("a", "1:C");
+        await s.feed(8.0);
+        expect(state(s.controller).manualTarget.size).toBe(0);
+        expect(releases(s.mock.journal)).toHaveLength(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("power-off paths", () => {
+    it("an OBSERVED off clears all three, through the helper, journalled", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, mock, a, feed } = await pinnedOnGen();
+        await controller.onUserFanChange("a");
+
+        a.power = false;
+        await feed(8.0);
+
+        expect(state(controller).manualTarget.size).toBe(0);
+        expect(state(controller).manualCap.size).toBe(0);
+        expect(state(controller).fanExempt.has("a")).toBe(false);
+        const rows = releases(mock.journal);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].detail).toContain("power off (observed)");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the DASHBOARD off still clears the level pins only: an intent is not a confirmed power cycle", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-09-05T10:00:00Z"));
+        const { controller, mock } = await pinnedOnGen();
+        await controller.onUserFanChange("a");
+
+        await controller.onUserPowerOff("a");
+
+        expect(state(controller).manualTarget.size).toBe(0);
+        expect(state(controller).manualCap.size).toBe(0);
+        // The fan exemption is the user's own, made on this same room, and this
+        // path runs BEFORE the cloud send: nothing has power-cycled yet.
+        expect(state(controller).fanExempt.has("a")).toBe(true);
+        expect(releases(mock.journal)).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });

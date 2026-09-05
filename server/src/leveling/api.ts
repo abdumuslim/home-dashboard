@@ -15,7 +15,12 @@ export interface LevelingDeps {
   isManualOffLocked: (deviceId: string) => Promise<boolean>;
   onLevelerFanCommand: (deviceId: string, fan: number) => void;
   onUrgentLevelingNeeded?: () => void;
-  onPowerEvent?: (kind: string) => void;
+  /**
+   * `now` is the controller's own event timestamp, not the collector's read of
+   * the clock: both sides window the same event (an observed off here, an
+   * observed level jump there), so they stamp ONE number or they drift.
+   */
+  onPowerEvent?: (kind: string, now: number) => void;
 }
 
 export interface LevelerDeviceContext {
@@ -24,6 +29,18 @@ export interface LevelerDeviceContext {
   needTier: NeedTier;
   needDelta: number;
   slotGenCap: number | null;
+  /**
+   * Which automation regime governs this device right now:
+   * `"<ruleId>:<slotId>"` for an active slot with a live metric value,
+   * `"<ruleId>:inactive"` when every matching rule is out of window (the regime
+   * is known, and it is "off"), `null` when it is UNKNOWN (no matching rule, or
+   * an active slot whose metric had no value this tick).
+   *
+   * REQUIRED on purpose: the leveler releases a manual pin when this key changes
+   * (2026-09-05), so production wiring that forgot to pass it must be a type
+   * error rather than a pin that silently never expires.
+   */
+  slotKey: string | null;
 }
 
 export interface LevelingAcStatusV2 {

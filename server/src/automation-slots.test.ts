@@ -165,6 +165,23 @@ describe("AC automation range slots", () => {
     expect((normalized?.[0] as unknown as Record<string, unknown>).unknown_field).toBeUndefined();
   });
 
+  // The leveler keys a manual pin's lifetime on `${ruleId}:${slotId}`
+  // (2026-09-05), so a slot id that changes when nothing changed would release
+  // pins for nothing, and two slots sharing one id would hide a real boundary.
+  it("preserves provided slot ids and synthesizes positional ones only when absent", () => {
+    const normalized = normalizeRangeSlots([
+      { id: "b7f3c2a1-9d44-4e21-8f0a-1c2d3e4f5061", type: "all_day", threshold_low: 24, threshold: 26 },
+      { type: "window", start_time: "06:00", end_time: "10:00", threshold_low: 22, threshold: 25 },
+      { id: "   ", type: "window", start_time: "10:00", end_time: "12:00", threshold_low: 22, threshold: 25 },
+    ]);
+
+    expect(normalized?.[0].id).toBe("b7f3c2a1-9d44-4e21-8f0a-1c2d3e4f5061");
+    expect(normalized?.[1].id).toBe("slot-2"); // positional, and only because none was given
+    expect(normalized?.[2].id).toBe("slot-3"); // whitespace is not an id
+    // A second pass over its own output is a no-op: ids are stable across saves.
+    expect(normalizeRangeSlots(normalized)?.map((s) => s.id)).toEqual(normalized?.map((s) => s.id));
+  });
+
   it("validates slot count and threshold bounds", () => {
     expect(validateRangeSlots([], metricBounds, () => null).ok).toBe(false);
     expect(validateRangeSlots(

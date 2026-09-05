@@ -70,9 +70,19 @@ const DEFAULT_RANGE_SLOT_TIMES = { start: "08:00", end: "12:00" } as const;
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const MINUTES_PER_DAY = 1440;
 
+/**
+ * A fresh slot identity. Ids must be unique within a rule: the leveler keys a
+ * device's governing range slot on `<ruleId>:<slotId>` and React keys the editor
+ * rows on the id alone, so two slots minted in the same millisecond used to
+ * share one identity.
+ */
+function newRangeSlotId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `slot-${Date.now()}`;
+}
+
 function createRangeSlot(overrides: Partial<AutomationRangeSlot> = {}): AutomationRangeSlot {
   return {
-    id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `slot-${Date.now()}`,
+    id: newRangeSlotId(),
     type: "window",
     start_mode: "exact",
     start_time: "08:00",
@@ -984,7 +994,7 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, maxGenLevel, levelingEl
       <div className="flex items-center justify-between gap-2">
         <span className="text-[10px] text-sky-400/70 uppercase tracking-wider">Ranges</span>
         <button
-          onClick={() => onChange([...slots, createRangeSlot({ id: `slot-${Date.now()}`, type: "window" })])}
+          onClick={() => onChange([...slots, createRangeSlot({ type: "window" })])}
           disabled={slots.length >= 24}
           className="flex items-center gap-1 px-2 py-1 rounded border border-white/10 bg-white/5 text-[10px] text-dim hover:text-text disabled:opacity-30"
         >
@@ -1006,7 +1016,7 @@ function RangeSlotsEditor({ slots, metricDef, conflicts, maxGenLevel, levelingEl
               <button onClick={() => moveSlot(index, -1)} disabled={index === 0} className="px-1.5 py-1 rounded text-[10px] text-dim border border-white/10 disabled:opacity-30">Up</button>
               <button onClick={() => moveSlot(index, 1)} disabled={index === slots.length - 1} className="px-1.5 py-1 rounded text-[10px] text-dim border border-white/10 disabled:opacity-30">Down</button>
               <button
-                onClick={() => onChange([...slots.slice(0, index + 1), { ...slot, id: `slot-${Date.now()}` }, ...slots.slice(index + 1)])}
+                onClick={() => onChange([...slots.slice(0, index + 1), { ...slot, id: newRangeSlotId() }, ...slots.slice(index + 1)])}
                 disabled={slots.length >= 24}
                 className="px-1.5 py-1 rounded text-[10px] text-dim border border-white/10 disabled:opacity-30"
               >

@@ -450,6 +450,212 @@ describe("AC control attribution (2026-07-24 'Najat keeps turning back on')", ()
     expect(locks.locked.has("DHihohFAAAE")).toBe(true);
   });
 
+  // 2026-08-31 funded spend, route half. The leveler is told about an off BEFORE
+  // the cloud send (intent has to beat a fast shadow poll), but the budget that
+  // off frees may only be priced once the publish is ACCEPTED: `sendControlVerified`
+  // resolves at that point (its shadow verify loop is fire-and-forget), so the
+  // hook keeps the whole latency win while a refused send credits nothing.
+  it("prices an off's freed budget only after the cloud ACCEPTS the send", async () => {
+    const events: string[] = [];
+    const tcl = createTclMock();
+    tcl.cloud.sendControlVerified = async () => { events.push("send"); };
+    const leveling = {
+      getConfig: async () => ({}), updateConfig: async () => ({}), getStatus: () => ({}),
+      onUserPowerOff: async () => { events.push("leveler-off"); },
+      onUserPowerOffSent: () => { events.push("leveler-off-sent"); },
+      onUserPowerOn: async () => undefined,
+      onUserGenLevel: async (_deviceId: string, level: number) => ({ reverted: false, level }),
+    } as never;
+    const { server, url } = await startServer({ tcl: tcl.cloud, leveling });
+    servers.push(server);
+
+    const resp = await control(url, { Cookie: loginCookie() }, "set_power", 0);
+
+    expect(resp.status).toBe(200);
+    expect(events).toEqual(["leveler-off", "send", "leveler-off-sent"]);
+  });
+
+  it("…and a REFUSED off never prices any freed budget", async () => {
+    const events: string[] = [];
+    const tcl = createTclMock();
+    tcl.cloud.sendControlVerified = async () => { throw new Error("cloud refused"); };
+    const leveling = {
+      getConfig: async () => ({}), updateConfig: async () => ({}), getStatus: () => ({}),
+      onUserPowerOff: async () => { events.push("leveler-off"); },
+      onUserPowerOffSent: () => { events.push("leveler-off-sent"); },
+      onUserPowerOn: async () => undefined,
+      onUserGenLevel: async (_deviceId: string, level: number) => ({ reverted: false, level }),
+    } as never;
+    const { server, url } = await startServer({ tcl: tcl.cloud, leveling });
+    servers.push(server);
+
+    const resp = await control(url, { Cookie: loginCookie() }, "set_power", 0);
+
+    expect(resp.status).toBe(500);
+    // The manual-off LOCK still stands (the user's intent was off); only the
+    // amps a peer could be admitted against are never armed.
+    expect(events).toEqual(["leveler-off"]);
+  });
+
+  it("rejects a non-boolean fundedSpend instead of silently sanitizing it back to ON", async () => {
+    // `mergeLevelingConfigV2` takes only a real boolean, so `"false"` would be
+    // persisted, reverted to the default, and reported 200, leaving an operator
+    // believing the kill switch is off while funded spending runs.
+    const forwarded: Array<Record<string, unknown>> = [];
+    const persisted: Array<Record<string, unknown>> = [];
+    const leveling = {
+      getConfig: async () => ({}),
+      updateConfig: async (cfg: Record<string, unknown>) => { persisted.push(cfg); return {}; },
+      getStatus: () => ({}),
+      onUserPowerOff: async () => undefined,
+      onUserPowerOn: async () => undefined,
+      onUserGenLevel: async (_deviceId: string, level: number) => ({ reverted: false, level }),
+      updateV2Config: async (cfg: Record<string, unknown>) => { forwarded.push(cfg); return {}; },
+    } as never;
+    const { server, url } = await startServer({ leveling });
+    servers.push(server);
+
+    // The PUT validates a whole config; only `fundedSpend` is under test here.
+    const base = {
+      enabled: true,
+      gridLimitAmps: 30,
+      genLimitAmps: 15,
+      marginAmps: 1,
+      comfortTargetC: 26,
+      priority: [],
+      ampModels: {},
+    };
+    const put = (body: Record<string, unknown>) => fetch(`${url}/api/ac/leveling`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: loginCookie() },
+      body: JSON.stringify({ ...base, ...body }),
+    });
+
+    const bad = await put({ fundedSpend: "false", genLimitAmps: 12 });
+    expect(bad.status).toBe(400);
+    expect((await bad.json()).error).toBe("fundedSpend must be a boolean");
+    expect(forwarded, "nothing reaches the controller").toEqual([]);
+    // …and NOTHING was persisted on the way to that 400: the same body carried a
+    // changed generator limit, and a caller told "rejected" must not find a
+    // breaker-critical setting already moved.
+    expect(persisted, "no write before the type check").toEqual([]);
+
+    const good = await put({ fundedSpend: false });
+    expect(good.status).toBe(200);
+    expect(forwarded).toEqual([{ fundedSpend: false }]);
+    expect(persisted, "a valid save still persists once").toHaveLength(1);
+  });
+
+  // 2026-09-05: the over-limit bucket's capacity became a settable field. It is a
+  // BREAKER guard, so the route validates it (and every other v2 field) before a
+  // single write, and the response has to carry what row 2 now holds, because the
+  // client installs the PUT response verbatim.
+  describe("PUT /api/ac/leveling: the configurable over-limit budget", () => {
+    /** A leveling facade whose row 2 actually remembers what was written to it. */
+    function createLevelingMock(row2: Record<string, unknown> = {}) {
+      const forwarded: Array<Record<string, unknown>> = [];
+      const persisted: Array<Record<string, unknown>> = [];
+      const stored = { ...row2 };
+      const handlers = {
+        // The merged view both rows land in: what `getConfig` serves is what a
+        // GET would serve a moment later.
+        getConfig: async () => ({ ...stored }),
+        updateConfig: async (cfg: Record<string, unknown>) => { persisted.push(cfg); return { ...stored }; },
+        getStatus: () => ({}),
+        onUserPowerOff: async () => undefined,
+        onUserPowerOn: async () => undefined,
+        onUserGenLevel: async (_deviceId: string, level: number) => ({ reverted: false, level }),
+        updateV2Config: async (cfg: Record<string, unknown>) => {
+          forwarded.push(cfg);
+          Object.assign(stored, cfg);
+          return { ...stored };
+        },
+      } as never;
+      return { handlers, forwarded, persisted, stored };
+    }
+
+    const base = {
+      enabled: true,
+      gridLimitAmps: 30,
+      genLimitAmps: 15,
+      marginAmps: 1,
+      comfortTargetC: 26,
+      priority: [],
+      ampModels: {},
+    };
+
+    const putConfig = (url: string, body: Record<string, unknown>) => fetch(`${url}/api/ac/leveling`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: loginCookie() },
+      body: JSON.stringify({ ...base, ...body }),
+    });
+
+    it("rejects 3, 21, 4.5 and an explicit null with 400, before either write", async () => {
+      const leveling = createLevelingMock();
+      const { server, url } = await startServer({ leveling: leveling.handlers });
+      servers.push(server);
+
+      for (const bad of [3, 21, 4.5, null]) {
+        // Each body also carries a changed generator limit: a caller told
+        // "rejected" must not find a breaker-critical setting already moved.
+        const resp = await putConfig(url, { overLimitBudgetPoints: bad, genLimitAmps: 12 });
+        expect(resp.status, `overLimitBudgetPoints ${String(bad)}`).toBe(400);
+        expect((await resp.json()).error).toBe("overLimitBudgetPoints must be an integer 4–20");
+      }
+      expect(leveling.persisted, "no row-1 write on the way to a 400").toEqual([]);
+      expect(leveling.forwarded, "no row-2 write either").toEqual([]);
+    });
+
+    it("rejects a null restingBufferAmps and a non-boolean fanTrimEnabled before any write", async () => {
+      // `null` used to pass (`v == null` was treated as absent) and the merge then
+      // restored the default behind a 200, which is a silent setting change.
+      const leveling = createLevelingMock();
+      const { server, url } = await startServer({ leveling: leveling.handlers });
+      servers.push(server);
+
+      const nulled = await putConfig(url, { restingBufferAmps: null, genLimitAmps: 12 });
+      expect(nulled.status).toBe(400);
+      expect((await nulled.json()).error).toBe("invalid v2 leveling field");
+
+      const fan = await putConfig(url, { fanTrimEnabled: "yes", genLimitAmps: 12 });
+      expect(fan.status).toBe(400);
+      expect((await fan.json()).error).toBe("fanTrimEnabled must be a boolean");
+
+      expect(leveling.persisted).toEqual([]);
+      expect(leveling.forwarded).toEqual([]);
+    });
+
+    it("forwards a valid capacity to row 2 and answers with the value row 2 now holds", async () => {
+      const leveling = createLevelingMock({ overLimitBudgetPoints: 5 });
+      const { server, url } = await startServer({ leveling: leveling.handlers });
+      servers.push(server);
+
+      const resp = await putConfig(url, { overLimitBudgetPoints: 8 });
+
+      expect(resp.status).toBe(200);
+      expect(leveling.forwarded).toEqual([{ overLimitBudgetPoints: 8 }]);
+      // The config captured before the row-2 write still said 5; the response is
+      // re-read afterwards, or the card would show the old capacity until the
+      // next poll.
+      expect((await resp.json()).config).toMatchObject({ overLimitBudgetPoints: 8 });
+    });
+
+    it("a stale client that omits the key forwards nothing for it and keeps the stored value", async () => {
+      // A tab whose draft predates the deploy sends no `overLimitBudgetPoints`.
+      // Absent is not null: row 2 keeps its 8.
+      const leveling = createLevelingMock({ overLimitBudgetPoints: 8 });
+      const { server, url } = await startServer({ leveling: leveling.handlers });
+      servers.push(server);
+
+      const resp = await putConfig(url, { fanTrimEnabled: true });
+
+      expect(resp.status).toBe(200);
+      expect(leveling.forwarded).toEqual([{ fanTrimEnabled: true }]);
+      expect(leveling.stored.overLimitBudgetPoints).toBe(8);
+      expect((await resp.json()).config).toMatchObject({ overLimitBudgetPoints: 8 });
+    });
+  });
+
   it("does not call leveling handlers for the ineligible Guest AC", async () => {
     const tcl = createTclMock();
     const levelCalls: string[] = [];

@@ -21,7 +21,7 @@ read that slice).
 `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns
 its own row; merged with id=2 winning; re-read every 30 s ⇒ **live-flippable**).
 
-Implementation: **`server/src/leveling/`** — 21 small modules, pure decision functions + one stateful
+Implementation: **`server/src/leveling/`** — 22 small modules, pure decision functions + one stateful
 shell. `controller: "v1" | "shadow" | "v2"`; in `shadow`, v1 acts while v2 journals every decision
 with `executed=false`.
 
@@ -176,7 +176,10 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
     `OVER_LIMIT_SEVERE_AMPS` (1.0), so it drained 1 point per reading — **52 s** to the first act —
     and `noteActed` then refilled the bucket to FULL, costing another **38 s**. Now
     `OVER_LIMIT_DRAIN_MODERATE` (2 points above `OVER_LIMIT_MODERATE_AMPS` 0.5 A) and
-    `OVER_LIMIT_BUDGET_AFTER_ACT` = `OVER_LIMIT_DRAIN_SEVERE + 1` (**4**, not 5).
+    `OVER_LIMIT_BUDGET_AFTER_ACT` = `OVER_LIMIT_DRAIN_SEVERE + 1` (**4**, not the default capacity 5).
+    Since 2026-09-05 the capacity is configurable (`overLimitBudgetPoints`, 4 to 20, invariant 75)
+    while this refill stays a fixed 4, and `OVER_LIMIT_BUDGET_MIN` is 4 precisely so the relation
+    below survives every admissible setting.
     ⚠️ **The post-act bucket must stay ABOVE the severe drain.** Shipped at 2 and double-shed within
     20 minutes: one lingering severe reading — still inside the 4-wide smoothing window from before
     the FIRST shed landed — emptied it alone and shed a second room at a smoothed 12.555 A. The
@@ -479,6 +482,17 @@ option — a fan-only spend rewinds only the MAIN clock, 71), while the
 `fanCalmSince` lifecycle guard (the fan clock survives a fan spend) stays
 `controller.test.ts`-only.
 
+**2026-09-05: three more shell-side debts, none of them mirrored.** `scenario.ts`
+models neither the **power-cycle intent release** (73: its `pinLevel` is a sim
+INPUT, so a pin there simply never expires), nor the **beep-reset fingerprint
+flip** (74: the fingerprint arrives from the collector's device poll, which the
+harness does not model at all, and with it the adopt marker, the structural-ON
+bookkeeping and the zeroed spendable share), nor **slot keys** (its context
+carries no `slotKey`, so no boundary can occur in a scenario). `controller.test.ts`
+is the only net for all three, per the mirror rule below. What the harness DID
+take: `refillBucket` now passes `this.cfg.overLimitBudgetPoints` at the turn-on
+refill, so a scenario run at a non-default capacity behaves like the shell (75).
+
 **Added 2026-08-03 (midday) after the top-priority room sat 20 min at a level its compressor will not run at:**
 36. **A level that does not cool is an off — in BOTH directions.** A comfort
     floor means "below this, this room does not cool in this weather", so a HOT
@@ -713,8 +727,9 @@ option — a fan-only spend rewinds only the MAIN clock, 71), while the
     `SEVERE_STREAK_READINGS` (2) banked readings must now ALL be severe before
     their min may speak; newest, not merely two anywhere, because two spikes
     minutes apart are still two spikes. It costs no reaction time: a severe
-    reading drains 3 of the bucket's 5 points, so a genuine step-up has always
-    banked its second before this is consulted. And the extreme tier's deficit
+    reading drains 3 points of the configured capacity (default 5, minimum 4,
+    invariant 75), so a genuine step-up has always banked its second before this
+    is consulted. And the extreme tier's deficit
     no longer sizes the general reducer's shed ceiling — that rung exists to
     relieve a sustained strain, not to clear an arithmetic bill.
 50. **Which room is cooler is not that room's own business.** `computeAcNeed`
@@ -1438,6 +1453,287 @@ option — a fan-only spend rewinds only the MAIN clock, 71), while the
     acceptance scenario pins a cut fan fully home within 150 s of a shed (live it
     took ~9.8 min).
 
+**Added 2026-08-31 after the user asked for freed budget to be spent at once (best case before:
+~30–45 s from a dashboard off to a peer's restore, ~130–160 s from a demote to a peer's fan):**
+72. **Freed budget is spent on the PREDICTION, not on the median, and only budget
+    that was FREED.** (2026-08-31, user: *"when there is a budget because of
+    another AC off or level down, it should act instantly based on prediction to
+    turn on an offed AC or level it (or its fan) up"*.) The one credit path (11)
+    gains a spend side: `pendingCut.spendableAmps` marks the part of a cut's priced
+    saving a spender may be admitted against. SPENDABLE: a room switched off by any
+    hand (the dashboard off once its send is accepted, the observed external off), a
+    manual gen-level-down, an idle demote batch (`out.reason === "demote"`). ZERO for
+    everything else, and zero is what a caller that says nothing gets: over-limit
+    reductions, FLOORS clamps, a restore's peer floor-downs, a swap's donor off.
+    Those amps belong to the breaker, to the entry policy, or to the turn-on in
+    their own batch (69), and
+    spending them is a cut → raise → cut limit cycle (staged in acceptance: the
+    2026-07-30 turn-on replay answered its own reduction with a peer raise 20 s
+    later, went over again, cut a second room and raised again, four batches).
+    A reduction stacking onto a live off ZEROES the spendable share (one pool, one
+    anchor, one clock, and the ladder has just proved the house cannot carry what it
+    is carrying); an off stacking onto a reduction contributes its own amps only.
+    `spendableCredit()` (sensing.ts, published as `MeterView.spendableCreditAmps`)
+    additionally returns 0 on: `stalled` per `cutTrendOf` (38's outrun void catches
+    only a RISE above the anchor, and a meter pinned AT it is the 2026-08-03/04 trip
+    shape read from the spend side), a frozen meter, a latched collapse, a stale
+    feed. It is also net of the fall the median has ALREADY shown
+    (`anchorAmps − smoothedAmps`): for one reading the same amps sit in both
+    `headroomAmps` and the credit, and unfixed a 3.6 A off funded a 2.4 A raise and
+    a SECOND 2.4 A raise on the next tick.
+    Three consumers, one shared test (`fundedByCredit`:
+    `cost ≤ credit − REBALANCE_FUND_MARGIN_AMPS`, 69's own margin, one constant and
+    one meaning, or the swap and the funded restore disagree about a noise band they
+    both exist to survive; a zero credit is byte-identical to the old admission):
+    (a) **Shed restore.** The credit is subtracted from `committedAmps` and the
+    `restoreCalmOk` gate is waived for the candidate it covers. 41's `landingAmps`
+    floor is unchanged and is what makes this safe by construction: the subtraction
+    CONVERGES to that floor as the cut lands and `max()` can never go below it, so
+    the credit buys back the median's lag and never the room's own trough (41/54).
+    (b) **Level raise.** Added into `available` exactly ONCE, never per candidate
+    (one 2.5 A credit would otherwise fund a 2 A step in every room); each admission
+    then debits its own jump, so the first spender consumes it exactly as it
+    consumes ordinary headroom. The `raiseCalmOk` gate is waived for a covered step.
+    The grid-start ceiling re-adds the credit inside its own subtraction so an entry
+    policy priced against a PRE-START baseline cannot spend it a second time. Still
+    binding: the physics envelope + measured house (16, end-state-predictive and the
+    safety net for exactly this feature), ramp debits (12) and the `ramping` skip
+    (NOT waived), the gen start floor (13), the victim/funding cooldowns (30/35).
+    (c) **Fan restore.** Added into `spendable` (58's flicker charge still paid on
+    top), plus a funded FAST path when the credit covers the WHOLE remaining swing:
+    one jump home, the calm gate waived (first gear or continuation), and the
+    remaining `FAN_RESTORE_AFTER_CUT_MS` waived only while `bounces === 0`, so a
+    proven bouncer keeps 67's compounded ladder exactly as FIX B leaves it when
+    escalated. The caller passes 0 credit while a shed restore has amps reserved, so
+    71d still holds: a funded gear cannot ride a reservation. Unchanged: the
+    self-ramp skip (59), continuation spacing and confirm-or-resend (71a/71c), the
+    fan debit armed at the admitted price (18).
+    A narrow **SETTLING funded lane** (`fundedOnly`) opens only while a credit is
+    spendable, the pressure side is `calm` and the tick carries no corrections, and
+    it admits ONLY fully funded candidates: no harvests, no funding demotes, no
+    swaps, no idle demotes, no entry policies (a grid start and a warm restore are
+    priced by something the credit does not describe), and a funded restore must fit
+    PLAIN, because a room needing peer floor-downs is asking for a second cut inside
+    the window the first one opened. It reports NO flicker refusals (68's anchor
+    rule: an unreported list DROPS anchors, and a lane that never ran the ordinary
+    raise phase would restart patience for every waiting room). Finding nothing to
+    fund returns the ordinary settle plan, mode, reason and corrections included.
+    36's floor-recovery yield reads the SAME credit-adjusted budget as the
+    admission, or a funded budget restores a milder shed room past a needier
+    stranded one.
+    **Urgent evaluation** (`noteBudgetFreed` → `deps.onUrgentLevelingNeeded`, the
+    same dep `bucket_empty` fires, so the collector's serialization and its 2.5 s
+    `LEVELING_RERUN_MIN_MS` drop already bound a burst) fires ONLY on the freeing
+    events: the dashboard off once the cloud has ACCEPTED it, the observed external
+    off when the credit actually armed (never a deduped re-observation), the idle
+    demote batch, the manual level-down. Never a raise, a restore or a fan restore:
+    they free nothing and must not shorten their own wait.
+    **Accounting: a credit is armed on SUCCESS, never on intent.** `onUserPowerOff`
+    still runs before the cloud send (intent first, or a fast shadow poll turns the
+    unit back on), but it only SNAPSHOTS the level the off would free
+    (`pendingOffCredit`, taken before `clearOnPowerOff` wipes the reconciler's copy).
+    `onUserPowerOffSent`, called the moment `sendControlVerified` resolves (the
+    publish-acceptance point; the shadow verify loop it starts is fire-and-forget),
+    promotes that snapshot through `creditRoomOff` and fires the urgent evaluation.
+    A refused send therefore credits NOTHING and there is nothing to revoke; a
+    snapshot older than `PENDING_CUT_MS`, or one whose room is seen ON first, is
+    dropped, and a promotion that never happens is still caught by the device poll's
+    observed off (same `creditRoomOff`, `OFF_CREDIT_DEDUP_MS`-deduped). Strictly
+    safer than the pre-feature shape, where the demand-side credit armed at the tap.
+    ⚠️ A batch is ONE arithmetic: after any send throws, every later LOAD-ADDING
+    command is skipped and logged, per command and as a batch summary (`addsLoad` →
+    `batchLoadDirections`, ⚠️ but with a confirmed level 0 read as the device's TOP
+    level, since 0 is UNRESTRICTED: read numerically the never-level-0 recap looks
+    like an add, and skipping it leaves a managed AC unrestricted on gen, the one
+    state hard rule 5 forbids. Unknown level still counts as adding, trip-safe. The
+    grading shell keeps the numeric reading: it asks which way the batch moved the
+    meter). The remaining CUTS still ship: abandoning relief is the unsafe direction.
+    What did ship then prices the credit (`commandedCutAmpsOf` over the failures,
+    subtracted; FLOORS subtracts failed `power_off` only), and `sentCommands` drives
+    everything downstream: the funding-donor (30) and victim (35) cooldowns, and the
+    pacing attempts (`attemptShipped`), since an attempt for a `power_on` nobody sent
+    parks the room behind a confirm window and then erases its bounce history as a
+    false success.
+    ⚠️ The SEND and its BOOKKEEPING are separate `try` blocks (round 2 of review).
+    Only a cloud REFUSAL counts as failed. A bookkeeping throw after an accepted
+    command logs at error level and the command KEEPS counting as sent: classifying
+    it as refused would credit nothing for a cliff that is really coming (5's phantom
+    collapse, the 2026-07-28 shape), and `recordShed` has already put the room in
+    `shedIds`, so the observed-off path would not credit it either.
+    ⚠️ A REFUSED off leaves NOTHING behind, and that is correct. The shed record is
+    written after the send, so it never reaches `recordShed`: no `shedIds` entry, no
+    row for 4's confirm-or-resend to re-send, no bar. The room is still on and the
+    reducer re-plans it next tick. (The bar loop walks the whole list only because a
+    refused off contributes no `power_off` state to skip.) Same for the swap: the
+    failed-send case its reservation exists for (57/69) is the RECEIVER's, donor's
+    off shipped and receiver's turn-on failed or never confirmed. A refused DONOR off
+    reserves nothing, and must not: the abort above skips the receiver in that same
+    pass, so no trade is in flight.
+    A manual level-down is priced from the LOWEST already-committed level (the
+    confirmed shadow or any lower unconfirmed send, never `pendingLevel`, 7): the
+    envelope's worst case would credit a fall an in-flight demote already credited,
+    which is 31's laundering direction.
+    Kill-switch: **`fundedSpend`** (v2 config row id=2, default true), applied at ONE
+    place in `plan()`; BOTH `v2Keys` lists must carry it (`routes.ts` forwarding and
+    the controller's `updateConfig`), and a key missing from either is silently
+    dropped behind a 200 (37's shape). Since 2026-09-05 those two lists ARE one
+    shared `LEVELING_V2_CONFIG_KEYS` with compile-time completeness (75), so a new
+    v2 key can no longer be added to one copy only. A non-boolean value is REJECTED 400: the merge
+    takes only a real boolean and restores the default otherwise, so a `200` on
+    `"fundedSpend": "false"` would leave the feature live and the operator sure it
+    was off.
+    Harness: `scenario.ts` mirrors both credit sites (an observed off is spendable, a
+    batch only when `out.reason === "demote"`); the shell-only halves (the urgent
+    triggers, the promote-on-send hook, the manual level-down pricing, the partial
+    batch) are guarded in `controller.test.ts`, per the mirror rule below.
+    ⚠️ Every funded admission journals `funded by in-flight cut (N.NA credit)`
+    (`fundedNote`): it jumped a calm window, sometimes a settle window, on a
+    prediction. A silent fast path is the next forensic mystery.
+
+**Added 2026-09-05 on two user asks (a manual level must not outlive the state it was made in; the
+over-limit points should be a setting):**
+73. **A manual intent lives until the room POWER-CYCLES or its range slot
+    changes.** (2026-09-05, user: *"a manual set of the AC level should be reset
+    on the next power cycle or on the next automation range-slot boundary. The
+    same rule should hold for fan speed and swing."*) All three leveler intents
+    end together: `manualCap`, `manualTarget` and `fanExempt`, through ONE helper
+    (`releaseManualIntent`), so every edge logs and journals the same way. The
+    CALLER journals: a changeover appends the `manual intent released` decisions
+    to the `source_change` row it writes anyway, every other edge inserts its own
+    commandless `manual_release` row. A room carrying no intent costs no
+    manual-release log line and no `manual_release` row (the fingerprint path
+    still logs its own `power cycle observed (…)` line either way).
+    Two edges end it that did not before (the power-off always did):
+    (a) **A REAL power cycle, in EITHER direction.** `powerEventRestartsAcs(kind)`
+    decides, and it now lives in `leveling/power-events.ts` where BOTH the
+    collector (fan/swing intent) and this controller (level pins) import it: two
+    copies of that question would drift, silently, on both sides. A source
+    transition (excluding the boot `source none → X`), `power collapse` and
+    `AC circuit dead` restart the units; `ESP gap Ns` and `meter frozen` say
+    nothing about the line (2026-08-31, unchanged). The grid-only clear is GONE:
+    a grid interlude has no special status, superseding the 2026-06-09 decision
+    and its 2026-08-19 re-affirmation. ⚠️ ORDER is load-bearing: `notePowerEvent`
+    stamps `lastPowerEventAt`, THEN releases (stamping the restart-only
+    `lastAcRestartAt`), THEN calls `deps.onPowerEvent(kind, now)`, because the
+    collector's wipe runs inside that callback and can re-enter this controller.
+    And `now` travels WITH the kind: the collector's observed-off window and this
+    controller's level-jump window are one clock or they are two (56).
+    (b) **A range-slot boundary.** `computeAcNeed` publishes `slotKey` on the tick
+    context, REQUIRED so unwired production is a type error rather than a pin that
+    never expires: `"<ruleId>:<slotId>"` (active slot, live metric),
+    `"<ruleId>:inactive"` (every matching rule out of window: the regime is KNOWN
+    and it is "off"), `null` (UNKNOWN: no matching rule, or an active slot whose
+    metric had no value this tick). `noteSlotBoundary` runs in the structural loop
+    BEFORE `buildViews`, so the tick that ends the pin already plans against the
+    new slot's `slotGenCap`. `null` neither compares nor stores; a device with no
+    stored key only STORES (recovering from an initial unknown is not a boundary).
+    So A→B releases, A→inactive→A releases once, A→inactive→B releases,
+    A→null→A does not, boot→null→A does not, and a pin made after a boundary
+    lives until the next one. Slot ids are client UUIDs preserved by
+    `normalizeRangeSlots` (positional `slot-N` only when absent).
+    Out of scope, deliberately: the unmanaged-AC `AC_USER_GEN_OVERRIDE_MS` (30
+    min) override, and the DASHBOARD off, which still clears the level pins only
+    and before its cloud send (an intent is not a confirmed power cycle). The
+    OBSERVED off routes through the helper like every other edge.
+74. **A beep-reset fingerprint is the OFF→ON flip the shadow never showed.** A
+    blackout that changes no source reaches this controller as an `esp_gap` at
+    most, and the unit's shadow stays `power=true`, so the structural flip never
+    runs for it: `onDevicePowerCycle(deviceId, reason, now)` IS that flip, called
+    only from the collector's beep-reset site (`acLeveler2` directly, v1 being
+    rollback-only). It does, in order:
+    (a) **Release + journal** the intents (73).
+    (b) **Re-baseline with a one-shot MARKER, never a null.**
+    `ReconDevice.adoptNextObservation` (`markRebaseOnPowerCycle`) is checked FIRST
+    in `observeLevel`: adopt the observation as `confirmedLevel` **even while
+    SETTLING**, dropping the send bookkeeping for THAT level only (other levels'
+    unconfirmed sends, `pendingLevel` and the fan bookkeeping survive, 34). A null
+    baseline returns `none` inside a settle, leaves the device unbased for the
+    whole window, and the firmware's own level restore (the 2026-08-06 07:01:52Z
+    shape) is then read as a hand and re-mints the pin the release just cleared.
+    While the marker is pending the baseline is stale BY DEFINITION, so
+    `baselineStale` makes `onUserGenLevel` read `confirmed` as `null` and take the
+    existing unknown-baseline branch: a cap, no level-down credit, exactly what a
+    dashboard change right after a changeover already gets.
+    (c) **The structural-ON bookkeeping, in two halves** because the ordinary flip
+    has an await in the middle of it (the shed clear): `noteDevicePoweredOnPre`
+    (ramp re-arm, phantom-house void) and `noteDevicePoweredOnPost` (start window,
+    external-ON shield, `lastLoadAddAt`, up-grade contamination). Parametrized so
+    the ordinary flip is byte-identical to before: it passes `powerEvent: false`
+    (a TIMED ramp) and `external: !wasShed && !restoreInFlight`, while the
+    fingerprint passes `powerEvent: true` (restart protection outlasts
+    `AC_RAMP_MS`, 44) and `external: true` (a physical restart is external by
+    definition, 65).
+    (d) **The SPENDABLE share of any live credit is zeroed** while its demand side
+    survives: same rule as a reduction stacking onto an off (72). The room is
+    coming back, so those amps are not free; the fall it explains is still real
+    (5/11).
+    (e) **Per-device clocks only.** It stamps `devicePowerCycleAt`, never the
+    house-wide `lastPowerEventAt`/`lastAcRestartAt`: one unit's reboot says
+    nothing about its neighbours. `inPowerEventWindow(now, deviceId?)` is true on
+    the house clock OR that device's own, and `powerEventWindowClock` returns
+    WHICH one fired so the suppression line can name it.
+    **The restart window gates the SPEND side of an observed off** (a narrow delta
+    to 72): `creditRoomOff` is passed `spendable: false` while
+    `restartWindowActive(now, deviceId)`, which is
+    `POWER_EVENT_LEVEL_JUMP_GRACE_MS` (15 min) from the house-wide `lastAcRestartAt`
+    (restart kinds only) or that device's own fingerprint. Inside it the off is
+    power-loss shaped, the classifier already reads it as a power event (hard rule
+    2) and the automation is about to turn the room back on, so funding a raise on
+    it is the cut → raise → cut cycle 72 forbids. ⚠️ NEVER key this on
+    `lastPowerEventAt`: every routine CT02 blip stamps that one, and funded spend
+    would be off most of the day. The dashboard off is unaffected (authenticated,
+    therefore attributable).
+    **Fan after a reboot:** an observed `fanSpeed === 0` under a live hold whose
+    `lastSetFan` is not 0, with `pendingFan == null` and after the resend branch,
+    is the firmware's reset (TCL zeroes the blower on every power-loss restart; no
+    hold asks for 0 unless it is restoring a room that was on built-in auto, and
+    the dashboard "A" goes through `onUserFanAuto`). It releases the hold
+    (`power_cycle_reset`) and mints NO `fanExempt`, or one blackout would bar the
+    room from fan trimming for the rest of the episode. A NON-ZERO uncommanded fan
+    still mints it.
+75. **The over-limit bucket's CAPACITY is configuration; its drains are not.**
+    (2026-09-05, user: *"make the over-limit budget points changeable in the
+    leveler settings instead of the fixed 5"*.) `overLimitBudgetPoints` (v2 row
+    id=2, default **5**, merged as whole points clamped to
+    `OVER_LIMIT_BUDGET_MIN` 4 / `OVER_LIMIT_BUDGET_MAX` 20) is read at the
+    source-change reset, the calm refill, the turn-on full refill and the swap's
+    full-bucket gate; `refillBucket(state, points)` takes `points` as a REQUIRED
+    argument so a capacity-8 bucket can never be silently refilled to 5. Severe 3
+    / moderate 2 / mild 1 and `OVER_LIMIT_BUDGET_AFTER_ACT` (4) do NOT move, so
+    the bucket empties on the N-th mild reading or the ceil(N/3)-th severe one.
+    ⚠️ **MIN 4 is what keeps invariant 19 true by construction:** the post-act
+    refill is a fixed 4, so at the minimum capacity it is a FULL bucket and still
+    outranks `OVER_LIMIT_DRAIN_SEVERE` (3), and no single severe reading can empty
+    it at ANY admissible setting. Shipped below that relation once (2026-07-31, at
+    2) and it double-shed a room in twenty minutes.
+    **A capacity change MIGRATES the live bucket, preserving spent debt:**
+    `applyBucketCapacity(state, prevMax, nextMax)` is
+    `clamp(nextMax − (prevMax − current), 0, nextMax)`, applied in `reloadConfig()`
+    whenever the value changed, so a raise mid-overload never hands the house a
+    fresh full bucket. A CUT keeps the same debt against the smaller capacity and
+    clamps at 0: cut below what this episode has already spent and the bucket is
+    EMPTY, so the next over-limit reading acts. That is the honest consequence of
+    asking for less tolerance than has already been used.
+    `updateConfig` ends in `reloadConfig()`, so a PUT applies it
+    before it answers, and the same branch refreshes the cached `lastStatus`
+    (`overLimitBudget` + `overLimitBudgetMax`) because `getStatus()` serves the
+    LAST TICK's object and the card divides one by the other ("over-limit 6/5
+    points" otherwise, for the seconds until the next tick). The 30 s periodic
+    reload covers a direct SQL edit.
+    **One key set, and validation before either write.** `LEVELING_V2_CONFIG_KEYS`
+    (+ `LEVELING_V2_CONFIG_KEY_SET` / `isLevelingV2Key`, completeness pinned at
+    COMPILE time) replaces both hand-maintained `v2Keys` lists, closing 37's shape
+    by construction. The route validates every v2 key the body CARRIES before
+    either row is written (an explicit `null` is refused: the merge would sanitize
+    it back to the default behind a 200), rejects a non-integer or out-of-range
+    capacity with `overLimitBudgetPoints must be an integer 4–20`, forwards only
+    what the body carried (a stale tab keeps the stored value), and RE-READS
+    `getConfig()` after `updateV2Config` so the response the client installs is
+    not the pre-write one. `sensing.test.ts` asserts the RELATIONS
+    (`OVER_LIMIT_BUDGET_MIN > OVER_LIMIT_DRAIN_SEVERE`,
+    `OVER_LIMIT_BUDGET_AFTER_ACT <= OVER_LIMIT_BUDGET_MIN`, default within the
+    bounds), per hard rule 5c, not just the values. v1's own bucket is untouched.
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's
@@ -1446,9 +1742,10 @@ hid bug 14 for five days: the harness priced a turn-on at its real level while t
 floor, so no harness test could disagree with the shell. Anything you change in one, change in the
 other — and put the guard in `controller.test.ts`, not only `scenarios.test.ts`.
 
-**Hard rules preserved from v1:** never level 0 · manual wins · slot caps · boost floors ·
-shed ≠ manual-off · warm restore · opt-out · collapse latch · leaky bucket ·
-requireShed ≥ max(3 A, 20%).
+**Hard rules preserved from v1:** never level 0 · manual wins (until the room power-cycles or its
+range slot changes, 73) · slot caps · boost floors ·
+shed ≠ manual-off · warm restore · opt-out · collapse latch · leaky bucket (capacity configurable,
+75) · requireShed ≥ max(3 A, 20%).
 
 **Mode machine:** COLLAPSED > FLOORS > GRID_FULL > SETTLING > NORMAL. FLOORS arms on ANY entry into
 gen (incl. cold start); GRID_FULL on any entry into grid.
@@ -1469,9 +1766,12 @@ until 2026-07-31.)
 It feeds the same ingest path (`ct02-feed.ts` → `createRouter().ingestPower`, flag `CT02_POWER_METER`),
 so on GRID the measured total now includes the grid-only guest AC (the ESP never saw it); GEN is
 unchanged. The ~1 s stream reaches the controller at **≥ 4 s** (`LEVELER_FORWARD_MIN_GAP_MS`) so the
-reading-count-tuned statistics still hold; a 1 s retune is an open user wish. Changeover-gap
-semantics carry over unchanged (the CT02 power-cycles ~15 s at a changeover and reads like the
-ESP-era blackout gap), and the first real changeover on the new meter is the live watch item. Full
+reading-count-tuned statistics still hold; a 1 s retune is an open user wish, narrowed since
+2026-08-31 by funded spend (invariant 72): a spender the in-flight cut pays for no longer waits out
+the median's lag at all, so what the retune still buys is reduce-side reaction time and ordinary
+(unfunded) spend latency. Changeover-gap semantics carry over unchanged (the CT02 power-cycles ~15 s
+at a changeover and reads like the ESP-era blackout gap), and the first real changeover on the new
+meter is the live watch item. Full
 detail: `docs/CT02_FLASH_PLAN.md` (ESP-SWITCH RECORD 2026-08-29).
 
 Abdu = **2-ton** (≈ 4.1 / 6.5 / ~9 A at L1/2/3). Abdullah & Najat = **1-ton** (≈ 2.2 / 3.9 / 5.3 A).

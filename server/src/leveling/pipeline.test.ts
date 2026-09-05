@@ -5,8 +5,9 @@
 import { describe, it, expect } from "vitest";
 import { plan, type PlanInput } from "./pipeline.js";
 import { DEFAULT_LEVELING_CONFIG_V2, type LevelingConfigV2 } from "./config.js";
-import { initialPacingState } from "./pacing.js";
+import { initialPacingState, noteAttempt } from "./pacing.js";
 import { updateCost } from "./costs.js";
+import { recordFanCut } from "./fan-trim.js";
 import type { AcView, Command, MeterView } from "./types.js";
 
 const T = 1_000_000;
@@ -74,6 +75,7 @@ function meter(overrides: Partial<MeterView> = {}): MeterView {
     flickerMarginAmps: 0,
     derateAmps: 0,
     commandedCutCreditAmps: 0,
+    spendableCreditAmps: 0,
     commandedCutAnchorAmps: 0,
     commandedCutTotalAmps: 0,
     commandedCutAgeMs: 0,
@@ -831,6 +833,16 @@ describe("proactive shed: the donor's power_off ships with the receiver's on", (
     ]);
   });
 
+  // The gate is "the bucket is FULL", and since 2026-09-05 full is whatever the
+  // operator configured. Read against a hardcoded 5 it would arm the trade on a
+  // capacity-8 house that had already banked two over-limit readings.
+  it("reads the CONFIGURED bucket capacity, not a hardcoded 5", () => {
+    const config: LevelingConfigV2 = { ...swapCfg, overLimitBudgetPoints: 8 };
+    const bucket = (overLimitBudget: number) => meter({ smoothedAmps: 12.5, calmMs: 300_000, overLimitBudget });
+    expect(run([hot(), mid(), cool()], bucket(6), { config }).swap).toBeNull();
+    expect(run([hot(), mid(), cool()], bucket(8), { config }).swap).toEqual({ donorId: "c", receiverId: "a" });
+  });
+
   it("stands down on a tick where an invariant correction also ships", () => {
     // `mid` is inside its gen start window, so the L2→L1 clamp owns this tick.
     const out = run([hot(), mid({ startBaselineAmps: 5 }), cool()], calm(), { config: swapCfg });
@@ -901,5 +913,85 @@ describe("a reduce batch escalates past the fan (FIX B, 2026-08-26)", () => {
     expect(out.commands.some((cmd) => cmd.kind === "set_level")).toBe(false);
     expect(out.commands.some((cmd) => cmd.kind === "power_off")).toBe(false);
     expect(out.fanHolds.c.escalatedAt).toBeUndefined();
+  });
+});
+
+// 2026-08-31 FUNDED SPEND, pipeline half: the kill-switch, the SETTLING lane,
+// and the one place the credit must NOT reach (a live restore reservation).
+describe("funded spend (2026-08-31)", () => {
+  /** A shed room waiting on amps the running house does not have. */
+  const waiting = (): AcView[] => [
+    ac("a", { currentLevel: 1, needDelta: 2 }),
+    ac("b", { on: false, shed: true, needDelta: 4 }),
+  ];
+  /** Calm line, no room on the meter, a 3A off still travelling to it. */
+  const credited = (over: Partial<MeterView> = {}): MeterView =>
+    meter({
+      smoothedAmps: 13.4,
+      calmMs: 60_000,
+      commandedCutCreditAmps: 3,
+      spendableCreditAmps: 3,
+      commandedCutAnchorAmps: 13.4,
+      commandedCutTotalAmps: 3,
+      ...over,
+    });
+
+  it("funds a waiting restore on a calm tick", () => {
+    const out = run(waiting(), credited());
+    expect(out.commands).toEqual([
+      { deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 },
+    ]);
+  });
+
+  it("`fundedSpend: false` reverts it to the meter-only admission", () => {
+    const out = run(waiting(), credited(), { config: { ...cfg, fundedSpend: false } });
+    expect(out.commands).toEqual([]);
+    expect(out.decisions.find((d) => d.deviceId === "b")?.blockedBy).toBe("no headroom");
+  });
+
+  it("SETTLING: the funded lane ships the restore the in-flight cut pays for", () => {
+    // Today this window returns corrections only, house-wide, for up to 30s on
+    // top of the median's own lag. A spender priced entirely off what WE
+    // commanded is the one thing the window is not protecting anything from.
+    const out = run(waiting(), credited(), { mode: "SETTLING" });
+    expect(out.commands).toEqual([
+      { deviceId: "b", kind: "power_on", level: 1, reason: "restore", fan: 1 },
+    ]);
+    expect(out.reason).toBe("restore");
+    // Invariant 68's ⚠: a settle-window tick reports no flicker-only refusals, or
+    // the shell drops every anchor missing from the list.
+    expect(out.flickerRefused).toBeUndefined();
+  });
+
+  it("SETTLING: everything the credit does NOT cover stays blocked", () => {
+    const out = run(waiting(), credited({ commandedCutCreditAmps: 1, spendableCreditAmps: 1, commandedCutTotalAmps: 1 }), {
+      mode: "SETTLING",
+    });
+    expect(out.commands).toEqual([]);
+    expect(out.reason).toBe("settling");
+  });
+
+  it("SETTLING: no credit at all is byte-identical to the old settle window", () => {
+    const out = run(waiting(), meter({ smoothedAmps: 10, calmMs: 60_000 }), { mode: "SETTLING" });
+    expect(out.commands).toEqual([]);
+    expect(out.reason).toBe("settling");
+    expect(out.decisions.some((d) => d.blockedBy === "settle window")).toBe(true);
+  });
+
+  it("a live restore reservation still parks even a funded fan step (invariant 71d)", () => {
+    // `b`'s restore is in its send→confirm window: it reserves its amps and the
+    // whole raise phase stands down. A credit handed to the fan on top of that
+    // reservation is the bounded carve-out that was built and removed on review
+    // 2026-08-09: during that window the commanded compressor has no ramp debit
+    // yet, so the reservation is the ONLY protection of those amps.
+    const acs = [
+      ac("a", { currentLevel: 1, fanSpeed: 1, needDelta: 2 }),
+      ac("b", { on: false, shed: true, needDelta: 4 }),
+    ];
+    const holds = recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - 10_000);
+    const pacing = noteAttempt(initialPacingState("gen"), "b", "restore", T - 10_000);
+    const out = run(acs, credited(), { fanHolds: holds, pacing });
+    expect(out.commands.some((c) => c.kind === "set_fan")).toBe(false);
+    expect(out.decisions.some((d) => d.blockedBy === "restore reservation")).toBe(true);
   });
 });

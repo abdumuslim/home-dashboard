@@ -466,6 +466,14 @@ function getProfileEnforcement(collector: Collector) {
   return (collector as never as { acProfileEnforcement: Map<string, { manual: Set<string> }> }).acProfileEnforcement;
 }
 
+function getPowerCycleAt(collector: Collector) {
+  return (collector as never as { acPowerCycleAt: Map<string, number> }).acPowerCycleAt;
+}
+
+function getLastPowerEventAt(collector: Collector) {
+  return (collector as never as { lastPowerEventAt: number }).lastPowerEventAt;
+}
+
 describe("AC range dead-zone adoption + turn-off re-fire (regressions)", () => {
   beforeEach(() => {
     acTimers.clear();
@@ -4002,6 +4010,79 @@ describe("AC beep-off enforcement", () => {
     await checkAcBeep(collector);
     expect(tclCloud.sendControl).not.toHaveBeenCalled();
   });
+
+  /** A manual fan override from before the restart, on the books. */
+  function manualFanIntent(collector: Collector) {
+    getFanEnforcement(collector).set("1:ac1", {
+      slotId: "morning", lastCommandedFan: 5, lastFanCommandAt: 0, manual: true,
+    } as never);
+  }
+
+  // The per-device belt for a blackout that changed no source (2026-08-31): a
+  // bare meter gap is no longer a power cycle, so the unit's own fingerprint has
+  // to carry it. The firmware resets beepSwitch to ON ONLY on a power-loss
+  // restart, and every managed AC carries an `ac_beep_off` row.
+  it("reads a beep reset on a beep-off AC as that device's power cycle", async () => {
+    const { collector, tclCloud, beepPrefs } = createCollector();
+    beepPrefs.add("ac1");
+    setDevices(tclCloud, beepingAc());
+    manualFanIntent(collector);
+
+    await checkAcBeep(collector);
+
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(false);
+    expect(getPowerCycleAt(collector).get("ac1")).toBe(Date.now());
+  });
+
+  it("does not re-wipe intent while the lagging shadow keeps echoing the beep on", async () => {
+    const { collector, tclCloud, beepPrefs } = createCollector();
+    beepPrefs.add("ac1");
+    setDevices(tclCloud, beepingAc());
+
+    await checkAcBeep(collector); // the restart is noted here
+    const cycleAt = getPowerCycleAt(collector).get("ac1");
+
+    // The user picks a fan AFTER the restart; the shadow is still reporting the
+    // buzzer on. A second cycle here would eat the choice he just made.
+    vi.advanceTimersByTime(31_000);
+    manualFanIntent(collector);
+    await checkAcBeep(collector);
+
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+    expect(getPowerCycleAt(collector).get("ac1")).toBe(cycleAt);
+  });
+
+  it("does not read the user's own fresh Beep OFF as a restart", async () => {
+    const { collector, tclCloud } = createCollector();
+    setDevices(tclCloud, beepingAc());
+    manualFanIntent(collector);
+
+    collector.noteUserAcBeep("ac1", false);
+    await vi.advanceTimersByTimeAsync(0); // flush the async DB write
+
+    // Past the resend cooldown the buzzer still reads on: his own set_beep 0
+    // has not reached the shadow yet, and that is not a power cycle.
+    vi.advanceTimersByTime(31_000);
+    await checkAcBeep(collector);
+
+    expect(tclCloud.sendControl).toHaveBeenCalledWith("ac1", "set_beep", 0);
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+    expect(getPowerCycleAt(collector).has("ac1")).toBe(false);
+  });
+
+  it("never fires for an AC with no beep-off row (its buzzer is nobody's evidence)", async () => {
+    const { collector, tclCloud, beepPrefs } = createCollector();
+    beepPrefs.add("ac1");
+    setDevices(tclCloud, [
+      { id: "ac1", name: "Najat", power: true, beep: true },
+      { id: "ac2", name: "Abdu", power: true, beep: true },
+    ]);
+
+    await checkAcBeep(collector);
+
+    expect(getPowerCycleAt(collector).has("ac1")).toBe(true);
+    expect(getPowerCycleAt(collector).has("ac2")).toBe(false);
+  });
 });
 
 async function checkAcEnforce(collector: Collector) {
@@ -4463,6 +4544,96 @@ describe("AC fan/swing enforcement sweep (2026-08-06)", () => {
     (devices[0] as { lastSeenAt?: number | null }).lastSeenAt = null;
     await checkAcRangeAutomation(collector, enforceRule(7));
     expect(getFanEnforcement(collector).get("1:ac1")).toHaveProperty("initializationPending", true);
+  });
+
+  // Since the 2026-08-29 CT02 switch the meter arrives over MQTT and blips often
+  // (broker restarts on deploys, WiFi hiccups, the meter's own reboot), and every
+  // blip was reaching notePowerCycle as a full power cycle. Live 2026-08-31: the
+  // user set swing 9 / fan 5 at 02:14:50Z; a bare "ESP gap 24s" fired at
+  // 02:23:28Z with grid current continuous at 12.7 A across it, and the same tick
+  // re-asserted the slot's fan/swing over him. He re-corrected twice and was
+  // reverted twice.
+  it("REGRESSION 2026-08-31: a bare meter gap is not a power cycle, so manual fan/swing intent survives", () => {
+    const { collector } = enforceSetup({}, 7, 9);
+    collector.noteUserAcFanChange("ac1");
+    collector.noteUserAcSwingChange("ac1");
+
+    collector.notePowerEvent("ESP gap 24s");
+
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+    expect(getSwingOverrides(collector).has("1:ac1")).toBe(true);
+    expect(getPowerCycleAt(collector).has("ac1")).toBe(false);
+  });
+
+  it("a frozen meter is telemetry too, so it gets the same treatment as a gap", () => {
+    const { collector } = enforceSetup({}, 7, 9);
+    collector.noteUserAcFanChange("ac1");
+    collector.noteUserAcSwingChange("ac1");
+
+    collector.notePowerEvent("meter frozen");
+
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+    expect(getSwingOverrides(collector).has("1:ac1")).toBe(true);
+    expect(getPowerCycleAt(collector).has("ac1")).toBe(false);
+  });
+
+  it("still opens the observed-off classification window for a gap (hard rule 2 is untouched)", () => {
+    const { collector } = enforceSetup();
+
+    collector.notePowerEvent("ESP gap 24s");
+
+    expect(getLastPowerEventAt(collector)).toBe(Date.now());
+  });
+
+  it("a boot/cold-start source event is not an AC restart either (the leveler's source resets to none after a long outage)", () => {
+    // "source none → X" means only the SERVER came back. On a real boot the
+    // maps are empty and the wipe would be a no-op anyway, but the leveler also
+    // falls back to "none" after a long enough meter outage, and then the first
+    // reading back would eat LIVE intent on a pure telemetry event.
+    const { collector } = enforceSetup({}, 7, 9);
+    collector.noteUserAcFanChange("ac1");
+    collector.noteUserAcSwingChange("ac1");
+
+    collector.notePowerEvent("source none → grid");
+
+    expect(getFanEnforcement(collector).get("1:ac1")?.manual).toBe(true);
+    expect(getSwingOverrides(collector).has("1:ac1")).toBe(true);
+    expect(getPowerCycleAt(collector).has("ac1")).toBe(false);
+    expect(getLastPowerEventAt(collector)).toBe(Date.now()); // the classification window still opens
+  });
+
+  it("a collapse and an AC-circuit-dead latch still drop pre-cycle intent (those units really restarted)", () => {
+    const collapse = enforceSetup({}, 7, 9);
+    collapse.collector.noteUserAcFanChange("ac1");
+    collapse.collector.noteUserAcSwingChange("ac1");
+    collapse.collector.notePowerEvent("power collapse on gen");
+    expect(getFanEnforcement(collapse.collector).get("1:ac1")?.manual).toBe(false);
+    expect(getSwingOverrides(collapse.collector).has("1:ac1")).toBe(false);
+    expect(getPowerCycleAt(collapse.collector).has("ac1")).toBe(true);
+
+    const dead = enforceSetup({}, 7, 9);
+    dead.collector.noteUserAcFanChange("ac1");
+    dead.collector.notePowerEvent("AC circuit dead on gen");
+    expect(getFanEnforcement(dead.collector).get("1:ac1")?.manual).toBe(false);
+    expect(getPowerCycleAt(dead.collector).has("ac1")).toBe(true);
+  });
+
+  it("opens no swing re-assert window on a gap, while a real source change still does", async () => {
+    const { collector, actions, devices } = enforceSetup({ verticalSwing: 1 }, 7, 9);
+    await setWeatherValue(collector, 24);
+
+    collector.notePowerEvent("ESP gap 24s");
+    await checkAcEnforce(collector);
+    expect(actions).toEqual([]); // no cycle → the drift stays the ordinary diff's business
+
+    collector.notePowerEvent("source grid → gen");
+    const cycleAt = Date.now();
+    vi.advanceTimersByTime(20_000);
+    (devices[0] as { lastSeenAt?: number | null }).lastSeenAt = cycleAt + 15_000;
+    await setWeatherValue(collector, 24);
+    await checkAcEnforce(collector);
+
+    expect(actions).toEqual([{ deviceId: "ac1", action: { vertical_swing: 9 } }]);
   });
 });
 
@@ -5282,7 +5453,10 @@ describe("computeAcNeed — per-AC need override", () => {
   function computeAcNeed(collector: Collector, deviceId: string, device: Record<string, unknown>) {
     return (
       collector as never as {
-        computeAcNeed: (id: string, d: unknown) => { tier: string; delta: number; slotGenCap: number | null };
+        computeAcNeed: (
+          id: string,
+          d: unknown,
+        ) => { tier: string; delta: number; slotGenCap: number | null; slotKey: string | null };
       }
     ).computeAcNeed(deviceId, device);
   }
@@ -5329,6 +5503,454 @@ describe("computeAcNeed — per-AC need override", () => {
       tier: "mild",
       delta: 1,
       slotGenCap: null,
+      slotKey: null,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The server's own eyes on the Xiaomi device list (2026-08-31 purifier wedge).
+// refreshDevices() had ZERO callers repo-wide, so the only thing that ever hit
+// /home/device_list was a browser on /api/devices; with no admin tab open a
+// dead token sat unnoticed for 1h25m. The step therefore lives in collectAll,
+// NOT in checkAutomations, which returns early when there are no rules.
+// ---------------------------------------------------------------------------
+describe("periodic Xiaomi device refresh + re-auth backoff", () => {
+  type FakeXiaomi = {
+    isReady: () => boolean;
+    getAuthStatus: () => { status: string };
+    init: () => Promise<void>;
+    refreshDevices: () => Promise<unknown[]>;
+  };
+
+  function seatXiaomi(collector: Collector, fake: FakeXiaomi) {
+    (collector as never as { xiaomiCloud: FakeXiaomi }).xiaomiCloud = fake;
+  }
+
+  function refreshXiaomiDevices(collector: Collector): Promise<void> {
+    return (collector as never as { refreshXiaomiDevices: () => Promise<void> }).refreshXiaomiDevices();
+  }
+
+  function reauth(collector: Collector) {
+    (collector as never as { maybeReauthXiaomiCloud: () => void }).maybeReauthXiaomiCloud();
+  }
+
+  function checkAutomations(collector: Collector): Promise<void> {
+    return (collector as never as { checkAutomations: () => Promise<void> }).checkAutomations();
+  }
+
+  function setRetryAt(collector: Collector, at: number) {
+    (collector as never as { xiaomiRetryAt: number }).xiaomiRetryAt = at;
+  }
+
+  function retryDelay(collector: Collector): number {
+    return (collector as never as { xiaomiRetryAt: number }).xiaomiRetryAt - Date.now();
+  }
+
+  function reauthFailures(collector: Collector): number {
+    return (collector as never as { xiaomiReauthFailures: number }).xiaomiReauthFailures;
+  }
+
+  /** Backdate the outstanding attempt so the in-flight deadline has lapsed. */
+  function ageInFlight(collector: Collector, ms: number) {
+    (collector as never as { xiaomiReauthInFlightSince: number }).xiaomiReauthInFlightSince = Date.now() - ms;
+  }
+
+  /** Let a settled init()'s continuation record its success/failure. */
+  function settle(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it("recovers a wedged session with ZERO automation rules", async () => {
+    const { collector } = createCollector();
+    // No rules at all: checkAutomations early-returns before its re-auth block,
+    // which is exactly the house the wedge was found in.
+    (collector as never as { automationRulesLastFetch: number }).automationRulesLastFetch = Date.now();
+    (collector as never as { automationRules: unknown[] }).automationRules = [];
+    setRetryAt(collector, 0);
+
+    let initCalls = 0;
+    seatXiaomi(collector, {
+      isReady: () => false,
+      getAuthStatus: () => ({ status: "error" }),
+      init: async () => { initCalls++; },
+      refreshDevices: async () => [],
+    });
+
+    await checkAutomations(collector);
+    expect(initCalls).toBe(0); // proves the early return still swallows that path
+
+    await refreshXiaomiDevices(collector);
+    expect(initCalls).toBe(1); // the periodic step drives the recovery instead
+  });
+
+  it("calls refreshDevices when the cloud is ready", async () => {
+    const { collector } = createCollector();
+    const refreshDevices = vi.fn(async () => []);
+    seatXiaomi(collector, {
+      isReady: () => true,
+      getAuthStatus: () => ({ status: "authenticated" }),
+      init: async () => undefined,
+      refreshDevices,
+    });
+
+    await refreshXiaomiDevices(collector);
+
+    expect(refreshDevices).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs as its own collectAll step", async () => {
+    const { collector } = createCollector();
+    seatXiaomi(collector, {
+      isReady: () => true,
+      getAuthStatus: () => ({ status: "authenticated" }),
+      init: async () => undefined,
+      refreshDevices: async () => [],
+    });
+    const steps: string[] = [];
+    // Record the step names only: no step body runs, so the loop does no I/O.
+    (collector as never as { runStep: (name: string, fn: () => Promise<void>) => Promise<void> }).runStep =
+      async (name: string) => { steps.push(name); };
+
+    await (collector as never as { collectAll: () => Promise<void> }).collectAll();
+
+    expect(steps).toContain("xiaomi-devices");
+  });
+
+  it("escalates the re-auth backoff 60s, 5 min, 15 min and resets it on success", async () => {
+    const { collector } = createCollector();
+    let ready = false;
+    let loginWorks = false;
+    let initCalls = 0;
+    seatXiaomi(collector, {
+      isReady: () => ready,
+      getAuthStatus: () => ({ status: "error" }),
+      // init() swallows its own errors, so the collector reads the outcome off
+      // isReady() exactly as it does live.
+      init: async () => { initCalls++; ready = loginWorks; },
+      refreshDevices: async () => [],
+    });
+
+    // First attempt: the throttle is armed at the bottom rung before launch.
+    setRetryAt(collector, 0);
+    reauth(collector);
+    expect(retryDelay(collector)).toBeLessThanOrEqual(60_000);
+    expect(retryDelay(collector)).toBeGreaterThan(30_000);
+    await settle();
+    expect(initCalls).toBe(1);
+    expect(retryDelay(collector)).toBeGreaterThan(4 * 60_000); // failure 1 → 5 min
+
+    // Inside the window nothing relaunches.
+    reauth(collector);
+    expect(initCalls).toBe(1);
+
+    setRetryAt(collector, 0);
+    reauth(collector);
+    await settle();
+    expect(initCalls).toBe(2);
+    expect(retryDelay(collector)).toBeGreaterThan(14 * 60_000); // failure 2 → 15 min
+
+    setRetryAt(collector, 0);
+    reauth(collector);
+    await settle();
+    expect(initCalls).toBe(3);
+    expect(retryDelay(collector)).toBeGreaterThan(14 * 60_000);
+    expect(retryDelay(collector)).toBeLessThanOrEqual(15 * 60_000); // capped, not 45 min
+
+    // A login that works resets the ladder: the next failure waits 60s, not 15 min.
+    loginWorks = true;
+    setRetryAt(collector, 0);
+    reauth(collector);
+    await settle();
+    expect(initCalls).toBe(4);
+    expect(ready).toBe(true);
+
+    ready = false;
+    loginWorks = false;
+    setRetryAt(collector, 0);
+    reauth(collector);
+    expect(retryDelay(collector)).toBeLessThanOrEqual(60_000);
+    expect(retryDelay(collector)).toBeGreaterThan(30_000);
+    await settle();
+  });
+
+  it("still stops retrying while a 2FA or captcha prompt is pending", async () => {
+    for (const status of ["needs_2fa", "needs_captcha"]) {
+      const { collector } = createCollector();
+      setRetryAt(collector, 0);
+      let initCalls = 0;
+      seatXiaomi(collector, {
+        isReady: () => false,
+        getAuthStatus: () => ({ status }),
+        init: async () => { initCalls++; },
+        refreshDevices: async () => [],
+      });
+
+      await refreshXiaomiDevices(collector);
+
+      // That path waits on a human answering POST /api/xiaomi/verify.
+      expect(initCalls).toBe(0);
+    }
+  });
+
+  // The ladder only escalates when init() SETTLES, so an init() that hangs for a
+  // reason the auth status never reflects used to relaunch a fresh login every
+  // 60s forever: 60 logins/hour is the volume that earns a captcha, and a captcha
+  // needs a human at a terminal.
+  it("launches only one login while an init() never settles, until the deadline", () => {
+    const { collector } = createCollector();
+    let initCalls = 0;
+    seatXiaomi(collector, {
+      isReady: () => false,
+      getAuthStatus: () => ({ status: "error" }),
+      init: () => { initCalls++; return new Promise<void>(() => {}); },
+      refreshDevices: async () => [],
+    });
+
+    setRetryAt(collector, 0);
+    reauth(collector);
+    expect(initCalls).toBe(1);
+
+    // The 60s rung lapses twice over, but the attempt is still outstanding.
+    setRetryAt(collector, 0);
+    reauth(collector);
+    setRetryAt(collector, 0);
+    reauth(collector);
+    expect(initCalls).toBe(1);
+
+    // Past the deadline the hung attempt is written off: the guard itself must
+    // never be able to wedge recovery.
+    ageInFlight(collector, 10 * 60_000 + 1);
+    setRetryAt(collector, 0);
+    reauth(collector);
+    expect(initCalls).toBe(2);
+  });
+
+  it("ignores a superseded attempt that settles after a newer login succeeded", async () => {
+    const { collector } = createCollector();
+    let ready = false;
+    let initCalls = 0;
+    let failFirst: (err: Error) => void = () => {};
+    seatXiaomi(collector, {
+      isReady: () => ready,
+      getAuthStatus: () => ({ status: "error" }),
+      init: () => {
+        initCalls++;
+        // The first attempt hangs and is settled by hand below; the second one
+        // is the fresh login that actually fixes the session.
+        if (initCalls === 1) return new Promise<void>((_resolve, reject) => { failFirst = reject; });
+        ready = true;
+        return Promise.resolve();
+      },
+      refreshDevices: async () => [],
+    });
+
+    setRetryAt(collector, 0);
+    reauth(collector);
+    expect(initCalls).toBe(1);
+
+    ageInFlight(collector, 10 * 60_000 + 1);
+    setRetryAt(collector, 0);
+    reauth(collector);
+    await settle();
+    expect(initCalls).toBe(2);
+    expect(ready).toBe(true);
+
+    // The written-off attempt finally reports the failure it saw. Booking it now
+    // would stamp a failure over a session a newer login already fixed, and push
+    // the next retry out to the 5-minute rung for no reason.
+    failFirst(new Error("hung login gave up"));
+    await settle();
+
+    expect(reauthFailures(collector)).toBe(0);
+    expect(retryDelay(collector)).toBeLessThanOrEqual(60_000);
+  });
+
+  // POST /api/xiaomi/relogin exists to rescue a wedged session, so it must not
+  // answer {ok:true} and then sit out the rung the ladder had reached (up to 15
+  // minutes of nothing).
+  it("clears the backoff when a human requests a re-login", () => {
+    const { collector } = createCollector();
+    let initCalls = 0;
+    seatXiaomi(collector, {
+      isReady: () => false,
+      getAuthStatus: () => ({ status: "error" }),
+      init: async () => { initCalls++; },
+      refreshDevices: async () => [],
+    });
+
+    setRetryAt(collector, Date.now() + 15 * 60_000);
+    reauth(collector);
+    expect(initCalls).toBe(0);
+
+    collector.requestXiaomiRelogin();
+    expect(retryDelay(collector)).toBeLessThanOrEqual(0);
+
+    reauth(collector);
+    expect(initCalls).toBe(1);
+    // Back on the bottom rung, not the 15-minute one it was parked on.
+    expect(retryDelay(collector)).toBeLessThanOrEqual(60_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manual-intent lifetime, collector side (2026-09-05, user: "a manual set of
+// the AC level should be reset on the next power cycle or on the next
+// automation range-slot boundary"). Three pieces live here: the slot KEY the
+// leveler keys a pin's life on, the ONE timestamp both power-event windows are
+// stamped from, and the beep-reset fingerprint's second delivery (the v2
+// leveler treats it as the OFF→ON flip its shadow never showed).
+// ---------------------------------------------------------------------------
+describe("computeAcNeed: the range-slot key a manual pin lives under", () => {
+  function computeAcNeed(collector: Collector, deviceId: string, device: Record<string, unknown>) {
+    return (
+      collector as never as {
+        computeAcNeed: (
+          id: string,
+          d: unknown,
+        ) => { tier: string; delta: number; slotGenCap: number | null; slotKey: string | null };
+      }
+    ).computeAcNeed(deviceId, device);
+  }
+
+  const allDayRule = (id: number) => ({
+    ...acRangeRule(),
+    id,
+    range_slots: [{ id: "default", type: "all_day", threshold_low: 20, threshold: 28 }] as AutomationRangeSlot[],
+  });
+  /** 06:00–10:00 Baghdad: out of window at the 12:00 the tests run at. */
+  const morningRule = (id: number) => ({
+    ...acRangeRule(),
+    id,
+    range_slots: [
+      { id: "morning", type: "window", start_mode: "exact", start_time: "06:00", end_mode: "exact", end_time: "10:00", threshold_low: 22, threshold: 25 },
+    ] as AutomationRangeSlot[],
+  });
+
+  async function withRules(rules: unknown[]) {
+    const { collector, setLevelingConfig } = createCollector();
+    setLevelingConfig({ ...LEVELING_CONFIG, comfortTargetC: 25 });
+    await collector.acLeveler.ensureLoaded();
+    (collector as never as { automationRules: unknown[] }).automationRules = rules;
+    return collector;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T09:00:00Z")); // 12:00 Baghdad
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("names the rule AND the active slot (one device can be targeted by two rules)", async () => {
+    const collector = await withRules([allDayRule(4)]);
+    await setWeatherValue(collector, 24);
+
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 30, mode: 1 }).slotKey).toBe("4:default");
+  });
+
+  it("the FIRST matching rule that is merely out of window owns the inactive key", async () => {
+    const collector = await withRules([morningRule(7), morningRule(9)]);
+    await setWeatherValue(collector, 24);
+
+    // The regime is KNOWN here, and it is "off": the automation owes an OFF,
+    // not a threshold. Naming the rule keeps the key stable while it holds.
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 30, mode: 1 }).slotKey).toBe("7:inactive");
+  });
+
+  it("an active slot with NO metric value reads unknown, even beside an inactive rule", async () => {
+    // A one-tick sensor gap must never look like a boundary: the leveler would
+    // release a live pin on it. Unknown beats inactive for exactly that reason.
+    const collector = await withRules([morningRule(7), allDayRule(4)]);
+    (collector as never as { latestWeatherRow: Record<string, unknown> }).latestWeatherRow = {};
+
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 30, mode: 1 }).slotKey).toBeNull();
+  });
+
+  it("is null when no rule targets this device at all", async () => {
+    const collector = await withRules([]);
+    await setWeatherValue(collector, 24);
+
+    expect(computeAcNeed(collector, "ac1", { currentTemp: 30, mode: 1 }).slotKey).toBeNull();
+  });
+});
+
+describe("power events: one clock, and the per-device fingerprint the leveler needs", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T09:00:00Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("stamps the cycle maps from the timestamp the leveler passed, not its own clock", () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", name: "Najat" }]);
+    const eventAt = Date.now() - 60_000; // the leveler's reading time, a minute back
+
+    collector.notePowerEvent("source grid → gen", eventAt);
+
+    expect(getLastPowerEventAt(collector)).toBe(eventAt);
+    expect(getPowerCycleAt(collector).get("ac1")).toBe(eventAt);
+    expect(
+      (collector as never as { acSourceCycleAt: Map<string, number> }).acSourceCycleAt.get("ac1"),
+    ).toBe(eventAt);
+  });
+
+  it("the beep-reset fingerprint tells the v2 leveler, once per fingerprint", async () => {
+    const { collector, tclCloud, beepPrefs } = createCollector();
+    beepPrefs.add("ac1");
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", name: "Najat", power: true, beep: true }]);
+    tclCloud.fetchDevicesLive.mockResolvedValue([{ id: "ac1", name: "Najat", power: true, beep: true }] as never);
+    const hook = vi.spyOn(collector.acLeveler2, "onDevicePowerCycle").mockImplementation(() => undefined);
+
+    await (collector as never as { checkAcBeepEnforcement: () => Promise<void> }).checkAcBeepEnforcement();
+
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook).toHaveBeenCalledWith("ac1", expect.stringContaining("beep reset observed"), Date.now());
+
+    // The shadow keeps echoing the buzzer for ticks after a restart; the
+    // 15-min guard that stops a second intent wipe stops a second delivery too.
+    vi.advanceTimersByTime(31_000);
+    await (collector as never as { checkAcBeepEnforcement: () => Promise<void> }).checkAcBeepEnforcement();
+    expect(hook).toHaveBeenCalledTimes(1);
+  });
+
+  it("a house-wide power event never calls it, because the controller releases its own intents there", () => {
+    const { collector, tclCloud } = createCollector();
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", name: "Najat" }]);
+    const hook = vi.spyOn(collector.acLeveler2, "onDevicePowerCycle").mockImplementation(() => undefined);
+
+    collector.notePowerEvent("source grid → gen");
+    collector.notePowerEvent("power collapse on gen");
+    collector.notePowerEvent("ESP gap 24s");
+
+    expect(hook).not.toHaveBeenCalled();
+  });
+
+  it("smoke with v1 ACTING: the new ctx field and the fingerprint hook change nothing here", async () => {
+    // These collector tests run with v1 as the acting controller (testing.md),
+    // so this is the only place the shipped-with-v1 path gets exercised at all:
+    // v1 ignores `slotKey` structurally, and the fingerprint reaches v2 while it
+    // is idle without loading it or throwing.
+    const { collector, tclCloud, beepPrefs, setLevelingConfig } = createCollector();
+    setLevelingConfig(LEVELING_CONFIG);
+    tclCloud.getDevices.mockReturnValue([{ id: "ac1", name: "Najat", power: true, beep: true, generatorMode: 1 }]);
+    tclCloud.fetchDevicesLive.mockResolvedValue([
+      { id: "ac1", name: "Najat", power: true, beep: true, generatorMode: 1 },
+    ] as never);
+    beepPrefs.add("ac1");
+    (collector as never as { automationRules: unknown[] }).automationRules = [];
+
+    genReadings(collector, 6, 3);
+    await checkAcLeveling(collector);
+    await expect(
+      (collector as never as { checkAcBeepEnforcement: () => Promise<void> }).checkAcBeepEnforcement(),
+    ).resolves.toBeUndefined();
+
+    expect(collector.acLeveler2.controllerFlavor()).not.toBe("v2");
+    expect(getPowerCycleAt(collector).get("ac1")).toBe(Date.now());
   });
 });

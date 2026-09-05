@@ -14,7 +14,7 @@ import { effectiveLimit } from "./config.js";
 import type { CostBook } from "./costs.js";
 import { commandedCutAmpsOf, modelFor, steadyDraw } from "./costs.js";
 import { assessPressure } from "./pressure.js";
-import { cutTrendOf, OVER_LIMIT_BUDGET } from "./sensing.js";
+import { cutTrendOf } from "./sensing.js";
 import { planReduction, SHED_NEED_GAP_C } from "./reduce.js";
 import { invariantCorrections, planRaise, rampDebitAmps, type SwapDecision } from "./raise.js";
 import { noteEscalation, planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
@@ -170,6 +170,14 @@ export function plan(input: PlanInput): PlanOutput {
   }
 
   const onManaged = acs.filter((a) => a.on && a.managed && !a.shed);
+  /**
+   * FUNDED SPEND (2026-08-31): budget an off/demote/level-down has already freed
+   * that the meter has not shown yet, and the ONE place the kill-switch is
+   * applied. Every consumer below reads this, never `meter.spendableCreditAmps`,
+   * so `fundedSpend: false` reverts the shed restore, the level raise and the fan
+   * restore to their meter-only admissions in one gate.
+   */
+  const spendableCredit = config.fundedSpend ? meter.spendableCreditAmps : 0;
   // Our own restore's compressor-start inrush can spike two consecutive raw
   // readings over the severe bar while the SMOOTHED mean is still under the
   // limit — a locked-rotor transient does not revert, so it mints no flicker to
@@ -614,20 +622,42 @@ export function plan(input: PlanInput): PlanOutput {
   }
 
   // ---- SETTLING: a batch is in flight — corrections only, no new spending.
-  if (mode === "SETTLING") {
-    return {
-      ...emptyPlan(input, "settling", [{ at: now, action: "raises/restores", blockedBy: "settle window" }]),
-      commands: corrections.commands,
-      // Corrections carry real down-moves (a level-0 re-cap, a gen start clamp),
-      // so they credit the collapse detector like every other cut — invariant 11.
-      commandedCutAmps: commandedCutAmpsOf(corrections.commands, onManaged, config, source, book, now),
-      decisions: [...corrections.decisions, { at: now, action: "raises/restores", blockedBy: "settle window" }],
-      compareAfter: corrections.commands.length > 0 ? now + GRADE_LEVEL_MS : 0,
-    };
-  }
+  const settlingPlan = (): PlanOutput => ({
+    ...emptyPlan(input, "settling", [{ at: now, action: "raises/restores", blockedBy: "settle window" }]),
+    commands: corrections.commands,
+    // Corrections carry real down-moves (a level-0 re-cap, a gen start clamp),
+    // so they credit the collapse detector like every other cut (invariant 11).
+    commandedCutAmps: commandedCutAmpsOf(corrections.commands, onManaged, config, source, book, now),
+    decisions: [...corrections.decisions, { at: now, action: "raises/restores", blockedBy: "settle window" }],
+    compareAfter: corrections.commands.length > 0 ? now + GRADE_LEVEL_MS : 0,
+  });
+  /**
+   * …with ONE lane through it (2026-08-31): a spender the in-flight cut PAYS FOR.
+   *
+   * The settle window exists so a second batch is not planned against a meter
+   * that has not digested the first, and every figure it protects is a MEASURED
+   * one. A funded admission is the opposite case: it is priced entirely off what
+   * we ourselves commanded, so the settle window is guarding it against its own
+   * evidence. Live cost of not having it: a leveler demote arms 30 s of SETTLING
+   * on top of the median lag, and the peer whose fan (or room) the demote just
+   * paid for waits the whole of it out.
+   *
+   * The lane is deliberately narrow: only when a credit is actually spendable,
+   * only while the pressure side is calm (a `hold` is the deliberate near-limit
+   * ride, and `over` returns above), and inside `planRaise`/`planFanRestore` only
+   * candidates the funded condition admits. Everything else is blocked exactly
+   * as the settle window blocks it today. The funded batch re-arms SETTLING via
+   * `noteBatch`, which is accepted: it spends one credit, once.
+   */
+  const settlingFundedLane =
+    mode === "SETTLING" && spendableCredit > 0 && pressure.kind === "calm" && corrections.commands.length === 0;
+  if (mode === "SETTLING" && !settlingFundedLane) return settlingPlan();
 
   // ---- NORMAL + calm: spend headroom (restore ≫ warm ≫ raise ≫ fan restore).
+  // Reached in SETTLING too, but only through the funded lane above, and then
+  // ONLY a funded candidate may ship (`fundedOnly`).
   if (pressure.kind === "calm") {
+    const fundedOnly = settlingFundedLane;
     // Committed-but-unmetered draw of ramping compressors. GEN only, the same
     // split the physics envelope uses: grid starts every AC FULL by explicit
     // user directive and leans on the reducer as its safety, so charging a
@@ -656,6 +686,13 @@ export function plan(input: PlanInput): PlanOutput {
       // the trough of its own shed comes straight back out (2026-08-03).
       cutAnchorAmps: meter.commandedCutAnchorAmps,
       commandedCutAmps: meter.commandedCutTotalAmps,
+      // …and the other face of the same cut: what it has already freed and the
+      // meter has not shown yet, which a waiting room may be admitted against
+      // instead of sitting out the median's lag plus a calm window (2026-08-31).
+      // `landingAmps` still floors the committed figure, so this can only ever
+      // buy back the lag, never the trough the cut itself digs (invariant 41).
+      spendableCreditAmps: spendableCredit,
+      fundedOnly,
       limitAmps: limit,
       calmMs: meter.calmMs,
       config,
@@ -716,7 +753,7 @@ export function plan(input: PlanInput): PlanOutput {
         !meter.collapsed &&
         meter.derateAmps <= 0 &&
         meter.smoothedOverMs === 0 &&
-        meter.overLimitBudget >= OVER_LIMIT_BUDGET &&
+        meter.overLimitBudget >= input.config.overLimitBudgetPoints &&
         meter.commandedCutCreditAmps <= 0 &&
         meter.commandedCutTotalAmps <= 0 &&
         input.overLimitActedRecently !== true,
@@ -742,9 +779,20 @@ export function plan(input: PlanInput): PlanOutput {
     // raise below can defer to it (change C), and reading the fan path's OWN calm
     // clock (`fanCalmMs` — a fan hold does not queue behind another hold's fan
     // step, 2026-08-09, the 16:22Z gen cycle #11098-#11126).
+    /**
+     * The freed-but-unmetered budget a fan step may be admitted against, and
+     * ZERO while a shed restore has amps reserved (invariant 71d, re-affirmed
+     * 2026-08-09 after a bounded carve-out was built and removed the same day):
+     * a live reservation parks even a one-gear step, and handing the fan a credit
+     * on top of `headroomAmps − reservedAmps` would be that carve-out by another
+     * route. Off is worse than any fan gear, so the restore spends it first.
+     */
+    const fanCredit = raisePlan.reservedAmps > 0 ? 0 : spendableCredit;
     const fanStep = planFanRestore(input.fanHolds, acs, {
       calmMs: meter.fanCalmMs,
-      headroomAmps: pressure.headroomAmps - raisePlan.reservedAmps - rampDebit,
+      headroomAmps: pressure.headroomAmps - raisePlan.reservedAmps - rampDebit + fanCredit,
+      spendableCreditAmps: fanCredit,
+      fundedOnly,
       // …and never into the wobble of the supply itself. A house riding the
       // limit with every level at its floor has only the fan left, so the
       // restore lands right back inside the flicker band that trimmed it —
@@ -774,6 +822,14 @@ export function plan(input: PlanInput): PlanOutput {
       raisePlan.swap == null &&
       raisePlan.fundingDonors.length === 0 &&
       corrections.commands.length === 0;
+    /**
+     * Invariant 68's ⚠, kept intact by the funded lane: a tick that did not run
+     * the ORDINARY raise phase reports no flicker-only refusals, and SETTLING is
+     * one of the ticks it names by hand. The shell DROPS every anchor missing
+     * from a reported list, so a funded lane inside a settle window would restart
+     * patience for every waiting room. Report nothing there.
+     */
+    const flickerRefused = fundedOnly ? undefined : raisePlan.flickerRefused;
     if (pureRaise && fanStep != null) {
       const raiseSummary = raisePlan.commands
         .map((c) => (c.kind === "set_level" ? `${c.deviceId}→L${c.level}` : c.deviceId))
@@ -796,7 +852,7 @@ export function plan(input: PlanInput): PlanOutput {
         fanHolds: fanStep.holds,
         attempts: [],
         fanOnly: true,
-        flickerRefused: raisePlan.flickerRefused,
+        flickerRefused,
       };
     }
 
@@ -834,7 +890,7 @@ export function plan(input: PlanInput): PlanOutput {
         fanOnly: false,
         fundingDonors: raisePlan.fundingDonors,
         swap: raisePlan.swap,
-        flickerRefused: raisePlan.flickerRefused,
+        flickerRefused,
       };
     }
     // Nothing to raise — walk any SATISFIED room parked above its need ceiling
@@ -849,7 +905,10 @@ export function plan(input: PlanInput): PlanOutput {
     //    restore's own feasibility already prices peer floor-downs (floors sit
     //    at or below ceilings). Letting demotes churn here would strand exactly
     //    the room the reservation exists to bring back.
-    if (raisePlan.reservedAmps <= 0) {
+    //  - …and never in the funded lane: a demote is a CUT, and the settle window
+    //    it would ship inside exists because another cut is still landing. The
+    //    lane spends a credit; it does not plan a second one (2026-08-31).
+    if (raisePlan.reservedAmps <= 0 && !fundedOnly) {
       const demotes = planIdleDemotes({
         acs,
         config,
@@ -870,7 +929,7 @@ export function plan(input: PlanInput): PlanOutput {
           fanHolds: input.fanHolds,
           attempts: [],
           fanOnly: false,
-          flickerRefused: raisePlan.flickerRefused,
+          flickerRefused,
         };
       }
       raisePlan.decisions.push(...demotes.decisions);
@@ -898,12 +957,16 @@ export function plan(input: PlanInput): PlanOutput {
         fanHolds: fanStep.holds,
         attempts: [],
         fanOnly: true,
-        flickerRefused: raisePlan.flickerRefused,
+        flickerRefused,
       };
     }
+    // The funded lane found nothing to fund: this tick is an ordinary settle
+    // window again, and it must report itself as one (mode, reason and the
+    // corrections it would have carried are all `settlingPlan`'s).
+    if (fundedOnly) return settlingPlan();
     // A pure flicker-only refusal ships no command — carry its `flickerRefused`
     // report through the idle return so the shell still anchors it.
-    return { ...emptyPlan(input, "idle", raisePlan.decisions), flickerRefused: raisePlan.flickerRefused };
+    return { ...emptyPlan(input, "idle", raisePlan.decisions), flickerRefused };
   }
 
   // ---- hold: the deliberate near-limit ride — do nothing, on purpose.

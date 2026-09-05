@@ -180,7 +180,38 @@ export interface MeterState {
    * `absorbedAmps` ratchets on the deepest fall below `anchorAmps`, so credit is
    * spent once the meter has actually shown the cut.
    */
-  pendingCut: { anchorAmps: number; amps: number; absorbedAmps: number; until: number } | null;
+  pendingCut: {
+    anchorAmps: number;
+    amps: number;
+    absorbedAmps: number;
+    until: number;
+    /**
+     * How much of `amps` a SPENDER may be admitted against (2026-08-31): the
+     * part that freed budget the limit did not need back: a room switched off by
+     * any hand, a manual level-down, an idle demote of dormant capacity.
+     *
+     * ZERO for an over-limit reduction, a FLOORS clamp, the peer floor-downs
+     * bundled into a restore and a swap's donor off: those amps are already
+     * spoken for by the breaker, by the entry policy, by the turn-on in their
+     * own batch (invariant 69), and handing them to a spender turns the
+     * reducer's own work into a cut → raise → cut cycle. Staged in the
+     * acceptance harness, the 2026-07-30 turn-on replay answered its own
+     * reduction with a peer raise 20 s later, went over again, cut a second room
+     * and raised again: four batches, one limit cycle.
+     *
+     * Tracked as amps rather than a flag because the two kinds STACK: a user's
+     * off thirty seconds after a reduction really did free its own draw, and the
+     * credit is one pooled number, so that off contributes its own amps and
+     * nothing more. The reverse order does NOT compose: a reduction arriving on
+     * top of an off zeroes this, because it re-bases the pool's single anchor and
+     * clock and because the ladder has just acted (see `noteCommandedCut`).
+     * Never more than `amps`.
+     *
+     * The DEMAND side (`commandedCutCreditAmps`) ignores this and still counts
+     * every cut: "do not demand these amps twice" is true whatever freed them.
+     */
+    spendableAmps: number;
+  } | null;
 }
 
 /** What the decision pipeline needs to know about the meter, per evaluation. */
@@ -274,6 +305,17 @@ export interface MeterView {
    * CREDIT_LANDING_GRACE_MS).
    */
   commandedCutAgeMs: number;
+  /**
+   * The same credit as `commandedCutCreditAmps`, but for the SPEND side: budget
+   * an off/demote/level-down has already freed that the meter has not shown yet
+   * (2026-08-31, user: "when there is a budget because of another AC off or level
+   * down, it should act instantly based on prediction"). Zero whenever spending
+   * against it would be a bet rather than a prediction: a `stalled` cut (the
+   * house is outrunning it), a frozen meter, a latched collapse, a stale feed.
+   * The demand side reads `commandedCutCreditAmps`; only this one may fund a
+   * raise, a shed restore or a fan restore (see `spendableCredit` in sensing.ts).
+   */
+  spendableCreditAmps: number;
 }
 
 /** A single device command the pipeline wants executed. */
@@ -398,7 +440,14 @@ export interface AcView {
   envelopeLevel: number;
   /** Observed fan (0 = built-in auto); null when unknown. */
   fanSpeed: number | null;
-  /** User touched the fan this episode — never trim it again until the episode ends. */
+  /**
+   * User touched the fan this episode — never trim it again until the episode
+   * ends. "The episode" since 2026-09-05: it lives until the room power-cycles
+   * (any off, a real changeover in either direction, a collapse, the
+   * AC-circuit-dead latch, the beep-reset blackout fingerprint) or its governing
+   * range slot changes. An observed fan 0 is the firmware's own reset and mints
+   * no exemption at all.
+   */
   fanExempt: boolean;
   /**
    * °C above this room's OWN satisfied point (≤0 = satisfied), measured with
@@ -512,6 +561,20 @@ export interface AcView {
    * condition does not currently hold, and any non-boost floor, keeps the rung.
    */
   boostFloorHard: boolean;
+  /**
+   * The live manual level intents: a hand-set ceiling (`manualCap`) or a
+   * hand-set floor (`manualTarget`), both of which win over every automatic
+   * decision while they stand (invariant 42, "manual wins").
+   *
+   * LIFETIME (2026-09-05, user: "a manual set of the AC level should be reset on
+   * the next power cycle or on the next automation range-slot boundary"): each
+   * lives until the room power-cycles (any off, a real changeover in EITHER
+   * direction, a collapse, the AC-circuit-dead latch, the beep-reset blackout
+   * fingerprint) or its governing range slot changes. A grid interlude no longer
+   * has special status: it used to be the only changeover that cleared them,
+   * which left a pin made on grid governing the room through the whole
+   * generator session that followed.
+   */
   manualCap: number | null;
   manualTarget: number | null;
   slotCap: number | null;

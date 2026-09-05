@@ -20,6 +20,13 @@ export interface PurifierDevice {
   led?: boolean;
   buzzer?: boolean;
   child_lock?: boolean;
+  // True when the last props RPC for this device failed: the readings above are
+  // the last-known ones, kept rather than blanked, but they are NOT live. An
+  // offline device keeps the previous attempt's verdict (it gets no RPC), and
+  // fetchDevicesLive writes the flag on both outcomes, because a flag that is
+  // only ever set one way is the ambiguity that made an empty list mean two
+  // different things in the first place.
+  readingsStale?: boolean;
 }
 
 export interface PurifierAction {
@@ -59,6 +66,40 @@ function isPurifier(model: string): boolean {
   return PURIFIER_MODELS.some((prefix) => model.startsWith(prefix));
 }
 
+/**
+ * The list call answers with identity only ({id, name, model, isOnline}); power,
+ * mode, aqi, temperature, humidity, filter_life, led and child_lock arrive after
+ * it, one props RPC per device. So assigning a fresh list straight over the
+ * cache STRIPS every reading, and the collector's 5-minute refresh did exactly
+ * that: the "serve the last-known devices on failure" guarantee then handed back
+ * tiles with no readings at all.
+ *
+ * Merge, never replace. The fresh list owns identity and membership (a device it
+ * no longer lists has genuinely gone), the cache owns the readings until a props
+ * RPC replaces them.
+ */
+export function mergeDeviceCache(previous: PurifierDevice[], fetched: PurifierDevice[]): PurifierDevice[] {
+  const known = new Map(previous.map((d) => [d.id, d]));
+  return fetched.map((d) => {
+    const prev = known.get(d.id);
+    return prev ? { ...prev, ...d } : d;
+  });
+}
+
+/**
+ * The single test for "the serviceToken died". Every path that invalidates auth
+ * must key on exactly the same condition, so these literals live here only.
+ * A 429 or a timeout is NOT an auth failure and must never drop the session.
+ */
+export function isAuthError(err: unknown): boolean {
+  const msg = (err as Error | null | undefined)?.message;
+  if (typeof msg !== "string") return false;
+  // \b401\b, never a bare substring: "401" also lives inside a device id, a byte
+  // count, a timestamp or a port, and a false positive here is expensive and
+  // silent: it drops a healthy session and deletes the credentials file.
+  return msg.includes("Unauthorized") || /\b401\b/.test(msg);
+}
+
 type AuthStatus = "authenticated" | "needs_2fa" | "needs_captcha" | "not_configured" | "error";
 
 export class XiaomiCloud {
@@ -68,6 +109,12 @@ export class XiaomiCloud {
   private region: string;
   private cachedDevices: PurifierDevice[] = [];
   private deviceCacheTime = 0;
+  // Armed after a failed list call. A failure leaves deviceCacheTime untouched
+  // (the cache did not refresh), and the collector loop ticks every ~5s, so
+  // without this gate an outage would be answered with a list call per tick.
+  private deviceListRetryAt = 0;
+  // Serializes the region borrow in fetchPurifiersForRegion (see there).
+  private regionFetchChain: Promise<unknown> = Promise.resolve();
 
   // 2FA state
   private authStatus: AuthStatus = "not_configured";
@@ -75,6 +122,17 @@ export class XiaomiCloud {
   private pending2faResolve: ((code: string) => void) | null = null;
   private pendingCaptchaResolve: ((code: string) => void) | null = null;
   private captchaImage: string | null = null;
+  /**
+   * Monotonic id of the login attempt that owns the session state. The
+   * collector runs one init() at a time, but it writes an attempt off after a
+   * deadline so a hung login cannot wedge recovery for good, which by design
+   * permits exactly one overlap: the written-off attempt is still alive when a
+   * newer login succeeds. Its late settle then lands in init()'s catch, which
+   * sets "error" outside the 2FA guard, and a healthy session is stamped back
+   * to "error". The collector's guard cannot see in here; this id can, so a
+   * superseded attempt may read but never write.
+   */
+  private authAttempt = 0;
 
   constructor(email: string, password: string, region: string) {
     this.email = email;
@@ -92,10 +150,27 @@ export class XiaomiCloud {
     });
   }
 
+  /** False once a newer init() has claimed the session (see authAttempt). */
+  private isCurrentAuthAttempt(attempt: number): boolean {
+    return attempt === this.authAttempt;
+  }
+
   async init(): Promise<void> {
+    const attempt = ++this.authAttempt;
     try {
       await this.client.miot.login({
         on2fa: async (_url: string) => {
+          // A superseded attempt must not park its resolver here:
+          // /api/xiaomi/verify hands the human's code to whichever resolver is
+          // parked on the instance, so a dead attempt would spend the code and
+          // leave the live prompt waiting for one that never comes. An empty
+          // answer is xmihome's own abort path ("2FA ticket was not
+          // provided"), so this attempt settles into the guarded catch below
+          // instead of hanging on a prompt nobody will answer.
+          if (!this.isCurrentAuthAttempt(attempt)) {
+            log.warn("[xiaomi] 2FA prompt for a superseded login attempt, abandoning it");
+            return "";
+          }
           log.info("[xiaomi] 2FA verification required — waiting for code via /api/xiaomi/verify");
           this.authStatus = "needs_2fa";
           return new Promise<string>((resolve) => {
@@ -103,6 +178,10 @@ export class XiaomiCloud {
           });
         },
         onCaptcha: async (imageB64: string) => {
+          if (!this.isCurrentAuthAttempt(attempt)) {
+            log.warn("[xiaomi] CAPTCHA prompt for a superseded login attempt, abandoning it");
+            return "";
+          }
           log.info("[xiaomi] CAPTCHA required — waiting for solution via /api/xiaomi/verify");
           this.authStatus = "needs_captcha";
           this.captchaImage = imageB64;
@@ -112,9 +191,21 @@ export class XiaomiCloud {
         },
       });
 
+      // A late SUCCESS is as damaging as a late failure: saveCredentials()
+      // would overwrite the live session's token file with this attempt's,
+      // discoverRegionAndDevices() rewrites cachedDevices, and its 401 path
+      // calls invalidateAuth(), i.e. it would drop a session it does not own.
+      if (!this.isCurrentAuthAttempt(attempt)) {
+        log.warn("[xiaomi] Login succeeded after being superseded, discarding its result");
+        return;
+      }
+
       // Save credentials to file for next restart
       await this.saveCredentials();
       this.authStatus = "authenticated";
+      // Without this the stale "serviceToken expired (401)" outlives the
+      // recovery and /api/xiaomi/auth-status reports an error while healthy.
+      this.authError = null;
       log.info("[xiaomi] Cloud login successful");
 
       await this.discoverRegionAndDevices();
@@ -125,6 +216,14 @@ export class XiaomiCloud {
         log.info(`[xiaomi]   - ${d.name} (${d.model}, ${d.isOnline ? "online" : "offline"})`);
       }
     } catch (err) {
+      if (!this.isCurrentAuthAttempt(attempt)) {
+        // The whole point of the id: this failure belongs to an attempt the
+        // collector already wrote off, and the session it would report on is a
+        // newer login's. Stamping "error" here costs a healthy session and a
+        // spurious re-login.
+        log.warn("[xiaomi] Superseded login attempt failed, leaving the current session alone:", (err as Error).message);
+        return;
+      }
       this.authError = (err as Error).message;
       if (this.authStatus !== "needs_2fa" && this.authStatus !== "needs_captcha") {
         this.authStatus = "error";
@@ -183,14 +282,30 @@ export class XiaomiCloud {
   }
 
   private async discoverRegionAndDevices(): Promise<void> {
-    const devices = await this.fetchPurifiersForRegion(this.region);
-    if (devices.length > 0) {
-      this.cachedDevices = devices;
-      this.deviceCacheTime = Date.now();
-      return;
+    // "This account has no purifiers" is a finding; "we could not ask" is not.
+    // The cache may only be emptied at the end when every region answered.
+    let everyRegionAnswered = true;
+    try {
+      const devices = await this.fetchPurifiersForRegion(this.region);
+      if (devices.length > 0) {
+        // Merged like every other list assignment: init() runs again after a
+        // re-login, and replacing here would throw away the readings the cache
+        // held through the outage.
+        this.cachedDevices = mergeDeviceCache(this.cachedDevices, devices);
+        this.deviceCacheTime = Date.now();
+        return;
+      }
+      log.info(`[xiaomi] No purifiers in region "${this.region}", scanning all regions...`);
+    } catch (err) {
+      // Deliberate: a non-auth failure here must NOT reach init()'s catch,
+      // which would flip authStatus to "error" and spend a full re-login (and
+      // risk a captcha) on a dropped packet. Only an auth failure moves the
+      // status; a blip falls through to the scan below.
+      if (isAuthError(err)) throw err;
+      everyRegionAnswered = false;
+      log.warn(`[xiaomi] Region "${this.region}" did not answer, scanning all regions`);
     }
 
-    log.info(`[xiaomi] No purifiers in region "${this.region}", scanning all regions...`);
     for (const region of ALL_REGIONS) {
       if (region === this.region) continue;
       try {
@@ -200,21 +315,53 @@ export class XiaomiCloud {
           this.region = region;
           // Update the client's country for future requests
           this.client.config.credentials!.country = region;
-          this.cachedDevices = found;
+          this.cachedDevices = mergeDeviceCache(this.cachedDevices, found);
           this.deviceCacheTime = Date.now();
           await this.saveCredentials();
           return;
         }
       } catch (err) {
+        // A dead token fails identically in every region: rethrow so init()'s
+        // catch flips authStatus to "error" (which re-arms the collector's
+        // re-auth) instead of burning six 401s and then clobbering the cache.
+        if (isAuthError(err)) throw err;
+        everyRegionAnswered = false;
         log.warn(`[xiaomi] Region "${region}" scan failed: ${(err as Error).message}`);
       }
+    }
+
+    if (!everyRegionAnswered) {
+      // Silence from a region is not evidence of an empty account: emptying the
+      // cache on that would blank the tiles for a network blip.
+      log.warn("[xiaomi] Region scan incomplete, keeping the last-known purifiers");
+      return;
     }
     log.warn("[xiaomi] No purifiers found in any region");
     this.cachedDevices = [];
     this.deviceCacheTime = Date.now();
   }
 
-  private async fetchPurifiersForRegion(region: string): Promise<PurifierDevice[]> {
+  /**
+   * Region fetches run one at a time. The fetch below has to point the shared
+   * client at `region` and put the previous value back afterwards, so two
+   * overlapping calls restore each other's mid-flight value and leave every
+   * later RPC aimed at the wrong regional endpoint. It is reachable because
+   * init() publishes authStatus "authenticated" BEFORE discoverRegionAndDevices()
+   * finishes, so a browser /api/devices poll or the collector's refresh step can
+   * land inside a multi-region scan.
+   *
+   * One queue, same idiom as RateGate (rate-gate.ts) minus the pacing: a caller
+   * that lands mid-scan waits for it instead of racing it.
+   */
+  private fetchPurifiersForRegion(region: string): Promise<PurifierDevice[]> {
+    const result = this.regionFetchChain.then(() => this.requestPurifiersForRegion(region));
+    // The queue must survive a rejected fetch: swallow here, not for the caller,
+    // who still gets the rejection from `result`.
+    this.regionFetchChain = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async requestPurifiersForRegion(region: string): Promise<PurifierDevice[]> {
     const creds = this.client.config.credentials!;
     const savedCountry = creds.country;
     creds.country = region;
@@ -231,8 +378,24 @@ export class XiaomiCloud {
       }
       return purifiers;
     } catch (err) {
+      // The 2026-08-31 wedge: returning [] here read as "no purifiers", clobbered
+      // cachedDevices and left authStatus "authenticated", so the props loop that
+      // owns the only other 401 detector never ran and nothing ever re-logged in.
+      // The failure erased its own repair trigger. Invalidate and rethrow: the
+      // status flip is the signal, and callers keep their last-known devices.
+      if (isAuthError(err)) {
+        log.warn(`[xiaomi] Auth failure fetching devices for region "${region}", invalidating auth for re-login:`, (err as Error).message);
+        await this.invalidateAuth();
+        throw err;
+      }
+      // A timeout, a DNS failure or a 500 gets the same treatment minus the
+      // invalidation: returning [] for those blanked the purifier tiles while
+      // the route still answered available:true, which is the wedge's own
+      // symptom reached through a different door. This is the throwing
+      // primitive, so an empty list can only ever mean the cloud answered and
+      // had nothing to report. It logs the detail; callers log the consequence.
       log.warn(`[xiaomi] Fetch devices for region "${region}" failed:`, (err as Error).message);
-      return [];
+      throw err;
     } finally {
       creds.country = savedCountry;
     }
@@ -240,18 +403,40 @@ export class XiaomiCloud {
 
   async refreshDevices(): Promise<PurifierDevice[]> {
     if (this.authStatus !== "authenticated") return this.cachedDevices;
-    if (Date.now() - this.deviceCacheTime < 300_000 && this.cachedDevices.length > 0) {
-      return this.cachedDevices;
+    // No "&& cachedDevices.length > 0": an empty cache DEFEATED this throttle,
+    // i.e. maximum hammering in exactly the wedged state. An empty list is not
+    // the failure signal; the auth status flip is.
+    if (Date.now() - this.deviceCacheTime < 300_000) return this.cachedDevices;
+    if (Date.now() < this.deviceListRetryAt) return this.cachedDevices;
+    try {
+      // Merged: this step runs every 5 minutes and the list it gets back is
+      // identity only, so replacing here stripped every reading out of the
+      // cache twelve times an hour and left the failure path serving tiles with
+      // no power, mode, aqi or temperature. It refreshes identity, not readings.
+      this.cachedDevices = mergeDeviceCache(this.cachedDevices, await this.fetchPurifiersForRegion(this.region));
+      this.deviceCacheTime = Date.now();
+      this.deviceListRetryAt = 0;
+    } catch (err) {
+      // Keep the last-known-good list on ANY failure, not just an auth one: an
+      // empty list is a claim about the account, and a blip cannot make it.
+      // A 401 already invalidated auth inside the fetch, so the status guard
+      // above short-circuits every call until re-login; a blip leaves the
+      // session alone and comes back through the retry gate.
+      this.deviceListRetryAt = Date.now() + 60_000;
+      log.warn("[xiaomi] Device refresh failed, keeping cached devices:", (err as Error).message);
     }
-    this.cachedDevices = await this.fetchPurifiersForRegion(this.region);
-    this.deviceCacheTime = Date.now();
     return this.cachedDevices;
   }
 
   /** Fetch fresh device list + live props (bypasses cache, for API use) */
   async fetchDevicesLive(): Promise<PurifierDevice[]> {
     if (this.authStatus !== "authenticated") return this.cachedDevices;
-    const devices = await this.fetchPurifiersForRegion(this.region);
+    // Deliberately unguarded: ANY failing list call throws past this assignment,
+    // so cachedDevices keeps its last-known-good contents and the route reports
+    // the failure instead of serving an empty list as if it were the truth. For
+    // a blip that is honest ("we could not confirm these are live") and it
+    // surfaces as the client's stale marker for a poll or two.
+    const devices = mergeDeviceCache(this.cachedDevices, await this.fetchPurifiersForRegion(this.region));
     this.cachedDevices = devices;
     this.deviceCacheTime = Date.now();
 
@@ -259,9 +444,19 @@ export class XiaomiCloud {
     await Promise.all(
       devices.filter((d) => d.isOnline).map(async (d) => {
         try {
-          Object.assign(d, await this.getDeviceProps(d.id));
-        } catch {
-          // ignore — device may be unreachable
+          // A successful RPC is the whole truth for this device: an undefined
+          // prop means it answered without one, so it must clear the merged
+          // value rather than leave yesterday's reading standing.
+          Object.assign(d, await this.getDeviceProps(d.id), { readingsStale: false });
+        } catch (err) {
+          // Was a silent `catch {}`. With the merge above the device now keeps
+          // its previous readings instead of losing them, which is the right
+          // trade only if it stops claiming to be live: mark it and say so,
+          // otherwise one dead device reads exactly like its healthy siblings.
+          // A 401 here already invalidated auth inside sendCommand, so the
+          // route re-reads isReady() and answers available:false.
+          d.readingsStale = true;
+          log.warn(`[xiaomi] Props read failed for device ${d.id}, keeping the last-known readings:`, (err as Error).message);
         }
       }),
     );
@@ -270,6 +465,24 @@ export class XiaomiCloud {
 
   private isMiot(model: string): boolean {
     return MIOT_MODELS.includes(model);
+  }
+
+  /**
+   * getModel() returns "" for an unknown id, so with an empty cache isMiot() is
+   * false and a MIoT unit silently receives legacy miIO commands. Populate
+   * before any model lookup on a control path (mirrors TCL's namesake).
+   *
+   * Throws when the list call fails, deliberately: refusing the command beats
+   * sending the wrong protocol off an unpopulated cache. Both callers tolerate
+   * it (the control route answers 500, the collector's automation step logs and
+   * moves to the next tick), and a cache that survives blips now means this
+   * only bites on a cold start.
+   */
+  private async ensureDeviceCachePopulated(): Promise<void> {
+    if (this.cachedDevices.length > 0) return;
+    if (this.authStatus !== "authenticated") return;
+    this.cachedDevices = await this.fetchPurifiersForRegion(this.region);
+    this.deviceCacheTime = Date.now();
   }
 
   private getModel(deviceId: string): string {
@@ -367,8 +580,14 @@ export class XiaomiCloud {
     try {
       await unlink(CREDENTIALS_FILE);
       log.info("[xiaomi] Deleted stale credentials file");
-    } catch {
-      // File may not exist
+    } catch (err) {
+      // ENOENT is the happy case (the file is already gone). Anything else is
+      // severe and must be loud: xmihome's login() short-circuits while the file
+      // still holds userId+ssecurity+serviceToken, so a surviving stale file
+      // turns every re-login attempt into a permanent no-op.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        log.warn("[xiaomi] Failed to delete stale credentials file, re-login may be a no-op:", (err as Error).message);
+      }
     }
   }
 
@@ -382,8 +601,7 @@ export class XiaomiCloud {
       log.info(`[xiaomi] Command ${method}(${JSON.stringify(params)}) → device ${deviceId}: OK`);
       return result;
     } catch (err) {
-      const msg = (err as Error).message ?? "";
-      if (msg.includes("Unauthorized") || msg.includes("401")) {
+      if (isAuthError(err)) {
         log.warn("[xiaomi] Got 401/Unauthorized, invalidating auth for re-login");
         await this.invalidateAuth();
       }
@@ -392,6 +610,7 @@ export class XiaomiCloud {
   }
 
   async executeAction(deviceId: string, action: PurifierAction): Promise<void> {
+    await this.ensureDeviceCachePopulated();
     if (this.isMiot(this.getModel(deviceId))) {
       await this.executeMiotAction(deviceId, action);
     } else {
@@ -430,6 +649,7 @@ export class XiaomiCloud {
 
   /** Send a control command, auto-detecting miIO vs MIoT protocol */
   async sendControlCommand(deviceId: string, command: string, params: unknown[]): Promise<unknown> {
+    await this.ensureDeviceCachePopulated();
     if (this.isMiot(this.getModel(deviceId))) {
       return this.sendMiotControl(deviceId, command, params);
     }

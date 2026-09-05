@@ -173,6 +173,33 @@ Guest is grid-only and never leveling-managed, so the admin UI adapts per select
 - **`alerts-modal.tsx` (AC trigger form):** when the selected AC is not leveling-eligible (`selectedAcLevelingEligible === false`), the "Smart leveling controls generator level" checkbox is **hidden** and the saved rule forces `smart_leveling: false`. The per-slot **Gen** buttons then set the generator level **directly** for that range instead of capping the leveler — the tooltip wording flips accordingly (Auto: "Smart AC Leveling picks the level" → "keep the preset or direct generator level"; L*n*: "Cap the generator level at L*n* … Smart Leveling never raises above it" → "Set this AC directly to L*n*"). The `L1..Lmax` button count comes from the selected AC's `maxGeneratorLevel` (guest → L1–L6).
 - **`ac-leveling-section.tsx` (leveling config):** `seedDraft()` seeds defaults only for loaded `levelingEligible` devices and prunes ONLY ids positively known to be ineligible (`acDevices.filter((d) => !d.levelingEligible)`), so guest never appears in the leveling device list — but absence from the transient `acDevices` list never removes a config entry. The list is EMPTY whenever the TCL cloud is down or still loading, and pruning on absence silently erased calibrated amp models and the priority order on the next save (review-confirmed 2026-08-18); with an empty list nothing is pruned, nothing is seeded, and the Active kill-switch stays usable.
 
+### Leveling settings card (`ac-leveling-section.tsx`)
+
+- **Limits grid: nine fields in `grid-cols-3` since 2026-09-05** (eight in `grid-cols-4` before). The
+  new one is **"Over-limit pts"** (`min={4} max={20} step={1} integer`), the leaky bucket's capacity,
+  and its `title` describes what DEPLETES the bucket rather than when the controller acts: *"the
+  bucket empties on the N-th mild over-limit reading or the ceil(N/3)-rd severe one; other guards can
+  act sooner"*. The ranges in this grid mirror the API's own validation (a value the input accepts
+  must be one `PUT /api/ac/leveling` will take), and 4–20 mirrors `OVER_LIMIT_BUDGET_MIN`/`_MAX` in
+  `server/src/leveling/config.ts`.
+- **`NumericInput` holds raw text while editing** and only commits values that parse and pass the
+  range. Two guards added with the integer field: an empty or whitespace-only box returns early
+  (`Number("")` is 0, and committing that would zero a config field for someone merely clearing it to
+  retype), and parsing is `Number` plus `Number.isInteger` for `integer` fields, never `parseInt`,
+  which silently turned "4.5" into a valid-looking 4. `NumberField` forwards both `integer` and
+  `title`.
+- **The gating hint reads `over-limit N/M points`**, M being `status.overLimitBudgetMax` (the
+  configured capacity), with the tooltip *"Over-limit leaky bucket: acts when the points run out (a
+  reading over 1A above the limit costs 3, over 0.5A costs 2, otherwise 1; sustained headroom refills
+  it)"*. `seedDraft()` prefills `overLimitBudgetPoints ?? 5` without marking the draft dirty, the same
+  not-dirty gotcha every seeded field has.
+- **Range-slot editor ids (`alerts-modal.tsx`)**: Add and Duplicate both mint an id through the shared
+  `newRangeSlotId()` helper (`crypto.randomUUID()`, falling back to `slot-${Date.now()}`) instead of
+  overriding it with a timestamp, because two slots created in the same millisecond used to share one
+  identity: a duplicate React key here, and, since 2026-09-05, a range-slot boundary the leveler
+  cannot see (it keys a manual pin's lifetime on `<ruleId>:<slotId>`, see
+  [ac-leveling.md](ac-leveling.md)).
+
 ## Presets UI
 
 - **10 slots per device** (was 5 until 2026-06-06), stored server-side in the `ac_presets` PostgreSQL table (shared across all browsers/devices). `PresetData` captures 10 properties (mode, targetTemp, fanSpeed, eco, turbo, screen, verticalSwing, horizontalSwing, freshAir, generatorMode). Slot count derives from the `PRESET_COUNT`/`PRESET_SLOTS` constants in `ac-widget.tsx` — **never hardcode `[1,2,3,4,5]` arrays**. One-time migration from localStorage on first overlay open. Preset API routes and apply/sync-to-automations semantics → [ac-automations.md](ac-automations.md).

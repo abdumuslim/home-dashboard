@@ -10,6 +10,10 @@
 import type { AcView, Command, PowerSource } from "./types.js";
 import type { CostBook } from "./costs.js";
 import { fanTrimSavings } from "./costs.js";
+// The ONE funded-spend test and its journal note, shared with the shed restore
+// and the level raise (raise.ts owns `REBALANCE_FUND_MARGIN_AMPS`, invariant
+// 69's own margin). Import direction is safe: raise.ts does not know this file.
+import { fundedByCredit, fundedNote } from "./raise.js";
 
 /**
  * Sustained calm required before a held fan CUT for an overload starts climbing
@@ -388,11 +392,30 @@ export function planFanRestore(
      * biggest spike and bounces (2026-08-06, invariant 58 / hard rule 5c).
      */
     flickerMarginAmps: number;
+    /**
+     * Budget a cut already in flight has freed and the meter has not shown yet
+     * (`MeterView.spendableCreditAmps`), already netted of any shed-restore
+     * reservation by the caller. 0 when there is none, and 0 whenever
+     * `config.fundedSpend` is off. `opts.headroomAmps` ALREADY includes it (the
+     * caller adds it there); this is the same figure again, so the funded FAST
+     * PATH below can ask whether the credit alone covers the whole remaining
+     * swing. Defaults to 0, i.e. the admission this extends.
+     */
+    spendableCreditAmps?: number;
+    /**
+     * The SETTLING funded lane (2026-08-31): a batch is still landing, so ONLY a
+     * hold whose whole remaining swing the in-flight cut pays for may step. Every
+     * other hold stays blocked exactly as the settle window blocks it today,
+     * including a continuation gear, whose 20 s spacing would otherwise fit
+     * inside a 30 s settle window and ship unfunded. Defaults to false.
+     */
+    fundedOnly?: boolean;
     book: CostBook;
     source: Exclude<PowerSource, "none">;
     now: number;
   },
 ): FanRestoreStep | null {
+  const spendableCreditAmps = Math.max(0, opts.spendableCreditAmps ?? 0);
   // The calm gate AND the spendable budget are judged PER HOLD, not once for the
   // batch: a climb already under way asks a shorter question than one deciding
   // whether to start, and only a fromCut hold is charged the supply wobble.
@@ -428,7 +451,43 @@ export function planFanRestore(
     const firstGearCalm =
       (hold.fromCut ?? true) && !escalated ? FAN_RESTORE_CALM_MS : FAN_RESTORE_GENTLE_CALM_MS;
     const gate = hold.climbStartedAt == null ? firstGearCalm : FAN_RESTORE_CONTINUE_CALM_MS;
-    if (opts.calmMs < gate) continue;
+    /**
+     * What this hold still OWES, hoisted above the gates so they can ask whether
+     * a cut already in flight PAYS for the whole of it: an auto original is one
+     * indivisible 6-gear swing, a numeric one is the gears that are left.
+     */
+    const observedFan = ac.fanSpeed ?? hold.lastSetFan;
+    const remainingGears = hold.originalFan === 0 ? 6 : hold.originalFan - observedFan;
+    const swingCost =
+      remainingGears > 0 ? fanTrimSavings(opts.book, ac.deviceId, opts.source, remainingGears, opts.now) : 0;
+    /**
+     * FUNDED FAST PATH (2026-08-31, user: "when there is a budget because of
+     * another AC off or level down, it should act instantly ... [or] its fan
+     * up"). When the credit alone covers the ENTIRE remaining swing with
+     * `REBALANCE_FUND_MARGIN_AMPS` to spare, this hold takes the existing fast
+     * path's shape (one jump home) and ALSO waives the two clocks that made a
+     * demote → peer-fan recovery take ~130–160 s: the remaining
+     * `FAN_RESTORE_AFTER_CUT_MS` window and the first-gear calm gate.
+     *
+     * Why those two may go, when 58's whole point was that they may not: the
+     * after-cut wait is anti-bounce for the fan's OWN overload episode ("will
+     * this gear re-cross the limit the trim was answering?"), and a fresh credit
+     * is evidence that the house materially changed since that episode, by more
+     * than the whole swing costs. The user's own ranking settles the rest: fan 1
+     * is emergency-only and must not take long to come back (invariant 60,
+     * 2026-08-06/08). A saturated line still cannot reach this path: it needs a
+     * live credit bigger than the swing plus the margin, which is precisely the
+     * house that just lost a compressor.
+     *
+     * Everything else stands in BOTH paths: the self-ramp skip (59), the
+     * continuation-gear spacing and the confirm-or-resend (71a/71c), the fan
+     * debit armed at exactly the price admitted (18), and the caller's
+     * restore-reservation parking (71d: the caller passes 0 credit while a shed
+     * restore has amps reserved, so a funded gear cannot ride a reservation).
+     */
+    const fundedFast = remainingGears > 0 && fundedByCredit(swingCost, spendableCreditAmps);
+    if (opts.fundedOnly === true && !fundedFast) continue;
+    if (opts.calmMs < gate && !fundedFast) continue;
     // …and a continuation gear also owes its OWN last-gear spacing (2026-08-09).
     // The fan calm clock now SURVIVES a fan-only spend — that is what stops fans
     // queueing behind fans — so `fanCalmMs` no longer rewinds when THIS hold's
@@ -465,17 +524,13 @@ export function planFanRestore(
     // not overload relief, and charging it the wobble was invariant 58's own
     // admitted regression axis, now user-confirmed (2026-08-08).
     const attempt = (spendable: number): FanRestoreStep | null => {
-      const current = ac.fanSpeed ?? hold.lastSetFan;
-      // What this hold still OWES, priced exactly as the branches below price
-      // their own steps: an auto original is one indivisible 6-gear swing, a
-      // numeric one is the gears that are left. When the room covers the whole of
-      // it with FAN_RESTORE_FAST_MARGIN_AMPS to spare, the gear bound and the long
-      // after-cut wait are guarding against a re-cross that cannot arithmetically
-      // happen — so the climb goes home in one step and owes the short wait.
-      const remainingGears = hold.originalFan === 0 ? 6 : hold.originalFan - current;
-      const swingCost =
-        remainingGears > 0 ? fanTrimSavings(opts.book, ac.deviceId, opts.source, remainingGears, opts.now) : 0;
-      const fast = remainingGears > 0 && spendable >= swingCost + FAN_RESTORE_FAST_MARGIN_AMPS;
+      const current = observedFan;
+      // `remainingGears`/`swingCost` are hoisted above (the gates need them). When
+      // the room covers the whole of the swing with FAN_RESTORE_FAST_MARGIN_AMPS
+      // to spare, or a cut in flight covers it outright (`fundedFast`), the gear
+      // bound and the long after-cut wait are guarding against a re-cross that
+      // cannot arithmetically happen, so the climb goes home in one step.
+      const fast = fundedFast || (remainingGears > 0 && spendable >= swingCost + FAN_RESTORE_FAST_MARGIN_AMPS);
       // Cut→restore hysteresis. A fan-only batch does not rewind the shared calm
       // clock, so without this the calm gate let a fan cut come all the way back
       // ~80s later and the over-limit episode simply repeated. Gentle-restore holds
@@ -508,7 +563,16 @@ export function planFanRestore(
       const withinAfterCutWait =
         (hold.fromCut ?? true) && opts.now - (hold.lastCutAt ?? hold.heldAt) < afterCutWait;
       const skipAfterCutWait = escalated && bounces === 0;
-      if (withinAfterCutWait && !skipAfterCutWait) {
+      // …and a FUNDED swing skips the remaining wait outright (2026-08-31): the
+      // window is anti-bounce for THIS fan's own overload episode, and a live
+      // credit bigger than the whole swing is evidence the house changed since
+      // that episode by more than the swing costs. A proven bouncer keeps the
+      // full compounded ladder even when funded, exactly as FIX B leaves it when
+      // escalated. SETTLE, don't bounce (2026-07-31; the 13:12Z bounce house).
+      // Kept as its own term rather than folded into `skipAfterCutWait` so the
+      // journal below can still tell a deeper-cut admission from a funded one.
+      const skipForFunding = fundedFast && bounces === 0;
+      if (withinAfterCutWait && !skipAfterCutWait && !skipForFunding) {
         return null;
       }
       // A gentle hold never owed the cut wait and its auto original was always one
@@ -520,10 +584,16 @@ export function planFanRestore(
       const escalatedAdmission =
         (escalated && (hold.fromCut ?? true) && hold.climbStartedAt == null && opts.calmMs < FAN_RESTORE_CALM_MS) ||
         (skipAfterCutWait && withinAfterCutWait);
+      // LOUD when the in-flight cut is what admitted this step: it may have
+      // jumped the first-gear calm minute AND the after-cut window on a
+      // prediction, which is the single most permissive thing this function can
+      // do (2026-08-31).
       const action =
         (fast && hold.fromCut !== false
           ? `fan restore step (fast: ${swingCost.toFixed(1)}A swing, ${spendable.toFixed(1)}A spendable)`
-          : "fan restore step") + (escalatedAdmission ? " (after deeper cut)" : "");
+          : "fan restore step") +
+        (escalatedAdmission ? " (after deeper cut)" : "") +
+        (fundedFast ? ` · ${fundedNote(spendableCreditAmps)}` : "");
       if (hold.originalFan === 0) {
         // Built-in auto: single indivisible jump, costed as a full swing — which
         // is `swingCost` above, the same 6 gears.

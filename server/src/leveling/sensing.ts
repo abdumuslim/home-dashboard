@@ -10,12 +10,19 @@
 
 import type { CollapseLatch, CutTrend, MeterEvent, MeterState, MeterView, PowerSource } from "./types.js";
 import type { LevelingConfigV2 } from "./config.js";
-import { effectiveLimit } from "./config.js";
+import { DEFAULT_LEVELING_CONFIG_V2, effectiveLimit } from "./config.js";
 
 // ---- Ported v1 constants (values unchanged; provenance: ac-leveling.ts) ----
 
-/** Leaky-bucket capacity in points; empty (≤0) = act. */
-export const OVER_LIMIT_BUDGET = 5;
+/**
+ * Default leaky-bucket capacity in points; empty (≤0) = act.
+ *
+ * The live capacity is `config.overLimitBudgetPoints` (4–20, settable from the
+ * dashboard since 2026-09-05). This alias is the DEFAULT, and the only state it
+ * still seeds is `initialMeterState()`, which the first reading's source-change
+ * reset overwrites with the configured value.
+ */
+export const OVER_LIMIT_BUDGET = DEFAULT_LEVELING_CONFIG_V2.overLimitBudgetPoints;
 /** Points drained by a reading more than OVER_LIMIT_SEVERE_AMPS over the limit. */
 export const OVER_LIMIT_DRAIN_SEVERE = 3;
 /**
@@ -554,11 +561,35 @@ export function initialMeterState(): MeterState {
  * `amps` is the batch's own priced saving (learned/model), so the credit can
  * never exceed what the pipeline believed it was cutting. Stacking sheds add
  * up; the anchor re-bases on the meter as it stood when this batch went out.
+ *
+ * `spendable` says whether the amps this cut freed are anyone's to SPEND (see
+ * `MeterState.pendingCut.spendableAmps`): true for a room switched off by any
+ * hand, a manual level-down and an idle demote; false for everything else, which
+ * is the DEFAULT: a caller that has not thought about it may not fund a
+ * spender. The demand-side credit is identical either way.
  */
-export function noteCommandedCut(state: MeterState, amps: number, now: number): MeterState {
+export function noteCommandedCut(
+  state: MeterState,
+  amps: number,
+  now: number,
+  opts?: { spendable?: boolean },
+): MeterState {
   if (!(amps > 0)) return state;
   const live = state.pendingCut != null && now < state.pendingCut.until ? state.pendingCut : null;
   const carried = live != null ? Math.max(0, live.amps - live.absorbedAmps) : 0;
+  // What survives of the freeing part, capped at what survives of the pool: the
+  // absorption ratchet is one number over the whole episode, so assume it spent
+  // the spendable share FIRST. Under-crediting only makes a spender wait.
+  //
+  // ⚠ Carried forward ONLY by another freeing cut. A credit is one pooled claim
+  // with ONE anchor and ONE clock, and stacking re-bases both, so a reduction
+  // landing on top of an off would hand the off's amps a fresh landing grace
+  // they have not earned (`cutTrendOf` would read `settling` again for a fall
+  // that already stalled), and it would do it at the exact moment the ladder has
+  // just proved the house cannot carry what it is carrying. Zeroing here is the
+  // conservative reading of both facts: the reducer's own amps are never
+  // spendable, and its arrival ends any spending claim already in flight.
+  const carriedSpendable = live != null ? Math.max(0, Math.min(live.spendableAmps, carried)) : 0;
   return {
     ...state,
     pendingCut: {
@@ -566,6 +597,7 @@ export function noteCommandedCut(state: MeterState, amps: number, now: number): 
       amps: carried + amps,
       absorbedAmps: 0,
       until: now + PENDING_CUT_MS,
+      spendableAmps: opts?.spendable === true ? carriedSpendable + amps : 0,
     },
   };
 }
@@ -597,6 +629,74 @@ export function pendingCutCredit(state: MeterState, now: number): number {
   const outrun = smoothedAmps(state) - cut.anchorAmps;
   if (outrun > Math.max(flickerAmps(state), FLICKER_MIN_AMPS)) return 0;
   return Math.max(0, cut.amps - cut.absorbedAmps);
+}
+
+/**
+ * The credit a SPENDER may act on: `pendingCutCredit` less every case where
+ * spending it would be a bet instead of a prediction (2026-08-31, user: "when
+ * there is a budget because of another AC off or level down, it should act
+ * instantly based on prediction to turn on an offed AC or level it (or its fan)
+ * up").
+ *
+ * The physics is invariant 69's, from the demand side of the same trade: a
+ * freed compressor's draw leaves the meter in ~10–40 s while a newly admitted
+ * one engages minutes later (TCL restart protection + soft start), so the two
+ * never overlap on the line. What the reduce side reads as "do not demand these
+ * amps a second time" the spend side may read as "these amps are already free".
+ *
+ * Four subtractions, each a known failure mode:
+ *
+ *  - the part of the credit that is not the SPENDER'S to take
+ *    (`pendingCut.spendableAmps`). The
+ *    reduce side credits every cut; only a cut that freed budget the limit did
+ *    not need back may fund one. An over-limit reduction's amps belong to the
+ *    breaker, and spending them is a cut → raise → cut cycle: staged in the
+ *    acceptance harness, the 2026-07-30 turn-on replay answered its own
+ *    reduction with a peer raise 20 s later, went over again, cut a second room,
+ *    and raised again: four batches, one limit cycle (SETTLE, don't bounce).
+ *  - `stalled` per `cutTrendOf`: the cut is past its landing grace with the
+ *    fall still short, i.e. the house is outrunning it. Invariant 38's outrun
+ *    void only catches a RISE above the anchor plus flicker; a meter pinned AT
+ *    the anchor keeps its credit, and that is exactly the 2026-08-03/04 shape
+ *    (3.0 A commanded, 0.49 A delivered in 91 s) read from the spend side. A
+ *    prediction the meter is already refusing may not buy a compressor.
+ *  - `frozen`: a hung CT is not evidence of anything, and the credit's own
+ *    absorption cannot advance while the reading does not move.
+ *  - a latched `collapse`, or a stale feed: the line is not there to spend on.
+ *
+ * Everything else the credit already guarantees is inherited unchanged: the
+ * model pricing (invariant 11), the outrun void (38) and `PENDING_CUT_MS`.
+ */
+export function spendableCredit(state: MeterState, now: number): number {
+  const cut = state.pendingCut;
+  if (cut == null || !(cut.spendableAmps > 0)) return 0;
+  if (state.collapse != null || state.frozen) return 0;
+  if (state.lastReadingAt === 0 || now - state.lastReadingAt > STALE_POWER_MS) return 0;
+  const credit = pendingCutCredit(state, now);
+  if (!(credit > 0)) return 0;
+  const smoothed = smoothedAmps(state);
+  const trend = cutTrendOf({ ...liveCutFigures(cut, now), smoothedAmps: smoothed });
+  if (trend === "stalled") return 0;
+  // …and NEVER the part of the fall the meter has already shown. `absorbedAmps`
+  // ratchets inside `ingestReading` against the median as it stood BEFORE that
+  // reading joined the ring (see `priorMedian`), so for one reading the same
+  // amps sit in both `headroomAmps` (which reads the CURRENT median) and the
+  // credit. Harmless where the credit only SHRINKS a demand; on the spend side
+  // it is one whole reading of double-counted budget, and 4 s of it is enough
+  // for a second admission: staged in the harness, a 3.6 A off funded a 2.4 A
+  // raise and then a SECOND 2.4 A raise on the next tick: 4.8 A spent out of
+  // 3.6 A freed, and a house parked above its resting ceiling. Capped here
+  // rather than by changing the ratchet, because the demand side's reading of
+  // `absorbedAmps` is correct as it stands (invariant 5's collapse arithmetic
+  // judges the cliff from the anchor, one reading of lag included).
+  //
+  // Charged against the FREEING share, not the pool: with a reduction's amps
+  // mixed into the same episode, the fall is assumed to be the spendable part
+  // landing first, the same conservative assumption `noteCommandedCut` carries
+  // forward. Under-crediting only makes a spender wait; over-crediting spends
+  // the breaker's amps.
+  const landedAmps = Math.max(0, cut.anchorAmps - smoothed);
+  return Math.max(0, Math.min(credit, cut.spendableAmps - landedAmps));
 }
 
 /** The four numbers a cut's trend is judged from — `MeterView` satisfies it. */
@@ -742,7 +842,7 @@ export function ingestReading(
       source,
       lastReadingAt: now,
       recent: [],
-      overLimitBudget: OVER_LIMIT_BUDGET,
+      overLimitBudget: config.overLimitBudgetPoints,
       overLimitReadings: [],
       calmSince: null,
       fanCalmSince: null,
@@ -1096,7 +1196,7 @@ export function ingestReading(
       // the smoothed mean, so an oscillation CENTRED on the limit still never
       // refills. What refills now is the case that should always have: a mean
       // with real headroom under it, crossed occasionally by supply noise.
-      overLimitBudget = OVER_LIMIT_BUDGET;
+      overLimitBudget = config.overLimitBudgetPoints;
       overLimitReadings = [];
     }
   } else {
@@ -1151,11 +1251,39 @@ export function ingestReading(
  * At 4 a severe reading still needs a partner (as it did at 5), while a
  * moderate pair or four mild readings act sooner — which is where the live
  * latency actually was.
+ *
+ * Independent of the configured capacity (`overLimitBudgetPoints`, 4–20): at
+ * the minimum capacity of 4 this refill is FULL, not partial, which is exactly
+ * why that minimum is 4. A bigger bucket only means the post-act state is a
+ * smaller share of it, never that one severe reading can empty it.
  */
 export const OVER_LIMIT_BUDGET_AFTER_ACT = OVER_LIMIT_DRAIN_SEVERE + 1;
 
-export function refillBucket(state: MeterState, points = OVER_LIMIT_BUDGET): MeterState {
+/**
+ * `points` is REQUIRED: the full refill is the configured capacity, which only
+ * the caller knows, and a default here would silently refill a capacity-8 bucket
+ * to 5 the day the knob left its default.
+ */
+export function refillBucket(state: MeterState, points: number): MeterState {
   return { ...state, overLimitBudget: points, overLimitReadings: [] };
+}
+
+/**
+ * Re-scale a live bucket when the configured capacity changes under it, PRESERVING
+ * SPENT DEBT: the points already drained by this episode's readings stay drained,
+ * so a capacity raise mid-overload does not hand the house a fresh full bucket,
+ * and a capacity cut keeps that same debt against the smaller capacity.
+ *
+ * The floor at 0 is the honest end of a shrink: when the episode has already
+ * spent more points than the new capacity holds, the bucket is EMPTY and the next
+ * over-limit reading acts. Choosing less tolerance than an episode has already
+ * used is a decision to stop tolerating it, not a debt to forgive. An untouched
+ * bucket has spent nothing, so it simply becomes full at the new capacity.
+ */
+export function applyBucketCapacity(state: MeterState, prevMax: number, nextMax: number): MeterState {
+  const spent = Math.max(0, prevMax - state.overLimitBudget);
+  const next = Math.max(0, nextMax - spent);
+  return next === state.overLimitBudget ? state : { ...state, overLimitBudget: next };
 }
 
 /**
@@ -1196,6 +1324,7 @@ export function meterView(state: MeterState, now: number): MeterView {
     flickerAmps: stale ? 0 : flickerAmps(state),
     flickerMarginAmps: stale ? 0 : flickerMarginAmps(state),
     commandedCutCreditAmps: pendingCutCredit(state, now),
+    spendableCreditAmps: spendableCredit(state, now),
     ...liveCutFigures(state.pendingCut, now),
   };
 }

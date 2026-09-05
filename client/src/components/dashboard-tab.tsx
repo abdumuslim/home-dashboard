@@ -11,6 +11,7 @@ import { AirQualitySection } from "./sections/air-quality-section";
 import { PrayerSectionHeader, PrayerSectionContent } from "./sections/prayer-section";
 import { ForecastSection } from "./sections/forecast-section";
 import { BatteryIndicator } from "./ui/battery-indicator";
+import { XiaomiVerifyPrompt } from "./ui/xiaomi-verify-prompt";
 
 interface DashboardTabProps {
   weather: WeatherReading | null;
@@ -26,10 +27,21 @@ interface DashboardTabProps {
 
 export function DashboardTab({ weather, air, weatherHistory, airHistory, openOverlay, power, powerHistory, isAdmin, forecast }: DashboardTabProps) {
   const { order, collapsed, toggleCollapsed, moveUp, moveDown } = useSectionLayout();
-  const { devices, sendControl } = useDevices(isAdmin);
+  const {
+    devices,
+    sendControl,
+    available: devicesAvailable,
+    error: devicesError,
+    loading: devicesLoading,
+    authState,
+    submitVerification,
+    requestRelogin,
+  } = useDevices(isAdmin);
   const { devices: acDevices, sendControl: acSendControl } = useAcDevices(isAdmin);
 
   const visibleOrder = isAdmin ? order : order.filter((id) => id !== "indoor");
+  // Don't flash an outage on first paint, before the first /api/devices response lands
+  const purifiersAvailable = devicesLoading || devicesAvailable;
 
   const sections: Record<SectionId, { header: ReactNode; headerRight?: ReactNode; content: ReactNode }> = {
     outdoor: {
@@ -50,6 +62,8 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
           airHistory={airHistory}
           openOverlay={openOverlay}
           devices={devices}
+          purifiersAvailable={purifiersAvailable}
+          purifiersError={devicesError}
           sendControl={sendControl}
           acDevices={acDevices}
           acSendControl={acSendControl}
@@ -85,6 +99,7 @@ export function DashboardTab({ weather, air, weatherHistory, airHistory, openOve
 
   return (
     <div className="max-w-[1536px] mx-auto px-5 pt-2 pb-8">
+      <XiaomiVerifyPrompt authState={authState} onSubmit={submitVerification} onRelogin={requestRelogin} />
       {visibleOrder.map((id, idx) => (
         <SectionWrapper
           key={id}

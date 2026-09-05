@@ -2708,3 +2708,181 @@ describe("2026-08-07 bounce backoff: a bouncing restore is held, not machine-gun
     expect(after).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-08-31 FUNDED SPEND. User: "when there is a budget because of another AC
+// off or level down, it should act instantly based on prediction to turn on an
+// offed AC or level it (or its fan) up."
+//
+// Before this, NOTHING on the spend side consumed the in-flight cut credit: a
+// waiting room sat out the 8-wide median's lag (~12–20 s) AND its calm window
+// AND the next scheduled tick: ~30–45 s for a peer restore, ~130–160 s for a
+// cut fan behind a demote. The credit was already there, model-priced, on the
+// one path invariant 11 allows; it was simply only ever read by the reduce side.
+//
+// The physics licence is invariant 69's, from the other direction: a freed
+// compressor's draw leaves the meter in ~10–40 s while a newly admitted one
+// engages minutes later, so the two never overlap on the line.
+// ---------------------------------------------------------------------------
+describe("ACCEPTANCE: funded spend acts on the freed budget, not on the median (2026-08-31)", () => {
+  /** Saturated three-room house with one room shed and waiting to come back. */
+  const waiting = (fundedSpend: boolean): Scenario =>
+    new Scenario(
+      { ...cfg, fundedSpend },
+      [
+        { ...ABDU, level: 1, demandAmps: 6.0, needDelta: 2, fan: 5 },
+        { ...ABDULLAH, level: 1, demandAmps: 2.2, needDelta: 1, fan: 5 },
+        // Off and waiting: her 2.7A model price does not fit the running house.
+        { ...NAJAT, shed: true, on: false, level: 1, demandAmps: 3.0, needDelta: 1.5 },
+      ],
+      { nonAcAmps: 6.6, source: "gen" },
+    );
+
+  it("a dashboard off funds the waiting room's restore within a tick or two", () => {
+    const s = waiting(true);
+    s.advance(6 * 60); // ramps expire, the refusal is steady ("floors 16.0A vs 14.8A")
+    expect(s.sim("najat").on).toBe(false);
+    s.turnOff("abdu");
+    const t0 = s.now;
+    s.advance(60);
+    const restore = s.commandsSince(t0, "power_on").find((e) => e.cmd.deviceId === "najat");
+    expect(restore, "the freed budget bought the shed room back").toBeDefined();
+    // The whole point: the meter has not moved yet and the calm clock was reset
+    // by the off itself. Live this leg measured ~30–45 s.
+    expect((restore!.at - t0) / 1000).toBeLessThanOrEqual(15);
+    // LOUD: a funded admission jumps a calm window on a prediction.
+    const admitted = s.plans
+      .flatMap((p) => p.decisions)
+      .find((d) => d.deviceId === "najat" && String(d.action).startsWith("restore @L"));
+    expect(admitted?.detail).toContain("funded by in-flight cut");
+    expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps);
+  });
+
+  it("…and the kill-switch puts it back behind the median and the calm window", () => {
+    const s = waiting(false);
+    s.advance(6 * 60);
+    s.turnOff("abdu");
+    const t0 = s.now;
+    s.advance(60);
+    const restore = s.commandsSince(t0, "power_on").find((e) => e.cmd.deviceId === "najat");
+    // She still comes back, just not until the meter has shown the fall and the
+    // restore calm window has run (the pre-2026-08-31 behaviour, verbatim).
+    expect(restore).toBeDefined();
+    expect((restore!.at - t0) / 1000).toBeGreaterThan(15);
+  });
+
+  /**
+   * A cut fan, a calm line, and the freeing event landing INSIDE the fan's own
+   * `FAN_RESTORE_AFTER_CUT_MS` window. Every room is satisfied (`needDelta` inside
+   * `nearTargetBandC`) so no level competes for the amps and the reducer's only
+   * rung is the fan, which is the house the 2026-08-06 bounce lived in.
+   */
+  const fanHouse = (fundedSpend: boolean): Scenario =>
+    new Scenario(
+      { ...cfg, fundedSpend },
+      [
+        { ...ABDULLAH, level: 1, minLevel: 1, demandAmps: 2.2, needDelta: 0.4, fan: 5 },
+        { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 0.4, fan: 7 },
+        { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 0.4, fan: 5 },
+      ],
+      { nonAcAmps: 3.0, source: "gen", seed: 20260831 },
+    );
+
+  /** Run the overload that trims the fans, then relieve and let the line settle. */
+  const trimThenRelieve = (s: Scenario): number => {
+    s.advance(5 * 60);
+    s.setNonAc(6.5); // over by ~0.8A with every room already at its floor
+    s.advance(60);
+    const cuts = s.commandsSince(s.now - 60_000, "set_fan").filter((e) => e.cmd.deviceId === "abdu");
+    expect(cuts.length, "the overload trimmed the tracked fan").toBeGreaterThan(0);
+    expect(s.sim("abdu").fan).toBe(1);
+    s.setNonAc(4.0); // relief: comfortably under again, bucket refills, calm returns
+    s.advance(55);
+    return cuts[cuts.length - 1].at;
+  };
+
+  it("a peer's off brings a cut fan home in ONE jump, inside the after-cut window", () => {
+    const s = fanHouse(true);
+    const lastCutAt = trimThenRelieve(s);
+    s.turnOff("abdullah");
+    const t0 = s.now;
+    // Still inside FAN_RESTORE_AFTER_CUT_MS: the wait the credit waives.
+    expect(t0 - lastCutAt).toBeLessThan(FAN_RESTORE_AFTER_CUT_MS);
+    s.advance(30);
+    expect(s.sim("abdu").fan, "the fan is home").toBe(7);
+    const steps = s.commandsSince(t0, "set_fan").filter((e) => e.cmd.deviceId === "abdu");
+    expect(steps, "ONE jump home, not a 2-gear climb").toHaveLength(1);
+    expect(steps[0].at - lastCutAt).toBeLessThan(FAN_RESTORE_AFTER_CUT_MS);
+    const admitted = s.plans
+      .flatMap((p) => p.decisions)
+      .find((d) => d.deviceId === "abdu" && String(d.action).startsWith("fan restore step"));
+    expect(admitted?.action).toContain("funded by in-flight cut");
+  });
+
+  it("…and without the credit the same fan waits the anti-bounce window out", () => {
+    const s = fanHouse(false);
+    const lastCutAt = trimThenRelieve(s);
+    s.turnOff("abdullah");
+    s.advance(30);
+    // The control: same house, same off, and the fan is still down because the
+    // after-cut window has not expired.
+    expect(s.now - lastCutAt).toBeLessThan(FAN_RESTORE_AFTER_CUT_MS);
+    expect(s.sim("abdu").fan).toBeLessThan(7);
+  });
+
+  it("ONE credit cannot fund two spenders across consecutive ticks", () => {
+    // The 2026-08-01 phantom-house fixture, which is the cleanest raise-side
+    // shape there is: Abdullah's ~3.6A off, and Abdu (the hot room) wanting
+    // 2.4A-a-step levels. Two steps is 4.8A out of 3.6A freed, and the first
+    // build of this feature shipped exactly that, because the credit still
+    // counted a fall the median had already shown (see `spendableCredit`).
+    const s = new Scenario(
+      cfg,
+      [
+        { ...ABDULLAH, level: 2, minLevel: 2, demandAmps: 3.5, needDelta: 0.6 },
+        { ...NAJAT, level: 1, demandAmps: 3.0, needDelta: 1.1 },
+        { ...ABDU, level: 1, demandAmps: 9.0, needDelta: 2.4 },
+      ],
+      { nonAcAmps: 3.4, source: "gen" },
+    );
+    s.advance(6 * 60);
+    s.turnOff("abdullah");
+    const t0 = s.now;
+    s.advance(4 * 60);
+    const raises = setLevels(s, t0).filter((e) => e.cmd.deviceId === "abdu");
+    expect(raises.map((e) => e.cmd.level), "ONE step, not two").toEqual([2]);
+    // …and the house is left inside the resting band the raise path aims at,
+    // not riding the limit on amps it spent twice.
+    expect(s.totalAmps()).toBeLessThanOrEqual(cfg.genLimitAmps - cfg.marginAmps);
+  });
+
+  it("a STALLED credit funds nothing: the house outran the cut", () => {
+    // A room goes off and a household load of the same size comes on in the same
+    // moment, so the meter never falls: the credit's premise ("these amps are
+    // late") is false, and `cutTrendOf` says so once the landing grace is up.
+    //
+    // ⚠ The first `CREDIT_LANDING_GRACE_MS` of ANY credit is `settling` by
+    // design (invariant 48: fast actuators are never called liars for physics
+    // they have not had time to deliver), so what a scenario can pin is the state
+    // after the grace, plus the outcome. The gate itself is pinned in
+    // `sensing.test.ts` ("spendableCredit").
+    // Abdullah is the room that goes: his 2.5A model does NOT cover Najat's 2.7A
+    // return with the margin to spare, so no funded admission is possible in the
+    // `settling` phase either and the whole window is one clean statement.
+    const s = waiting(true);
+    s.advance(6 * 60);
+    const before = s.totalAmps();
+    s.turnOff("abdullah");
+    s.setNonAc(6.6 + (before - s.totalAmps())); // a heater replaces exactly what the room drew
+    const t0 = s.now;
+    s.advance(90);
+    expect(Math.abs(s.totalAmps() - before), "the meter never moved").toBeLessThan(0.3);
+    const view = meterView(s.meterState, s.now);
+    expect(view.commandedCutCreditAmps, "the demand side still holds the credit").toBeGreaterThan(0);
+    expect(view.spendableCreditAmps, "…and the spend side refuses it").toBe(0);
+    // Nothing was bought with it: the room the credit would have funded is still
+    // off, and no raise took the amps either.
+    expect(s.sim("najat").on).toBe(false);
+    expect(setLevels(s, t0).filter((e) => e.cmd.level > 1)).toHaveLength(0);
+  });
+});

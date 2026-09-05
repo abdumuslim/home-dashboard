@@ -675,7 +675,10 @@ export class Scenario {
     if (this.line !== "none" && ac.on && !ac.shed) {
       const draw = this.drawOf(ac);
       if (draw > 0) {
-        this.meterState = noteCommandedCut(this.meterState, draw, this.now);
+        // Shell parity (2026-08-31): an off by another hand frees budget the
+        // limit never asked for, so its credit is SPENDABLE: a waiting room may
+        // be admitted against it before the meter shows the fall.
+        this.meterState = noteCommandedCut(this.meterState, draw, this.now, { spendable: true });
         // Shell parity: an observed off is a peer removal for any bounce-extended
         // shed bar (invariant 54's release valve, 2026-08-07).
         this.creditPeerShedBars(draw, new Set([deviceId]));
@@ -1485,7 +1488,13 @@ export class Scenario {
       // set by reduce batches and silently missed demotes, funding swaps, and
       // the gen start clamp.
       if (out.commandedCutAmps > 0) {
-        this.meterState = noteCommandedCut(this.meterState, out.commandedCutAmps, this.now);
+        // Shell parity (2026-08-31): only the IDLE DEMOTE's freed amps are a
+        // spender's to take. An over-limit reduction's belong to the breaker, a
+        // FLOORS clamp's to the entry policy, and a restore's floor-downs are
+        // paying for the turn-on in their own batch.
+        this.meterState = noteCommandedCut(this.meterState, out.commandedCutAmps, this.now, {
+          spendable: out.reason === "demote",
+        });
       }
       // Shell parity (belt, 2026-08-08): a commanded OFF arms the house sampler's
       // drop cooldown directly, so a commanded off cannot be booked as house even
@@ -1496,7 +1505,7 @@ export class Scenario {
       }
       // Shell parity: a turn-on invalidates banked over-limit readings.
       if (out.commands.some((c) => c.kind === "power_on")) {
-        this.meterState = refillBucket(this.meterState);
+        this.meterState = refillBucket(this.meterState, this.cfg.overLimitBudgetPoints);
       }
       if (out.reason.startsWith("over")) {
         // Shell parity: the ladder acted — the comfort trade stands down.

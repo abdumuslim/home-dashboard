@@ -261,6 +261,38 @@ export const REBALANCE_NEED_GAP_C = 0.7;
 export const REBALANCE_FUND_MARGIN_AMPS = 0.5;
 
 /**
+ * FUNDED SPEND (2026-08-31): may this step be paid for out of budget a cut has
+ * already freed but the meter has not shown yet (`MeterView.spendableCreditAmps`)?
+ *
+ * ONE test, shared by the shed restore, the level raise and the fan restore, so
+ * three admission paths cannot drift apart about what "the credit covers it"
+ * means. The margin is `REBALANCE_FUND_MARGIN_AMPS` deliberately, and it is invariant
+ * 69's own margin, sized against this generator's measured noise band, for the
+ * same trade (a saving priced from the model against a spend priced from the
+ * model). Inventing a second constant here would mean the one-batch swap and
+ * the funded restore disagree about a margin they both exist to survive.
+ *
+ * The `> 0` guard is what makes the whole feature vanish when the caller passes
+ * 0: with no credit nothing is ever funded, so a zero (kill-switch off, stalled
+ * cut, frozen meter) is byte-identical to the admission this extends.
+ */
+export function fundedByCredit(costAmps: number, spendableCreditAmps: number): boolean {
+  return spendableCreditAmps > 0 && costAmps <= spendableCreditAmps - REBALANCE_FUND_MARGIN_AMPS;
+}
+
+/**
+ * The journal note every funded admission carries. A funded spend jumps a calm
+ * window (and, in the SETTLING lane, a settle window) on a PREDICTION, so it may
+ * never be silent: a step admitted against amps the meter has not shown and a
+ * step admitted against a meter that really fell are the same line in a command
+ * log, told apart only by this (invariants 57/60: a silent fast path is the
+ * next forensic mystery).
+ */
+export function fundedNote(spendableCreditAmps: number): string {
+  return `funded by in-flight cut (${spendableCreditAmps.toFixed(1)}A credit)`;
+}
+
+/**
  * How much HOTTER a shed room must be than a RUNNING peer before that peer's
  * WHOLE ROOM is traded for it — the gated proactive shed (user, 2026-08-06,
  * after the 02:21–02:49 heater episode: *"after Najat on and be stable, there
@@ -498,6 +530,27 @@ export interface RaiseInput {
   cutAnchorAmps?: number;
   /** What that in-flight cut was priced to save (0/absent when none). */
   commandedCutAmps?: number;
+  /**
+   * Budget an off/demote/level-down has already freed that the meter has not
+   * shown yet (`MeterView.spendableCreditAmps`), or 0 when there is none, and 0
+   * whenever `config.fundedSpend` is off, which is how the kill-switch reverts
+   * every path below to its meter-only admission.
+   *
+   * Spent in exactly TWO places, both once: subtracted from `committedAmps` (so a
+   * shed restore is judged on the meter the off is taking us to, never below
+   * `landingAmps`) and added ONCE into the raise phase's `available`. Never
+   * per-candidate, or one credit would fund every room in the list.
+   */
+  spendableCreditAmps?: number;
+  /**
+   * The SETTLING funded lane (2026-08-31): a batch is still landing, so ONLY a
+   * spender the in-flight cut pays for may ship: everything else is blocked
+   * exactly as the settle window blocks it today. Entry policies (grid start,
+   * warm restore) and funding demotes are out of the lane entirely: a cut is
+   * already travelling, and this lane exists to SPEND it, not to plan another.
+   * Defaults to false, i.e. the ordinary calm-tick admission.
+   */
+  fundedOnly?: boolean;
   limitAmps: number;
   calmMs: number;
   config: LevelingConfigV2;
@@ -819,10 +872,30 @@ export function planRaise(input: RaiseInput): RaisePlan {
    */
   const cutAnchor = input.cutAnchorAmps ?? 0;
   const landingAmps = cutAnchor > 0 ? cutAnchor - (input.commandedCutAmps ?? 0) : 0;
-  // The meter plus the load already on its way to it — the honest picture of
-  // what this house is committed to right now — and never below where a cut in
-  // flight is taking it.
-  const committedAmps = Math.max(input.smoothedAmps + input.rampDebitAmps, landingAmps);
+  /**
+   * FUNDED SPEND (2026-08-31, user: "when there is a budget because of another AC
+   * off or level down, it should act instantly based on prediction to turn on an
+   * offed AC"). The amps a cut has freed and the meter has not shown yet are
+   * subtracted from the committed picture, so a waiting room comes back on the
+   * PREDICTION instead of waiting out the 8-wide median's ~12–20 s lag on top of
+   * its calm window (best case measured at ~30–45 s from the off).
+   *
+   * The `landingAmps` floor below is what makes this safe by construction, and it
+   * is invariant 41 unchanged: `landingAmps` IS the predicted post-cut meter, the
+   * subtraction converges to exactly that figure as the cut lands, and `max()`
+   * can never take the committed meter BELOW it. So the room's own shed trough
+   * (41/54) is still disbelieved, and the credit only ever buys back the lag
+   * between the command and the median, never the trough itself.
+   */
+  const spendableCreditAmps = Math.max(0, input.spendableCreditAmps ?? 0);
+  const fundedOnly = input.fundedOnly === true;
+  // The meter plus the load already on its way to it, less the load already on
+  // its way OFF it: the honest picture of what this house is committed to right
+  // now, and never below where a cut in flight is taking it.
+  const committedAmps = Math.max(
+    input.smoothedAmps + input.rampDebitAmps - spendableCreditAmps,
+    landingAmps,
+  );
   const rampNote = input.rampDebitAmps > 0 ? ` (+${input.rampDebitAmps.toFixed(1)}A ramping in)` : "";
   /**
    * The same claim as `landingAmps`, but about ONE room and for longer: where
@@ -881,7 +954,14 @@ export function planRaise(input: RaiseInput): RaisePlan {
     const target = Math.min(ac.currentLevel + 1, floorOf(ac));
     if (envelopeGuard && raiseEnvelope({ [ac.deviceId]: target }) > envelopeCeiling) return false;
     const step = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, target, ac.maxLevel, now);
-    return step.amps <= input.headroomAmps - input.rampDebitAmps;
+    // The SAME budget the restore admission below is judged against, credit
+    // included (2026-08-31). Two views of one house is how the ordering inverts:
+    // with a freed-but-unmetered credit live, the shed room's admission could
+    // afford itself while this test still read the bare meter, called the floor
+    // recovery unaffordable, and let a LESS needy room take the amps a room
+    // stranded below its active comfort floor was waiting for. Invariant 36's
+    // own incident, arriving through the funded path.
+    return step.amps <= input.headroomAmps - input.rampDebitAmps + spendableCreditAmps;
   };
 
   const swapInFlight = input.swapInFlight ?? null;
@@ -1141,6 +1221,17 @@ export function planRaise(input: RaiseInput): RaisePlan {
     const fits = admitted.fits;
     const fitsPlain = fits.plain;
     const fitsAtFloors = fits.atFloors;
+    /**
+     * Is this room's whole return paid for by a cut already in flight? Priced at
+     * exactly what admission charges (`cost`, probe resolution included) against
+     * exactly the credit the meter view publishes: the two figures a funded
+     * admission is a claim about. Only the CALM gate is waived by it (below):
+     * the shed-trough bar, the bounce backoff, the awaiting-confirm park, the
+     * flicker patience anchor, the manual-off rules and the ordering are all
+     * about something other than "has the line been quiet long enough", and none
+     * of them is answered by knowing where the meter is heading.
+     */
+    const funded = fundedByCredit(cost.amps, spendableCreditAmps);
     const bar = barFor(candidate.deviceId);
     /**
      * Would it fit if we judged it on the trough its own shed dug? The BARE
@@ -1254,6 +1345,10 @@ export function planRaise(input: RaiseInput): RaisePlan {
       !fitsPlain &&
       !fitsAtFloors &&
       input.swapAllowed === true &&
+      // …and never in the funded lane, whose contract is "spend a credit, not
+      // plan another cut". The caller already gates the trade on NORMAL mode, so
+      // this is a belt on a pure function that could be called either way.
+      !fundedOnly &&
       swapInFlight == null &&
       // Only the HOTTEST shed room may be bought back this way. A cooler
       // candidate reaching for a donor would be trading rooms sideways, and the
@@ -1457,7 +1552,14 @@ export function planRaise(input: RaiseInput): RaisePlan {
 
     // Feasible but waiting out its calm gate: reserve its amps and STOP — no
     // queue-jumping past a needier room that is merely time-gated.
-    if (!restoreCalmOk) {
+    //
+    // …unless the in-flight cut PAYS for it (2026-08-31). The calm window asks
+    // "has the line settled enough to carry more load", and a credit answers a
+    // strictly better version of that question: these amps were on this line
+    // seconds ago and are leaving it now, so the settled figure is already known.
+    // Waiting the window out on top of the median's own lag is what made a
+    // dashboard off take ~30–45 s to reach a waiting room.
+    if (!restoreCalmOk && !funded) {
       reservedAmps = Math.max(reservedAmps, cost.amps);
       decisions.push({
         at: now,
@@ -1465,6 +1567,25 @@ export function planRaise(input: RaiseInput): RaisePlan {
         action: "restore",
         blockedBy: "calm",
         detail: `reserved ${cost.amps.toFixed(1)}A`,
+      });
+      break;
+    }
+    // The SETTLING lane: a batch is still landing, so only a spender that cut
+    // pays for may ship, and it must fit PLAIN. A room that needs peer
+    // floor-downs to fit is asking for a second cut inside the window the first
+    // one opened, which is what this lane exists NOT to do; it ships normally one
+    // tick later. `break`, not `continue`: the ordering rule is unchanged, a
+    // milder room may not jump a needier one just because it is cheaper.
+    if (fundedOnly && !(funded && fitsPlain)) {
+      decisions.push({
+        at: now,
+        deviceId: candidate.deviceId,
+        action: "restore",
+        blockedBy: "settle window",
+        detail: funded
+          ? `${cost.amps.toFixed(1)}A is funded but needs peer floor-downs, not inside a settle window`
+          : `needs ${cost.amps.toFixed(1)}A, in-flight cut covers ` +
+            `${spendableCreditAmps.toFixed(1)}A − ${REBALANCE_FUND_MARGIN_AMPS.toFixed(1)}A margin`,
       });
       break;
     }
@@ -1489,7 +1610,11 @@ export function planRaise(input: RaiseInput): RaisePlan {
     const patienceDetail = flickerPatienceExpired
       ? `flicker patience: admitted at bare ceiling after ${((now - (flickerAnchorAt ?? now)) / 1000).toFixed(0)}s`
       : undefined;
-    const admitDetail = [probeDetail, patienceDetail].filter(Boolean).join(" · ") || undefined;
+    // LOUD when the credit is what admitted this room: it jumped a calm window
+    // (or a settle window) on a prediction, and a prediction that turns out wrong
+    // re-sheds into invariant 67's bounce ladder. Say so in the journal.
+    const fundedDetail = funded ? fundedNote(spendableCreditAmps) : undefined;
+    const admitDetail = [probeDetail, patienceDetail, fundedDetail].filter(Boolean).join(" · ") || undefined;
     if (fitsPlain) {
       commands.push(restoreCmd());
       attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: candidateCommitted });
@@ -1548,7 +1673,19 @@ export function planRaise(input: RaiseInput): RaisePlan {
   // steady draw of the AC that just came on (see gridStartLevel).
   // …minus what ramping compressors have committed but not yet spent on the
   // meter, or a peer raise buys amps a neighbour is already on its way to using.
-  let available = input.headroomAmps - input.rampDebitAmps;
+  // …plus the amps a cut we commanded has already freed and the meter has not
+  // shown yet (2026-08-31). Added ONCE, to the phase budget, never per
+  // candidate, or one 2.5A credit would fund a 2A step in every room on the
+  // list. Each admission below debits `available` by its own jump, so the credit
+  // is consumed by the first spender exactly like ordinary headroom is, and the
+  // remainder (if any) is genuinely still free.
+  //
+  // UNCHANGED and still binding above this figure: the physics envelope plus the
+  // measured house (invariant 16), which is end-state-predictive and is the
+  // safety net for exactly this feature, since it prices a room switched off at
+  // its full worst-case level until the shadow says otherwise. Also the ramp debits
+  // (12), the gen start-floor clamp (13) and the victim/funding cooldowns (30/35).
+  let available = input.headroomAmps - input.rampDebitAmps + spendableCreditAmps;
   const raiseCalmOk = input.calmMs >= config.raiseCalmSeconds * 1000;
   const restingCeiling = input.limitAmps - config.marginAmps - config.restingBufferAmps;
 
@@ -1686,6 +1823,13 @@ export function planRaise(input: RaiseInput): RaisePlan {
       decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "victim cooldown" });
       continue;
     }
+    /**
+     * Is this room's next step paid for by a cut already in flight? Set only on
+     * the ORDINARY raise path below: a grid start and a warm restore are entry
+     * policies with their own pricing (a whole steady draw against a pre-start
+     * baseline, a recently-proven level), neither of which the credit describes.
+     */
+    let fundedRaise = false;
     // Grid turn-on full start (user directive "on grid start all to full"):
     // an AC that just came on restores its last gen level (usually L1 from the
     // previous gen episode) — lift it to the affordable ceiling in ONE command
@@ -1696,7 +1840,13 @@ export function planRaise(input: RaiseInput): RaisePlan {
     const startTarget =
       startBaseline == null
         ? null
-        : gridStartLevel(ac, ceil, config, restingCeiling - (input.headroomAmps - available));
+        // `+ spendableCreditAmps` inside the subtraction, so this ceiling reads
+        // exactly what it read before the credit existed: a grid start is priced
+        // against its own PRE-START baseline (the rest of the house), and a
+        // credit is already part of that baseline's future, so folding it in here
+        // as well would spend it twice on the one path that does not anchor on
+        // the meter at all.
+        : gridStartLevel(ac, ceil, config, restingCeiling - (input.headroomAmps + spendableCreditAmps - available));
     const warmTarget =
       ac.warmStartLevel != null && ac.warmStartLevel > ac.currentLevel
         ? Math.min(ac.warmStartLevel, ceil)
@@ -1717,10 +1867,20 @@ export function planRaise(input: RaiseInput): RaisePlan {
         continue;
       }
     } else if (warmTarget == null) {
-      if (!raiseCalmOk) {
+      // The step this candidate would take, priced now so the calm gate can ask
+      // whether an in-flight cut PAYS for it (2026-08-31). Exact, not an
+      // estimate: an ordinary raise targets `currentLevel + 1` and the envelope
+      // loop below can only ever lower that, in which case the room is refused
+      // outright, so nothing more expensive than this can be admitted here.
+      const step = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, ac.currentLevel + 1, ac.maxLevel, now);
+      fundedRaise = fundedByCredit(step.amps, spendableCreditAmps);
+      if (!raiseCalmOk && !fundedRaise) {
         decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "calm" });
         continue;
       }
+      // The ramp gate is NOT waived: a room's own committed-but-unmetered draw
+      // is not budget the credit can hand out (invariants 1/12), and a credit
+      // says nothing about a compressor that is still climbing.
       if (ac.ramping) {
         decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "ramping" });
         continue;
@@ -1740,6 +1900,22 @@ export function planRaise(input: RaiseInput): RaisePlan {
       const desired = target;
       while (target > ac.currentLevel && raiseEnvelope({ [ac.deviceId]: target }) > envelopeCeiling) target--;
       if (target === ac.currentLevel) {
+        // …but NOT in the funded lane. A settle window is no time to go shopping
+        // for a funding demote: this lane exists to spend a credit that is
+        // already travelling, not to plan a second cut on top of it (2026-08-31).
+        // The meter-blocked trade below is unreachable here for the same reason
+        // by arithmetic (the lane admits only `jump ≤ available`); this branch
+        // runs BEFORE that guard, so it needs its own.
+        if (fundedOnly) {
+          decisions.push({
+            at: now,
+            deviceId: ac.deviceId,
+            action: `raise L${desired}`,
+            blockedBy: "settle window",
+            detail: `physics envelope refuses it and a funding demote may not be planned inside a settle window`,
+          });
+          continue;
+        }
         // FUNDING SWAP, envelope-blocked case. The cap models object, but the
         // METER may already hold the amps — and the peers standing in the way
         // are satisfied, i.e. drawing well under the caps the envelope charges
@@ -1841,6 +2017,22 @@ export function planRaise(input: RaiseInput): RaisePlan {
       }
     }
     const jump = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, target, ac.maxLevel, now);
+    // The SETTLING lane (2026-08-31): while a batch is still landing, the only
+    // step that may ship is one the in-flight cut pays for AND the budget already
+    // holds. No funding demotes and no entry policies here: a cut is already
+    // travelling, and this lane exists to spend that one, not to plan another.
+    if (fundedOnly && !(fundedRaise && jump.amps <= available)) {
+      decisions.push({
+        at: now,
+        deviceId: ac.deviceId,
+        action: `raise L${target}`,
+        blockedBy: "settle window",
+        detail:
+          `needs ${jump.amps.toFixed(1)}A, in-flight cut covers ${spendableCreditAmps.toFixed(1)}A ` +
+          `− ${REBALANCE_FUND_MARGIN_AMPS.toFixed(1)}A margin (${Math.max(0, available).toFixed(1)}A available)`,
+      });
+      continue;
+    }
     // A grid start was already admitted against its pre-start baseline — the
     // meter cannot price it while the compressor is still ramping.
     if (startTarget == null && jump.amps > available) {
@@ -1937,7 +2129,12 @@ export function planRaise(input: RaiseInput): RaisePlan {
         at: now,
         deviceId: ac.deviceId,
         action: `raise L${ac.currentLevel}→L${target}`,
-        detail: `${jump.amps.toFixed(1)}A ${jump.confidence}`,
+        // LOUD when the credit is what admitted this step: it may have jumped the
+        // raise calm window (or a settle window) on a prediction, and a silent
+        // one is the next forensic mystery.
+        detail:
+          `${jump.amps.toFixed(1)}A ${jump.confidence}` +
+          (fundedRaise ? ` · ${fundedNote(spendableCreditAmps)}` : ""),
       });
       available -= jump.amps;
     }

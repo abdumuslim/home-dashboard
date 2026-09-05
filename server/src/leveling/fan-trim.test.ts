@@ -554,4 +554,91 @@ describe("planFanRestore", () => {
       ).toBeNull();
     });
   });
+
+  // 2026-08-31, user: "when there is a budget because of another AC off or level
+  // down, it should act instantly ... [or] its fan up". A live credit bigger than
+  // the whole remaining swing is evidence the house changed by more than the
+  // swing costs, so the two clocks that made a fan wait ~130–160 s for a peer's
+  // demote (the after-cut window and the first-gear minute) are waived for
+  // that one admission. The gear bound goes with them: it is the same fast-path
+  // shape, so the fan comes home in ONE command.
+  describe("funded fast path (2026-08-31)", () => {
+    /** Cut 10s ago: deep inside FAN_RESTORE_AFTER_CUT_MS, calm nowhere near 60s. */
+    const justCut = () => recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - 10_000);
+
+    it("a credit covering the whole swing waives the after-cut window AND the first-gear calm", () => {
+      const holds = justCut();
+      const tight = opts({ calmMs: 0, headroomAmps: 0.1 });
+      // Unfunded, this is refused twice over (the window and the calm gate).
+      expect(planFanRestore(holds, [ac("a", { fanSpeed: 1 })], tight)).toBeNull();
+      // The 6-gear swing prices at FAN_FULL_DROP_DEFAULT_AMPS (0.5); the credit
+      // covers it with REBALANCE_FUND_MARGIN_AMPS to spare, and `headroomAmps`
+      // carries the same credit at the call site.
+      const step = planFanRestore(
+        holds,
+        [ac("a", { fanSpeed: 1 })],
+        opts({ calmMs: 0, headroomAmps: 0.1 + 2.5, spendableCreditAmps: 2.5 }),
+      );
+      expect(step, "the freed budget brought it home").not.toBeNull();
+      expect(step!.command).toMatchObject({ fan: 7, reason: "trim_restore" }); // ONE jump
+      expect(step!.final).toBe(true);
+      expect(step!.action, "a silent fast path is the next forensic mystery").toContain(
+        "funded by in-flight cut",
+      );
+    });
+
+    it("a credit that does NOT cover the swing with margin changes nothing", () => {
+      // 0.5A swing needs 1.0A of credit to clear REBALANCE_FUND_MARGIN_AMPS.
+      const step = planFanRestore(
+        justCut(),
+        [ac("a", { fanSpeed: 1 })],
+        opts({ calmMs: 0, headroomAmps: 5, spendableCreditAmps: 0.9 }),
+      );
+      expect(step).toBeNull();
+    });
+
+    it("a proven BOUNCER keeps its compounded after-cut wait, funded or not", () => {
+      // SETTLE, don't bounce (2026-07-31): the one hold whose own restores have
+      // been re-cut is not handed a shortcut, exactly as FIX B leaves it.
+      const bounced: FanHolds = {
+        a: {
+          deviceId: "a", originalFan: 7, lastSetFan: 1, heldAt: T - 300_000, fromCut: true,
+          lastCutAt: T - 10_000, bounces: 1,
+        },
+      };
+      expect(
+        planFanRestore(bounced, [ac("a", { fanSpeed: 1 })], opts({ calmMs: 0, headroomAmps: 5, spendableCreditAmps: 2.5 })),
+      ).toBeNull();
+    });
+
+    it("still never climbs into the room's OWN ramp", () => {
+      // Invariant 59: a room's committed-but-unmetered draw is exactly what its
+      // fan would be sitting on top of. No credit answers that question.
+      expect(
+        planFanRestore(
+          justCut(),
+          [ac("a", { fanSpeed: 1, ramping: true })],
+          opts({ calmMs: 0, headroomAmps: 5, spendableCreditAmps: 2.5 }),
+        ),
+      ).toBeNull();
+    });
+
+    it("fundedOnly (the SETTLING lane) admits ONLY a funded swing", () => {
+      // A continuation gear's 20s spacing fits inside a 30s settle window, so
+      // without this an unfunded step would ship in the lane.
+      const cooled = recordFanCut({}, ac("a", { fanSpeed: 7 }), 1, T - FAN_RESTORE_AFTER_CUT_MS);
+      const wideOpen = opts({ calmMs: FAN_RESTORE_CALM_MS, headroomAmps: 5 });
+      expect(planFanRestore(cooled, [ac("a", { fanSpeed: 1 })], wideOpen)).not.toBeNull();
+      expect(
+        planFanRestore(cooled, [ac("a", { fanSpeed: 1 })], { ...wideOpen, fundedOnly: true }),
+      ).toBeNull();
+      expect(
+        planFanRestore(cooled, [ac("a", { fanSpeed: 1 })], {
+          ...wideOpen,
+          fundedOnly: true,
+          spendableCreditAmps: 2.5,
+        }),
+      ).not.toBeNull();
+    });
+  });
 });

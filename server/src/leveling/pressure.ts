@@ -38,9 +38,10 @@ export const EMERGENCY_SHED_OVERSHOOT_FRACTION = 0.2;
  *
  * Two is the smallest number that can distinguish load from a spike, and it
  * costs no reaction time on a genuine step-up: the leaky bucket needs
- * OVER_LIMIT_DRAIN_SEVERE (3) per severe reading out of a 5-point budget, so a
- * real step has always banked its second severe reading by the time the bucket
- * empties and this function is consulted at all. What a lone spike falls back
+ * OVER_LIMIT_DRAIN_SEVERE (3) per severe reading out of the configured capacity
+ * (`overLimitBudgetPoints`, default 5, minimum 4), so a real step has always
+ * banked its second severe reading by the time the bucket empties and this
+ * function is consulted at all. What a lone spike falls back
  * to is not nothing — it is the median/smoothed sizing, whose floor IS the
  * smoothed overshoot: the honest figure for a house whose mean sits at the line.
  */
