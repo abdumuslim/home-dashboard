@@ -1576,6 +1576,85 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
   }
 
+  // "Turn off once back online" (owner request 2026-10-09): the grid-only
+  // Guest AC drops offline while ON whenever the house runs on generator. Arm a
+  // one-shot plain OFF that the collector's off-when-online step sends on the
+  // unit's first fresh report (no manual-off lock: owner decision 2026-10-10).
+  router.post("/api/ac/devices/:id/off-when-online", requireAuth, async (req: Request, res: Response) => {
+    const cloud = getTclCloud?.();
+    if (!cloud || !cloud.isReady()) {
+      res.status(503).json({ error: "TCL Cloud not available" });
+      return;
+    }
+    const id = String(req.params.id);
+    const { enabled } = req.body as { enabled?: unknown };
+    if (typeof enabled !== "boolean") {
+      res.status(400).json({ error: "enabled (boolean) is required" });
+      return;
+    }
+    const device = cloud.getDevices().find((d) => d.id === id);
+    if (!device) {
+      res.status(404).json({ error: "Unknown AC device" });
+      return;
+    }
+    if (enabled && device.isOnline) {
+      res.status(409).json({ error: "AC is online now: turn it off directly" });
+      return;
+    }
+    // ACs outside Smart AC Leveling only (leader decision 2026-10-10): a
+    // deferred OFF on a leveled room would bypass the leveler's user-OFF
+    // bookkeeping below (onUserPowerOff/onUserPowerOffSent) and read as an
+    // unexplained draw change (hard rule 5b). A disarm stays allowed for any
+    // id, so a stale arm can always be cleared.
+    if (enabled && isAcLevelingEligible(id)) {
+      res.status(409).json({ error: "Turn off when back online is not available for Smart AC Leveling ACs" });
+      return;
+    }
+    auditAcControl(req, id, "off_when_online", enabled ? 1 : 0);
+    // Answer once the arm file holds the change (a durable acknowledgement; a
+    // disarm, once the file excludes the arm, whichever path removed it from
+    // memory: `TclCloud.offWhenOnlineDurablyAbsent`). A failed write leaves the
+    // change in memory only, and the answer says so.
+    try {
+      await cloud.setOffWhenOnline(id, enabled);
+    } catch (err) {
+      res.status(500).json({
+        error: enabled
+          ? "Armed, but it could not be saved: it is lost if the server restarts"
+          : "Cancelled, but it could not be saved: it comes back if the server restarts",
+        detail: (err as Error).message,
+        offWhenOnline: cloud.isOffWhenOnlineArmed(id),
+      });
+      return;
+    }
+    res.json({ ok: true, offWhenOnline: cloud.isOffWhenOnlineArmed(id) });
+  });
+
+  /**
+   * The control and preset routes cancel an armed "turn off once back online"
+   * at their entry, in memory and synchronously (`cancelOffWhenOnline`). Right
+   * before their success answer they wait until the arm file durably excludes
+   * the device (`offWhenOnlineDurablyAbsent`), whichever path removed the arm
+   * from memory (this cancel, an earlier one, the fetch's terminal OFF) and
+   * whatever became of that path's own write, so a 200 never precedes a
+   * removal that a restart could undo. The user's command itself succeeded
+   * either way: a failed write still answers 200, with a `warning` saying so,
+   * and logs at error level. Nothing to wait for when the file never held the
+   * arm, when an arm accepted since is newer than the cancel, or when the
+   * cloud predates the method.
+   */
+  async function offWhenOnlineCancelSaved(cloud: TclCloud, deviceId: string): Promise<{ warning?: string }> {
+    const durable = cloud.offWhenOnlineDurablyAbsent?.(deviceId);
+    if (!durable) return {};
+    try {
+      await durable;
+      return {};
+    } catch (err) {
+      log.error(`[routes] AC ${deviceId}: the off-when-back-online cancel could not be saved (${(err as Error).message}): it comes back if the server restarts`);
+      return { warning: "Turn off when back online was cancelled, but the cancel could not be saved: it comes back if the server restarts" };
+    }
+  }
+
   router.post("/api/ac/devices/:id/control", requireAuth, async (req: Request, res: Response) => {
     const cloud = getTclCloud?.();
     if (!cloud || !cloud.isReady()) {
@@ -1589,6 +1668,19 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       return;
     }
     try {
+      // A direct power command, ON or OFF, is newer intent than an armed "turn
+      // off once back online": drop the arm FIRST, synchronously at the
+      // request's entry, so only an arm made before this request is cancelled
+      // (one accepted while it waits on validation is newer and survives;
+      // sendControlVerified does not disarm). The step re-checks its arm at
+      // the OFF's publish boundary, so a cancelled arm publishes nothing. A
+      // command that then fails validation has still disarmed: the user
+      // expressed power intent. LOUD (TclCloud logs it). The success answer
+      // waits until the arm file durably excludes the arm
+      // (`offWhenOnlineCancelSaved`). Optional call: older test doubles of the
+      // cloud predate the method.
+      const cancelsOffWhenOnline = command === "set_power";
+      if (cancelsOffWhenOnline) cloud.cancelOffWhenOnline?.(id, "cancelled by direct user power command");
       const validation = await cloud.validateControlLive(id, command, value);
       if (!validation.ok) {
         res.status(validation.status).json({ error: validation.error });
@@ -1693,7 +1785,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       } else if (command === "set_beep") {
         acManualOffLocks?.onUserBeep?.(id, value === 1);
       }
-      res.json({ ok: true });
+      res.json({ ok: true, ...(cancelsOffWhenOnline ? await offWhenOnlineCancelSaved(cloud, id) : {}) });
     } catch (err) {
       // Nothing to unwind on the leveler side: the off's budget is priced only
       // after the send is accepted. The manual-off LOCK deliberately stays (the
@@ -2068,6 +2160,13 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     }
     const cloud = getTclCloud?.();
     if (!cloud || !cloud.isReady()) { res.status(503).json({ error: "TCL Cloud not available" }); return; }
+    // A verified preset is newer user intent than an armed "turn off once back
+    // online": cancel it here, at the request's entry before its first await,
+    // so an arm accepted while this request waits is newer and survives it
+    // (executeAcActionVerified does not disarm). LOUD. The success answer waits
+    // until the arm file durably excludes the arm (`offWhenOnlineCancelSaved`).
+    // Optional call: older test doubles of the cloud predate the method.
+    cloud.cancelOffWhenOnline?.(deviceId, "cancelled by verified preset");
     try {
       await cloud.ensureDeviceCachePopulated();
       const action = cloud.sanitizeAcAction(deviceId, presetDataToAcAction(presetData));
@@ -2098,7 +2197,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         [actionOn, deviceId],
       );
       onAutomationRulesChanged?.();
-      res.json({ ok: true, updated: result.rowCount, action });
+      res.json({ ok: true, updated: result.rowCount, action, ...(await offWhenOnlineCancelSaved(cloud, deviceId)) });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }

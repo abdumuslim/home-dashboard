@@ -6,7 +6,16 @@ import type { PrayerTimesResult } from "./prayer-engine/index.js";
 import type { Config } from "./config.js";
 import { getMetricValue, powerConditionSustained, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS, type PowerReadingEntry } from "./alert-metrics.js";
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
-import { TclCloud, isolatedPowerOffAfter, isPowerAcceptedError, type AcAction, type AcDevice } from "./tcl-cloud.js";
+import {
+  TclCloud,
+  isolatedPowerOffAfter,
+  isPowerAcceptedError,
+  OFF_WHEN_ONLINE_MAX_ATTEMPTS,
+  OFF_WHEN_ONLINE_RESEND_MS,
+  type AcAction,
+  type AcDevice,
+  type OffWhenOnlineArm,
+} from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
 import { AcLeveler } from "./ac-leveler.js";
 import { LevelingControllerV2 } from "./leveling/controller.js";
@@ -208,6 +217,83 @@ interface AcProfileEnforcement {
   manual: Set<AcProfileTrackedField>;
 }
 
+/**
+ * One off-when-online OFF publish (`Collector.noteOffWhenOnlineOffPublished`).
+ * Per publish and append-only: no path replaces, rewrites or deletes another
+ * publish's record (pruning drops records that can never count again, and past
+ * `OFF_WHEN_ONLINE_RECORD_CAP` the oldest).
+ * Two fields change, each with a single writer: `voided` (false to true), only
+ * by the operation whose publish appended the record, when the cloud did not
+ * accept that publish; and `reportAt` (null to the OFF's report), once, by the
+ * classifier when an OFF first matches the record.
+ */
+interface OffWhenOnlineOffRecord {
+  readonly id: number;
+  readonly publishedAt: number;
+  voided: boolean;
+  /** The power report of the OFF matched to this publish (pinned), once seen. */
+  reportAt: number | null;
+}
+
+/**
+ * The most off-when-online publish records a device keeps. A pinned record
+ * stays until a newer server ON, however many newer pins follow (an older OFF
+ * can still be presented again by a fetch that answers late), so only this cap
+ * bounds the list. An arm sends at most OFF_WHEN_ONLINE_MAX_ATTEMPTS (4)
+ * accepted OFFs, so 64 holds sixteen full arms with no server ON between them,
+ * far past real use (the owner arms by hand), while each observed OFF still
+ * scans a short list. The oldest go first: they cover the oldest reports, the
+ * least likely to be presented again.
+ */
+const OFF_WHEN_ONLINE_RECORD_CAP = 64;
+
+/** A record that can still make an OFF ours: its own publish did not void it, and no server ON came after it. */
+function offWhenOnlineOffCounts(record: OffWhenOnlineOffRecord, serverOnAt: number): boolean {
+  return !record.voided && record.publishedAt >= serverOnAt;
+}
+
+/** The newest OFF report a counted record was matched to, or null. */
+function newestOffWhenOnlinePin(records: readonly OffWhenOnlineOffRecord[]): number | null {
+  let pinnedAt: number | null = null;
+  for (const record of records) {
+    if (record.reportAt != null && (pinnedAt == null || record.reportAt > pinnedAt)) pinnedAt = record.reportAt;
+  }
+  return pinnedAt;
+}
+
+/**
+ * Is an observed OFF whose powerSwitch report is `reportAt` (null when the
+ * snapshot cannot date it) one of our off-when-online OFFs? A pure function of
+ * the device's publish records, the last server ON and the clock. A report is
+ * pinned to, and classified by, only a record that counts
+ * (`offWhenOnlineOffCounts`) and was published at or before it (AWS stamps
+ * whole seconds): a record published after the report never matches it. An OFF
+ * is ours when such a record is matched to it or to a later report, or is
+ * unmatched and younger than `expiryMs`: an unmatched record expires first,
+ * so an OFF first presented after that is not ours. `firstMatch` names the
+ * unmatched records such an OFF matches for the first time; the caller pins
+ * them to it. An OFF the snapshot cannot date is ours while a counted record
+ * is matched or unexpired.
+ */
+function classifyOffWhenOnlineOff(
+  records: readonly OffWhenOnlineOffRecord[],
+  reportAt: number | null,
+  serverOnAt: number,
+  now: number,
+  expiryMs: number,
+): { ours: boolean; firstMatch: OffWhenOnlineOffRecord[] } {
+  const counted = records.filter((record) => offWhenOnlineOffCounts(record, serverOnAt));
+  const pinnedAt = newestOffWhenOnlinePin(counted);
+  const open = counted.filter((record) => record.reportAt == null && now - record.publishedAt < expiryMs);
+  if (reportAt == null) return { ours: pinnedAt != null || open.length > 0, firstMatch: [] };
+  const publishedBy = (record: OffWhenOnlineOffRecord) => Math.floor(record.publishedAt / 1000) * 1000 <= reportAt;
+  if (counted.some((record) => record.reportAt != null && publishedBy(record) && reportAt <= record.reportAt)) {
+    return { ours: true, firstMatch: [] };
+  }
+  const firstMatch = open.filter(publishedBy);
+  return { ours: firstMatch.length > 0, firstMatch };
+}
+
 export class Collector {
   private pool: pg.Pool;
   private config: Config;
@@ -297,6 +383,8 @@ export class Collector {
   private acManualOffLocksLoaded = false;
   private readonly POWER_CACHE_TTL = 5_000;
   private readonly AC_MANUAL_OFF_CLEAR_GRACE_MS = 15_000;
+  /** The off-when-online step acts on a device snapshot at most this old (else it fetches). */
+  private readonly OFF_WHEN_ONLINE_SNAPSHOT_MAX_AGE_MS = 10_000;
   private acFanEnforcement = new Map<string, AcFanEnforcement>(); // key `${rule.id}:${deviceId}`
   private readonly AC_FAN_SETTLE_MS = 15_000;
   // A manual UI gen-level change wins over range generator_mode re-enforcement
@@ -413,6 +501,17 @@ export class Collector {
    */
   private acServerOnReversalAt = new Map<string, number>();
   private readonly AC_REPEAT_OFF_MANUAL_MS = 10 * 60_000;
+  /**
+   * The armed "off when back online" OFFs this process published, per device:
+   * a plain server-commanded OFF that the observed-off classifier must never
+   * take for a human's (owner decision 2026-10-10, hard rule 2: no lock by the
+   * back door). One record per publish (`OffWhenOnlineOffRecord`), appended at
+   * the publish boundary (`noteOffWhenOnlineOffPublished`); a publish the cloud
+   * did not accept is voided by its own operation, never by another one. Read
+   * by `isOffWhenOnlineOff` (`classifyOffWhenOnlineOff`). Memory only.
+   */
+  private offWhenOnlineOffs = new Map<string, OffWhenOnlineOffRecord[]>();
+  private offWhenOnlineOffSeq = 0;
   // Loop-liveness watchdog (2026-07-06 ~3h silent stall): heartbeat + per-step
   // deadlines so one hung external call can never freeze every automation.
   private lastLoopTickAt = Date.now();
@@ -614,6 +713,10 @@ export class Collector {
     // device by the beep-reset fingerprint in `noteBeepResetPowerCycle`.
     const restartsAcs = powerEventRestartsAcs(kind);
     if (restartsAcs) this.lastRestartPowerEventAt = now;
+    // The same restart is a new power epoch for every armed "off when back
+    // online": a report from before it says nothing about the unit after it.
+    // Optional call: test doubles of the cloud predate it.
+    if (restartsAcs) this.tclCloud?.noteOffWhenOnlinePowerEpoch?.(now);
     for (const dev of this.tclCloud?.getDevices() ?? []) {
       if (restartsAcs) this.notePowerCycle(dev.id, `power event (${kind})`, now);
       const hasSystemProfile = this.automationRules.some(
@@ -760,6 +863,13 @@ export class Collector {
     // a power event. Keep the lock; no re-record, no push (the user acted).
     if (await this.isAcManualOffLocked(deviceId)) {
       log.info(`[collector] ${context}: device ${deviceId} observed OFF but already manual-off locked — keeping the lock`);
+      return false;
+    }
+    // Our own armed "off when back online" OFF is server-commanded, never a
+    // human's: no lock (hard rule 2), and the rule stands down as after its own
+    // OFF. Ahead of the server-ON grace, whose "lag" reading would re-ON the unit.
+    if (this.isOffWhenOnlineOff(deviceId)) {
+      log.info(`[collector] ${context}: device ${deviceId} observed OFF is our own off-when-back-online OFF (server-commanded), not a manual off: no lock`);
       return false;
     }
     // An OFF observed shortly after a power ON we ourselves commanded CAN be the
@@ -1266,6 +1376,14 @@ export class Collector {
     }
 
     try {
+      // Before the automations: an armed "off when back online" OFF goes out
+      // (and is booked as ours) before any rule or timer of this tick looks.
+      await this.runStep("ac-off-when-online", () => this.checkOffWhenOnline());
+    } catch (err) {
+      log.error("[collector] AC off-when-back-online check failed:", err);
+    }
+
+    try {
       await this.runStep("automations", () => this.checkAutomations());
     } catch (err) {
       log.error("[collector] Automation check failed:", err);
@@ -1668,18 +1786,12 @@ export class Collector {
     await this.leveling().ensureLoaded();
     if (this.automationRules.length === 0) return;
 
-    if (this.tclCloud && !this.tclCloud.isReady() && Date.now() >= this.tclRetryAt) {
-      // Fire-and-forget for the same reason as the Xiaomi re-auth below: nothing
-      // awaited inside the collection loop may block on an unbounded wait. TCL
-      // auto-refreshes (no human 2FA today), but a hung auth request must not
-      // freeze weather/alerts/automations. AC rules that need TCL just skip the
-      // tick until isReady() (see the device-loop guard below). Throttle set
-      // before launch so an in-flight init isn't relaunched next tick.
-      this.tclRetryAt = Date.now() + 60_000;
-      log.warn("[collector] TCL Cloud not ready, attempting re-auth");
-      void this.tclCloud.init().catch((err) =>
-        log.error("[collector] TCL Cloud re-auth failed:", (err as Error).message));
-    }
+    // Fire-and-forget for the same reason as the Xiaomi re-auth below: nothing
+    // awaited inside the collection loop may block on an unbounded wait. TCL
+    // auto-refreshes (no human 2FA today), but a hung auth request must not
+    // freeze weather/alerts/automations. AC rules that need TCL just skip the
+    // tick until isReady() (see the device-loop guard below).
+    this.maybeReauthTclCloud();
 
     // Same ladder as the periodic device step above; the throttle makes the
     // second caller per tick a no-op.
@@ -1698,6 +1810,20 @@ export class Collector {
         await this.checkMetricAutomation(rule);
       }
     }
+  }
+
+  /**
+   * Throttled TCL re-auth while the cloud is not ready: at most one attempt a
+   * minute (`tclRetryAt`, set before the launch so an in-flight init isn't
+   * relaunched next tick), fire-and-forget. Shared by the automations and the
+   * off-when-online step, which needs it when no automation rule exists.
+   */
+  private maybeReauthTclCloud(): void {
+    if (!this.tclCloud || this.tclCloud.isReady() || Date.now() < this.tclRetryAt) return;
+    this.tclRetryAt = Date.now() + 60_000;
+    log.warn("[collector] TCL Cloud not ready, attempting re-auth");
+    void this.tclCloud.init().catch((err) =>
+      log.error("[collector] TCL Cloud re-auth failed:", (err as Error).message));
   }
 
   private async executeAutomationAction(rule: AutomationRule, action: PurifierAction | AcAction, deviceIds: string[]): Promise<void> {
@@ -2892,6 +3018,187 @@ export class Collector {
         this.automationState.set(rule.id, { status: "idle", lastToggle: now, conditionSince: null, conditionLostAt: null, canAutoTurnOn: true });
       }
     }
+  }
+
+  /**
+   * "Turn off once back online" (owner request 2026-10-09; TclCloud stores the
+   * arms). The armed OFF resolves HERE, in its own loop step right before the
+   * automations, never inside a device fetch (a fetch only observes). It is a
+   * plain server-commanded OFF (owner decision 2026-10-10: the manual-off lock
+   * was tried and dropped): nothing on this path reads, records or clears a
+   * lock, and the OFF is booked at its publish boundary so the observed-off
+   * classifier never takes it for a human's (`isOffWhenOnlineOff`). An OFF any
+   * device fetch sees ends the arm in that fetch (TclCloud); this step pins it
+   * as our OFF's report when it is one. Each armed device is claimed (token and
+   * lease) BEFORE the snapshot is read, so an operation that runStep
+   * abandoned, or that outlived its lease, is taken over and can then neither
+   * publish nor change the arm. With the cloud not ready it drives the
+   * throttled re-auth itself: no automation rule may exist.
+   */
+  private async checkOffWhenOnline(): Promise<void> {
+    const tcl = this.tclCloud;
+    if (!tcl) return;
+    this.pinSeenOffWhenOnlineOffs(tcl);
+    const arms = tcl.getOffWhenOnlineArms();
+    if (arms.length === 0) return;
+    if (!tcl.isReady()) {
+      this.maybeReauthTclCloud();
+      return;
+    }
+    const claimed: Array<{ arm: OffWhenOnlineArm; token: number }> = [];
+    for (const arm of arms) {
+      const token = tcl.claimOffWhenOnline(arm.deviceId);
+      if (token != null) claimed.push({ arm, token });
+    }
+    if (claimed.length === 0) return;
+    try {
+      const devices = await tcl.getDevicesNoOlderThan(this.OFF_WHEN_ONLINE_SNAPSHOT_MAX_AGE_MS);
+      // That snapshot's own fetch may have ended an arm on an OFF.
+      this.pinSeenOffWhenOnlineOffs(tcl);
+      for (const { arm, token } of claimed) {
+        const device = devices.find((d) => d.id === arm.deviceId);
+        if (!device) continue;
+        try {
+          await this.stepOffWhenOnline(tcl, arm, token, device);
+        } catch (err) {
+          log.warn(`[collector] Off-when-back-online for ${arm.deviceId} failed: ${(err as Error).message}`);
+        }
+      }
+    } finally {
+      for (const { arm, token } of claimed) tcl.releaseOffWhenOnline(arm.deviceId, token);
+    }
+  }
+
+  private async stepOffWhenOnline(tcl: TclCloud, arm: OffWhenOnlineArm, token: number, device: AcDevice): Promise<void> {
+    // An arm a device fetch ended on an OFF (our OFF landing, or the unit
+    // coming back OFF) is no longer current: no further OFF, even when the unit
+    // reads ON again by now (someone switched it back on, and they win, hard
+    // rule 7).
+    if (!tcl.isOffWhenOnlineOperationCurrent(arm, token)) return;
+    // AWS metadata is second-resolution: only a report strictly after the arm
+    // and the last power epoch proves the unit came back (the stale offline
+    // shadow still says ON), and only a CURRENT one proves it is still there,
+    // so a brief report followed by another outage spends nothing. The epoch
+    // this gate read goes with the send: a newer one stops it at its publish.
+    const reportedAt = device.lastSeenAt;
+    const gatedEpochAt = arm.epochAt;
+    if (!device.isOnline || reportedAt == null || reportedAt <= Math.max(arm.armedAt, gatedEpochAt)) return;
+    if (!device.power) {
+      this.pinOffWhenOnlineOff(arm.deviceId, device.powerReportedAt ?? null);
+      tcl.finishOffWhenOnline(arm, token, arm.attempts > 0 ? "done: unit reported OFF" : "done: unit reported OFF, nothing sent");
+      return;
+    }
+    const now = Date.now();
+    if (arm.attempts >= OFF_WHEN_ONLINE_MAX_ATTEMPTS) {
+      if (now - arm.lastSentAt < OFF_WHEN_ONLINE_RESEND_MS) return;
+      tcl.finishOffWhenOnline(arm, token, `gave up: still ON after ${arm.attempts} OFF sends`, "warn");
+      return;
+    }
+    if (arm.attempts > 0 && now - arm.lastSentAt < OFF_WHEN_ONLINE_RESEND_MS) return;
+    // Each publish appends its own record at its boundary, so a fast echo of
+    // our OFF is never taken for a human's. This operation owns the records it
+    // appended and voids only those: all of them when the cloud did not accept
+    // the send (rejected or superseded), and all but the last when it did (a
+    // re-auth retry publishes again only after a 403 refused the publish
+    // before it). Another operation's record is never touched, so an old
+    // operation's rollback can never take back a newer accepted OFF.
+    const published: OffWhenOnlineOffRecord[] = [];
+    let accepted = false;
+    try {
+      accepted = await tcl.sendOffWhenOnline(
+        arm,
+        token,
+        () => published.push(this.noteOffWhenOnlineOffPublished(arm.deviceId)),
+        gatedEpochAt,
+      ) === "sent";
+    } finally {
+      const kept = accepted ? published[published.length - 1] : undefined;
+      for (const record of published) if (record !== kept) record.voided = true;
+    }
+  }
+
+  /**
+   * Record an off-when-online OFF at its publish boundary: a new record of its
+   * own, appended to the device's list (`offWhenOnlineOffs`). Returned to the
+   * publishing operation, the only one that may void it.
+   */
+  private noteOffWhenOnlineOffPublished(deviceId: string): OffWhenOnlineOffRecord {
+    const record: OffWhenOnlineOffRecord = { id: ++this.offWhenOnlineOffSeq, publishedAt: Date.now(), voided: false, reportAt: null };
+    this.offWhenOnlineOffs.set(deviceId, [...this.offWhenOnlineOffRecords(deviceId), record]);
+    return record;
+  }
+
+  /**
+   * The device's records that can still count, and the list pruned to them so
+   * it stays bounded. A voided publish, one a newer server ON voided, and an
+   * unmatched one past its expiry can never make an OFF ours again. A pinned
+   * one stays, whatever newer pins follow: a fetch that answers late can
+   * present its older OFF again, and dropping it would read our own OFF as a
+   * human's (2026-10-10 repair). Past OFF_WHEN_ONLINE_RECORD_CAP the oldest
+   * go (records are appended in publish order). Only the list is replaced: no
+   * record is changed.
+   */
+  private offWhenOnlineOffRecords(deviceId: string): OffWhenOnlineOffRecord[] {
+    const records = this.offWhenOnlineOffs.get(deviceId);
+    if (!records) return [];
+    const now = Date.now();
+    const serverOnAt = this.lastServerAcOnAt.get(deviceId) ?? 0;
+    const kept = records
+      .filter((record) => offWhenOnlineOffCounts(record, serverOnAt))
+      .filter((record) => record.reportAt != null || now - record.publishedAt < this.AC_POWER_EVENT_GRACE_MS)
+      .slice(-OFF_WHEN_ONLINE_RECORD_CAP);
+    if (kept.length > 0) this.offWhenOnlineOffs.set(deviceId, kept);
+    else this.offWhenOnlineOffs.delete(deviceId);
+    return kept;
+  }
+
+  /**
+   * Classify an OFF (power report `reportAt`) against the device's records
+   * (`classifyOffWhenOnlineOff`) and pin the records it matched for the first
+   * time, so the same OFF reads as ours to every later look.
+   */
+  private matchOffWhenOnlineOff(deviceId: string, reportAt: number | null): boolean {
+    const records = this.offWhenOnlineOffRecords(deviceId);
+    if (records.length === 0) return false;
+    const serverOnAt = this.lastServerAcOnAt.get(deviceId) ?? 0;
+    const { ours, firstMatch } = classifyOffWhenOnlineOff(records, reportAt, serverOnAt, Date.now(), this.AC_POWER_EVENT_GRACE_MS);
+    for (const record of firstMatch) record.reportAt = reportAt;
+    return ours;
+  }
+
+  /** Pin the OFFs device fetches ended arms on (`TclCloud.takeOffWhenOnlineSeenOffs`). Optional call: test doubles of the cloud predate it. */
+  private pinSeenOffWhenOnlineOffs(tcl: TclCloud): void {
+    for (const [deviceId, reportAt] of tcl.takeOffWhenOnlineSeenOffs?.() ?? []) this.pinOffWhenOnlineOff(deviceId, reportAt);
+  }
+
+  /**
+   * An arm ended on an OFF (power report `reportAt`): pin it as our OFF's
+   * report when it is one (`matchOffWhenOnlineOff`). An unmatched record past
+   * the shadow-lag allowance has expired first: it is never pinned, since a
+   * pin would make that late OFF ours for good.
+   */
+  private pinOffWhenOnlineOff(deviceId: string, reportAt: number | null): void {
+    if (reportAt != null) this.matchOffWhenOnlineOff(deviceId, reportAt);
+  }
+
+  /**
+   * Is the OFF a rule just observed our own off-when-online OFF? Only a record
+   * no server ON (dashboard, automation, timer) came after counts. The unit's
+   * OFF is ours when it is the first power report at or after such a publish
+   * (AWS stamps whole seconds); that report is pinned, so the same OFF reads as
+   * ours to every rule for as long as it stands, while a LATER OFF (after an
+   * ON) is judged as before. An unmatched record expires after the shadow-lag
+   * allowance the power-event window uses: an OFF that took longer to show is
+   * not ours. Only the powerSwitch report dates an OFF (other fields re-stamp
+   * while the unit sits OFF); one the snapshot cannot date (no such metadata,
+   * or the snapshot already reads ON again) is ours while a record is matched
+   * or fresh.
+   */
+  private isOffWhenOnlineOff(deviceId: string): boolean {
+    if (!this.offWhenOnlineOffs.has(deviceId)) return false;
+    const dev = this.tclCloud?.getDevices().find((d) => d.id === deviceId);
+    const reportAt = dev && !dev.power ? (dev.powerReportedAt ?? null) : null;
+    return this.matchOffWhenOnlineOff(deviceId, reportAt);
   }
 
   private async checkAcTimers(): Promise<void> {

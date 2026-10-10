@@ -44,6 +44,8 @@ export interface AcDevice {
   lastSeenAt?: number | null;
   power: boolean;
   manualOffLocked?: boolean;
+  /** Armed one-shot OFF that fires when this offline unit reports again (grid-only Guest). */
+  offWhenOnline?: boolean;
   mode: number;
   targetTemp: number;
   currentTemp: number;

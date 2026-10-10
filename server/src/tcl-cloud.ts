@@ -1,5 +1,5 @@
 import { createHash, createHmac } from "crypto";
-import { readFile, writeFile } from "fs/promises";
+import { readFile, rename, writeFile } from "fs/promises";
 import { IoTDataPlaneClient, PublishCommand } from "@aws-sdk/client-iot-data-plane";
 import { childLogger } from "./logger.js";
 import {
@@ -257,6 +257,19 @@ export interface AcActionExecutionOptions {
   preserveProfileIntent?: boolean;
   /** Only stale automation enforcement may opt into this suppression. */
   suppressWhileManualPresetPending?: boolean;
+  /**
+   * Caller's publish-boundary guard (see sendControl), honoured by a power OFF
+   * (the armed off-when-online send): read before the call claims anything and
+   * again right before the publish. False → `ControlSupersededError`, nothing
+   * claimed or sent, so a stale caller never silences a newer user command.
+   */
+  stillCurrent?: () => boolean;
+  /**
+   * Called synchronously at a power OFF's publish boundary: right after
+   * `stillCurrent` passed, in the same tick as the publish start (each publish,
+   * a re-auth retry included). The armed off-when-online send books its OFF here.
+   */
+  onPublish?: () => void;
 }
 
 /**
@@ -309,6 +322,8 @@ export interface AcDevice {
   minFanSpeed: number;
   maxFanSpeed: number;
   beep: boolean;
+  /** Armed "turn off once back online" signal (owner request 2026-10-09, grid-only Guest). */
+  offWhenOnline?: boolean;
 }
 
 interface AuthData {
@@ -340,6 +355,84 @@ interface PersistedState {
   tokenExpiry?: number;
   baseApiUrl?: string;
 }
+
+/**
+ * One armed "turn off once back online" (see `setOffWhenOnline`). TclCloud owns
+ * the arm store, the per-device operation claim and the OFF send; the
+ * collector's off-when-online step drives them. The entry's identity IS the
+ * arm: a cancel, a disarm or a re-arm removes or replaces it, so an operation
+ * holding an older entry knows it went stale (`isOffWhenOnlineCurrent`).
+ */
+export interface OffWhenOnlineArm {
+  readonly deviceId: string;
+  readonly armedAt: number;
+  /**
+   * The last real source transition since the arm (a power epoch, see
+   * `noteOffWhenOnlinePowerEpoch`), 0 when none. Only a report newer than both
+   * this and `armedAt` proves the unit is back. Persisted.
+   */
+  epochAt: number;
+  /** Completed OFF sends in this epoch, and when the last one COMPLETED (the resend spacing counts from it). */
+  attempts: number;
+  lastSentAt: number;
+}
+
+/** The persisted subset: attempt counts and times restart from zero after a restart. */
+type PersistedOffWhenOnline = Pick<OffWhenOnlineArm, "armedAt" | "epochAt">;
+
+/** One queued write of the arm file (`saveOffWhenOnline`). */
+interface OffWhenOnlineWrite {
+  /** The device ids it writes: null until it runs, since it snapshots the arms then. */
+  ids: ReadonlySet<string> | null;
+  /** Set once it completed or failed. */
+  settled: boolean;
+  /** Settles with the write; rejects when it failed. */
+  done: Promise<void>;
+}
+
+/**
+ * `persisted` may be an older file's entry: `{armedAt, attempts, lastSentAt}`
+ * (first release) or one from the manual-off lock rounds (`lockRecorded`,
+ * `offConfirmedAt`, `lockFailedAt`; the lock was dropped 2026-10-10). The extra
+ * fields are ignored and a missing `epochAt` reads as none.
+ */
+function newOffWhenOnline(
+  deviceId: string,
+  armedAt: number,
+  persisted: Partial<Record<keyof PersistedOffWhenOnline, unknown>> = {},
+): OffWhenOnlineArm {
+  return {
+    deviceId,
+    armedAt,
+    epochAt: typeof persisted.epochAt === "number" ? persisted.epochAt : 0,
+    attempts: 0,
+    lastSentAt: 0,
+  };
+}
+
+/** OFF sends per arm and power epoch, each 15 s apart; then the arm gives up. */
+export const OFF_WHEN_ONLINE_MAX_ATTEMPTS = 4;
+export const OFF_WHEN_ONLINE_RESEND_MS = 15_000;
+/**
+ * How long one step operation holds its device's claim (`claimOffWhenOnline`)
+ * before a newer step may take it over. Correctness does not hang on it: the
+ * claim token is checked at the OFF's publish boundary and before any change
+ * to the arm, so an operation that lost its claim can neither publish nor
+ * touch the arm. It only bounds how long a hung or abandoned operation blocks
+ * the next one. Two minutes outlasts one send short of a full TCL re-login
+ * (every TCL/AWS call has a 15 s deadline) and runStep's 90 s step deadline,
+ * so a step that finishes inside its deadline is never overtaken.
+ */
+export const OFF_WHEN_ONLINE_LEASE_MS = 2 * 60_000;
+/**
+ * How many arm-file writes one cancel acknowledgement waits through
+ * (`offWhenOnlineDurablyAbsent`) before it gives up and rejects. It waits
+ * again only when the device is still neither armed nor out of the file after
+ * a write settled: re-armed and removed again meanwhile, or a failed write with
+ * a newer one queued. Reached only by a device that keeps changing without
+ * end, so the acknowledgement can never wait forever.
+ */
+export const OFF_WHEN_ONLINE_DURABLE_MAX_WRITES = 32;
 
 interface PendingPowerCycleRestore {
   state: Record<string, unknown>;
@@ -384,8 +477,42 @@ export class TclCloud {
   private deviceCacheTime = 0;
   private lastState: Record<string, Record<string, unknown>> = {};
   private pendingPowerCycleRestores = new Map<string, PendingPowerCycleRestore>();
+  /** deviceId -> arm state of the "turn off once back online" signal. Persisted. */
+  private pendingOffWhenOnline = new Map<string, OffWhenOnlineArm>();
+  /** deviceId -> the step operation holding it: its token and when its lease ends. */
+  private offWhenOnlineClaims = new Map<string, { token: number; expiresAt: number }>();
+  private offWhenOnlineClaimSeq = 0;
+  /**
+   * deviceId -> power report time of the OFF a device fetch ended its arm on
+   * (`observeOffWhenOnline`), until the collector's step takes it
+   * (`takeOffWhenOnlineSeenOffs`) to pin its own OFF's booking. Memory only.
+   */
+  private offWhenOnlineSeenOffs = new Map<string, number>();
+  /**
+   * Devices armed or disarmed since construction. The startup file read can land
+   * after such a change and must never override it (resurrect a cancelled arm,
+   * or replace a newer arm time).
+   */
+  private offWhenOnlineTouched = new Set<string>();
+  /** The startup read of the arm file; never rejects. init() waits for it. */
+  private offWhenOnlineLoaded: Promise<void>;
+  /** Tail of the serialized arm-file writes; starts after the startup read, never rejects. */
+  private offWhenOnlineSaved: Promise<void>;
+  /**
+   * The device ids the arm file may hold: as the startup read found it, then
+   * as each write that succeeded left it (a failed write adds its own ids: the
+   * file is in doubt for them). Null while unknown: before the startup read
+   * settles, or when the file could not be read. Read by
+   * `offWhenOnlineAbsentOnDisk`.
+   */
+  private offWhenOnlineDurableIds: Set<string> | null = null;
+  /** The newest arm-file write queued, settled or not. */
+  private offWhenOnlineLastWrite: OffWhenOnlineWrite | null = null;
+  /** The arm-file write running now, if any (writes are serialized: at most one). */
+  private offWhenOnlineRunningWrite: OffWhenOnlineWrite | null = null;
 
   private static readonly STATE_FILE = "/app/data/ac-last-state.json";
+  private static readonly OFF_WHEN_ONLINE_FILE = "/app/data/ac-off-when-online.json";
 
   // Properties to save/restore per model type
   private static readonly SAVE_PROPS_CHSA = [
@@ -407,9 +534,17 @@ export class TclCloud {
     this.username = username;
     this.passwordMd5 = md5hex(password);
     this.loadLastState();
+    this.offWhenOnlineLoaded = this.loadOffWhenOnline();
+    // Writes queue behind the read, so none can persist a snapshot that is
+    // missing the arms the file still holds.
+    this.offWhenOnlineSaved = this.offWhenOnlineLoaded;
   }
 
   async init(): Promise<void> {
+    // A persisted arm must be in memory before the first device fetch: that
+    // fetch must already report it and keep the unit's reboot-default ON state
+    // out of the saved last state (`saveStateProps`).
+    await this.offWhenOnlineLoaded;
     await this.loadCredentials();
 
     await this.ensureValidTokens();
@@ -449,6 +584,14 @@ export class TclCloud {
     if (this.cachedDevices.length === 0) {
       await this.fetchDevicesLive();
     }
+  }
+
+  /** The cached device snapshot while it is at most `maxAgeMs` old, else a live fetch. */
+  async getDevicesNoOlderThan(maxAgeMs: number): Promise<AcDevice[]> {
+    if (this.cachedDevices.length > 0 && Date.now() - this.deviceCacheTime <= maxAgeMs) {
+      return this.cachedDevices;
+    }
+    return this.fetchDevicesLive();
   }
 
   getDeviceState(deviceId: string): Partial<AcAction> | null {
@@ -614,6 +757,8 @@ export class TclCloud {
      * it. False → `ControlSupersededError`, nothing published.
      */
     stillCurrent?: () => boolean,
+    /** Runs at each publish boundary, right after `stillCurrent` passed (see `publishControl`). */
+    onPublish?: () => void,
   ): Promise<void> {
     // Raw leveler/calibration controls do not pass through the verified UI
     // wrapper. If one lands while a manual preset verifier is pending, make it
@@ -629,7 +774,7 @@ export class TclCloud {
     if (command === "set_power" && value === 1) {
       const desired: Record<string, unknown> = { powerSwitch: 1 };
       try {
-        await this.publishControl(deviceId, desired, stillCurrent);
+        await this.publishControl(deviceId, desired, stillCurrent, onPublish);
       } catch (err) {
         const msg = (err as Error).message ?? "";
         const name = (err as { name?: string }).name ?? "";
@@ -639,7 +784,7 @@ export class TclCloud {
           this.tokenExpiry = 0;
           this.tokenData = null;
           await this.ensureValidTokens();
-          await this.publishControl(deviceId, desired, stillCurrent);
+          await this.publishControl(deviceId, desired, stillCurrent, onPublish);
         } else {
           throw err;
         }
@@ -667,7 +812,7 @@ export class TclCloud {
         throw new Error(`Invalid swing value: ${v}`);
       }
       try {
-        await this.publishControl(deviceId, desired, stillCurrent);
+        await this.publishControl(deviceId, desired, stillCurrent, onPublish);
       } catch (err) {
         const msg = (err as Error).message ?? "";
         const name = (err as { name?: string }).name ?? "";
@@ -677,7 +822,7 @@ export class TclCloud {
           this.tokenExpiry = 0;
           this.tokenData = null;
           await this.ensureValidTokens();
-          await this.publishControl(deviceId, desired, stillCurrent);
+          await this.publishControl(deviceId, desired, stillCurrent, onPublish);
         } else {
           throw err;
         }
@@ -700,7 +845,7 @@ export class TclCloud {
         desired = { windSpeed: v, silenceSwitch: 0, turbo: 0 };
       }
       try {
-        await this.publishControl(deviceId, desired, stillCurrent);
+        await this.publishControl(deviceId, desired, stillCurrent, onPublish);
       } catch (err) {
         const msg = (err as Error).message ?? "";
         const name = (err as { name?: string }).name ?? "";
@@ -710,7 +855,7 @@ export class TclCloud {
           this.tokenExpiry = 0;
           this.tokenData = null;
           await this.ensureValidTokens();
-          await this.publishControl(deviceId, desired, stillCurrent);
+          await this.publishControl(deviceId, desired, stillCurrent, onPublish);
         } else {
           throw err;
         }
@@ -743,7 +888,7 @@ export class TclCloud {
     }
     const desired: Record<string, unknown> = advancedPayload ?? { [prop]: value };
     try {
-      await this.publishControl(deviceId, desired, stillCurrent);
+      await this.publishControl(deviceId, desired, stillCurrent, onPublish);
     } catch (err) {
       const msg = (err as Error).message ?? "";
       const name = (err as { name?: string }).name ?? "";
@@ -753,7 +898,7 @@ export class TclCloud {
         this.tokenExpiry = 0;
         this.tokenData = null;
         await this.ensureValidTokens();
-        await this.publishControl(deviceId, desired, stillCurrent);
+        await this.publishControl(deviceId, desired, stillCurrent, onPublish);
       } else {
         throw err;
       }
@@ -1070,6 +1215,9 @@ export class TclCloud {
         const vSwitch = isChsaModel ? shadow.verticalWind : shadow.verticalSwitch;
         const hSwitch = isChsaModel ? shadow.horizontalWind : shadow.horizontalSwitch;
 
+        const power = shadow.powerSwitch != null ? shadow.powerSwitch === 1 : powerFromId?.value === 1;
+        this.observeOffWhenOnline(dev.deviceId, power, powerReport.powerReportedAt ?? reportedAt);
+
         const policy = getAcDevicePolicy(dev.deviceId);
         const model: AcModel = isChsaModel ? "TAC-24CHSA" : "TAC-12CHSD";
         const capabilities = deriveAcCapabilities(dev.deviceId, model, shadow);
@@ -1089,7 +1237,7 @@ export class TclCloud {
           powerReportedAt: powerReport.powerReportedAt,
           powerReportCohort: powerReport.powerReportCohort,
           fullStateReportAt: powerReport.fullStateReportAt,
-          power: shadow.powerSwitch != null ? shadow.powerSwitch === 1 : powerFromId?.value === 1,
+          power,
           mode: shadow.workMode ?? 0,
           targetTemp: shadow.targetTemperature ?? 24,
           currentTemp: shadow.currentTemperature ?? 0,
@@ -1114,6 +1262,10 @@ export class TclCloud {
           minFanSpeed: positiveFanSpeeds.length > 0 ? Math.min(...positiveFanSpeeds) : 0,
           maxFanSpeed: Math.max(...capabilities.fanSpeeds.map((option) => option.value), 0),
           beep: shadow.beepSwitch === 1,
+          // The arm as of this snapshot. A fetch never sends for an armed "off
+          // when back online"; the one thing it does (above) is end the arm on
+          // an OFF the unit reported. The collector's off-when-online step sends.
+          offWhenOnline: this.isOffWhenOnlineArmed(dev.deviceId),
         });
 
         // The restore publish is awaited un-caught inside this loop, so one
@@ -1177,8 +1329,14 @@ export class TclCloud {
   }
 
   /** Not async on purpose: the guard runs synchronously and the publish starts in the same tick. */
-  private publishControl(deviceId: string, desired: Record<string, unknown>, stillCurrent?: () => boolean): Promise<void> {
+  private publishControl(
+    deviceId: string,
+    desired: Record<string, unknown>,
+    stillCurrent?: () => boolean,
+    onPublish?: () => void,
+  ): Promise<void> {
     if (stillCurrent && !stillCurrent()) throw new ControlSupersededError(deviceId);
+    onPublish?.();
     return this.publishShadowUpdate(deviceId, desired);
   }
 
@@ -1286,6 +1444,420 @@ export class TclCloud {
     return createHmac("sha256", kService).update("aws4_request").digest();
   }
 
+  // ---------- Off When Back Online ----------
+
+  /**
+   * Arm (or disarm) a one-shot OFF for an AC that dropped offline while ON,
+   * e.g. the grid-only Guest unit losing its line on generator. TclCloud only
+   * stores the arm: a device fetch never sends for it (it only ends the arm on
+   * an OFF the unit reported, `observeOffWhenOnline`). The collector's dedicated
+   * off-when-online step sends a plain server OFF (`sendOffWhenOnline`) on the
+   * first report that is strictly newer than the arm time and the last power
+   * epoch AND current (the device loop's own online rule). No manual-off lock
+   * is involved (owner decision 2026-10-10). Any later user power command
+   * disarms it.
+   *
+   * Arming is newer user power intent than any `set_power` still in flight: it
+   * supersedes an older dashboard command still waiting to publish and stops
+   * an older verifier's resends. It also cancels a pending last-state restore
+   * (LOUD): the owner asked for this unit to come back OFF, and the restore
+   * would republish its pre-event ON state. While armed, a new restore is
+   * refused and state saving pauses.
+   *
+   * Only for ACs outside Smart AC Leveling (leader decision 2026-10-10): a
+   * deferred OFF on a leveled room would bypass the leveler's user-OFF
+   * bookkeeping (the control route's onUserPowerOff/onUserPowerOffSent) and
+   * read as an unexplained draw change (hard rule 5b). The route already
+   * answers 409; refusing here too is defense in depth, like
+   * preparePowerCycleRestore. A disarm is accepted for any id.
+   *
+   * An arm resolves once the arm-file write holding it has completed, and
+   * rejects when it failed (the in-memory change stands): see
+   * `saveOffWhenOnline`. A disarm resolves once the arm file durably excludes
+   * the device, whichever path removed the arm from memory, and rejects when
+   * the write that was to exclude it failed: see `offWhenOnlineDurablyAbsent`.
+   */
+  setOffWhenOnline(deviceId: string, enabled: boolean): Promise<void> {
+    if (!enabled) return this.disarmOffWhenOnline(deviceId, "cancelled from the dashboard");
+    if (isAcLevelingEligible(deviceId)) {
+      log.warn(`[tcl] Refusing off-when-back-online for ${deviceId}: a Smart AC Leveling AC (its deferred OFF would bypass the leveler's user-OFF bookkeeping)`);
+      return Promise.resolve();
+    }
+    this.offWhenOnlineTouched.add(deviceId);
+    this.pendingOffWhenOnline.set(deviceId, newOffWhenOnline(deviceId, Date.now()));
+    log.info(`[tcl] Armed off-when-back-online for ${deviceId}`);
+    if (this.pendingPowerCycleRestores.delete(deviceId)) {
+      log.info(`[tcl] Pending last-state restore for ${deviceId} cancelled by off-when-back-online (armed)`);
+    }
+    this.supersedeControlVerify(deviceId, "set_power", "user");
+    return this.saveOffWhenOnline();
+  }
+
+  isOffWhenOnlineArmed(deviceId: string): boolean {
+    return this.pendingOffWhenOnline.has(deviceId);
+  }
+
+  /** The current arms, for the collector's off-when-online step. */
+  getOffWhenOnlineArms(): OffWhenOnlineArm[] {
+    return [...this.pendingOffWhenOnline.values()];
+  }
+
+  /** True while `arm` is still its device's arm: no cancel, disarm or re-arm since. */
+  isOffWhenOnlineCurrent(arm: OffWhenOnlineArm): boolean {
+    return this.pendingOffWhenOnline.get(arm.deviceId) === arm;
+  }
+
+  /**
+   * One off-when-online operation per device at a time. Returns the claim's
+   * token, or null while another operation holds an unexpired claim. A claim
+   * older than OFF_WHEN_ONLINE_LEASE_MS (a step that runStep abandoned, or one
+   * hung on the cloud) is taken over, LOUDLY; the token is how the old
+   * operation learns it lost (`isOffWhenOnlineOperationCurrent`). Pair every
+   * token with `releaseOffWhenOnline`.
+   */
+  claimOffWhenOnline(deviceId: string): number | null {
+    const now = Date.now();
+    const held = this.offWhenOnlineClaims.get(deviceId);
+    if (held && now < held.expiresAt) return null;
+    if (held) {
+      log.warn(`[tcl] Off-when-back-online for ${deviceId}: the previous operation held its claim past the ${OFF_WHEN_ONLINE_LEASE_MS / 1000}s lease; a new one takes over (the old one can no longer publish or change the arm)`);
+    }
+    const token = ++this.offWhenOnlineClaimSeq;
+    this.offWhenOnlineClaims.set(deviceId, { token, expiresAt: now + OFF_WHEN_ONLINE_LEASE_MS });
+    return token;
+  }
+
+  /** Release the claim `token` holds; a claim taken over since is left alone. */
+  releaseOffWhenOnline(deviceId: string, token: number): void {
+    if (this.offWhenOnlineClaims.get(deviceId)?.token === token) this.offWhenOnlineClaims.delete(deviceId);
+  }
+
+  /** True while `arm` is current AND the operation holding `token` still holds its device's claim. */
+  isOffWhenOnlineOperationCurrent(arm: OffWhenOnlineArm, token: number): boolean {
+    return this.isOffWhenOnlineCurrent(arm) && this.offWhenOnlineClaims.get(arm.deviceId)?.token === token;
+  }
+
+  /**
+   * The collector's step resolved `arm` (done, or gave up): drop it, LOUDLY.
+   * Only the operation holding the current arm's claim can: a stale arm or an
+   * overtaken operation leaves it alone, so a newer arm survives.
+   */
+  finishOffWhenOnline(arm: OffWhenOnlineArm, token: number, outcome: string, level: "info" | "warn" = "info"): void {
+    if (!this.isOffWhenOnlineOperationCurrent(arm, token)) return;
+    this.pendingOffWhenOnline.delete(arm.deviceId);
+    void this.saveOffWhenOnline();
+    log[level](`[tcl] Off-when-back-online for ${arm.deviceId} ${outcome}`);
+  }
+
+  /**
+   * Send the armed OFF for the operation holding `token`, whose snapshot gate
+   * read the arm's power epoch `gatedEpochAt` (the caller gates and calls in
+   * one tick, so the default is that epoch). The publish-boundary guard
+   * (`executeAcAction` option `stillCurrent`, read before it claims the
+   * `set_power` generation and again right before each publish, after the
+   * token and re-auth waits) is all three: the arm is still current (no
+   * cancel, disarm, re-arm or finish since, and no OFF a device fetch saw: that
+   * ends the arm, see `observeOffWhenOnline`), this operation still holds the
+   * claim, and no power epoch came after the gate (the report that gate
+   * accepted says nothing about the unit after it). Any of them failing
+   * publishes nothing and answers "superseded". `onPublish` runs at that
+   * boundary, in the same tick as the publish start. A completed send is
+   * counted (a failed publish too, so a cloud outage cannot resend forever),
+   * but only while the same guard still holds.
+   */
+  async sendOffWhenOnline(
+    arm: OffWhenOnlineArm,
+    token: number,
+    onPublish?: () => void,
+    gatedEpochAt: number = arm.epochAt,
+  ): Promise<"sent" | "superseded"> {
+    const { deviceId } = arm;
+    const current = () => this.isOffWhenOnlineOperationCurrent(arm, token) && arm.epochAt === gatedEpochAt;
+    log.info(`[tcl] ${deviceId} back online and ON: sending armed OFF (attempt ${arm.attempts + 1})`);
+    let superseded = false;
+    try {
+      await this.executeAcAction(deviceId, { power: 0 }, { stillCurrent: current, onPublish });
+    } catch (err) {
+      if (!(err instanceof ControlSupersededError)) throw err;
+      superseded = true;
+      log.info(`[tcl] Armed OFF for ${deviceId} not sent: the arm ended or was cancelled, a newer operation took it over, or a power event came, while the send waited`);
+    } finally {
+      if (!superseded && current()) {
+        arm.attempts += 1;
+        arm.lastSentAt = Date.now();
+      }
+    }
+    return superseded ? "superseded" : "sent";
+  }
+
+  /**
+   * A real source transition (the collector's `notePowerEvent` for the kinds
+   * that restart the units; never "source none" or a meter-only gap): a new
+   * power epoch for every arm. A report from before it says nothing about the
+   * unit after it (a grid-only unit's last report stays "fresh" for minutes
+   * after its line died), so each arm now waits for a report newer than `at`,
+   * and its attempts start over; an OFF still waiting to publish under the
+   * older epoch publishes nothing (`sendOffWhenOnline`). Persisted, LOUD.
+   */
+  noteOffWhenOnlinePowerEpoch(at: number): void {
+    if (this.pendingOffWhenOnline.size === 0) return;
+    for (const arm of this.pendingOffWhenOnline.values()) {
+      arm.epochAt = Math.max(arm.epochAt, at);
+      arm.attempts = 0;
+      arm.lastSentAt = 0;
+    }
+    log.info(`[tcl] Power event: off-when-back-online for ${[...this.pendingOffWhenOnline.keys()].join(", ")} now waits for a report newer than it (attempts start over)`);
+    void this.saveOffWhenOnline();
+  }
+
+  /**
+   * Drop the arm for newer user power intent, synchronously at the entry of
+   * the request that carries it: the control route for any set_power, the
+   * preset route for a verified preset. Only an arm made before the request
+   * can be cancelled this way; an arm accepted while the request then waits is
+   * newer and survives it (`sendControlVerified` and `executeAcActionVerified`
+   * do not disarm). LOUD, see `disarmOffWhenOnline`. The cancel is in memory
+   * and synchronous; the request's success answer waits for it to be durable
+   * through `offWhenOnlineDurablyAbsent`, asked right before that answer.
+   */
+  cancelOffWhenOnline(deviceId: string, reason: string): void {
+    // A failed write is logged LOUDLY by the save chain; the acknowledgement
+    // that reports it is the caller's own `offWhenOnlineDurablyAbsent`.
+    this.disarmOffWhenOnline(deviceId, reason).catch(() => undefined);
+  }
+
+  /**
+   * Drop the arm, LOUDLY. The step re-checks its arm at the OFF's publish
+   * boundary, so a cancelled arm publishes nothing more. Marks the device
+   * touched, so a startup file read still in flight cannot revive it. A
+   * removal is written as every change is; with nothing armed in memory the
+   * file may still hold the arm (another path's removal write pending or
+   * failed, or the startup read pending), so a write is ensured whenever the
+   * device is not durably absent. Resolves as `offWhenOnlineDurablyAbsent`.
+   */
+  private disarmOffWhenOnline(deviceId: string, reason: string): Promise<void> {
+    this.offWhenOnlineTouched.add(deviceId);
+    if (this.pendingOffWhenOnline.delete(deviceId)) {
+      log.info(`[tcl] Off-when-back-online for ${deviceId} disarmed: ${reason}`);
+      void this.saveOffWhenOnline();
+    }
+    return this.offWhenOnlineDurablyAbsent(deviceId);
+  }
+
+  /**
+   * The durable acknowledgement of a cancel, whichever path removed the arm
+   * from memory (a cancel, a disarm, the fetch's terminal OFF, the step's
+   * finish) and whatever became of that path's own write. It decides only on
+   * state, re-read at the call and again after every write it waited for
+   * settles (a write it waited for proves nothing by itself: the device can be
+   * re-armed before that write runs and removed again while it is held).
+   * Resolves at a moment when the device is armed in memory (newer intent than
+   * the cancel being acknowledged: no cancel is left to make durable) or
+   * durably absent (`offWhenOnlineAbsentOnDisk`). Rejects at a moment when it
+   * is neither and the write it waited for, which was to exclude the device,
+   * failed with no newer write queued behind it. Otherwise it waits for the
+   * LAST write in the queue, which completes after every earlier one: joined
+   * when it has not run yet (it snapshots when it runs) or already excludes the
+   * device, else a new one is queued (so a failed removal is written again).
+   * Bounded: after OFF_WHEN_ONLINE_DURABLE_MAX_WRITES writes it rejects.
+   */
+  async offWhenOnlineDurablyAbsent(deviceId: string): Promise<void> {
+    let failed: { write: OffWhenOnlineWrite; err: unknown } | null = null;
+    for (let waited = 0; ; waited++) {
+      if (this.pendingOffWhenOnline.has(deviceId) || this.offWhenOnlineAbsentOnDisk(deviceId)) return;
+      if (failed && failed.write.ids != null && !failed.write.ids.has(deviceId) && this.offWhenOnlineLastWrite === failed.write) {
+        throw failed.err;
+      }
+      if (waited >= OFF_WHEN_ONLINE_DURABLE_MAX_WRITES) {
+        throw new Error(`the arm file may still hold ${deviceId} after ${waited} writes (it kept being armed and removed while the cancel waited)`);
+      }
+      const last = this.offWhenOnlineLastWrite;
+      const write = last && !last.settled && !last.ids?.has(deviceId) ? last : this.queueOffWhenOnlineWrite();
+      failed = null;
+      try {
+        await write.done;
+      } catch (err) {
+        failed = { write, err };
+      }
+    }
+  }
+
+  /**
+   * Out of the arm file: absent from the file as last written (or as the
+   * startup read found it) and from the write running now. A write still
+   * queued has not snapshotted the arms yet; it does when it runs, from memory.
+   */
+  private offWhenOnlineAbsentOnDisk(deviceId: string): boolean {
+    const durable = this.offWhenOnlineDurableIds;
+    const runningHolds = this.offWhenOnlineRunningWrite?.ids?.has(deviceId) ?? false;
+    return durable != null && !durable.has(deviceId) && !runningHolds;
+  }
+
+  /**
+   * The device fetch's only part in "off when back online". An OFF report from
+   * an armed unit that is newer than the arm and its last power epoch ENDS the
+   * arm, at once: after any of our sends it is our OFF landing (or a hand's),
+   * before them the unit came back OFF. Not only after the LAST send: the OFF
+   * one send caused can be reported after the next send started. Ending it
+   * here, in the fetch that saw the OFF, is what makes it terminal everywhere:
+   * an OFF still waiting to publish fails its guard on the arm's identity (a
+   * later ON is someone switching the unit back on, and they win), and the
+   * removal is persisted through the serialized save, so a restart cannot
+   * bring the arm back. Arm state only: nothing is sent or locked here. The
+   * OFF's report time is kept for the collector's step to pin its booking
+   * (`takeOffWhenOnlineSeenOffs`). LOUD.
+   */
+  private observeOffWhenOnline(deviceId: string, power: boolean, powerReportedAt: number | null): void {
+    const arm = this.pendingOffWhenOnline.get(deviceId);
+    if (!arm || power || powerReportedAt == null) return;
+    if (powerReportedAt <= Math.max(arm.armedAt, arm.epochAt)) return;
+    this.pendingOffWhenOnline.delete(deviceId);
+    this.offWhenOnlineSeenOffs.set(deviceId, powerReportedAt);
+    void this.saveOffWhenOnline();
+    log.info(`[tcl] Off-when-back-online for ${deviceId} done: unit reported OFF (${arm.attempts} OFF send(s) completed in this power epoch)`);
+  }
+
+  /** The OFFs device fetches ended arms on since the last call, as [deviceId, power report time]; each is handed out once. */
+  takeOffWhenOnlineSeenOffs(): Array<[string, number]> {
+    const seen = [...this.offWhenOnlineSeenOffs];
+    this.offWhenOnlineSeenOffs.clear();
+    return seen;
+  }
+
+  /**
+   * Queue a write of the arms. Serialized, and each write snapshots the map
+   * when it RUNS (not when it was queued), so the file always ends with the
+   * latest in-memory state however close together arms and disarms come. The
+   * chain starts after the startup read, so no write can drop an arm the file
+   * still holds. Atomic: a temp file in the same directory, renamed over the
+   * target, so a crash mid-write leaves the previous file whole.
+   *
+   * The returned promise settles with THIS write: the durable acknowledgement
+   * an arm's route waits for. A failure is also logged LOUDLY here and the
+   * chain goes on, so callers that do not wait need no handler.
+   */
+  private saveOffWhenOnline(): Promise<void> {
+    return this.queueOffWhenOnlineWrite().done;
+  }
+
+  /** `saveOffWhenOnline`, returning the write itself (its ids and state feed `offWhenOnlineDurablyAbsent`). */
+  private queueOffWhenOnlineWrite(): OffWhenOnlineWrite {
+    const write: OffWhenOnlineWrite = {
+      ids: null,
+      settled: false,
+      done: this.offWhenOnlineSaved.then(() => this.runOffWhenOnlineWrite(write)),
+    };
+    this.offWhenOnlineSaved = write.done.catch((err: unknown) => {
+      log.error(`[tcl] Could not save the off-when-back-online arms: ${(err as Error).message}`);
+    });
+    this.offWhenOnlineLastWrite = write;
+    return write;
+  }
+
+  private async runOffWhenOnlineWrite(write: OffWhenOnlineWrite): Promise<void> {
+    const snapshot = this.offWhenOnlineSnapshot();
+    const ids = new Set(Object.keys(snapshot));
+    write.ids = ids;
+    this.offWhenOnlineRunningWrite = write;
+    try {
+      await this.writeOffWhenOnlineFile(snapshot);
+      this.offWhenOnlineDurableIds = new Set(ids);
+    } catch (err) {
+      // The temp file and the rename should leave the previous file whole, but
+      // a failed write is not trusted: the file is in doubt for its ids too.
+      for (const id of ids) this.offWhenOnlineDurableIds?.add(id);
+      throw err;
+    } finally {
+      write.settled = true;
+      if (this.offWhenOnlineRunningWrite === write) this.offWhenOnlineRunningWrite = null;
+    }
+  }
+
+  private async writeOffWhenOnlineFile(snapshot: Record<string, PersistedOffWhenOnline>): Promise<void> {
+    const target = TclCloud.OFF_WHEN_ONLINE_FILE;
+    const temp = `${target}.tmp`;
+    await writeFile(temp, JSON.stringify(snapshot));
+    await rename(temp, target);
+  }
+
+  private offWhenOnlineSnapshot(): Record<string, PersistedOffWhenOnline> {
+    const data: Record<string, PersistedOffWhenOnline> = {};
+    for (const [id, { armedAt, epochAt }] of this.pendingOffWhenOnline) {
+      data[id] = { armedAt, epochAt };
+    }
+    return data;
+  }
+
+  /** The startup read. Never rejects: see `readOffWhenOnlineFile`. */
+  private async loadOffWhenOnline(): Promise<void> {
+    await this.readOffWhenOnlineFile();
+  }
+
+  /**
+   * No file (first run) means nothing is armed. A file that cannot be read is
+   * logged LOUDLY (what it holds stays unknown: `offWhenOnlineDurableIds`
+   * null). A file that is not a JSON object of arms is CORRUPT: logged LOUDLY
+   * and moved aside (`.corrupt-<time>`) for a human to inspect, never silently
+   * taken for "nothing armed"; a restart revives no arm from it either, so it
+   * counts as holding none. Malformed single entries are skipped.
+   */
+  private async readOffWhenOnlineFile(): Promise<void> {
+    let raw: string;
+    try {
+      raw = await readFile(TclCloud.OFF_WHEN_ONLINE_FILE, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        this.offWhenOnlineDurableIds = new Set();
+        return;
+      }
+      log.error(`[tcl] Could not read the off-when-back-online arms (${(err as Error).message}): starting with none armed`);
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = undefined;
+    }
+    if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      await this.setAsideCorruptOffWhenOnlineFile();
+      this.offWhenOnlineDurableIds = new Set();
+      return;
+    }
+    this.offWhenOnlineDurableIds = new Set(Object.keys(parsed));
+    let superseded = false;
+    type Entry = Partial<Record<keyof PersistedOffWhenOnline, unknown>> | null;
+    for (const [id, entry] of Object.entries(parsed as Record<string, Entry>)) {
+      if (entry == null || typeof entry.armedAt !== "number") continue;
+      // An arm or disarm made since construction is newer than this file.
+      if (this.offWhenOnlineTouched.has(id)) {
+        superseded = true;
+        continue;
+      }
+      // Out of scope (see setOffWhenOnline): never revive a leveled room's arm.
+      if (isAcLevelingEligible(id)) {
+        log.warn(`[tcl] Ignoring the persisted off-when-back-online arm for ${id}: a Smart AC Leveling AC`);
+        superseded = true;
+        continue;
+      }
+      this.pendingOffWhenOnline.set(id, newOffWhenOnline(id, entry.armedAt, entry));
+    }
+    // The file still holds what a newer change replaced or the scope rule
+    // dropped: rewrite it.
+    if (superseded) void this.saveOffWhenOnline();
+  }
+
+  private async setAsideCorruptOffWhenOnlineFile(): Promise<void> {
+    const file = TclCloud.OFF_WHEN_ONLINE_FILE;
+    const aside = `${file}.corrupt-${Date.now()}`;
+    try {
+      await rename(file, aside);
+      log.error(`[tcl] The off-when-back-online arm file is CORRUPT (not a JSON object of arms): moved aside to ${aside}; starting with none armed`);
+    } catch (err) {
+      log.error(`[tcl] The off-when-back-online arm file is CORRUPT (not a JSON object of arms) and could not be moved aside (${(err as Error).message}); starting with none armed`);
+    }
+  }
+
   // ---------- Last State Persistence ----------
 
   /** Freeze the last known manual state across an attributed mains event. */
@@ -1299,6 +1871,12 @@ export class TclCloud {
     // fails closed for unknown future ACs whose line may yet be leveler-owned.
     if (!isPowerCycleRestoreEligible(deviceId)) {
       log.warn(`[tcl] Refusing last-state restore for ${deviceId} — not verified restore-eligible physical wiring`);
+      return false;
+    }
+    // The owner asked for this unit to come back OFF: a restore would republish
+    // its pre-event ON state over that intent.
+    if (this.pendingOffWhenOnline.has(deviceId)) {
+      log.warn(`[tcl] Refusing last-state restore for ${deviceId}: off-when-back-online is armed`);
       return false;
     }
     const saved = this.lastState[deviceId];
@@ -1368,6 +1946,10 @@ export class TclCloud {
 
   private saveStateProps(deviceId: string, shadow: Record<string, number>, isChsa: boolean): void {
     if (this.pendingPowerCycleRestores.has(deviceId)) return;
+    // Armed off-when-back-online: the unit returns in its reboot-default ON
+    // state, which must not overwrite the frozen pre-outage settings. Saving
+    // resumes once the arm resolves.
+    if (this.pendingOffWhenOnline.has(deviceId)) return;
     const props = isChsa ? TclCloud.SAVE_PROPS_CHSA : TclCloud.SAVE_PROPS_OTHER;
     const state: Record<string, unknown> = {};
     for (const p of props) {
@@ -1384,7 +1966,8 @@ export class TclCloud {
     action: AcAction,
     options: AcActionExecutionOptions = {},
   ): Promise<AcActionExecutionResult> {
-    const { preserveProfileIntent = false, suppressWhileManualPresetPending = false } = options;
+    const { preserveProfileIntent = false, suppressWhileManualPresetPending = false, stillCurrent, onPublish } = options;
+    if (stillCurrent && !stillCurrent()) throw new ControlSupersededError(deviceId);
     if (!preserveProfileIntent) {
       // A verified preset is explicit, newer user intent. Until its shadow is
       // confirmed and the route reloads the matching automation profile, the
@@ -1411,10 +1994,15 @@ export class TclCloud {
     // publish-boundary guard in sendControl). Only an OFF supersedes: a raw ON (a
     // leveler restore, an automation) must never silence the user's own OFF
     // (manual wins; that off is already locked and its verifier keeps re-sending).
-    if (safeAction.power === 0) this.supersedeControlVerify(deviceId, "set_power");
+    // A guarded caller is re-checked in the same tick as the claim: one that went
+    // stale during the await above must not stop a newer user command.
+    if (safeAction.power === 0) {
+      if (stillCurrent && !stillCurrent()) throw new ControlSupersededError(deviceId);
+      this.supersedeControlVerify(deviceId, "set_power");
+    }
 
     if (safeAction.power === 0) {
-      await this.sendControl(deviceId, "set_power", 0, false, true);
+      await this.sendControl(deviceId, "set_power", 0, false, true, stillCurrent, onPublish);
       return "applied";
     }
 
@@ -1453,6 +2041,9 @@ export class TclCloud {
    * the caller instead of silently reporting success.
    */
   async executeAcActionVerified(deviceId: string, action: AcAction): Promise<AcVerifiedProfileResult> {
+    // An armed "off when back online" is cancelled by the preset route at its
+    // entry, not here: an arm accepted while this request waited is newer than
+    // the preset and must survive it (2026-10-10).
     await this.ensureDeviceCachePopulated();
     // A verified preset is newer user intent than any frozen last-state
     // snapshot: cancel a pending restore (un-freezing state-save) before the
@@ -1651,6 +2242,10 @@ export class TclCloud {
       this.pendingPowerCycleRestores.delete(deviceId);
       log.info(`[tcl] Pending last-state restore for ${deviceId} cancelled by direct user command`);
     }
+    // An armed "off when back online" is cancelled by the control route, its
+    // only caller, synchronously at the request's entry (`cancelOffWhenOnline`),
+    // not here: an arm accepted while this command waited on validation is
+    // newer and must survive it (2026-10-10).
     // Any newer direct user intent cancels an older whole-profile verifier so
     // that its retry cannot overwrite this command five seconds later.
     this.bumpProfileGeneration(deviceId);
@@ -1726,16 +2321,21 @@ export class TclCloud {
    */
   private controlGenerations = new Map<string, number>();
 
-  /** Bump a verify generation without starting a loop: any pending verifier of that field stops. */
-  private supersedeControlVerify(deviceId: string, command: string): void {
+  /**
+   * Bump a verify generation without starting a loop: any pending verifier of
+   * that field stops, and a command of it still waiting to publish is never
+   * sent. `by` words the loser's outcome: a raw OFF is "system", an
+   * off-when-online arm is the user's.
+   */
+  private supersedeControlVerify(deviceId: string, command: string, by: "user" | "system" = "system"): void {
     const genKey = `${deviceId}:${command}`;
     this.controlGenerations.set(genKey, (this.controlGenerations.get(genKey) ?? 0) + 1);
-    this.controlClaimedBy.set(genKey, "system");
+    this.controlClaimedBy.set(genKey, by);
   }
 
   /** Who made the latest generation claim per `(deviceId, command)`: a dashboard
-   * command ("user") or a raw OFF through executeAcAction ("system"). Only read
-   * to word a superseded outcome honestly. */
+   * command or an off-when-online arm ("user"), or a raw OFF through
+   * executeAcAction ("system"). Only read to word a superseded outcome honestly. */
   private controlClaimedBy = new Map<string, "user" | "system">();
 
   private async verifyControlApplied(

@@ -257,7 +257,44 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
     return () => clearTimeout(id);
   }, [powerError]);
 
+  // Offline while ON (the grid-only Guest on generator): the power button arms
+  // a one-shot OFF the server sends when the unit reports again.
+  // The optimistic value yields to any fresh snapshot of the unit, not only an
+  // offWhenOnline change: the server can arm and resolve between two polls, and
+  // then that flag never changes while online, power and last-seen do.
+  const [armedLocal, setArmedLocal] = useState<boolean | null>(null);
+  useEffect(() => { setArmedLocal(null); }, [d.offWhenOnline, d.isOnline, d.power, d.lastSeenAt]);
+  const offArmed = armedLocal ?? d.offWhenOnline === true;
+  // ACs outside Smart AC Leveling only (the server refuses the rest): a leveled
+  // AC offline keeps the disabled power button.
+  const canArmOff = offline && !d.levelingEligible && (isOn || offArmed);
+
+  const handleArmOff = async () => {
+    if (powerBusy) return;
+    const next = !offArmed;
+    setPowerBusy(true);
+    setPowerError("");
+    try {
+      const resp = await fetch(`/api/ac/devices/${encodeURIComponent(d.id)}/off-when-online`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: next }),
+      });
+      const body = await resp.json().catch(() => ({})) as { error?: string; offWhenOnline?: unknown };
+      // The server's answer is authoritative, not the request (it can refuse an
+      // arm, or the arm can already have resolved), also on a 500 whose change
+      // holds in memory only.
+      if (typeof body.offWhenOnline === "boolean") setArmedLocal(body.offWhenOnline);
+      if (!resp.ok) throw new Error(body.error ?? `Request failed (${resp.status})`);
+    } catch (err) {
+      setPowerError((err as Error).message || "Command failed");
+    } finally {
+      setPowerBusy(false);
+    }
+  };
+
   const handlePowerToggle = async () => {
+    if (canArmOff) { await handleArmOff(); return; }
     if (offline || powerBusy) return;
     setPowerBusy(true);
     setPowerError("");
@@ -280,7 +317,7 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
     <>
       <div className={cn(
         "flex flex-col items-center bg-[#171920]/90 border border-white/[0.05] p-1 rounded-2xl shadow-[0_4px_12px_-4px_rgba(0,0,0,0.5)] backdrop-blur-xl transition-all shrink-0 self-start",
-        offline ? "opacity-40" : "hover:border-white/10 hover:bg-[#1a1c23]/95"
+        offline ? (canArmOff ? "opacity-70" : "opacity-40") : "hover:border-white/10 hover:bg-[#1a1c23]/95"
       )}>
         {/* Header */}
         <span className="text-[0.65rem] text-text/70 font-bold tracking-wider mt-0.5 mb-0.5">{label ?? "AC"}</span>
@@ -289,18 +326,24 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
         <div className="flex items-center gap-1">
           <button
             onClick={handlePowerToggle}
-            disabled={offline || powerBusy}
+            disabled={(offline && !canArmOff) || powerBusy}
             className={cn(
               "relative flex items-center justify-center w-7 h-7 rounded-full transition-all shrink-0",
-              !isOn && "bg-white/[0.03] text-dim hover:bg-white/10 hover:text-white",
-              (offline || powerBusy) && "cursor-not-allowed",
+              canArmOff
+                ? (offArmed ? "bg-amber-400/90 text-black shadow-[0_0_12px_rgba(251,191,36,0.5)]" : "bg-white/[0.06] text-dim hover:bg-white/15 hover:text-white")
+                : !isOn && "bg-white/[0.03] text-dim hover:bg-white/10 hover:text-white",
+              ((offline && !canArmOff) || powerBusy) && "cursor-not-allowed",
             )}
-            style={isOn ? { backgroundColor: colors.accent, color: "#000", boxShadow: `0 0 12px ${colors.glow}` } : undefined}
-            title={offline ? "Offline" : isOn ? "Turn off" : "Turn on"}
+            style={isOn && !canArmOff ? { backgroundColor: colors.accent, color: "#000", boxShadow: `0 0 12px ${colors.glow}` } : undefined}
+            title={canArmOff
+              ? (offArmed ? "Will turn off when back online (tap to cancel)" : "Offline: turn off when back online")
+              : offline ? "Offline" : isOn ? "Turn off" : "Turn on"}
           >
             {powerBusy
               ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              : <Power className="w-3.5 h-3.5" strokeWidth={2.5} />
+              : offArmed && canArmOff
+                ? <TimerOff className="w-3.5 h-3.5" strokeWidth={2.5} />
+                : <Power className="w-3.5 h-3.5" strokeWidth={2.5} />
             }
           </button>
           <button
@@ -315,6 +358,9 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
 
         {powerError && (
           <p role="alert" className="mt-0.5 max-w-[8.5rem] text-center text-[0.55rem] leading-tight text-red-400">{powerError}</p>
+        )}
+        {canArmOff && offArmed && !powerError && (
+          <p className="mt-0.5 max-w-[8.5rem] text-center text-[0.55rem] leading-tight text-amber-300">off when back</p>
         )}
 
         <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
