@@ -1692,25 +1692,17 @@ export class LevelingControllerV2 {
     // on its own. The pin itself wins for as long as it stands (invariant 42) —
     // the hold is what survives him clearing it.
     //
-    // ⚠ ONLY for a room with a CONFIGURED levelBoost (FIX C, 2026-08-26). The
-    // learned hold refines the outdoor threshold (below its `outdoorAtLeastC`) of
-    // a low-level failure the user has DECLARED via a boost (Abdullah); it does
-    // not diagnose a new disease from a comfort tap. For a boost-less room a hand
-    // raise off L1 is a comfort choice, not compressor evidence: live 2026-08-26
-    // 13:45Z a household member raised Najat (no boost) L1→3 with fan 7 from the
-    // dashboard, and it minted a false 6h min-L2 hold that admitted her at L2 on
-    // the 14:02:49Z gen entry (journal #20044). The off-drop armer stays unscoped:
-    // a graded lone off measuring about a fan against a 2A model is meter
-    // evidence, and applies to any room.
+    // ⚠ ONLY for a room with a CONFIGURED levelBoost (FIX C, 2026-08-26; the gate
+    // is `levelHoldAllowed`, inside `noteLevelHold`). The learned hold refines the
+    // outdoor threshold (below its `outdoorAtLeastC`) of a low-level failure the
+    // user has DECLARED via a boost (Abdullah); it does not diagnose a new disease
+    // from a comfort tap. For a boost-less room a hand raise off L1 is a comfort
+    // choice, not compressor evidence: live 2026-08-26 13:45Z a household member
+    // raised Najat (no boost) L1→3 with fan 7 from the dashboard, and it minted a
+    // false 6h min-L2 hold that admitted her at L2 on the 14:02:49Z gen entry
+    // (journal #20044). Since 2026-09-24 the off-drop armer is scoped the same way.
     if (confirmed === 1 && target > 1) {
-      if (this.config.levelBoosts[deviceId] != null) {
-        await this.noteLevelHold(deviceId, 1, this.freshOutdoorC(now), now, "user raised the room off L1 by hand");
-      } else {
-        const name = this.deviceNames.get(deviceId) ?? deviceId;
-        log.info(
-          `[leveler2] ${name}: raised off L1 by hand, but no level boost is configured for this room: a comfort raise, not non-cooling evidence`,
-        );
-      }
+      await this.noteLevelHold(deviceId, 1, this.freshOutdoorC(now), now, "user raised the room off L1 by hand");
     }
     // Increment: hard pin unless the METER says it would breach the breaker.
     const view = meterView(this.meterState, now);
@@ -2728,13 +2720,13 @@ export class LevelingControllerV2 {
           // attributable no matter what the line is doing.
           //
           // …and ONLY for a room with a CONFIGURED levelBoost (FIX C, 2026-08-26),
-          // exactly like the dashboard path: the learned hold refines the outdoor
-          // threshold (below its `outdoorAtLeastC`) of a low-level failure the user
-          // has DECLARED via a boost (Abdullah); it does not diagnose a new disease
-          // from a comfort tap. For a boost-less room an observed raise off L1 is a
-          // comfort choice (live 2026-08-26 13:45Z Najat L1→3, journal #20044), so
-          // it is logged and arms nothing. The off-drop armer stays unscoped: its
-          // graded lone off is meter evidence, and applies to any room.
+          // exactly like the dashboard path and, since 2026-09-24, the off-drop
+          // (`levelHoldAllowed`, inside `noteLevelHold`): the learned hold refines
+          // the outdoor threshold (below its `outdoorAtLeastC`) of a low-level
+          // failure the user has DECLARED via a boost (Abdullah); it does not
+          // diagnose a new disease from a comfort tap. For a boost-less room an
+          // observed raise off L1 is a comfort choice (live 2026-08-26 13:45Z Najat
+          // L1→3, journal #20044), so it is logged and arms nothing.
           if (wasConfirmedAt === 1 && result.level > 1) {
             // Per-device since 2026-09-05: one room's own power-cycle
             // fingerprint must not stand the armer down for its neighbours, and
@@ -2748,12 +2740,8 @@ export class LevelingControllerV2 {
                   `(${Math.round(clock.agoMs / 1000)}s): firmware restore, ` +
                   `not a human raise; no hold`,
               );
-            } else if (this.config.levelBoosts[device.id] != null) {
-              await this.noteLevelHold(device.id, 1, outdoorTempC, now, "raised off L1 externally");
             } else {
-              log.info(
-                `[leveler2] ${device.name}: raised off L1 externally, but no level boost is configured for this room: a comfort raise, not non-cooling evidence`,
-              );
+              await this.noteLevelHold(device.id, 1, outdoorTempC, now, "raised off L1 externally");
             }
           }
         }
@@ -3244,6 +3232,35 @@ export class LevelingControllerV2 {
   }
 
   /**
+   * May this room carry a LEARNED non-cooling hold at all? Only when the user
+   * has DECLARED its low-level failure through a configured `levelBoosts` entry
+   * (Abdullah). The hold refines that declaration's outdoor threshold from
+   * evidence; it never diagnoses a new disease in a room the user has not named.
+   *
+   * The ONE gate for every armer, the view composition, the status card and the
+   * sweep, so the question cannot drift between them. The two hand-raise armers
+   * were scoped this way first (FIX C, 2026-08-26: a comfort tap on Najat minted
+   * a false 6h min-L2 hold, journal #20044); the graded off-drop was left
+   * unscoped as "meter evidence" until 2026-09-24, when it did the same to Abdu:
+   * shed at L1 at 07:39:11Z, the meter fell 0.93A against his 4.2A model, and a
+   * 6h min-L2 hold kept him at L2 (+1.9A on a 16A generator) while Najat sat
+   * shed. User: "Abdu AC never need more than L1 to work". A fan-sized drop
+   * proves the compressor was not running at that moment, not that the level
+   * cannot cool: the unit's own thermostat idles it, restart protection holds it
+   * off, and the fall is a whole-house delta that a household load stepping UP
+   * inside the window shrinks (the same flaw that made the lone-raise RISE
+   * report-only, from the other side).
+   */
+  private levelHoldAllowed(deviceId: string): boolean {
+    return this.config.levelBoosts[deviceId] != null;
+  }
+
+  /** The room's learned hold, or null when it has none or may not carry one. */
+  private learnedHoldFor(deviceId: string): LevelHold | null {
+    return this.levelHoldAllowed(deviceId) ? (this.levelHolds.get(deviceId) ?? null) : null;
+  }
+
+  /**
    * Record (or renew) the learned non-cooling hold for a room — R14, the user's
    * own rule, 2026-08-04: "when the system observe that abdullah is not working
    * on l1 (by own observation or manual raise), it should state the outside
@@ -3255,6 +3272,10 @@ export class LevelingControllerV2 {
    * temperature bar is just a six-hour ban — so we decline to record and say so.
    * The evidence recurs every tick the room keeps failing, so nothing is lost
    * but the ticks the station was down for.
+   *
+   * A room with no configured boost records nothing (`levelHoldAllowed`), and
+   * the line says why, so a forensic pass can tell "no evidence" from "evidence
+   * the room was not eligible to act on".
    */
   private async noteLevelHold(
     deviceId: string,
@@ -3264,6 +3285,13 @@ export class LevelingControllerV2 {
     why: string,
   ): Promise<void> {
     const name = this.deviceNames.get(deviceId) ?? deviceId;
+    if (!this.levelHoldAllowed(deviceId)) {
+      log.info(
+        `[leveler2] ${name}: ${why}, but no level boost is configured for this room: ` +
+          `not non-cooling evidence, no hold`,
+      );
+      return;
+    }
     if (outdoorC == null) {
       log.info(`[leveler2] ${name}: L${level} looks non-cooling (${why}) but the outdoor feed is stale — no hold recorded`);
       return;
@@ -3290,14 +3318,22 @@ export class LevelingControllerV2 {
    */
   private async sweepLevelHolds(outdoorTempC: number | null, now: number): Promise<void> {
     for (const [deviceId, hold] of [...this.levelHolds]) {
-      if (levelHoldLive(hold, outdoorTempC, now)) continue;
+      // A room that may not carry a hold loses it outright, whatever the weather
+      // or the clock says: its boost was removed, or the hold was minted before
+      // the off-drop armer was scoped (Abdu's 2026-09-24 row). It never binds in
+      // the meantime (`learnedHoldFor`); this retires the row so a later boost
+      // cannot adopt evidence gathered while the room was declared healthy.
+      const allowed = this.levelHoldAllowed(deviceId);
+      if (allowed && levelHoldLive(hold, outdoorTempC, now)) continue;
       this.levelHolds.delete(deviceId);
       await this.store.deleteLevelHold(deviceId).catch(() => undefined);
       log.info(
         `[leveler2] ${this.deviceNames.get(deviceId) ?? deviceId}: learned L${hold.level} hold released ` +
-          (now >= levelHoldExpiresAt(hold)
-            ? `(${(LEVEL_HOLD_TTL_MS / 3_600_000).toFixed(0)}h since the observation)`
-            : `(outdoor ${outdoorTempC?.toFixed(1) ?? "?"}°C is back under ${hold.outdoorC.toFixed(1)}°C)`),
+          (!allowed
+            ? "(no level boost is configured for this room: a learned hold only refines a declared one)"
+            : now >= levelHoldExpiresAt(hold)
+              ? `(${(LEVEL_HOLD_TTL_MS / 3_600_000).toFixed(0)}h since the observation)`
+              : `(outdoor ${outdoorTempC?.toFixed(1) ?? "?"}°C is back under ${hold.outdoorC.toFixed(1)}°C)`),
       );
     }
   }
@@ -3363,7 +3399,7 @@ export class LevelingControllerV2 {
       // to `manualTarget`/`manualCap`, so a user who pins L1 under a live hold
       // gets L1 and the sub-floor rung back. Declining is his to do.
       const maxLevel = device.maxGeneratorLevel || 3;
-      const holdFloor = levelHoldFloor(this.levelHolds.get(device.id) ?? null, outdoorTempC, now, maxLevel);
+      const holdFloor = levelHoldFloor(this.learnedHoldFor(device.id), outdoorTempC, now, maxLevel);
       const recon = this.recon[device.id];
       const ramping = (this.rampUntil.get(device.id) ?? 0) > now && device.power;
       // During settle the shadow reflects the pre-command state — use pending.
@@ -4336,12 +4372,18 @@ export class LevelingControllerV2 {
     // …and that is one of R14's triggers — and since 2026-08-06 one of only
     // three, the thermometer watch having stopped being evidence at all.
     //
-    // Deliberately UNSCOPED, unlike the hand-raise armers (FIX C, 2026-08-26): a
-    // graded lone off that moved the meter by about a fan against a 2A level model
-    // is METER evidence the compressor was not running, and that is true of any
-    // room whether or not a levelBoost is configured. The hand-raise armers gate
-    // on a configured boost because a comfort tap is a preference and not
-    // evidence; this measurement is evidence, so it applies everywhere.
+    // ⚠ SCOPED since 2026-09-24, like the hand-raise armers (FIX C, 2026-08-26):
+    // `noteLevelHold` records nothing for a room with no configured levelBoost.
+    // This was left unscoped as "meter evidence, true of any room", and the
+    // evidence is real, but it answers a narrower question than the hold asks.
+    // It proves the compressor was not running when the room went off, not that
+    // the level cannot cool: the unit's own thermostat idles it, restart
+    // protection holds it off, and the fall is a whole-house delta that a
+    // household load stepping UP inside the window shrinks. Live 07:39:11Z Abdu
+    // (2-ton, no boost) went off at L1 for a 0.93A fall against a 4.2A model and
+    // was held at min L2 for 6h; the user: "Abdu AC never need more than L1 to
+    // work". The measurement above is still recorded (`compressorOffLikely`,
+    // which only bites below an active floor, so it is inert for such a room).
     if (level === 1) {
       void this.noteLevelHold(deviceId, 1, this.freshOutdoorC(now), now, `off-drop of only ${dropAmps.toFixed(1)}A at L1`);
     }
@@ -4364,13 +4406,15 @@ export class LevelingControllerV2 {
    * 3.5 A bar, and the 6 h L1 hold that used to follow would spend the hottest
    * room's amps on a kettle. That is precisely the false-evidence class
    * invariant 56 exists to kill, arriving from the amps side instead of the
-   * thermometer side. `noteOffDrop` does not share the flaw: a household step
-   * DOWN coincident with our own off is both rarer and self-limiting, and the
-   * off-drop bar is a ceiling on a fall rather than a floor under a rise.
+   * thermometer side. (This comment used to say `noteOffDrop` does not share
+   * the flaw. It does, from the other side: a household load stepping UP inside
+   * the off window shrinks the measured fall, and on 2026-09-24 an off of Abdu
+   * at L1 graded 0.0A while the meter rose 1.57A. Hence `levelHoldAllowed`.)
    *
-   * So this journals and logs, and the three armers of the learned hold stay
-   * the ones that measure only what they can attribute: the graded off-drop
-   * (55), the dead window (44), and the user's own hand raise. Closing it for
+   * So this journals and logs, and the armers of the learned hold stay the ones
+   * that measure only what they can attribute: the graded off-drop (55) and the
+   * user's own hand raise, and since 2026-09-24 only in a room with a configured
+   * levelBoost (`levelHoldAllowed`). Closing it for
    * real needs the rise taken net of `houseLoadAmps` at both ends of the
    * window — its own piece of work, not a threshold tweak.
    *
@@ -4439,7 +4483,7 @@ export class LevelingControllerV2 {
     deviceId: string,
     now: number,
   ): { level: number; outdoorC: number; until: number; detail: string } | null {
-    const hold = this.levelHolds.get(deviceId);
+    const hold = this.learnedHoldFor(deviceId);
     if (hold == null || !levelHoldLive(hold, this.freshOutdoorC(now), now)) return null;
     return {
       level: hold.level,

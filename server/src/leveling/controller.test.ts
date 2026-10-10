@@ -2138,9 +2138,11 @@ describe("LevelingControllerV2 — a session that begins with a dead circuit", (
 // the outside temp, so it will never reduce the level to l1 untill it drop
 // below that temp or after [6] h".
 //
-// SHELL tests. The hold is armed by shell-owned evidence (the sub-floor watch
-// clock, a manual raise arriving on its own HTTP request), keyed on the outdoor
-// feed only the shell sees, and PERSISTED — none of which scenario.ts models.
+// SHELL tests. The hold is armed by shell-owned evidence (a graded lone
+// off-drop, a manual raise arriving on its own HTTP request or seen by the
+// device poll), only for a room with a configured levelBoost (2026-09-24),
+// keyed on the outdoor feed only the shell sees, and PERSISTED — none of which
+// scenario.ts models.
 // The pure release/merge arithmetic has its own guards in level-hold.test.ts.
 // ---------------------------------------------------------------------------
 
@@ -2208,9 +2210,14 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
-      // Observed an hour ago at 39°C outdoor; it is 44°C now, so it binds.
+      // Observed an hour ago at 39°C outdoor; it is 44°C now, so it binds. The
+      // room carries a CONFIGURED boost (dormant at 44°C, 50°C threshold): a
+      // learned hold only binds a room whose L1 failure the user declared.
       const holds = new Map([[HOT, { level: 1, outdoorC: 39, observedAt: Date.now() - 3_600_000 }]]);
-      const { controller, sent, offs, run } = setup({ holds });
+      const { controller, sent, offs, run } = setup({
+        holds,
+        levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 50 } },
+      });
       await controller.ensureLoaded();
 
       // The 13:10:47 shape: a projected mild overshoot with the coolest room
@@ -2233,7 +2240,10 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
     try {
       vi.setSystemTime(new Date("2026-08-04T10:00:00Z"));
       const holds = new Map([[HOT, { level: 1, outdoorC: 39, observedAt: Date.now() }]]);
-      const { mock, controller, run } = setup({ holds });
+      const { mock, controller, run } = setup({
+        holds,
+        levelBoosts: { [HOT]: { minLevel: 2, outdoorAtLeastC: 50 } },
+      });
       await controller.ensureLoaded();
 
       await run(12.0, 4, 44);
@@ -2243,6 +2253,33 @@ describe("LevelingControllerV2 — the learned L1 non-cooling hold (R14)", () =>
       expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.levelHold ?? null).toBeNull();
       expect(controller.getStatus().acs.find((a) => a.deviceId === HOT)?.minLevel).toBe(1);
       expect(mock.levelHolds.has(HOT)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("REGRESSION 2026-09-24: a persisted hold on a room with NO configured boost never binds and is released", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-24T08:20:00Z"));
+      // The live row: Abdu's false min-L2 hold, armed at 07:39:58Z at 35.1°C
+      // outdoor by a graded off-drop, still inside its 6h TTL and its outdoor
+      // bar (36°C now). The room has no levelBoost, so the deploy that scopes
+      // the armer must also retire the hold it already minted, row included.
+      const holds = new Map([[HOT, { level: 1, outdoorC: 35.1, observedAt: Date.parse("2026-09-24T07:39:58Z") }]]);
+      const { mock, controller, sent, run } = setup({ holds, hotLevel: 2, hotNeed: 0.2 });
+      await controller.ensureLoaded();
+
+      await run(12.0, 2, 36);
+
+      const status = controller.getStatus().acs.find((a) => a.deviceId === HOT);
+      expect(status?.levelHold ?? null).toBeNull();
+      expect(status?.minLevel).toBe(1);
+      expect(mock.levelHolds.has(HOT)).toBe(false);
+      // A satisfied room above its ceiling is demoted to L1 once the dwell is
+      // served: L1 is a legal level for it again.
+      await run(12.0, 40, 36);
+      expect(sent.some((c) => c.deviceId === HOT && c.value === 1)).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -2608,9 +2645,12 @@ describe("LevelingControllerV2 — a room's own shed bars its restore (R9)", () 
 // ---------------------------------------------------------------------------
 
 describe("LevelingControllerV2 — a fan-sized off-drop says the compressor was off (R6)", () => {
-  function setup(dropTo: number) {
+  function setup(dropTo: number, levelBoosts?: Record<string, { minLevel: number; outdoorAtLeastC: number }>) {
     // 2.3A modelled at L1 — a real 1-ton, so a small drop MEANS something.
-    const mock = createGradePool({ genAmpModels: { a: { baseAmps: 2.3, stepAmps: 1.5 } } });
+    const mock = createGradePool({
+      genAmpModels: { a: { baseAmps: 2.3, stepAmps: 1.5 } },
+      ...(levelBoosts != null ? { levelBoosts } : {}),
+    });
     const a = { id: "a", name: "a", power: true, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1, currentTemp: 30 };
     const deps: LevelingDeps = {
       ...createDeps(),
@@ -2643,7 +2683,12 @@ describe("LevelingControllerV2 — a fan-sized off-drop says the compressor was 
       // Settle high enough that the 4-wide median is really there before the
       // shed — the drop is measured from the SMOOTHED meter, so a lagging
       // median would measure the settle rather than the compressor.
-      const { mock, controller, a, run } = setup(15.1);
+      //
+      // A boost is CONFIGURED for the room (2026-09-24): the off-drop only arms
+      // the learned hold for a room whose low-level failure the user declared.
+      // Its 50°C threshold is dormant at 44°C, so the boost itself changes
+      // nothing and the off-drop is still what arms the hold.
+      const { mock, controller, a, run } = setup(15.1, { a: { minLevel: 2, outdoorAtLeastC: 50 } });
       await controller.ensureLoaded();
 
       await run(14.5, 12);
@@ -2658,6 +2703,34 @@ describe("LevelingControllerV2 — a fan-sized off-drop says the compressor was 
       // …and the evidence became a learned hold at the outdoor temperature it
       // was observed at (R14's first trigger, arriving from the METER).
       expect(mock.levelHolds.get("a")).toMatchObject({ level: 1, outdoorC: 44 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("REGRESSION 2026-09-24 07:39:11Z: a fan-sized off-drop in a room with NO configured boost arms no hold", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-24T07:30:00Z"));
+      // The live shape: Abdu (no levelBoost) was shed at L1 and the meter fell
+      // 0.93A against a 4.2A model. A compressor idles for reasons other than a
+      // level that cannot cool (its own thermostat, restart protection), and the
+      // fall is a whole-house delta a household step-up shrinks, so the graded
+      // off-drop minted a false 6h min-L2 hold on a room the user says never
+      // needs more than L1. The measurement is still recorded; only the hold is
+      // scoped to rooms whose L1 failure the user DECLARED via a boost.
+      const { mock, controller, a, run } = setup(15.1);
+      await controller.ensureLoaded();
+
+      await run(14.5, 12);
+      await run(16.5, 4);
+      expect(a.power).toBe(false);
+      await run(15.1, 16);
+
+      const internals = controller as unknown as { compressorOff: Map<string, { level: number }> };
+      expect(internals.compressorOff.get("a")).toMatchObject({ level: 1 });
+      expect(mock.levelHolds.size).toBe(0);
+      expect(controller.getStatus().acs.find((s) => s.deviceId === "a")?.levelHold ?? null).toBeNull();
     } finally {
       vi.useRealTimers();
     }

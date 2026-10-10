@@ -17,6 +17,74 @@ timestamp: 2026-07-28
 
 A ground-up rewrite lives in **`server/src/leveling/`** (22 small modules, pure decision functions + one stateful shell), built after a week-long forensic review (82 emergencies/32h, fan cascades, 49m–1h18m restore strands, 16.6A post-collapse double-raise; most breaker trips proved EXTERNAL street-gen failures). Selected by **`controller: "v1" | "shadow" | "v2"`** stored in `ac_leveling_config` **row id=2** (v1's save path would clobber unknown fields in row id=1, so v2 owns its own row; merged with id=2 winning; re-read every 30s → **live-flippable via `PUT /api/ac/leveling`, instant rollback**). In `shadow`, v1 acts while v2 journals every decision with `executed=false`.
 
+### 2026-09-24: a learned L1 hold only refines a DECLARED boost (Abdu's false min-L2)
+
+User, verbatim: *"it says Abdu ac needs l2 as minimum (learned). Abdu AC never need more than L1 to
+work."* SKILL invariant **76** (new), with **52**, **55** and **56** amended.
+
+**What happened.** The status card showed Abdu (2-ton, no `levelBoosts` entry) at `minLevel 2` with
+`levelHold {L1, 35.1 °C}` until 13:39Z, so on a 16 A generator he was held at L2 (6.1 A) instead of
+L1 (4.2 A) while Najat sat shed behind her own-shed-trough bar. The hold came from the graded lone
+off-drop (invariant 55), three times in one morning, each one a leveler shed of Abdu at L1 against a
+clamp-measured 4.2 A L1 draw (2026-08-19):
+
+| Shed (journal) | Graded off-drop | What it did |
+|---|---|---|
+| 06:42:47Z #32656 `over_extreme` | 0.0 A (the meter ROSE 1.57 A after the off) | armed the hold at 35.1 °C (06:43:36Z) |
+| 06:58:29Z #32662 `over_severe` | 0.4 A | evidence renewed |
+| 07:39:11Z #32676 `over_mild` | 0.9 A | hold renewed at 07:39:58Z, +6 h |
+
+The measured non-AC house was about 10 to 11 A that morning (the envelope refusals read
+"incl. 10.7A house"), so a household load stepping up inside a grading window swamps a 4 A fall: the
+first sample fell by nothing because the house rose by more than the compressor left.
+
+**Why the evidence misled.** A fan-sized off-drop proves the compressor was not drawing when the room
+went off, not that the level cannot cool the room. The unit's own thermostat idles it (its setpoint is
+not the leveler's comfort target), TCL restart protection holds it off after a power-on, and the fall
+is a whole-house delta. Invariant 56 demoted the lone-raise RISE to report-only because a household
+step UP inflates it, and argued the off-drop was immune because "a household step DOWN coincident
+with our own off is rarer". That was the wrong step: the false positive for a fall is ALSO a household
+step up (it shrinks the fall), exactly as common as it is for a rise.
+
+**The fix (`controller.ts`).** The boundary FIX C drew for the two hand-raise armers on 2026-08-26
+(journal #20044, a comfort tap on Najat), now drawn for every armer:
+- **One gate.** `levelHoldAllowed(deviceId)` is true only for a room with a configured `levelBoosts`
+  entry. `noteLevelHold` refuses anything else and logs
+  `<name>: <why>, but no level boost is configured for this room: not non-cooling evidence, no hold`.
+  The two FIX C call-site checks collapsed into it; the observed raise's power-event guard still runs
+  first.
+- **Never binds.** `learnedHoldFor(deviceId)` feeds `buildViews` (`holdFloor`, hence `minLevel`,
+  `boostFloorHard` and the watch minimum) and the status card, so an existing hold on a boost-less
+  room binds nothing and is not shown, in every mode.
+- **Retired on the first acting tick.** `sweepLevelHolds` deletes such a hold, row included
+  (`learned L1 hold released (no level boost is configured for this room: …)`), so the deploy retired
+  Abdu's live row by itself and a boost configured later cannot adopt evidence gathered while the room
+  was declared healthy. The sweep runs only while v2 acts; in shadow mode the row lingers inert.
+- **The measurement stays.** `compressorOff` is still recorded for every room and still surfaces as
+  `coolingState: "compressor_off"` until retired. It is inert for a boost-less room: `isNonCooling`
+  needs a level below an active floor, and such a room's floor is L1.
+
+Today that leaves Abdullah as the only room that can carry a learned hold. Configuring a boost for
+another room (Najat is the other 1-ton) re-enables learning for it.
+
+**Accepted risk.** A config row that transiently loses `levelBoosts` would let the sweep delete
+Abdullah's legitimate hold. The same glitch drops his configured boost too, and losing a hold is the
+fewer-amps direction (never a breaker risk), so it is not guarded.
+
+**Tests** (`controller.test.ts`), both RED on `d183f93`: *"REGRESSION 2026-09-24 07:39:11Z: a
+fan-sized off-drop in a room with NO configured boost arms no hold"* (R6 describe; `compressorOff`
+still recorded) and *"REGRESSION 2026-09-24: a persisted hold on a room with NO configured boost never
+binds and is released"* (R14 describe; row deleted, room demotable to L1 again). Three existing tests
+gained a dormant 50 °C boost so they keep exercising the arming and binding path.
+
+**Seen the same morning, NOT changed (open, for the user):** (1) the 07:39:11Z shed fired as
+`over_mild` ("reduce 0.6A") with the smoothed meter at 13.8 A against a 16.0 A limit and flicker 0.0;
+(2) Abdullah carried a learned hold keyed at 30.7 °C, far below his configured 38 °C boost. Its
+original observation predates the ~18 h of retained container logs; it was last renewed at 03:00:50Z
+on a device-poll tick (the timestamp shares the tick's millisecond phase), which points at an
+observed raise off L1, and a renewal logs nothing because `noteLevelHold` only speaks when the
+outdoor bar changes. It stays legal under the new rule (he has a boost) but deserves a look.
+
 ### 2026-09-05: manual intent lifetime, and the over-limit budget becomes a setting
 
 Two user asks, answered in one session: *"a manual set of the AC level should be reset on the next
@@ -1003,7 +1071,10 @@ information about whether the compressor is running.
 
   The off-drop does not share the flaw: a household step DOWN coincident with our own off is rarer,
   and its bar is a **ceiling on a fall** (a small drop proves absence) rather than a floor under a
-  rise (a large rise must be proven to belong to us). Closing the rise side for real needs the rise
+  rise (a large rise must be proven to belong to us). ⚠️ **Wrong, corrected 2026-09-24:** the false
+  positive for a fall is a household step UP, which shrinks it; the off-drop now arms a hold only in a
+  room with a configured boost (see "2026-09-24: a learned L1 hold only refines a DECLARED boost"
+  near the top of this section). Closing the rise side for real needs the rise
   taken **net of `houseLoadAmps` at both ends of the window** — its own piece of work, not a
   threshold tweak. Until then the detection, the exclusions and the constant all stay as
   observability and as the scaffolding that version would reuse.
@@ -3160,6 +3231,16 @@ First full gen run (06:42–07:16 UTC, 33/33 steps): Abdullah (2.08/3.81/4.32A) 
   override is untouched, and invariant 53's open question (may a pin jump the needier-room fence?)
   stays open.
   (See "2026-09-05: manual intent lifetime, and the over-limit budget becomes a setting".)
+- **2026-09-24 (Abdu's L1 always works; a learned hold needs a declared boost):** user, verbatim:
+  *"it says Abdu ac needs l2 as minimum (learned). Abdu AC never need more than L1 to work."* A
+  hardware statement about the 2-ton unit: its compressor runs at L1 in any heat this house sees, so a
+  min-L2 floor on Abdu is always a false positive and Abdu gets no `levelBoosts` entry. Decision
+  applied: the learned L1 hold (invariant 52) exists only for a room whose low-level failure the user
+  DECLARED via a configured boost, for every armer. This supersedes FIX C's "the off-drop armer stays
+  unscoped" (2026-08-26). ⚠️ Taken by the session as the conventional, reversible reading, not asked
+  explicitly: the same scope also covers **Najat** (1-ton, no boost). If her L1 is ever shown to fail
+  in heat, the lever is to configure a boost for her, which re-enables learning for that room.
+  (See "2026-09-24: a learned L1 hold only refines a DECLARED boost".)
 
 ## Gotchas & test notes
 

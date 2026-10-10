@@ -811,6 +811,12 @@ refill, so a scenario run at a non-default capacity behaves like the shell (75).
     room is ALREADY at L1, and an unclamped hard floor leaves that room no level
     move at all, so the search would answer "L1 is not a target" with a
     power_off.
+    ⚠️ **Since 2026-09-24 a hold exists ONLY for a room with a configured
+    `levelBoosts` entry (invariant 76), whatever armed it.** And the armer list
+    above was never exact: the dead window (44) feeds `compressorOffLikely`
+    and has no `noteLevelHold` call site. The code's armers are the graded
+    off-drop (55) and the hand raise off L1 (dashboard `onUserGenLevel` and the
+    observed device-poll raise), all behind the one gate `levelHoldAllowed`.
 53. **A level still in flight is recoverable, and a refusal has to cost
     something.** The restore refusal is `committedAmps − savingsAtFloors + cost`,
     and the two terms described different houses: `committedAmps` charges a
@@ -874,7 +880,8 @@ refill, so a scenario run at a non-default capacity behaves like the shell (75).
     to be the third and is not — it is report-only; see 56.) It feeds
     `isNonCooling` (so both
     ladder directions treat it exactly as they treat a stalled room), arms 52's
-    learned hold, and surfaces as `coolingState` per AC. ⚠️ Never from the
+    learned hold (only in a room with a configured boost since 2026-09-24,
+    invariant 76), and surfaces as `coolingState` per AC. ⚠️ Never from the
     standing residual — `smoothed − modelled` moves when a room under-draws its
     model, so reading it to decide whether the room is under-drawing is circular
     (invariant 40, and that reasoning already produced one wrong diagnosis). A
@@ -916,10 +923,16 @@ refill, so a scenario run at a non-default capacity behaves like the shell (75).
     step price alone while the quantity it is compared to contains the whole
     house. The off-drop (55) does not share it — a coincident household step
     DOWN is rarer, and its bar is a ceiling on a fall rather than a floor under
-    a rise. Closing it for real needs the rise taken net of `houseLoadAmps` at
+    a rise. ⚠️ **WRONG, corrected 2026-09-24 (invariant 76):** the false
+    positive for a FALL is also a household step UP, which shrinks the fall
+    exactly as it inflates a rise; live, an off of Abdu at L1 graded 0.0 A
+    while the meter rose 1.57 A. The off-drop therefore arms a hold only in a
+    room with a declared boost. Closing it for real needs the rise taken net of `houseLoadAmps` at
     both ends of the window; that is its own piece of work, not a threshold
     tweak. **So the armers of 52's hold are three, all attributable: the graded
     off-drop (55), the dead window (44), and the user's own hand raise off L1.**
+    (Corrected 2026-09-24: the dead window never had a `noteLevelHold` call
+    site, and every armer is now scoped to boost rooms, invariant 76.)
     The detection, its arm-time exclusions (`loneRaiseIsAttributable`: start
     window, power-event ramp, FLOORS, `fromLevel === 1`) and
     `raiseRiseSaysCompressorWasOff` all remain — as observability, and as the
@@ -1734,6 +1747,35 @@ over-limit points should be a setting):**
     `OVER_LIMIT_BUDGET_AFTER_ACT <= OVER_LIMIT_BUDGET_MIN`, default within the
     bounds), per hard rule 5c, not just the values. v1's own bucket is untouched.
 
+**Added 2026-09-24 after Abdu was held at min L2 by evidence from three of his own sheds:**
+76. **A learned hold only refines a DECLARED boost.** (User: *"Abdu AC never
+    need more than L1 to work."*) Invariant 52's hold may exist only for a room
+    with a configured `levelBoosts` entry, for EVERY armer: `levelHoldAllowed`
+    is the one gate, inside `noteLevelHold`, and `learnedHoldFor` is the only
+    read path (`buildViews` floor composition, the status card), so an existing
+    hold on a boost-less room binds nothing in any mode, and `sweepLevelHolds`
+    deletes it, row included, on the next ACTING tick. Today only Abdullah can
+    carry one; configuring a boost for another room re-enables learning there.
+    Live: Abdu (2-ton, no boost) was shed at L1 three times on the morning of
+    2026-09-24 and the graded off-drop read 0.0 / 0.4 / 0.9 A against a 4.2 A
+    model, so the unscoped off-drop armer held him at L2 for 6 h (+1.9 A on a
+    16 A generator) while Najat sat shed. The first sample fell by NOTHING
+    because the meter rose 1.57 A: with a ~10 A non-AC house, a household step
+    UP inside the window shrinks the fall exactly as it inflates 56's rise, so
+    56's "the off-drop does not share it" was wrong. A fan-sized drop also
+    cannot tell a failing level from a compressor idled by its own thermostat or
+    held off by restart protection. This extends FIX C (2026-08-26), which had
+    scoped only the hand-raise armers ("a comfort tap is not evidence") and left
+    the off-drop unscoped as "meter evidence".
+    ⚠️ The MEASUREMENT stays: `compressorOff` is still recorded for every room
+    and still surfaces as `coolingState: "compressor_off"`; it is inert for a
+    boost-less room because `isNonCooling` needs a level below an active floor.
+    ⚠️ Accepted risk: a config row that transiently loses `levelBoosts` lets the
+    sweep delete a legitimate hold; the same glitch drops the boost itself, and a
+    lost hold is the fewer-amps direction. Harness: `scenario.ts` does not model
+    learned holds at all, so `controller.test.ts` is the only net (the two
+    "REGRESSION 2026-09-24" tests).
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's
@@ -1775,6 +1817,8 @@ meter is the live watch item. Full
 detail: `docs/CT02_FLASH_PLAN.md` (ESP-SWITCH RECORD 2026-08-29).
 
 Abdu = **2-ton** (≈ 4.1 / 6.5 / ~9 A at L1/2/3). Abdullah & Najat = **1-ton** (≈ 2.2 / 3.9 / 5.3 A).
+**Abdu's L1 always cools** (user, 2026-09-24: *"Abdu AC never need more than L1 to work"*): he has
+no `levelBoosts` entry and must never get one, and any floor above L1 on Abdu is a bug (invariant 76).
 ⚠ The registry `model` field is protocol-inference only — **its capacity digits are WRONG** (see
 `docs/agent/tcl-ac.md`).
 

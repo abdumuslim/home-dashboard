@@ -411,13 +411,16 @@ export function offDropSaysCompressorOn(dropAmps: number): boolean {
  * it on ninety seconds into the window and a perfectly ordinary 1.5 A level
  * step measures 4.9 A against a 3.5 A bar — a false hold, six hours, spending
  * the hottest room's amps, which is the exact failure class invariant 56 was
- * written to kill. The off-drop (55) does not have this problem: it is a FALL,
- * and a coincident household fall is both rarer and self-limiting.
+ * written to kill. (This comment used to say the off-drop (55) does not have
+ * this problem. It does, from the other side: a household load stepping UP
+ * inside the off window shrinks the measured fall, which is why the off-drop
+ * arms a level hold only in a room with a configured levelBoost since
+ * 2026-09-24, `levelHoldAllowed` in controller.ts.)
  *
  * So the verdict is emitted and never acted on: `compressorOffLikely` is not
- * set and no level hold is armed. The armers stay the three that measure only
- * what they can attribute — the graded off-drop, the dead window, and the
- * user's own hand raise. Closing this properly needs the rise measured net of
+ * set and no level hold is armed. The armers stay the ones that measure only
+ * what they can attribute, the graded off-drop and the user's own hand raise,
+ * boost rooms only. Closing this properly needs the rise measured net of
  * `houseLoadAmps` at both ends of the window, which is its own investigation.
  */
 export const COMPRESSOR_START_RISE_MARGIN_AMPS = COMPRESSOR_ON_DROP_AMPS;
