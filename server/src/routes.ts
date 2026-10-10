@@ -17,6 +17,7 @@ import { PowerStatsService } from "./power-stats-service.js";
 import { createAuthMiddleware, requireAuth, handleLogin, handleLogout, handleAuthStatus, handleAgentSession, clientIp, type AuthKind } from "./auth.js";
 import { registerTuyaPowerRoutes } from "./tuya-power.js";
 import { childLogger } from "./logger.js";
+import { createAutomationAuditor, type AutomationAuditAction } from "./automation-audit.js";
 import { computeChangedKeys } from "./leveling-config-audit.js";
 import { isLevelingV2Key, OVER_LIMIT_BUDGET_MAX, OVER_LIMIT_BUDGET_MIN } from "./leveling/config.js";
 import {
@@ -1156,6 +1157,31 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     return null;
   }
 
+  const auditAutomation = createAutomationAuditor(pool);
+
+  /**
+   * Every automation mutation is logged, audited (automation_audit) and applied
+   * on the collector's next tick instead of after its 30 s rule cache expires.
+   * 2026-09-26: an enable/disable toggle left no trace at all.
+   */
+  function automationChanged(
+    req: Request,
+    row: { id: number; name?: string | null; enabled?: boolean } | undefined,
+    action: AutomationAuditAction,
+    enabledBefore: boolean | null,
+  ): void {
+    if (row) {
+      auditAutomation(req, {
+        automationId: row.id,
+        automationName: row.name ?? null,
+        action,
+        enabledBefore,
+        enabledAfter: action === "delete" ? null : (row.enabled ?? null),
+      });
+    }
+    onAutomationRulesChanged?.();
+  }
+
   router.post("/api/automations", requireAuth, async (req: Request, res: Response) => {
     const body = req.body as AutomationBody;
     const isSchedule = body.automation_type === "schedule";
@@ -1195,6 +1221,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
          sb.device_ids[0], sb.device_names[0] ?? sb.device_ids[0], sb.device_ids, sb.device_names, actionOn, actionOff,
          devType === "ac" ? (sb.smart_leveling ?? true) : true],
       );
+      automationChanged(req, result.rows[0], "create", null);
       res.json({ automation: result.rows[0] });
     } else {
       const mb = body as MetricAutomationBody;
@@ -1252,6 +1279,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
           devType === "ac" ? JSON.stringify(rangeSlots) : null,
         ],
       );
+      automationChanged(req, result.rows[0], "create", null);
       res.json({ automation: result.rows[0] });
     }
   });
@@ -1303,6 +1331,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
          devType === "ac" ? (sb.smart_leveling ?? true) : true, id],
       );
       if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
+      automationChanged(req, result.rows[0], "update", null);
       res.json({ automation: result.rows[0] });
     } else {
       const mb = body as MetricAutomationBody;
@@ -1366,6 +1395,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         ],
       );
       if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
+      automationChanged(req, result.rows[0], "update", null);
       res.json({ automation: result.rows[0] });
     }
   });
@@ -1373,7 +1403,8 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   router.delete("/api/automations/:id", requireAuth, async (req: Request, res: Response) => {
     const id = parseInt(String(req.params.id), 10);
     if (isNaN(id)) { res.status(400).json({ error: "Invalid id" }); return; }
-    await pool.query("DELETE FROM automations WHERE id = $1", [id]);
+    const result = await pool.query("DELETE FROM automations WHERE id = $1 RETURNING id, name, enabled", [id]);
+    automationChanged(req, result.rows[0], "delete", result.rows[0]?.enabled ?? null);
     res.json({ ok: true });
   });
 
@@ -1414,12 +1445,22 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
     const { enabled } = req.body as { enabled: boolean };
     if (typeof enabled !== "boolean") { res.status(400).json({ error: "enabled must be boolean" }); return; }
 
+    // The CTE hands back the value this UPDATE replaced, for the audit. FOR
+    // UPDATE is what makes it that value under READ COMMITTED: a plain read uses
+    // the statement snapshot, so two concurrent toggles could both read the same
+    // before-image. The lock makes the second one wait for the first to commit,
+    // then re-read the row's latest committed version (and hold the lock), so
+    // the UPDATE that follows replaces exactly the value reported.
     const result = await pool.query(
-      "UPDATE automations SET enabled = $1 WHERE id = $2 RETURNING *",
+      `WITH prev AS (SELECT id, enabled FROM automations WHERE id = $2 FOR UPDATE)
+       UPDATE automations a SET enabled = $1 FROM prev WHERE a.id = prev.id
+       RETURNING a.*, prev.enabled AS enabled_before`,
       [enabled, id],
     );
     if (result.rowCount === 0) { res.status(404).json({ error: "Not found" }); return; }
-    res.json({ automation: result.rows[0] });
+    const { enabled_before: enabledBefore, ...automation } = result.rows[0] as { enabled_before: boolean } & Record<string, unknown>;
+    automationChanged(req, automation as { id: number; name?: string; enabled?: boolean }, enabled ? "enable" : "disable", enabledBefore);
+    res.json({ automation });
   });
 
   // ---------- AC Devices (TCL Cloud) ----------
@@ -1588,16 +1629,55 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       // Verified send: the firmware (Najat especially) sometimes accepts a
       // command without applying it — the shadow is re-checked every 5s and
       // the command re-sent up to 3 times (gen level/beep/fan-auto excluded).
-      await cloud.sendControlVerified(id, command, value);
-      // The publish was ACCEPTED (the shadow verify loop it starts is
-      // fire-and-forget), so this is the earliest honest moment to price the
-      // budget this off frees: early enough to keep the whole latency win, late
-      // enough that a refused send can never fund a peer's spend (2026-08-31).
-      if (protectsManualOff && isAcLevelingEligible(id)) acLeveling?.onUserPowerOffSent?.(id);
-      if (command === "set_power") {
-        if (value === 1 && isAcLevelingEligible(id)) {
-          await acLeveling?.onUserPowerOn(id);
+      // The ON/OFF bookkeeping runs INSIDE the cloud's final "still current"
+      // tick (`onSent`), never after awaiting the result: a leveler OFF can
+      // claim the field in the microtask gap before this continuation runs, and
+      // `onUserPowerOn` would then clear its fresh shed (2026-09-27, Sol round
+      // 6). Its in-memory state is claimed synchronously (see the controller's
+      // `onUserPowerOn`); only its row DELETE is awaited below.
+      let postSendRan = false;
+      let powerOnBookkeeping: Promise<void> | undefined;
+      const runPostSend = () => {
+        postSendRan = true;
+        // The publish was ACCEPTED (the shadow verify loop it starts is
+        // fire-and-forget), so this is the earliest honest moment to price the
+        // budget this off frees: early enough to keep the whole latency win,
+        // late enough that a refused send can never fund a peer's spend
+        // (2026-08-31).
+        if (protectsManualOff && isAcLevelingEligible(id)) acLeveling?.onUserPowerOffSent?.(id);
+        if (command === "set_power" && value === 1 && isAcLevelingEligible(id)) {
+          powerOnBookkeeping = acLeveling?.onUserPowerOn(id);
         }
+      };
+      const outcome = await cloud.sendControlVerified(id, command, value, runPostSend);
+      if (outcome === "superseded" || outcome === "superseded_by_user") {
+        // A newer command of the same field owns it now: in practice a
+        // protective Smart AC Leveling OFF, or the user's own next tap. Either
+        // this command was never published, or it was published and then
+        // overridden while its saved-state restore ran (rounds 4 and 5). Both
+        // mean the same here: none of the post-send hooks may run. An
+        // `onUserPowerOn` would clear the leveler's newer shed (and its
+        // persistent row, which is the collector's shed guard), revoke its cut
+        // credit and arm ON bookkeeping over an OFF (2026-09-27). The
+        // claim-before-send lock release above deliberately STAYS released: the
+        // user's intent is ON, and a shed room with no lock is restored by the
+        // leveler when the budget allows. The manual-off lock of a superseded
+        // OFF likewise stays (the user's intent was off).
+        log.warn(`[routes] AC ${id}: ${command}=${String(value)} ${outcome}: a newer command owns this AC`);
+        res.status(409).json({
+          error: "superseded",
+          message: outcome === "superseded" && command === "set_power" && value === 1
+            ? "Not sent: Smart AC Leveling switched this AC off at the same moment (overload). It will be restored automatically when there is room."
+            : "Not sent: a newer command for this AC was sent at the same moment.",
+        });
+        return;
+      }
+      // A cloud implementation that never invokes `onSent` (test doubles; the
+      // real TclCloud always does on "sent") gets the old after-await order.
+      if (!postSendRan) runPostSend();
+      await powerOnBookkeeping;
+      if (command === "set_power") {
+        // Handled in `runPostSend` above.
       } else if (command === "set_generator_mode" && typeof value === "number") {
         const eligible = isAcLevelingEligible(id);
         if (!eligible) acLeveling?.noteUserGenLevel?.(id, value);

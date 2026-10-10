@@ -76,6 +76,16 @@ import { modeledRunningAmps, RESIDUAL_TRUST_GAP_AMPS } from "./dead-window.js";
 
 /** How far back the peak looks. Long enough to span a compressor duty cycle. */
 export const HOUSE_LOAD_WINDOW_MS = 15 * 60_000;
+/**
+ * How long the LAST grid session's house is remembered across a generator
+ * interlude (2026-09-27, Stream G). Nearly every grid entry follows ~2 h of
+ * generator, by which time the 15-minute window has aged the grid record out
+ * and the carry would stand in the GENERATOR's house, which excludes every
+ * grid-only load (the unmanaged guest AC among it). A day covers every
+ * outage the household sees; past that, the memory is too old to describe the
+ * house and the ordinary carry answers alone.
+ */
+export const GRID_SESSION_MEMORY_MS = 24 * 60 * 60_000;
 /** Ring bound — the tick is ~3–5s, so the window holds ~200–300 samples. */
 const MAX_SAMPLES = 400;
 /**
@@ -108,6 +118,62 @@ interface SourceHouseLoad {
   readonly lastModeledAmps: number;
   /** Sampling resumes here after a modeled drop. */
   readonly cooldownUntil: number;
+  /**
+   * The rolling peak as of this record's LAST usable sample, across running
+   * sets, frozen there (2026-09-27, Stream G). The ring itself cannot carry it
+   * across a generator interlude: the first tick back on this line prunes every
+   * sample older than the window before any new sample is usable, so the
+   * memory has to live beside the ring. See `rememberedSessionPeak`.
+   */
+  readonly session?: SessionMemory;
+}
+
+/** One frozen session peak, with the sample that set it (so a void can judge it). */
+interface SessionPeak {
+  readonly peakAmps: number;
+  readonly lastAt: number;
+  /** When the peak sample was taken, and the running set it was tagged with. */
+  readonly peakAt: number;
+  readonly peakSet: string;
+}
+
+/**
+ * The memory beside the ring: the current session peak, plus the last VALID
+ * peak whose samples the ring no longer holds (`prior`). `prior` is never read
+ * on the ordinary path, where a newer valid sample legitimately replaces the
+ * memory; it exists for `voidSamples`, so a retroactive void of the newer
+ * evidence falls back to it instead of to an empty ring (review, 2026-09-27).
+ */
+interface SessionMemory extends SessionPeak {
+  readonly prior?: SessionPeak;
+}
+
+/** Peak of `samples` inside the window that ends at the newest of them, across sets. */
+function sessionOf(samples: readonly HouseLoadSample[]): SessionPeak | undefined {
+  if (samples.length === 0) return undefined;
+  const lastAt = samples.reduce((max, s) => Math.max(max, s.at), -Infinity);
+  let peak: HouseLoadSample | null = null;
+  for (const s of samples) {
+    if (lastAt - s.at >= HOUSE_LOAD_WINDOW_MS) continue;
+    if (peak == null || s.amps > peak.amps) peak = s;
+  }
+  if (peak == null) return undefined;
+  return { peakAmps: peak.amps, lastAt, peakAt: peak.at, peakSet: peak.runningSet };
+}
+
+/** Strip a memory down to its own peak (a prior never nests a prior). */
+function peakOnly(m: SessionPeak): SessionPeak {
+  return { peakAmps: m.peakAmps, lastAt: m.lastAt, peakAt: m.peakAt, peakSet: m.peakSet };
+}
+
+/**
+ * The memory that outlives `ring`: the current session when none of its samples
+ * are still in the ring (it was frozen across a prune), else its own `prior`.
+ */
+function memoryBeyond(session: SessionMemory | undefined, ring: readonly HouseLoadSample[]): SessionPeak | undefined {
+  if (session == null) return undefined;
+  const inRing = ring.some((s) => s.at === session.lastAt);
+  return inRing ? session.prior : peakOnly(session);
 }
 
 /** Per-source records; the cross-source carry in `houseLoadAmps` is the one bridge. */
@@ -211,7 +277,10 @@ export function sampleHouseLoad(
         },
       ]
     : kept;
-  return { ...state, [opts.source]: { samples, lastModeledAmps: modeled, cooldownUntil } };
+  const fresh = usable ? sessionOf(samples) : undefined;
+  const session: SessionMemory | undefined =
+    fresh != null ? { ...fresh, prior: memoryBeyond(rec?.session, samples) } : rec?.session;
+  return { ...state, [opts.source]: { samples, lastModeledAmps: modeled, cooldownUntil, session } };
 }
 
 /**
@@ -307,7 +376,42 @@ export function houseLoadAmps(
   const own = peakUsableAmps(state[source], now, acs);
   if (own != null) return own;
   const other: PowerSource = source === "gen" ? "grid" : "gen";
-  return peakUsableAmps(state[other], now, acs) ?? 0;
+  const carried = peakUsableAmps(state[other], now, acs);
+  if (source !== "grid") return carried ?? 0;
+  // GRID ONLY (2026-09-27, Stream G): with no fresh grid evidence, the grid
+  // house is at least what the last grid session measured. The generator's
+  // record cannot see grid-only load, so on its own it under-states the grid
+  // house on almost every grid entry (4A carried vs a real 12A).
+  const remembered = rememberedSessionPeak(state.grid, now);
+  if (carried == null && remembered == null) return 0;
+  return Math.max(carried ?? 0, remembered ?? 0);
+}
+
+/**
+ * The house the LAST session on this record measured: the peak of the samples
+ * inside `HOUSE_LOAD_WINDOW_MS` before that session's final usable sample, i.e.
+ * the rolling peak the record itself was reporting when the session ended,
+ * frozen in `SourceHouseLoad.session` (the ring is pruned on the first tick
+ * back, before any new sample is usable). null when there is none, or when its
+ * last sample is older than `GRID_SESSION_MEMORY_MS`.
+ *
+ * Every sample in the ring was already VALID when it was taken (the ramping
+ * skip, the trust gap, the modeled-drop cooldown, the shell's suppressions and
+ * the phantom-ON void all gate what gets in: invariants 16, 20, 23, 28, 44), so
+ * this adds no new way for a residual taken while model and meter were out of
+ * step to be believed.
+ *
+ * Deliberately across running SETS, unlike `peakUsableAmps`. The set rules
+ * exist to stop a room's draw being charged twice, as house and as a cap, and
+ * this figure's only consumers (the grid entry budget and the grid roomy lane's
+ * model test) can only get MORE conservative from a higher house: a room
+ * double-counted here holds a level lower for the minutes until fresh grid
+ * samples exist, which is the direction that cannot overload the line.
+ */
+function rememberedSessionPeak(rec: SourceHouseLoad | undefined, now: number): number | null {
+  const session = rec?.session;
+  if (session == null || now - session.lastAt > GRID_SESSION_MEMORY_MS) return null;
+  return session.peakAmps;
 }
 
 /**
@@ -346,5 +450,20 @@ export function voidSamples(
     (s) => s.at < opts.since || s.runningSet.split(",").includes(opts.excludeDeviceId),
   );
   if (samples.length === rec.samples.length) return state;
-  return { ...state, [source]: { ...rec, samples } };
+  // A voided sample must not survive in the session memory either, but the void
+  // may never make the memory SMALLER than the last valid peak that preceded the
+  // voided evidence (review, 2026-09-27: back on grid, the entry tick prunes the
+  // ring, a later sample replaces the 12A memory, the shell then voids that
+  // sample, and recomputing from the now-empty ring dropped the grid figure to
+  // the 4A generator carry). The older memory is only dropped when IT is the
+  // voided evidence: its peak sample taken inside the void window without the
+  // room in its set.
+  const voided = (m: SessionPeak | undefined): boolean =>
+    m != null && m.peakAt >= opts.since && !m.peakSet.split(",").includes(opts.excludeDeviceId);
+  const beyond = memoryBeyond(rec.session, rec.samples);
+  const kept = voided(beyond) ? undefined : beyond;
+  const base = sessionOf(samples);
+  const best = base == null ? kept : kept == null || base.peakAmps >= kept.peakAmps ? base : kept;
+  const session: SessionMemory | undefined = best == null ? undefined : { ...peakOnly(best), prior: kept };
+  return { ...state, [source]: { ...rec, samples, session } };
 }

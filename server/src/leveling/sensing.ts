@@ -480,6 +480,41 @@ export function derateFor(state: MeterState, source: PowerSource, now: number): 
 }
 
 /**
+ * The live derate on `source`, split by cause, plus the instant the whole of it
+ * will have been handed back if nothing new arrives. For the status card only
+ * (2026-09-27: the owner set 16 A, saw 15 A and nothing said why). Reads the
+ * same records through `derateFor` / `strainDerateFor`; it changes no limit.
+ */
+export function derateBreakdown(
+  state: MeterState,
+  source: PowerSource,
+  now: number,
+): { collapseAmps: number; strainAmps: number; clearsAt: number | null } {
+  const collapseAmps = derateFor(state, source, now);
+  const strainAmps = strainDerateFor(state, source, now);
+  const clears = [
+    collapseAmps > 0 ? derateClearsAt(state.derate, COLLAPSE_DERATE_MS, COLLAPSE_DERATE_RECOVERY_STEP) : null,
+    strainAmps > 0 ? derateClearsAt(state.strainDerate, STRAIN_DERATE_MS, STRAIN_DERATE_RECOVERY_STEP) : null,
+  ].filter((t): t is number => t != null);
+  return { collapseAmps, strainAmps, clearsAt: clears.length > 0 ? Math.max(...clears) : null };
+}
+
+/**
+ * First instant a stepped-decay record reads 0: the first step lands at
+ * `until`, each later one a rung after, so N steps finish (N − 1) rungs past
+ * `until`. The epsilon keeps a float residue from adding a phantom rung.
+ */
+function derateClearsAt(
+  d: { amps: number; until: number } | null,
+  rungMs: number,
+  step: number,
+): number | null {
+  if (d == null || d.amps <= 0) return null;
+  const steps = Math.max(1, Math.ceil(d.amps / step - 1e-9));
+  return d.until + (steps - 1) * rungMs;
+}
+
+/**
  * The derate a fresh collapse on `source` arms, stacking on whatever rung is
  * still standing. ONE definition, shared by the fall-latched collapse inside
  * `ingestReading` and the entry-latched one below — a second copy would drift,

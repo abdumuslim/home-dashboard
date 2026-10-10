@@ -6,7 +6,7 @@ import type { PrayerTimesResult } from "./prayer-engine/index.js";
 import type { Config } from "./config.js";
 import { getMetricValue, powerConditionSustained, ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS, type PowerReadingEntry } from "./alert-metrics.js";
 import { XiaomiCloud, type PurifierAction } from "./xiaomi-cloud.js";
-import { TclCloud, type AcAction, type AcDevice } from "./tcl-cloud.js";
+import { TclCloud, isolatedPowerOffAfter, isPowerAcceptedError, type AcAction, type AcDevice } from "./tcl-cloud.js";
 import { acTimers } from "./routes.js";
 import { AcLeveler } from "./ac-leveler.js";
 import { LevelingControllerV2 } from "./leveling/controller.js";
@@ -281,6 +281,11 @@ export class Collector {
   private xiaomiReauthAttempt = 0;
   private automationRules: AutomationRule[] = [];
   private automationRulesLastFetch = 0;
+  /** Bumped by every invalidation; a fetch that straddles one must not re-arm the 30 s cache. */
+  private automationRulesGeneration = 0;
+  /** Start-order id of each rule fetch, and of the newest one whose rows are installed. */
+  private automationRulesFetchSeq = 0;
+  private automationRulesInstalledSeq = 0;
   private automationState = new Map<number, AutomationState>();
   private devicePowerCache = new Map<string, { power: "on" | "off" | undefined; ts: number }>();
   private acManualOffLocks = new Set<string>();
@@ -366,6 +371,17 @@ export class Collector {
    * live 2026-07-05/06). Stamped via the leveler's onPowerEvent dep.
    */
   private lastPowerEventAt = 0;
+  /**
+   * The last power event of a kind that physically RESTARTS the ACs
+   * (`powerEventRestartsAcs`: a real source change, a collapse, a dead AC
+   * circuit), and per device the last beep-reset fingerprint seen (a power-loss
+   * restart with no source change). Either one after our power ON voids the
+   * "the unit itself went off after our ON" verdict: a restarting unit's
+   * reports, and a beep reset the shadow shows late, are exactly what could
+   * otherwise mint a sacred lock (hard rule 2, 2026-09-27).
+   */
+  private lastRestartPowerEventAt = 0;
+  private acBeepResetSeenAt = new Map<string, number>();
   private readonly AC_POWER_EVENT_GRACE_MS = 15 * 60_000;
   /**
    * Server-commanded AC power-ons (automation/schedule/timer/leveler/UI) can
@@ -435,6 +451,7 @@ export class Collector {
 
   invalidateAutomationRules(): void {
     this.automationRulesLastFetch = 0;
+    this.automationRulesGeneration++;
   }
 
   private async ensureAcManualOffLocksLoaded(): Promise<void> {
@@ -596,6 +613,7 @@ export class Collector {
     // intent wipe is gated. A blackout that changes no source is caught per
     // device by the beep-reset fingerprint in `noteBeepResetPowerCycle`.
     const restartsAcs = powerEventRestartsAcs(kind);
+    if (restartsAcs) this.lastRestartPowerEventAt = now;
     for (const dev of this.tclCloud?.getDevices() ?? []) {
       if (restartsAcs) this.notePowerCycle(dev.id, `power event (${kind})`, now);
       const hasSystemProfile = this.automationRules.some(
@@ -708,9 +726,12 @@ export class Collector {
    * reset to 0 while we had commanded a fan) says the unit lost power. A remote
    * off resets neither.
    */
-  private classifyObservedAcOff(deviceId: string): "power_event" | "manual" {
+  private classifyObservedAcOff(
+    deviceId: string,
+    observed?: Pick<AcDevice, "power" | "beep" | "fanSpeed">,
+  ): "power_event" | "manual" {
     if (!this.config.observedOffLocks) return "power_event";
-    const dev = this.tclCloud?.getDevices().find((d) => d.id === deviceId);
+    const dev = observed ?? this.tclCloud?.getDevices().find((d) => d.id === deviceId);
     // Negative fingerprint beats the window: firmware resets beepSwitch to ON on
     // EVERY power-loss restart, so an off still showing beep=false on a
     // beep-off-enforced AC proves the unit never lost power — a by-hand off
@@ -753,11 +774,25 @@ export class Collector {
     // the dashboard showed nothing; the grace kept reversing it forever).
     const serverOnAt = this.lastServerAcOnAt.get(deviceId) ?? 0;
     const observedOnAt = this.lastAcObservedOnAt.get(deviceId) ?? 0;
-    if (
+    // The shadow's own metadata CAN carry staleness information (2026-09-27
+    // probe): a `powerSwitch` report that came ALONE, strictly after our ON was
+    // sent, is the unit itself going off after our ON landed. Our polls just
+    // never caught the ON in between. That is not lag, so it goes to the
+    // classifier below (beep fingerprint, power-event window, hard rule 2) like
+    // any other off. A stale report or a full-state reconnect dump answers false
+    // and keeps the lag reading (see `isolatedPowerOffAfter`).
+    const inGrace =
       serverOnAt > 0 &&
       Date.now() - serverOnAt < this.AC_SERVER_ON_SHADOW_GRACE_MS &&
-      observedOnAt < serverOnAt // the shadow has NOT confirmed this server ON yet
-    ) {
+      observedOnAt < serverOnAt; // the shadow has NOT confirmed this server ON yet
+    const dev = inGrace ? this.tclCloud?.getDevices().find((d) => d.id === deviceId) : undefined;
+    if (inGrace && dev && this.unitSwitchedOffAfterOurOn(dev, serverOnAt)) {
+      log.info(
+        `[collector] ${context}: device ${deviceId} observed OFF reported by the unit ` +
+          `${Math.round(((dev.powerReportedAt ?? serverOnAt) - serverOnAt) / 1000)}s after our ON, ` +
+          `after the ON's own full-state report (isolated, ${dev.powerReportCohort} field(s)); not shadow lag, classifying`,
+      );
+    } else if (inGrace) {
       // Repeat guard: a belt for offs that arrive before the shadow ever
       // confirmed our ON (the residual lag-window fight). A stale shadow never
       // shows an intervening ON, so it can NEVER trip this; a human flipping
@@ -798,6 +833,53 @@ export class Collector {
       `${deviceName} was turned off by hand — automations stay off until it's turned back on from the dashboard.`,
     );
     return false;
+  }
+
+  /**
+   * Causal evidence that the unit went off by itself AFTER our power ON landed
+   * (`isolatedPowerOffAfter`: our ON's full-state dump, then a lone powerSwitch
+   * OFF), and nothing since our ON that restarts units: a restart-kind power
+   * event or a beep-reset sighting voids the verdict (ambiguous, so the caller
+   * keeps today's behaviour).
+   */
+  private unitSwitchedOffAfterOurOn(
+    dev: Pick<AcDevice, "id" | "power" | "powerReportedAt" | "powerReportCohort" | "fullStateReportAt">,
+    sentAt: number,
+  ): boolean {
+    if (!isolatedPowerOffAfter(dev, sentAt)) return false;
+    if (this.lastRestartPowerEventAt >= sentAt) return false;
+    if ((this.acBeepResetSeenAt.get(dev.id) ?? 0) >= sentAt) return false;
+    return true;
+  }
+
+  /**
+   * The leveler asks: a shed room's restore landed and the unit then went off on
+   * its own. Runs the SAME judgment as every observed off (the causal evidence
+   * and restart voids above, then `classifyObservedAcOff`: beep fingerprints and
+   * the power-event window) and, on "manual", records the persistent manual-off
+   * lock (reason `restore_declined`) with the usual push, so the human's choice
+   * survives an idle rule's auto-on path, a rule re-enabled later, and a restart
+   * (the lock is in the DB). Anything else answers false: the leveler keeps the
+   * shed and its ordinary confirm-or-resend.
+   */
+  private async recordDeclinedRestore(deviceId: string, sentAt: number, device: AcDevice): Promise<boolean> {
+    if (!this.unitSwitchedOffAfterOurOn(device, sentAt)) {
+      log.info(`[collector] AC ${deviceId}: leveler asked about a declined restore, but the evidence is ambiguous; keeping the restore`);
+      return false;
+    }
+    if (await this.isAcManualOffLocked(deviceId)) return true; // the user's own off already stands
+    await this.ensureAcBeepPrefsLoaded();
+    if (this.classifyObservedAcOff(deviceId, device) !== "manual") {
+      log.info(`[collector] AC ${deviceId}: restore switched off near a power event (or observed-off locks disabled): not a manual off, keeping the restore`);
+      return false;
+    }
+    const name = this.tclCloud?.getDevices().find((d) => d.id === deviceId)?.name ?? device.name ?? deviceId;
+    log.info(`[collector] AC ${deviceId}: switched off by hand right after a Smart AC Leveling restore, recording manual-off lock`);
+    await this.recordObservedManualOff(
+      deviceId, "restore_declined", "AC automation paused",
+      `${name} was switched off by hand right after Smart AC Leveling turned it back on. It stays off until it's turned back on from the dashboard.`,
+    );
+    return true;
   }
 
   /** Record an observed-off manual lock and push the paused alert (one wrong
@@ -917,6 +999,12 @@ export class Collector {
 
     for (const dev of devices) {
       if (!this.acBeepOffPrefs.has(dev.id) || !dev.power || !dev.beep) continue;
+      // The raw sighting, ungated by the cycle de-dup below: our own restore
+      // stamps a power cycle at send, and a real restart right after it must
+      // still void a "human off" verdict (see `unitSwitchedOffAfterOurOn`).
+      if (Date.now() - (this.acBeepOffRecordedAt.get(dev.id) ?? 0) >= this.AC_BEEP_PREF_SETTLE_MS) {
+        this.acBeepResetSeenAt.set(dev.id, Date.now());
+      }
       this.noteBeepResetPowerCycle(dev.id);
       const lastSent = this.acBeepLastSent.get(dev.id) ?? 0;
       if (Date.now() - lastSent < this.AC_BEEP_RESEND_COOLDOWN_MS) continue;
@@ -936,9 +1024,10 @@ export class Collector {
     const levelerDeps = {
       getTclCloud: () => this.tclCloud,
       broadcast: (payload: Record<string, unknown>) => this.broadcastPush(payload),
-      setDevicePowerCache: (deviceId: string, power: "on" | "off") => {
+      setDevicePowerCache: (deviceId: string, power: "on" | "off", at?: number) => {
         this.devicePowerCache.set(deviceId, { power, ts: Date.now() });
-        if (power === "on") this.noteServerAcOn(deviceId);
+        // `at`: when the leveler PUBLISHED the power ON (v2 passes it; v1 does not).
+        if (power === "on") this.noteServerAcOn(deviceId, at);
         // The leveler touches this on its OWN shed and restore ONLY, so it is
         // the exact edge of a leveler-driven power cycle — and neither edge
         // reaches any rule-owned fan/swing clear site.
@@ -959,6 +1048,11 @@ export class Collector {
       // `now` is optional because v1's dep signature never had it; v2 always
       // passes its own event timestamp so both windows run off one clock.
       onPowerEvent: (kind: string, now?: number) => this.notePowerEvent(kind, now),
+      // A shed room's restore landed and was switched straight back off by hand:
+      // classify it the same way as any observed off and, on "manual", persist
+      // the lock (2026-09-27). False keeps the shed and the ordinary resend.
+      onRestoreDeclined: (deviceId: string, sentAt: number, device: AcDevice) =>
+        this.recordDeclinedRestore(deviceId, sentAt, device),
     };
     this.acLeveler = new AcLeveler(pool, levelerDeps);
     // v2 controller (server/src/leveling/) — selected via the `controller`
@@ -1423,11 +1517,23 @@ export class Collector {
 
   private async refreshAutomationRules(): Promise<void> {
     if (Date.now() - this.automationRulesLastFetch < 30_000) return;
+    const generation = this.automationRulesGeneration;
+    const fetchSeq = ++this.automationRulesFetchSeq;
     const result = await this.pool.query(
       "SELECT * FROM automations WHERE enabled = true",
     );
+    // Fetches can overlap: the step timeout abandons a tick whose fetch is still
+    // out, and the next tick starts another. Only a fetch that STARTED after the
+    // last installed one may install, or a late pre-change result would
+    // overwrite newer rows under their fresh timestamp for 30 s (2026-09-27).
+    if (fetchSeq <= this.automationRulesInstalledSeq) return;
+    this.automationRulesInstalledSeq = fetchSeq;
+    // Rows are installed even when an invalidation landed mid-fetch: they are
+    // newer than the set they replace. Only the timestamp is withheld, so the
+    // next tick (<= 5 s) reads the post-mutation rows instead of trusting these
+    // for 30 s.
     this.automationRules = result.rows as AutomationRule[];
-    this.automationRulesLastFetch = Date.now();
+    if (generation === this.automationRulesGeneration) this.automationRulesLastFetch = Date.now();
 
     // Prune stale state for deleted rules
     const activeIds = new Set(this.automationRules.map((r) => r.id));
@@ -1601,17 +1707,33 @@ export class Collector {
     for (const did of deviceIds) {
       const effectiveAction = this.stripLeveledControls(rule, action, did);
       if (rule.device_type === "ac") {
-        await this.tclCloud!.executeAcAction(did, effectiveAction as AcAction);
-        if ((effectiveAction as AcAction).power === 1) this.noteServerAcOn(did);
+        // Captured BEFORE the call: a power-on publishes powerSwitch first and
+        // only then waits ~3 s to send the profile, so "after the call" is ~3 s
+        // late and a remote off inside that gap would read as older than our ON.
+        const sentAt = Date.now();
+        try {
+          await this.tclCloud!.executeAcAction(did, effectiveAction as AcAction);
+        } catch (err) {
+          // The power ON was accepted and only the profile failed: the AC is
+          // coming ON, so the rule must book it as sent (stamp, triggered state)
+          // and let its diff re-enforcement re-assert the profile next tick.
+          // Treating it as a refused send left a later remote off unjudged
+          // (2026-09-27).
+          if (!isPowerAcceptedError(err)) throw err;
+          log.warn(`[collector] Automation "${rule.name}": ${err.message}; ON counts as sent, the profile is re-asserted by enforcement`);
+        }
+        if ((effectiveAction as AcAction).power === 1) this.noteServerAcOn(did, sentAt);
       } else {
         await this.xiaomiCloud!.executeAction(did, effectiveAction as PurifierAction);
       }
     }
   }
 
-  /** Stamp a server-commanded AC power-on for observed-off shadow-lag grace. */
-  private noteServerAcOn(deviceId: string): void {
-    this.lastServerAcOnAt.set(deviceId, Date.now());
+  /** Stamp a server-commanded AC power-on for observed-off shadow-lag grace.
+   * `at` is when the power ON was PUBLISHED (captured before the send call,
+   * committed only once the send was accepted), not when the call returned. */
+  private noteServerAcOn(deviceId: string, at: number = Date.now()): void {
+    this.lastServerAcOnAt.set(deviceId, at);
   }
 
   private async checkMetricAutomation(rule: AutomationRule): Promise<void> {
@@ -2096,14 +2218,46 @@ export class Collector {
   noteUserAcFanAuto(deviceId: string): void {
     // The physical fan changed — release any leveler fan hold, same as a manual change
     if (isAcLevelingEligible(deviceId)) void this.leveling().onUserFanChange(deviceId);
-    let resumed = false;
+    let dropped = false;
     for (const key of this.acFanEnforcement.keys()) {
       if (key.endsWith(`:${deviceId}`)) {
         this.acFanEnforcement.delete(key);
-        resumed = true;
+        dropped = true;
       }
     }
-    if (resumed) log.info(`[collector] AC ${deviceId}: user fan Auto — resuming automation fan enforcement (smart auto)`);
+    // Say what actually happens next. A stale entry can outlive its rule (live
+    // 2026-09-26: the owner's rule was disabled and this still claimed smart
+    // auto resumed), so name the ENABLED range rules that now own the fan.
+    const owners = this.automationRules.filter(
+      (rule) =>
+        rule.enabled !== false &&
+        rule.device_type === "ac" &&
+        rule.automation_type === "metric" &&
+        rule.threshold_low != null &&
+        (rule.device_ids ?? [rule.device_id]).includes(deviceId),
+    );
+    if (owners.length > 0) {
+      // …and what each owner will actually do with it: the active slot's fan is
+      // smart auto (no fixed gear) or a fixed gear, or no slot is active now and
+      // nothing is enforced until one is.
+      const what = owners.map((rule) => {
+        const slot = findActiveRangeSlot(
+          rule.range_slots ?? getLegacyRangeSlots(rule.threshold_low!, rule.threshold!),
+          getBaghdadMinutes(),
+          (prayer, offset) => this.resolvePrayerMinutes(prayer, offset),
+        );
+        if (!slot) return `"${rule.name}" (no active slot: nothing enforced until one starts)`;
+        return slot.fan_speed != null && slot.fan_speed >= 1
+          ? `"${rule.name}" (slot "${slot.id}": fixed fan ${slot.fan_speed})`
+          : `"${rule.name}" (slot "${slot.id}": smart auto)`;
+      });
+      log.info(`[collector] AC ${deviceId}: user fan Auto: fan handed back to range rule(s) ${what.join(", ")}`);
+    } else {
+      log.info(
+        `[collector] AC ${deviceId}: user fan Auto: no enabled range rule owns this AC` +
+          `${dropped ? " (stale fan enforcement dropped)" : ""}; the unit stays on its built-in auto`,
+      );
+    }
   }
 
   /**
@@ -2375,9 +2529,13 @@ export class Collector {
               if (power === undefined) continue;
               // Our own recent off still propagating is not an external off.
               if (now - (this.acRangeOffAt.get(did) ?? 0) < this.AC_OFF_REFIRE_GRACE_MS) continue;
+              // Classify FIRST: the fan-0 power-loss fingerprint reads the fan we
+              // last commanded (`lastCommandedFan`), and the clears below delete
+              // it; in the old order that fingerprint was dead at this site.
+              const resume = await this.handleObservedAcOff(`AC range "${rule.name}"`, did, deviceNames);
               this.clearAcFanEnforcement(rule.id, did); // power cycle — fan intent resets
               this.clearAcSwingOverride(rule.id, did);  // and swing intent resets
-              if (await this.handleObservedAcOff(`AC range "${rule.name}"`, did, deviceNames)) {
+              if (resume) {
                 // Locks beat ALL auto-on paths — even the power-event resume.
                 if (await this.isAcManualOffLocked(did)) {
                   log.info(`[collector] AC range "${rule.name}": device ${did} is manual-off locked, skipping power-event re-on`);
@@ -2779,8 +2937,15 @@ export class Collector {
               ? { generator_mode: preset.generator_mode as number }
               : {}),
           };
-          await this.tclCloud.executeAcAction(deviceId, action);
-          this.noteServerAcOn(deviceId);
+          const sentAt = Date.now(); // the power ON publishes first; see executeAutomationAction
+          try {
+            await this.tclCloud.executeAcAction(deviceId, action);
+          } catch (err) {
+            if (!isPowerAcceptedError(err)) throw err;
+            // The AC is coming ON; only the preset profile failed.
+            log.warn(`[collector] AC timer: ${err.message}; the ON counts as sent`);
+          }
+          this.noteServerAcOn(deviceId, sentAt);
           log.info(`[collector] AC timer: turned ON device ${deviceId} with preset`);
         }
       } catch (err) {

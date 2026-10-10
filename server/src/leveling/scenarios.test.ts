@@ -2886,3 +2886,221 @@ describe("ACCEPTANCE: funded spend acts on the freed budget, not on the median (
     expect(setLevels(s, t0).filter((e) => e.cmd.level > 1)).toHaveLength(0);
   });
 });
+
+
+// 2026-09-23..26 (invariant 77): five live double sheds, every second one 30.25
+// to 39.87 s after the first, every one at mode NORMAL and every one MILD. The
+// escalation and settle holds keyed on SETTLING (SETTLE_MS, 30 s) while the cut
+// they protect is `settling` for CREDIT_LANDING_GRACE_MS (60 s), so the second
+// shed fired the instant the mode clock ran out with the first room's off still
+// in flight (TCL send-to-confirm runs 6 s to minutes; `offLagMs` is that lag).
+// The live geometry: the first shed fires on the bucket while the 8-wide median
+// is still climbing toward the step that drained it, so the cut's anchor is the
+// LAGGING median; the median then catches up past it, the outrun void (38)
+// zeroes the credit, and only the landing grace still knows the cut is late.
+describe("ACCEPTANCE: a shed still landing past 30 s does not shed a second room (2026-09-26)", () => {
+  // Every room at its floor and at fan 1, so a shed is the only relief left.
+  const floored = (): SimAcSetup[] => [
+    { ...ABDULLAH, level: 1, demandAmps: 2.2, needDelta: 3, fan: 1, offLagMs: 35_000 },
+    { ...ABDU, level: 1, demandAmps: 4.1, needDelta: 2, fan: 1, offLagMs: 35_000 },
+    { ...NAJAT, level: 1, demandAmps: 2.2, needDelta: 1, fan: 1, offLagMs: 35_000 },
+  ];
+  // 8.5 A of floors + 6.0 A of house = 14.5 A: under the 14.9 A gen, no raise fits.
+  const settled = (): Scenario => {
+    const s = new Scenario(cfg, floored(), { nonAcAmps: 6.0, source: "gen", seed: 20260926 });
+    s.advance(5 * 60);
+    return s;
+  };
+  /** Step until the first `power_off` ships; returns its time. */
+  const firstShed = (s: Scenario, since: number): number => {
+    for (let i = 0; i < 24 && s.commandsSince(since, "power_off").length === 0; i++) s.step();
+    const offs = s.commandsSince(since, "power_off");
+    expect(offs, "the breach is answered with a shed").toHaveLength(1);
+    return offs[0].at;
+  };
+
+  it("a mild overload sheds ONE room, and the meter catching up while its off lands sheds nobody else", () => {
+    const s = settled();
+    const t0 = s.now;
+    s.setNonAc(7.2); // 15.7 A: 0.8 A over, mild, and only a shed covers it
+    const shedAt = firstShed(s, t0);
+    // The off takes 35 s to reach the meter and the median ~20 s more to show
+    // it; the pre-fix second shed fired at shedAt + 30 s, mode NORMAL.
+    s.advance(60);
+    expect(s.now - shedAt, "the window reaches past SETTLE_MS").toBeGreaterThan(55_000);
+    const offs = s.commandsSince(t0, "power_off");
+    expect(offs, JSON.stringify(offs)).toHaveLength(1);
+    // …and one room was enough: the house settles under the limit.
+    s.advance(30);
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(1);
+    expect(meterView(s.meterState, s.now).smoothedAmps).toBeLessThanOrEqual(cfg.genLimitAmps);
+  });
+
+  it("a genuine runaway inside the landing grace is answered at once, not held", () => {
+    // The harness reaches the SEVERE rung first here (a single fresh reading
+    // sizes from the mean, invariant 49), and past SETTLE_MS a severe cut that
+    // is only `settling` is deliberately not held, so the shed ships on the
+    // first tick after the climb. That EXTREME is never held at all is pinned
+    // in pipeline.test.ts ("never holds the EXTREME rung inside the extended window").
+    const s = settled();
+    const t0 = s.now;
+    s.setNonAc(7.2);
+    const shedAt = firstShed(s, t0);
+    // Into the extended window (mode NORMAL, cut still settling)…
+    s.advance(30);
+    expect(s.commandsSince(t0, "power_off")).toHaveLength(1);
+    // …the house then climbs far past what the in-flight cut can cover.
+    const plansFrom = s.plans.length;
+    s.setNonAc(10.7);
+    s.advance(20);
+    const offs = s.commandsSince(t0, "power_off");
+    expect(offs.length, JSON.stringify(offs)).toBeGreaterThanOrEqual(2);
+    expect(offs[1].at - shedAt, "inside the 60 s landing grace").toBeLessThan(60_000);
+    const shedPlan = s.plans.slice(plansFrom).find((p) => p.commands.some((c) => c.kind === "power_off"));
+    expect(shedPlan?.reason.startsWith("over_"), shedPlan?.reason).toBe(true);
+    expect(shedPlan?.decisions.some((d) => d.blockedBy === "escalation settle")).toBe(false);
+    // …and on the very first tick after the climb, not after a wait.
+    expect(offs[1].at - (shedAt + 30_000), "no hold between the climb and the shed").toBeLessThanOrEqual(5_000);
+  });
+});
+
+// STREAM G (2026-09-27). Owner decisions that day: "Budget-aware full start:
+// YES" (superseding the 2026-07-23/24 blind "on grid start all to full, then
+// drop") and "Grid fast lane: YES". Live 2026-09-26 13:13Z: the blind grid start
+// put every managed room at L3 on top of the grid-only house the CT02 measures
+// (the unmanaged guest AC among it), the meter reached 34.4A on a 30A line and
+// three severe cut batches followed within 21 s.
+describe("ACCEPTANCE: grid entry and the grid roomy lane (2026-09-27)", () => {
+  const grid30: LevelingConfigV2 = { ...cfg, gridLimitAmps: 30 };
+  // Hot rooms: every cap binds, so a level is its whole cap on the meter.
+  const HOT = [
+    { ...ABDULLAH, level: 1, demandAmps: 5.3, needDelta: 3 },
+    { ...ABDU, level: 1, demandAmps: 9.0, needDelta: 2 },
+    { ...NAJAT, level: 1, demandAmps: 5.3, needDelta: 1 },
+  ];
+
+  it("a grid entry onto ~12A of unmanaged house never crosses 30A and needs no cut", () => {
+    // A grid session long enough for the house sampler to MEASURE the grid
+    // house (the harness is never told it), then a short gen interlude, then
+    // back onto grid: the entry the 13:13Z batch was.
+    const s = new Scenario(grid30, HOT, { nonAcAmps: 12, source: "grid", seed: 20260927 });
+    s.advance(8 * 60);
+    s.setSource("gen");
+    s.setNonAc(4); // the guest AC and the grid-only loads are not on the generator
+    s.advance(3 * 60);
+    const plansFrom = s.plans.length;
+    const t0 = s.now;
+    s.setNonAc(12);
+    s.setSource("grid");
+    let peak = 0;
+    for (let i = 0; i < 72; i++) {
+      s.step();
+      peak = Math.max(peak, s.totalAmps());
+    }
+    const entry = s.plans.slice(plansFrom);
+    const over = entry.filter((p) => p.reason.startsWith("over_"));
+    expect(over.map((p) => p.reason), "no over-limit batch after the entry").toEqual([]);
+    expect(peak, "the line never crosses its limit").toBeLessThanOrEqual(30);
+    // …and it still starts high: the first entry batch lifts, in one go.
+    const first = s.commandsSince(t0, "set_level");
+    expect(first.length).toBeGreaterThan(0);
+    expect(first[0].at - t0, "lifted on the first grid tick").toBeLessThanOrEqual(10_000);
+    expect(entry.some((p) => p.decisions.some((d) => d.action === "grid-entry budget"))).toBe(true);
+  });
+
+  it("the COMMON entry: after a long generator session the first grid batch still fits (Sol, 2026-09-27)", () => {
+    // 2 h of generator ages the grid house record out of its 15-minute window,
+    // and the generator's own house (4A) cannot see the grid-only load (guest AC
+    // and the rest, 12A here). The harness MEASURES both houses; it is never
+    // handed either.
+    const s = new Scenario(grid30, HOT, { nonAcAmps: 12, source: "grid", seed: 20260928 });
+    s.advance(8 * 60);
+    s.setSource("gen");
+    s.setNonAc(4);
+    s.advance(20 * 60);
+    const plansFrom = s.plans.length;
+    const t0 = s.now;
+    s.setNonAc(12); // the guest load is already there when the grid comes back
+    s.setSource("grid");
+    let peak = 0;
+    for (let i = 0; i < 72; i++) {
+      s.step();
+      peak = Math.max(peak, s.totalAmps());
+    }
+    const entry = s.plans.slice(plansFrom);
+    const firstBatch = entry.find((p) => p.commands.length > 0);
+    expect(firstBatch?.reason, "the first entry batch is the budgeted start").toBe("grid_full");
+    expect(entry.filter((p) => p.reason.startsWith("over_")).map((p) => p.reason), "no cut").toEqual([]);
+    expect(s.commandsSince(t0, "power_off")).toEqual([]);
+    expect(peak, "the physical meter never crosses the limit").toBeLessThanOrEqual(30);
+  });
+
+  it("a remembered grid house that has since shrunk only delays the lift until fresh grid evidence exists", () => {
+    // Item 4 of the 2026-09-27 review, measured: the session memory (12A) holds
+    // the entry batch back, but the first tick back prunes the stale ring, so
+    // the grid figure is FRESH evidence as soon as the ramps allow a sample, and
+    // the budgeted start re-lifts inside the same GRID_FULL window.
+    const s = new Scenario(grid30, HOT, { nonAcAmps: 12, source: "grid", seed: 20260930 });
+    s.advance(8 * 60);
+    s.setSource("gen");
+    s.setNonAc(4);
+    s.advance(20 * 60);
+    s.setNonAc(4); // the guest AC is off this time
+    s.setSource("grid");
+    s.advance(10);
+    expect(["abdullah", "abdu", "najat"].map((id) => s.sim(id).level), "held back on entry").not.toEqual([3, 3, 3]);
+    s.advance(5 * 60 - 10);
+    expect(["abdullah", "abdu", "najat"].map((id) => s.sim(id).level), "lifted once measured").toEqual([3, 3, 3]);
+    expect(s.plans.some((p) => p.reason.startsWith("over_"))).toBe(false);
+  });
+
+  it("NOISE: ±0.5A and 60 s confirm lag near the 3A bar: no overload, no cut/raise churn (testing.md)", () => {
+    // docs/agent/testing.md: every new spend path runs under ±0.5A noise. The
+    // house is sized so the lane's 3A bar binds before the rooms reach their
+    // ceilings (models at all-L3: 19.3A + ~8A house against 29.7A), and every
+    // level confirms a full minute late, so the lane has to price unconfirmed
+    // sends (envelopeLevel) for the whole climb.
+    const lagged = HOT.map((r) => ({ ...r, needDelta: 0.2, confirmDelayMs: 60_000 }));
+    const s = new Scenario(grid30, lagged, { nonAcAmps: 8, source: "grid", seed: 20260929 });
+    s.advance(10 * 60);
+    s.setNoise(0.5);
+    s.advance(60);
+    for (const r of HOT) s.setDemand(r.deviceId, r.demandAmps, 3);
+    const t0 = s.now;
+    const plansFrom = s.plans.length;
+    let peak = 0;
+    for (let i = 0; i < 180; i++) {
+      s.step();
+      peak = Math.max(peak, s.totalAmps());
+    }
+    const plans = s.plans.slice(plansFrom);
+    expect(plans.filter((p) => p.reason.startsWith("over_")).map((p) => p.reason), "no over-limit batch").toEqual([]);
+    expect(s.commandsSince(t0, "power_off")).toEqual([]);
+    expect(peak, "the physical line never crosses its limit").toBeLessThanOrEqual(30);
+    // No churn: every room's commanded level only ever climbs, one step at a time.
+    for (const id of ["abdu", "abdullah", "najat"]) {
+      const levels = setLevels(s, t0).filter((e) => e.cmd.deviceId === id).map((e) => e.cmd.level);
+      for (let i = 1; i < levels.length; i++) expect(levels[i], `${id}: ${levels.join("→")}`).toBeGreaterThanOrEqual(levels[i - 1]);
+    }
+    // …and the lane did take part, so this is a replay of the new path.
+    expect(plans.some((p) => p.decisions.some((d) => (d.detail ?? "").includes("grid roomy lane:")))).toBe(true);
+  });
+
+  it("with plenty of grid headroom, raises converge without calm or settle waits", () => {
+    // Satisfied rooms at L1 after the entry window; then the rooms heat up.
+    const cool = HOT.map((r) => ({ ...r, needDelta: 0.2 }));
+    const s = new Scenario(grid30, cool, { nonAcAmps: 3, source: "grid", seed: 20260927 });
+    s.advance(10 * 60);
+    for (const r of HOT) s.setDemand(r.deviceId, r.demandAmps, 3);
+    const t0 = s.now;
+    s.advance(20);
+    const ups = s.commandsSince(t0, "set_level");
+    // Each room two steps (L1→L2→L3) in 20 s. Without the lane the second step
+    // waits out the 30 s raise calm after the first batch and lands at +40 s
+    // (measured in this harness with the lane closed).
+    for (const id of ["abdu", "abdullah", "najat"]) expect(s.sim(id).level, id).toBe(3);
+    expect(ups.length).toBeGreaterThanOrEqual(6);
+    expect(s.plans.some((p) => p.decisions.some((d) => (d.detail ?? "").includes("grid roomy lane:")))).toBe(true);
+    expect(s.plans.some((p) => p.reason.startsWith("over_"))).toBe(false);
+  });
+});

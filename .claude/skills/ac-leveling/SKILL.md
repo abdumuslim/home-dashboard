@@ -39,8 +39,11 @@ rollback target.
 
 **Physics-envelope veto (GEN only, `raise.ts` `envelopeTotalAmps`):** refuse a raise/restore when the
 worst-case cap-model total of the commanded end-state exceeds `limit − margin`, regardless of the
-meter. Meter-anchored admission is blind to ramp lag and to frozen readings. Grid is deliberately NOT
-envelope-guarded (grid starts FULL by directive; the reducer is the safety). Since 2026-07-31 a RAISE
+meter. Meter-anchored admission is blind to ramp lag and to frozen readings. An ordinary grid raise is
+deliberately NOT envelope-guarded (the reducer is its safety), but grid ENTRY is: since 2026-09-27
+GRID_FULL admits only what the measured grid house plus the modeled end-state fits (invariant 78,
+superseding the blind "grid starts FULL" directive), and the grid roomy lane carries its own model
+test (79). Since 2026-07-31 a RAISE
 is additionally charged the measured non-AC house load (`RaiseInput.nonAcAmps`, invariant 16);
 restores stay on the AC-only figure.
 
@@ -56,6 +59,7 @@ is killed so nothing can spend on a stale value. Reductions still act (safe dire
 4. **Shed clears on the CONFIRMED shadow ON, never at power_on send** — the send-to-confirm lag
    (5.8s–13 min) is when the collector's observed-off classifier minted a bogus manual-off lock.
    In-flight restores are parked by the `awaiting confirm` gate (60s, then confirm-or-resend).
+   (A restore the unit applied and a human then switched off is invariant 81, not a resend.)
 
 **Added 2026-07-28 after both remaining ACs sat shed through a blackout that never happened:**
 5. **A drop we commanded is not a breaker trip.** Every reducing batch credits the meter with its own
@@ -1219,7 +1223,7 @@ refill, so a scenario run at a non-default capacity behaves like the shell (75).
     than `CREDIT_LANDING_GRACE_MS` (60 s), its fall still short), whether or not
     the void has zeroed the credit: `cutLanding = commandedCutCreditAmps > 0 ||
     cutTrend === "settling"`. `escalationHold` holds SEVERE while `arriving` OR
-    `settling`; `settleHold` still covers mild when `commandedCutTotalAmps ≥
+    `settling` (inside SETTLING only; past it, 77 extends MILD alone); `settleHold` still covers mild when `commandedCutTotalAmps ≥
     rawRequiredAmps`. ⚠️ EXTREME is NEVER held — its sustained clock and
     required-sizing are the emergency escape, and invariant 48's "fires on
     `stalled`" contract stays intact: a genuine runaway inside the 60 s still
@@ -1392,8 +1396,9 @@ refill, so a scenario run at a non-default capacity behaves like the shell (75).
     (≥ `FAN_SETTLE_MS` 10 s floor) only when NOTHING is owed in either direction
     (`commandedCutTotalAmps ≤ 0` AND `rampDebitAmps === 0`, wired as
     `unabsorbedSpendAmps`). ⚠️ Deliberately the FULL-landing condition, NOT "the cut
-    is arriving" (35 % landed): `escalationHold`/`settleHold` (pipeline.ts) key on
-    `mode === "SETTLING"`, so exiting mid-landing would drop the invariant-64
+    is arriving" (35 % landed): `settleHold` (pipeline.ts) keys on
+    `mode === "SETTLING"` and `escalationHold` on SETTLING or the invariant-77 grace
+    window, so exiting mid-landing would drop the invariant-64
     double-shed holds — but at full landing those holds are vacuous by construction
     (credit and total are 0), so no protection is lost; it may only ever make the
     window SHORTER. Learning windows, calm durations, pacing, and the shed-trough
@@ -1776,6 +1781,231 @@ over-limit points should be a setting):**
     learned holds at all, so `controller.test.ts` is the only net (the two
     "REGRESSION 2026-09-24" tests).
 
+**Added 2026-09-27 after five double sheds in four days, every second one 30.25 to 39.87 s after the first:**
+77. **The shed hold lives on the CUT's clock, not the mode's, and only for an OFF in flight.**
+    `escalationHold` keyed on `mode === "SETTLING"`, which is `SETTLE_MS` (30 s) after the batch,
+    while the protection it gives is defined by `cutTrendOf`, whose `settling` lasts
+    `CREDIT_LANDING_GRACE_MS` (60 s). Two constants for one window (hard rule 5c class). For a cut
+    aged 30 to 60 s the mode had already flipped to NORMAL, the hold was false, and a second room went
+    off while the first shed was still landing. Live: four duplicate-off pairs, every second shed at
+    mode NORMAL and MILD: 2026-09-23 08:53:51 to 08:54:23 (31.45 s, then 16.34 A fell to 9.70 A: one
+    room would have done), 15:35:56 to 15:36:27 (30.25 s, pre 16.074 A at BOTH ticks, the meter had
+    not moved), 2026-09-25 03:58:55 to 03:59:26 (30.60 s), 2026-09-26 04:47:51 to 04:48:31 (39.87 s,
+    the priority-#1 room; the +29.3 s tick still in SETTLING had correctly held). A fifth pair
+    (2026-09-26 14:26:07 to 14:26:41, "case E") is a different defect this predicate does not cover:
+    a user ON cleared the shed record before the second OFF (dated section; its credit half is 82,
+    its verifier half the tcl-ac.md last-write-wins rule: a protective OFF supersedes a pending
+    dashboard power command at the publish boundary). The shape: the first
+    shed fires on the bucket while the 8-wide median is still climbing toward the step that drained
+    it, so the cut's anchor is the LAGGING median; the median catches up past it, the outrun void (38)
+    zeroes the credit, and only the landing grace still knows the off is late.
+    Now, in NORMAL, the shed rung also holds while `graceWindow` is open:
+    `commandedCutTotalAmps > 0 && commandedCutAgeMs < CREDIT_LANDING_GRACE_MS && some managed room
+    is shed`. Inside that window `escalationHold` holds MILD only, while `cutLanding` (credit live
+    or trend `settling`). Inside SETTLING nothing changed (64 verbatim). The deliberate limits, each
+    pinned by a test:
+    - ⚠️ **SEVERE is NOT extended, `settling` or `arriving`.** Past SETTLE_MS the median has had its
+      ~12 to 20 s, so a severe mean that has not moved is off-lag or a real overload and the meter
+      cannot say which; the breaker gets the doubt. Staged, a severe-settling extension held the only
+      rung left (every level and fan spent, the level cut overpriced as in 38) and pushed the first
+      shed from 40 s to 80 s at 1.4 A over a 14.9 A gen; the 2026-08-04 12:39:57 breaker went after
+      91 s at 0.6 to 1.1 A. Severe `arriving` was extended in the first build and removed on
+      independent review (2026-09-27): `roomShed` does not tie the pooled cut to an off in flight, so
+      a stale shed plus a fresh fan trim reading `arriving` held a severe shed to 60 s with no release
+      but extreme. EXTREME is never held (48, 64).
+    - ⚠️ **Mild is released by two DIFFERENT clocks, neither an unconditional bound.** A flat mean
+      that STAYS over the limit promotes to severe after 45 s of mean-over
+      (`SUSTAINED_OVER_SEVERE_MS`), which the extension never holds, but that clock resets on a
+      reading where the cut is visibly landing; and a single pooled cut's added grace ends at 60 s,
+      but a new cut re-bases the pooled clock.
+    - ⚠️ **Only the SHED rung.** `settleHold` (which also parks levels and fans) keeps the mode
+      window. A fan trim arms the same pooled cut, and a 60 s freeze after every trim turned the fan
+      rung's 10 s pace (`FAN_SETTLE_MS`) into a minute per gear (the 2026-08-31 funded-spend
+      acceptance caught it). A deficit that grows past what is in flight (case-E shape, required
+      0.63 to 2.44 A, `satisfied=false`) still gets level and fan cuts at once; only the shed waits.
+    - ⚠️ **Only while a room is shed.** The pooled cut's clock is re-based by every cut, a fan trim
+      included, so a trim on top of an old hand-off the house had outrun read `settling` again and
+      held the causer's shed 40 s at 0.4 A over (the 2026-08-31 stalled-credit acceptance caught
+      it). The 60 s grace stands for an OFF in flight; with no room off on our record there is none.
+    - ⚠️ **SETTLING is not lengthened** and FLOORS/GRID_FULL are untouched. SETTLING parks raises and
+      restores and has the invariant-70 early exit; this change only gates a HOLD, so it can turn a
+      shed into a wait and never create an action. 70's early exit fires only at full landing, where
+      `cutLanding` is false and the grace window is vacuous.
+    Residual, by design: an off whose lag plus the median's exceeds the 60 s grace (TCL: 6 s to
+    13 min) is still re-shed at `stalled`; so is a mild ride whose flat mean stays over the limit for
+    45 s. Pipeline only; `scenario.ts` needed no mirror. Tests: `pipeline.test.ts` "…and the holds
+    track the CUT's landing grace, not the 30s settle mode (2026-09-26)" (incl. "a stale shed plus a
+    fresh FAN TRIM that reads arriving does not hold a SEVERE shed"); `scenarios.test.ts`
+    "ACCEPTANCE: a shed still landing past 30 s does not shed a second room (2026-09-26)".
+    Cross-reference 27, 35, 48, 64, 70.
+
+**Added 2026-09-27 after the 2026-09-26 13:13Z grid entry reached 34.4 A on a 30 A line, and a week of grid parity forensics:**
+78. **Grid entry is budget-aware; the reducer is the backstop, not the plan.** (Owner, 2026-09-27:
+    "Budget-aware full start: YES", superseding the 2026-07-23/24 "on grid start all to full, then
+    drop".) GRID_FULL used to drive every ON managed room to its ceiling blind. Live 2026-09-26
+    13:13Z it put all three at L3 (models 8.0 + 7.3 + 6.3 = 21.6 A) on top of the grid-only house
+    (guest AC included, measured by the CT02 since 2026-08-29); the meter reached 34.4 A and three
+    severe cut batches followed within 21 s. `planGridFullStart` (raise.ts) now charges every running
+    room at `max(currentLevel, envelopeLevel)` (level 0 priced as unrestricted, invariant 7's worst
+    case) and a restore already in flight at its ceiling, then admits in order: manual pins, hottest
+    `rankNeedDelta`, `acs` order. A running room gets the highest level up to its ceiling that fits
+    (never below its charged level: this phase never cuts); a shed room restores at the highest level
+    at or above its floor that fits, else stays shed for the ordinary restore path. Budget:
+    `input.nonAcAmps` (the controller's `houseLoadAmps` for the active source, which the pipeline
+    zeroes only for the raise path's envelope) + Σ `steadyDraw` <= limit − margin − restingBuffer.
+    ⚠️ When everything fits, the command list and the journal are byte-identical to the blind start
+    (pinned by a parity test against a verbatim copy of the old loop in `grid-start.test.ts`). A
+    limited batch journals one extra decision, `grid-entry budget`: "lifted a→L3; b holds L1: house
+    20.0A + 12.0A at ceilings > 29.7A". ⚠️ The G1 ceiling includes the resting buffer for restores
+    too (restores elsewhere are exempt from it): conservative by 0.2 A, by design. GRID_FULL still
+    ends on its usual exits (confirm, 5-min backstop, manual change, bucket_empty); ending it early
+    once a limited batch is out was evaluated and NOT built (dated section: the ordinary grid path
+    has no envelope and no ramp debit, so a restore could be admitted on a changeover trough).
+    Tests: `grid-start.test.ts`, `pipeline.test.ts` "G1 budget-aware grid full start (pipeline
+    wiring)", `scenarios.test.ts` "ACCEPTANCE: grid entry and the grid roomy lane (2026-09-27)".
+79. **The grid roomy lane waives time, never physics.** (Owner, 2026-09-27: "Grid fast lane: YES".)
+    Grid pacing gates blocked 64 % of 290 grid raise/restore decisions in 7 days with a median 13 A
+    of 30 A unused (gen: 25 %, median 1.8 A). `planRaise` takes `roomyLane?: { houseAmps }`, set by
+    pipeline.ts only when `roomyLaneOpen`: grid, mode NORMAL or SETTLING, `pressure.kind === "calm"`,
+    no corrections this tick, `overLimitActedRecently !== true` (the swap's own quiet input,
+    `SWAP_QUIET_AFTER_OVER_MS` = `PENDING_CUT_MS`), `derateAmps <= 0`, not collapsed, not frozen. It
+    waives only the restore and raise CALM gates and, via the existing settle-lane flag
+    (`fundedOnly = settlingFundedLane || settlingRoomyLane`), the SETTLE window, and only for a
+    candidate whose spare after the step is `>= max(GRID_ROOMY_SPARE_AMPS (3 A), its own cost)` on
+    BOTH (a) the meter test the admission already uses (restore: `ceilingFor − (candidateCommitted +
+    cost)`, plain fit only; raise: `available − step`, to the resting ceiling) and (b) a model test
+    against the SAME ceiling: grid house + every managed room's steady draw (priced at its worst level,
+    below) + this batch's restores + the candidate at its target. So a second spend in one batch, or one settle window, sees the
+    first. Every other gate stays: backoff, ramping, duplicate send, awaiting confirm, reservations,
+    shed bars, bounce backoff, victim/funding cooldowns, flicker patience, manual pins, need ordering.
+    Every roomy admission is journaled ("grid roomy lane: 11.2A spare after (meter 16.4A, model
+    11.2A)"). ⚠️ Gen can never reach it: `roomyLaneOpen` requires grid and `planRaise` re-checks
+    `source === "grid"`. The funded lane (72) is untouched and composes with it.
+    ⚠️ The model prices EVERY room, the candidate included, at the WORST level the firmware may still
+    apply: `worstCaseLevel([currentLevel, envelopeLevel, this batch's command, the candidate's
+    target])`, level 0 as unrestricted. A new lower command does not cancel an unconfirmed higher one
+    until it confirms (review 2026-09-27: an L3 in flight priced at a new L2 read 4.7 A of spare where
+    the worst case left 2.7 A, wrongly clearing the bar).
+    ⚠️ The 3 A spare is a lane ADMISSION bar validated in the harness (including a ±0.5 A noise,
+    60 s confirm-lag replay near the bar), not a proven breaker margin against grid-only load swings:
+    a guest AC starting after an admission is the reducer's to answer, exactly as before the lane.
+    Tests: `grid-lane.test.ts`, `pipeline.test.ts` "G2 grid roomy lane: the situational gate
+    (pipeline)", and the `scenarios.test.ts` acceptance above incl. "NOISE: ±0.5A and 60 s confirm
+    lag near the 3A bar: no overload, no cut/raise churn".
+80. **The grid house survives a generator interlude.** `houseLoadAmps(…, "grid")` with no fresh grid
+    evidence used to fall back to the GENERATOR's record alone, and the generator cannot see grid-only
+    load (the unmanaged guest AC among it). Nearly every grid entry follows ~2 h of generator, so the
+    grid entry budget read 4 A where the real house was 12 A (4 + 21.6 A ceiling-priced passed a
+    29.7 A ceiling; the end-state was 33.6 A). Each source record now keeps `session`: the rolling
+    peak, across running sets, as of its last usable sample, frozen there (the ring itself cannot
+    carry it: the first tick back on grid prunes every stale sample before anything is usable, since
+    every compressor is ramping). The grid figure with no fresh grid evidence is `max(carried
+    generator peak, remembered grid session peak)` while that session's last sample is within
+    `GRID_SESSION_MEMORY_MS` (24 h). Only samples that were valid when taken can be in it (the ring's
+    own gates: ramping skip, trust gap, modeled-drop cooldown, shell suppressions), and `voidSamples`
+    recomputes it, so a phantom-ON sample leaves the memory too. Across sets by design: its only
+    consumers (the grid entry budget and the roomy lane's model test) can only get more conservative
+    from a higher house. Peak, not a percentile: it is exactly the statistic the grid record was
+    reporting when the session ended, and the house-load contract is a PEAK (a worst case).
+    ⚠️ GRID ONLY: the generator's query is unchanged, byte for byte. ⚠️ Fresh grid evidence wins the
+    moment a usable, set-matched grid sample exists, and because the ring was pruned at entry that
+    evidence is post-entry only, so a remembered house that has since shrunk delays the lift only
+    until the ramps allow a sample (harness: lifted inside the 5-minute GRID_FULL window; one
+    exploratory run put it at 2 to 3 minutes, which the test does not assert; live ramp windows are
+    240 s, and the 5-min backstop bounds the worst case).
+    ⚠️ **A retroactive void never drops the memory below the last VALID peak before the voided
+    evidence.** Each memory keeps a `prior` (the last valid peak whose samples the ring no longer
+    holds); a void falls back to it instead of recomputing from an emptied ring, and `prior` is itself
+    dropped only when its own peak sample is the voided evidence (taken inside the void window without
+    the room in its set). `prior` is never read on the ordinary path, where a newer valid sample
+    legitimately replaces the memory. Found on the recheck round (2026-09-27): back on grid the entry
+    tick pruned the ring, a later usable sample replaced the 12 A memory, the shell then voided that
+    sample (a room found already drawing), and the grid figure fell to the 4 A generator carry inside
+    the GRID_FULL window.
+    ⚠️ Not persisted: a server restart forgets it (the carry then answers alone, as before). Visible:
+    the status API's `nonAcLoadAmps` reports this grid figure, so it can show the remembered peak while
+    no fresh grid evidence exists (no client use found). Tests:
+    `house-load.test.ts` "houseLoadAmps — the grid session memory (2026-09-27, Stream G)", incl. "a
+    POST-RETURN sample voided as a phantom falls back to the prior valid grid memory" (RED before the
+    fix: 4.0 A instead of 12.0 A) and its guard "…but a prior memory that was ITSELF the voided
+    evidence is dropped";
+    `scenarios.test.ts` "the COMMON entry: after a long generator session the first grid batch still
+    fits" (with the memory disabled the same replay needs four `over_mild` batches) and "a remembered
+    grid house that has since shrunk only delays the lift until fresh grid evidence exists".
+
+**Added 2026-09-27 after "Mom's AC turns back on by itself" (Najat, remote off reversed):**
+81. **A restore a human declined is not re-sent, and the decline is the collector's verdict.**
+    Invariant 4 keeps a restored room SHED until the shadow confirms the ON, and confirm-or-resend
+    re-sends `power_on` after `RESTORE_CONFIRM_WAIT_MS` (60 s) while the room still reads shed+off.
+    When the unit applied the ON and someone switched it straight back off between two polls, the
+    leveler turned it back on. Now:
+    - `restoreSentAt` is stamped at the `power_on` case with the PUBLISH time (captured before the
+      send call, committed once the cloud accepted; the call itself takes ~3 s for the profile), and
+      only when `shedOffObservedAt` proves the room was seen off before we asked it on. `recordShed`,
+      `clearShed` and a load delete it; so do a restart-kind power event (`notePowerEvent` clears the
+      whole map) and this unit's power-cycle fingerprint (`onDevicePowerCycle`).
+    - The tick device loop, where it would stamp `shedOffObservedAt`, asks `restoreDeclinedByHand`:
+      within `GRADE_TURN_ON_MS` of the send, no restart since (`lastAcRestartAt`,
+      `devicePowerCycleAt`, belt to the clears above), and `isolatedPowerOffAfter(device,
+      restoreSentAt)` (our ON's full-state dump, then a lone OFF; the causal shadow discriminator in
+      `docs/agent/tcl-ac.md` "Shadow metadata"). Acting flavour only.
+    - It then asks the collector (`deps.onRestoreDeclined`), which runs the same judgment as every
+      observed off (causal + restart voids, beep fingerprints, power-event window) and on "manual"
+      records the PERSISTENT manual-off lock (reason `restore_declined`) with the push. `false`, a
+      thrown error, or no dep wired: nothing is declined, the shed and the ordinary resend stand, and
+      this send is not asked about again.
+    - `declineRestore` (only after a `true`): clears the shed as **`restore_declined`**, releases any
+      gentle-restore fan hold, clears the room's pending-ON / start / ramp / reconciler send
+      bookkeeping, arms house-load's modeled-drop cooldown (`armDropCooldown`: whatever the
+      compressor drew in its seconds of running is never sampled as house; 20/28), releases a
+      proactive-shed swap whose RECEIVER this room was (the donor's reservation would otherwise park
+      raises and fan restores for up to `SWAP_RESERVATION_MS`), and journals a LOUD commandless
+      `restore_declined` row plus a warn log.
+    - ⚠️ It is neither a success nor a failure: the attempt is removed from every open grade window
+      (no `noteSuccess`, no `noteFailure`, no bounce), any window whose single actuator was this room
+      is marked contaminated (it would learn an on-cost from a room that never ran), the pacing
+      restore entry's `lastAttemptAt` is zeroed so `restoreInFlight` stops claiming a later remote ON
+      as our echo, and `clearBounces` ends the episode as an external hand does. **Nothing is
+      credited**: the room was shed (modeled off) the whole time, `creditRoomOff` refuses shed rooms
+      anyway, and the tick sees no structural ON→OFF edge.
+    - A room the poll DID catch ON takes the ordinary `restore_confirmed` + ON→OFF path. FLOORS
+      blocks restores and is entered only through a source change, which clears `restoreSentAt`, so
+      no FLOORS-era decline exists; GRID_FULL restores go through the same `power_on` case and
+      decline identically.
+    - **A power-accepted restore is a SENT restore.** When the restore's power publish was accepted
+      and only its profile (level/fan) publish failed (`AcProfileNotAppliedError`, tcl-ac.md), the
+      send path books it exactly like a successful send (not `failedCommands`): `restoreSentAt`, the
+      pacing attempt, the shed kept until confirm (4) and the collector ON stamp, with a warning.
+      Booking it as refused left it untracked, so another restore could reverse a human's OFF. The
+      missing level is re-emitted by the reconciler's unconfirmed-level resend.
+    Shell-side only (`scenario.ts` does not model the device poll): `controller.test.ts` "a restore
+    declined by hand is not re-sent (2026-09-27)"; collector half in `remote-off.test.ts` "item 2".
+82. **A human ON takes the room's own unlanded off back out of the cut credit.** `pendingCut` is ONE
+    pooled number, so the controller now keeps each room's share (`cutShares`: the priced off of its
+    shed in a sent batch, or of an observed off via `creditRoomOff`, with its time and spendability;
+    cleared on a source change). When a human turns that room back ON (`onUserPowerOn`, and the
+    reconcile path's external-ON branches for a shed room), `revokeRoomCutShare` removes the room's
+    APPORTIONED part of the pool's unabsorbed remainder from BOTH sides of the credit (the spendable
+    side too when the share was spendable), dropping the pool when nothing is left. Apportioned:
+    before every new cut stacks (`rebaseCutShares`; every stacking site, `creditRoomOff`,
+    `creditManualLevelDown` and the reducing batch, goes through the single `stackCommandedCut`
+    wrapper, so a future site cannot forget the rebase) each live share
+    shrinks to its proportional part of what the pool still holds unabsorbed and is re-dated to the
+    pool's new clock; at revoke time the current remainder is split across the live shares by those
+    amounts, and a room never loses more than its own share. The pool has ONE absorption ratchet, so a
+    fall shown since the last stack is spread proportionally rather than attributed. Example (the
+    recheck's test): a 4 A off with 3 A absorbed, then a second room's 4 A off (pool 5 A): turning
+    the first room back on revokes 1 A, not 4 A, so the second room's credit is untouched and a
+    legitimate restore is not delayed. Live 2026-09-26 14:26Z (case E of 77): the
+    owner switched Najat back ON from the dashboard 3.9 s before the reducer re-shed her as the
+    causer; her earlier shed's credit was still pending, so `requiredAmps` was understated and the
+    re-shed stacked on it through `noteCommandedCut` (one room's off counted twice). 74(d) is the
+    device power-cycle twin (spend side only). ⚠️ Whether the reducer may re-shed a room a human
+    switched on seconds earlier is a recorded policy, unchanged: yes when that turn-on caused the
+    overload (43), and 65 bars only the comfort swap. Shell-side
+    (`cutShares` lives in the controller). Test: `controller.test.ts` "a human ON revokes the room's
+    own unlanded cut credit".
+
 ⚠️ **`scenario.ts` mirrors the shell's projection and start-window bookkeeping** — and since
 2026-07-31 also the **house-load sampling, the fan debit, calm-on-fan-restore, and the partial bucket
 refill**. The harness must MEASURE the non-AC split off the simulated meter, never be handed the sim's
@@ -1783,6 +2013,18 @@ ground-truth `nonAcAmps`. That mirror is what
 hid bug 14 for five days: the harness priced a turn-on at its real level while the shell priced the
 floor, so no harness test could disagree with the shell. Anything you change in one, change in the
 other — and put the guard in `controller.test.ts`, not only `scenarios.test.ts`.
+**2026-09-27 (77 to 82): no new mirror was needed.** 81 and 82 are shell-only (the device poll,
+`restoreSentAt`, `cutShares`), which `scenario.ts` does not model, so `controller.test.ts` is their
+only net. 77 lives in `pipeline.ts` and 78/79 in
+`raise.ts` + `pipeline.ts`, which the harness runs as-is. 80's grid session memory lives in
+`house-load.ts`, which the harness IMPORTS (it samples `sampleHouseLoad` off the simulated meter),
+so the memory is exercised, not mirrored; grid acceptance scenes must run grid long enough for the
+sampler to MEASURE the grid house (8 min at 12 A in the G acceptance) rather than hand it over. Two
+harness facts to know: the shell's memory is in-process only (a restart forgets it; the harness has
+no restart to model), and right after a batch the harness's calm clock is 0, so pressure is not
+`calm` and the SETTLING half of the roomy lane (79) rarely opens there; the calm-gate half carries
+the measured speed-up (second step at +15 s instead of +40 s). Live readings arrive every 1 to 4 s,
+so both halves apply in production.
 
 **Hard rules preserved from v1:** never level 0 · manual wins (until the room power-cycles or its
 range slot changes, 73) · slot caps · boost floors ·
@@ -1790,7 +2032,7 @@ shed ≠ manual-off · warm restore · opt-out · collapse latch · leaky bucket
 75) · requireShed ≥ max(3 A, 20%).
 
 **Mode machine:** COLLAPSED > FLOORS > GRID_FULL > SETTLING > NORMAL. FLOORS arms on ANY entry into
-gen (incl. cold start); GRID_FULL on any entry into grid.
+gen (incl. cold start); GRID_FULL on any entry into grid, budget-aware since 2026-09-27 (78).
 
 **Reduction ladder:** levels → floor → fans → **sub-floor levels** → the COOLEST room whose single
 off covers the deficit → (only if none does) the coolest TWO in one batch (invariants 17, 18, 25, 26,

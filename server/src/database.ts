@@ -285,6 +285,24 @@ const MIGRATIONS: string[] = [
     power_2     REAL NOT NULL
   )`,
   "CREATE INDEX IF NOT EXISTS idx_tuya_power_ts_brin ON tuya_power_readings USING BRIN (ts)",
+  // Who changed an automation (automation-audit.ts). 2026-09-26: the owner's
+  // disable/re-enable of an automation left no log line and no row anywhere, so
+  // it could not be verified. Mirrors ac_leveling_config_audit: BIGSERIAL id,
+  // BRIN on at, kept 30 days (opportunistic prune on the write path). No FK to
+  // automations: a delete is audited too, and its row must outlive the rule.
+  `CREATE TABLE IF NOT EXISTS automation_audit (
+    id              BIGSERIAL PRIMARY KEY,
+    at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    automation_id   INTEGER NOT NULL,
+    automation_name TEXT,
+    action          TEXT NOT NULL,
+    enabled_before  BOOLEAN,
+    enabled_after   BOOLEAN,
+    auth_kind       TEXT,
+    ip              TEXT,
+    user_agent      TEXT
+  )`,
+  "CREATE INDEX IF NOT EXISTS automation_audit_at_brin ON automation_audit USING BRIN (at)",
 ];
 
 async function migrateLegacyBreakpoints(client: pg.PoolClient): Promise<void> {

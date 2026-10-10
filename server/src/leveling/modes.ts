@@ -119,9 +119,10 @@ export function noteBatch(state: ModeState, opts: { fanOnly: boolean }, now: num
  *      fan debit the meter has not shown yet).
  *
  * Deliberately the FULL-landing condition, NOT "the cut is arriving" (35%
- * landed): `escalationHold`/`settleHold` (pipeline.ts) key on `mode ===
- * "SETTLING"`, so exiting while most of a cut is still in flight would drop the
- * invariant-64 double-shed holds. At full landing those holds are already
+ * landed): `settleHold` (pipeline.ts) keys on `mode === "SETTLING"` and
+ * `escalationHold` on SETTLING or the invariant-77 landing-grace window (mild
+ * only in NORMAL), so exiting while most of a cut is still in flight would drop
+ * the invariant-64 double-shed holds. At full landing those holds are already
  * vacuous by construction — credit and total are 0, so `cutLanding` is false —
  * and no protection is lost. It may only ever make the window SHORTER: a slow
  * level-cut wind-down (`commandedCutTotalAmps > 0` for up to 180 s) simply keeps

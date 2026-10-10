@@ -1,12 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
 import { LevelingControllerV2, batchLoadDirections } from "./controller.js";
 import type { LevelingDeps } from "./api.js";
+import { AcProfileNotAppliedError } from "../tcl-cloud.js";
 import { SUBFLOOR_WATCH_MS } from "./needs.js";
 import { EXTERNAL_ON_DONOR_SHIELD_MS } from "./raise.js";
 import { attemptedWithin, noteAttempt, noteFailure, restoreBounces, restoreFailures, type PacingState } from "./pacing.js";
 import { baselineStale, noteFanSend, noteLevelSend, unconfirmedLevels, type ReconcilerState } from "./reconciler.js";
 import { houseLoadAmps, type HouseLoadState } from "./house-load.js";
-import { meterView } from "./sensing.js";
+import { meterView, pendingCutCredit } from "./sensing.js";
 import { noteBatch, type ModeState } from "./modes.js";
 import { powerEventRestartsAcs } from "./power-events.js";
 import type { FanHolds } from "./fan-trim.js";
@@ -1113,6 +1114,560 @@ describe("LevelingControllerV2 — shed clears on confirmed ON, not at command s
       b.power = true; // the shadow finally confirms
       await run(8, 2);
       expect(controller.isShed("b")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Remote off must stick (owner report 2026-09-27, R3). Per invariant 4 a shed
+// room stays shed until the shadow CONFIRMS the restore's ON. When the unit
+// applies the ON and a human switches it straight back off between two of our
+// polls, the room still reads shed+off, and confirm-or-resend re-sent power_on
+// 60 s later: Mom's AC "turned back on by itself". The shadow metadata tells
+// the cases apart (tcl-cloud `isolatedPowerOffAfter`): our ON's full-state dump
+// followed by a lone powerSwitch OFF is the unit going off by itself. The
+// collector owns the verdict and the persistent lock (`onRestoreDeclined`).
+// SHELL test: the device-poll timing is invisible to scenario.ts.
+// ---------------------------------------------------------------------------
+describe("LevelingControllerV2: a restore declined by hand is not re-sent (2026-09-27)", () => {
+  const pacingOf = (c: LevelingControllerV2) => (c as unknown as { pacing: PacingState }).pacing;
+  const houseOf = (c: LevelingControllerV2) => (c as unknown as { houseLoad: HouseLoadState }).houseLoad;
+  /** Epoch-second start of the report second, `secAfter` seconds after `sentAt`. */
+  const reportSec = (sentAt: number, secAfter: number) => (Math.floor(sentAt / 1000) + secAfter) * 1000;
+  /** The shadow after our ON landed (dump) and a hand switched it off (lone powerSwitch). */
+  const humanOffAfter = (b: Record<string, unknown>, publishedAt: number, dumpSec = 2, offSec = 8) => {
+    b.fullStateReportAt = reportSec(publishedAt, dumpSec);
+    b.powerReportedAt = reportSec(publishedAt, offSec);
+    b.powerReportCohort = 1;
+  };
+
+  function setup(opts: { verdict?: boolean; profileDelayMs?: number; grid?: boolean; profileFails?: boolean } = {}) {
+    const mock = createGradePool({}, ["b"]);
+    const b: Record<string, unknown> = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+    /** When each power_on was PUBLISHED: the start of the call, before any profile delay. */
+    const powerOns: number[] = [];
+    const onRestoreDeclined = vi.fn(async () => opts.verdict ?? true);
+    const deps: LevelingDeps = {
+      ...createDeps(),
+      onRestoreDeclined,
+      getTclCloud: () =>
+        ({
+          sendControl: async () => undefined,
+          executeAcAction: async (_deviceId: string, action: { power?: number }) => {
+            if (action.power === 1) {
+              powerOns.push(Date.now());
+              // The real call publishes powerSwitch first, then waits ~3 s for the profile.
+              if (opts.profileDelayMs) vi.setSystemTime(Date.now() + opts.profileDelayMs);
+              if (opts.profileFails) throw new AcProfileNotAppliedError("b", new Error("profile publish HTTP 503"));
+            }
+          },
+        }) as never,
+    };
+    const controller = new LevelingControllerV2(mock.pool, deps);
+    const ctx = [
+      { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null, slotKey: null },
+      { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
+    ];
+    let flip = 1;
+    const run = async (steps: number, amps = 8) => {
+      for (let i = 0; i < steps; i++) {
+        flip = -flip;
+        const reading = amps + 0.01 * flip;
+        controller.onPowerReading(
+          (opts.grid ? { current_1: reading, current_2: 0 } : { current_1: 0, current_2: reading }) as never,
+        );
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx, 30);
+      }
+    };
+    return { mock, b, powerOns, controller, run, onRestoreDeclined };
+  }
+
+  it("our ON's dump, then a lone OFF: cleared as restore_declined, never re-sent", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run, onRestoreDeclined } = setup();
+      await controller.ensureLoaded();
+      await run(8); // calm builds, the restore ships
+      expect(powerOns).toHaveLength(1);
+      expect(controller.isShed("b")).toBe(true);
+      const sentAt = powerOns[0];
+      type Grade = { single: { deviceId: string } | null; attempts: Array<{ deviceId: string; kind: string }>; contaminated: boolean };
+      const gradesOf = () => (controller as unknown as { pendingGrades: Grade[] }).pendingGrades;
+      expect(
+        gradesOf().some((g) => g.attempts.some((a) => a.deviceId === "b" && a.kind === "restore")),
+        "precondition: the restore's grade window is open",
+      ).toBe(true);
+
+      humanOffAfter(b, sentAt);
+      await run(2);
+
+      expect(onRestoreDeclined).toHaveBeenCalledWith("b", sentAt, expect.objectContaining({ id: "b" }));
+      expect(controller.isShed("b"), "a human declined the restore: shed cleared").toBe(false);
+      expect(
+        gradesOf().some((g) => g.attempts.some((a) => a.deviceId === "b" && a.kind === "restore")),
+        "the declined restore is neither graded a success nor a failure",
+      ).toBe(false);
+      expect(
+        gradesOf().some((g) => g.single?.deviceId === "b" && !g.contaminated),
+        "no window may learn b's on-cost from a room that never ran",
+      ).toBe(false);
+      const row = mock.journal.find((j) => j.reason === "restore_declined");
+      expect(row, "journalled LOUDLY as a commandless row").toBeDefined();
+      expect(JSON.parse(String(row!.commands))).toEqual([]);
+      expect(restoreFailures(pacingOf(controller), "b"), "not a restore failure").toBe(0);
+      expect(restoreBounces(pacingOf(controller), "b"), "not a bounce").toBe(0);
+      expect(attemptedWithin(pacingOf(controller), "b", "restore", 10 * 60_000, Date.now()), "no restore left in flight").toBe(false);
+
+      await run(20); // well past the 60 s confirm window
+      expect(powerOns, "the restore is never re-sent over the human's off").toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("partial success: power ON accepted, profile failed: booked as SENT, then a human OFF is declined, never re-sent", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run, onRestoreDeclined } = setup({ profileFails: true });
+      await controller.ensureLoaded();
+      await run(8);
+      expect(powerOns).toHaveLength(1);
+      expect(controller.isShed("b"), "shed kept until the ON confirms (invariant 4)").toBe(true);
+      expect(attemptedWithin(pacingOf(controller), "b", "restore", 60_000, Date.now()), "the restore attempt is booked").toBe(true);
+      await run(3); // inside the confirm window: not re-sent as if it had failed
+      expect(powerOns).toHaveLength(1);
+      humanOffAfter(b, powerOns[0]);
+      await run(20);
+      expect(onRestoreDeclined).toHaveBeenCalledTimes(1);
+      expect(controller.isShed("b")).toBe(false);
+      expect(powerOns, "no re-send over the human's off").toHaveLength(1);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("item 1: the ON reference is the PUBLISH, not the call's return (~3 s profile delay)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { b, powerOns, controller, run } = setup({ profileDelayMs: 3_000 });
+      await controller.ensureLoaded();
+      await run(8);
+      expect(powerOns).toHaveLength(1);
+      // Dump 1 s after the power publish, remote OFF 2 s after it: both BEFORE
+      // the action returned (publish + 3 s).
+      humanOffAfter(b, powerOns[0], 1, 2);
+      await run(20);
+      expect(controller.isShed("b")).toBe(false);
+      expect(powerOns, "no later power ON over the human's off").toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("item 2: when the collector does not call it a hand (power event), the shed stays and confirm-or-resend runs", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run, onRestoreDeclined } = setup({ verdict: false });
+      await controller.ensureLoaded();
+      await run(8);
+      humanOffAfter(b, powerOns[0]);
+      await run(14);
+      expect(onRestoreDeclined, "asked once for this send, not every tick").toHaveBeenCalledTimes(1);
+      expect(controller.isShed("b")).toBe(true);
+      expect(powerOns.length, "ordinary resend past the confirm window").toBeGreaterThanOrEqual(2);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("item 2: with no collector verdict wired, nothing is ever declined (fail safe)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const mock = createGradePool({}, ["b"]);
+      const b: Record<string, unknown> = { id: "b", name: "b", power: false, generatorMode: 1, maxGeneratorLevel: 3, fanSpeed: 1 };
+      const powerOns: number[] = [];
+      const controller = new LevelingControllerV2(mock.pool, {
+        ...createDeps(),
+        getTclCloud: () =>
+          ({
+            sendControl: async () => undefined,
+            executeAcAction: async (_id: string, action: { power?: number }) => { if (action.power === 1) powerOns.push(Date.now()); },
+          }) as never,
+      });
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null, slotKey: null },
+        { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null },
+      ];
+      let flip = 1;
+      for (let i = 0; i < 8; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: 8 + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx, 30);
+      }
+      humanOffAfter(b, powerOns[0]);
+      for (let i = 0; i < 4; i++) {
+        flip = -flip;
+        controller.onPowerReading({ current_1: 0, current_2: 8 + 0.01 * flip } as never);
+        vi.advanceTimersByTime(5_000);
+        await controller.tick(ctx, 30);
+      }
+      expect(controller.isShed("b")).toBe(true);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("item 4: a restart-kind power event after our ON voids the verdict (no decline, no question asked)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run, onRestoreDeclined } = setup();
+      await controller.ensureLoaded();
+      await run(8);
+      (controller as unknown as { notePowerEvent: (kind: string, now: number) => unknown }).notePowerEvent(
+        "power collapse on gen",
+        Date.now(),
+      );
+      humanOffAfter(b, powerOns[0]);
+      await run(2);
+      expect(onRestoreDeclined).not.toHaveBeenCalled();
+      expect(controller.isShed("b")).toBe(true);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("item 4: a source change after our ON voids the verdict too", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run, onRestoreDeclined } = setup();
+      await controller.ensureLoaded();
+      await run(8);
+      const firstSend = powerOns[0];
+      // gen → grid changeover: the grid reading takes over.
+      controller.onPowerReading({ current_1: 8, current_2: 0 } as never);
+      humanOffAfter(b, firstSend);
+      vi.advanceTimersByTime(5_000);
+      const ctxB = { device: b as never, managed: true, needTier: "full" as const, needDelta: 3, slotGenCap: null, slotKey: null };
+      await controller.tick([{ device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 0.3, slotGenCap: null, slotKey: null }, ctxB], 30);
+      expect(onRestoreDeclined).not.toHaveBeenCalled();
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("item 4: this unit's own power-cycle fingerprint after our ON voids the verdict", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run, onRestoreDeclined } = setup();
+      await controller.ensureLoaded();
+      await run(8);
+      controller.onDevicePowerCycle("b", "beep reset observed (power-loss restart)", Date.now());
+      humanOffAfter(b, powerOns[0]);
+      await run(2);
+      expect(onRestoreDeclined).not.toHaveBeenCalled();
+      expect(controller.isShed("b")).toBe(true);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("item 5: the decline arms the house-sampling cooldown and releases a swap reserved for this room", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { b, powerOns, controller, run } = setup();
+      await controller.ensureLoaded();
+      await run(8);
+      // The receiver of a proactive shed is exactly the room a restore brings back.
+      (controller as unknown as { swap: unknown }).swap = { donorId: "a", receiverId: "b", at: Date.now() };
+      humanOffAfter(b, powerOns[0]);
+      // The compressor drew briefly before the remote OFF: the meter carries it.
+      await run(1, 10);
+      expect(controller.isShed("b")).toBe(false);
+      expect(
+        houseOf(controller).gen?.cooldownUntil ?? 0,
+        "the wind-down of an unmodelled compressor is never sampled as house",
+      ).toBeGreaterThan(Date.now());
+      expect((controller as unknown as { swap: unknown }).swap, "reservation released at once").toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("item 5: the decline works the same on the grid (GRID_FULL entry)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { b, powerOns, controller, run } = setup({ grid: true });
+      await controller.ensureLoaded();
+      await run(8);
+      expect(powerOns.length).toBeGreaterThanOrEqual(1);
+      humanOffAfter(b, powerOns[powerOns.length - 1]);
+      const sent = powerOns.length;
+      await run(20);
+      expect(controller.isShed("b")).toBe(false);
+      expect(powerOns).toHaveLength(sent);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("no post-send dump (a late-delivered lone OFF) keeps confirm-or-resend exactly as before", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run, onRestoreDeclined } = setup();
+      await controller.ensureLoaded();
+      await run(8);
+      b.fullStateReportAt = reportSec(powerOns[0], -300); // only the shed-era dump
+      b.powerReportedAt = reportSec(powerOns[0], 8);
+      b.powerReportCohort = 1;
+      await run(14);
+      expect(onRestoreDeclined).not.toHaveBeenCalled();
+      expect(controller.isShed("b")).toBe(true);
+      expect(powerOns.length).toBeGreaterThanOrEqual(2);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a STALE off report (older than the send) keeps confirm-or-resend exactly as before", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run } = setup();
+      await controller.ensureLoaded();
+      await run(8);
+      humanOffAfter(b, powerOns[0], -300, -120); // the shed's own dump and off; the unit never applied our ON
+      await run(14);
+      expect(controller.isShed("b")).toBe(true);
+      expect(powerOns.length, "resent past the confirm window").toBeGreaterThanOrEqual(2);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an off stamped inside a FULL-STATE dump after the send (a reconnect) keeps confirm-or-resend", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run } = setup();
+      await controller.ensureLoaded();
+      await run(8);
+      b.fullStateReportAt = reportSec(powerOns[0], 8);
+      b.powerReportedAt = reportSec(powerOns[0], 8);
+      b.powerReportCohort = 50;
+      await run(14);
+      expect(controller.isShed("b")).toBe(true);
+      expect(powerOns.length).toBeGreaterThanOrEqual(2);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("our OWN re-shed after the restore is never read as a declined restore", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run } = setup();
+      await controller.ensureLoaded();
+      await run(8);
+      await (controller as unknown as { recordShed: (id: string, r: string) => Promise<void> }).recordShed("b", "test re-shed");
+      humanOffAfter(b, powerOns[0]);
+      await run(2);
+      expect(controller.isShed("b")).toBe(true);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a restore confirmed ON for one poll, then switched off, takes the ordinary ON→OFF edge (no decline row)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T15:21:00Z"));
+      const { mock, b, powerOns, controller, run } = setup();
+      await controller.ensureLoaded();
+      await run(8);
+      b.power = true; // the poll caught the ON: restore_confirmed
+      await run(1);
+      expect(controller.isShed("b")).toBe(false);
+      b.power = false;
+      humanOffAfter(b, powerOns[0], 2, 20);
+      await run(20);
+      expect(controller.isShed("b")).toBe(false);
+      expect(powerOns, "the leveler never turns an un-shed room back on").toHaveLength(1);
+      expect(mock.journal.some((j) => j.reason === "restore_declined")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Item 7 (double-shed forensics, live 2026-09-26 14:26Z): the owner switched
+// Najat back ON from the dashboard 3.9 s before the reducer re-shed her as the
+// causer. Her earlier shed's cut credit was still pending, so `requiredAmps`
+// was understated and the re-shed stacked on it: one room's off counted twice.
+// A human ON takes that room's unlanded share back out of the pooled credit.
+// ---------------------------------------------------------------------------
+describe("LevelingControllerV2: onUserPowerOn claims its state synchronously (round 6)", () => {
+  it("every in-memory effect lands before the first await, so a caller can run it in the same tick as a check", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T17:00:00Z"));
+      const mock = createGradePool({}, ["b"]);
+      const controller = new LevelingControllerV2(mock.pool, createDeps());
+      await controller.ensureLoaded();
+      expect(controller.isShed("b")).toBe(true);
+      const pending = controller.onUserPowerOn("b"); // NOT awaited: only the synchronous prefix has run
+      const shell = controller as unknown as { pendingOn: Map<string, number>; externalOnAt: Map<string, number>; lastLoadAddAt: number };
+      expect(controller.isShed("b"), "shed cleared in the same tick").toBe(false);
+      expect(shell.pendingOn.has("b"), "pending ON registered in the same tick").toBe(true);
+      expect(shell.externalOnAt.has("b"), "donor shield stamped in the same tick").toBe(true);
+      expect(shell.lastLoadAddAt).toBe(Date.now());
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("LevelingControllerV2: a human ON revokes the room's own unlanded cut credit", () => {
+  it("a MANUAL LEVEL-DOWN stacking onto a partly absorbed off rebases the room's share too", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T16:00:00Z"));
+      const mock = createGradePool({ genAmpModels: { a: { baseAmps: 4, stepAmps: 0 }, b: { baseAmps: 1, stepAmps: 2 } } });
+      const controller = new LevelingControllerV2(mock.pool, {
+        ...createDeps(),
+        getTclCloud: () => ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never,
+      });
+      await controller.ensureLoaded();
+      for (let i = 0; i < 3; i++) {
+        controller.onPowerReading({ current_1: 0, current_2: 12 } as never);
+        vi.advanceTimersByTime(4_000);
+      }
+      type Shell = {
+        meterState: MeterState;
+        creditRoomOff: (id: string, level: number | null, now: number) => boolean;
+        creditManualLevelDown: (id: string, confirmed: number, target: number, unconfirmed: number[], now: number) => void;
+      };
+      const shell = controller as unknown as Shell;
+      const pool = () => shell.meterState.pendingCut!;
+      expect(shell.creditRoomOff("a", 1, Date.now())).toBe(true); // a off by hand: 4 A
+      shell.meterState = { ...shell.meterState, pendingCut: { ...pool(), absorbedAmps: 3 } }; // 3 A shown
+      shell.creditManualLevelDown("b", 3, 1, [], Date.now()); // b pinned L3 → L1 by hand: 4 A
+      expect(pool().amps - pool().absorbedAmps).toBeCloseTo(5, 5);
+
+      await controller.onUserPowerOn("a");
+
+      expect(pool().amps - pool().absorbedAmps, "only a's remaining 1 A leaves; the level-down's 4 A stays").toBeCloseTo(4, 5);
+      expect(pool().spendableAmps).toBeCloseTo(4, 5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stacked cuts, the first partly absorbed: turning the first room back on revokes only what is left of ITS cut", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-27T16:00:00Z"));
+      const mock = createGradePool({ genAmpModels: { a: { baseAmps: 4, stepAmps: 0 }, b: { baseAmps: 4, stepAmps: 0 } } });
+      const controller = new LevelingControllerV2(mock.pool, {
+        ...createDeps(),
+        getTclCloud: () => ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never,
+      });
+      await controller.ensureLoaded();
+      for (let i = 0; i < 3; i++) {
+        controller.onPowerReading({ current_1: 0, current_2: 12 } as never);
+        vi.advanceTimersByTime(4_000);
+      }
+      type Shell = { meterState: MeterState; creditRoomOff: (id: string, level: number | null, now: number) => boolean };
+      const shell = controller as unknown as Shell;
+      const pool = () => shell.meterState.pendingCut!;
+      // Room a switched off by hand: 4 A credited.
+      expect(shell.creditRoomOff("a", 1, Date.now())).toBe(true);
+      expect(pool().amps).toBeCloseTo(4, 5);
+      // The meter has shown 3 A of it.
+      shell.meterState = { ...shell.meterState, pendingCut: { ...pool(), absorbedAmps: 3 } };
+      // Room b switched off too: the pool carries a's 1 A and adds b's 4 A.
+      expect(shell.creditRoomOff("b", 1, Date.now())).toBe(true);
+      expect(pool().amps - pool().absorbedAmps).toBeCloseTo(5, 5);
+
+      await controller.onUserPowerOn("a"); // a back on: only ITS remaining 1 A is not coming
+
+      expect(pool().amps - pool().absorbedAmps, "b's 4 A stays; a's original 4 A would have left 1").toBeCloseTo(4, 5);
+      expect(pool().spendableAmps).toBeCloseTo(4, 5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shed → dashboard ON seconds later: the shed's credit is revoked on both sides", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-26T14:26:00Z"));
+      const mock = createGradePool({ genAmpModels: { a: { baseAmps: 3, stepAmps: 1 }, b: { baseAmps: 3, stepAmps: 1 } } });
+      const controller = new LevelingControllerV2(mock.pool, {
+        ...createDeps(),
+        getTclCloud: () => ({ sendControl: async () => undefined, executeAcAction: async () => undefined }) as never,
+      });
+      await controller.ensureLoaded();
+      const ctx = [
+        { device: acDevice("a", true, 1), managed: true, needTier: "full" as const, needDelta: 1, slotGenCap: null, slotKey: null },
+        { device: acDevice("b", true, 1), managed: true, needTier: "full" as const, needDelta: 1, slotGenCap: null, slotKey: null },
+      ];
+      let flip = 1;
+      const run = async (amps: number, steps: number) => {
+        for (let i = 0; i < steps; i++) {
+          flip = -flip;
+          controller.onPowerReading({ current_1: 0, current_2: amps + 0.01 * flip } as never);
+          vi.advanceTimersByTime(4_000);
+          await controller.tick(ctx, 30);
+        }
+      };
+      await run(9, 30); // settled, both rooms running
+      const credit = () =>
+        pendingCutCredit((controller as unknown as { meterState: MeterState }).meterState, Date.now());
+      for (let i = 0; i < 12 && !controller.isShed("a") && !controller.isShed("b"); i++) await run(19, 1); // over the 15 A gen: the reducer sheds
+      const shedId = controller.isShed("a") ? "a" : controller.isShed("b") ? "b" : null;
+      expect(shedId, "precondition: the reducer shed a room").not.toBeNull();
+      const before = credit();
+      expect(before, "precondition: its off is credited, not landed yet").toBeGreaterThan(0);
+
+      await controller.onUserPowerOn(shedId!); // the owner switches it back on from the dashboard
+
+      // Its own priced off (L1 on a 3 A model) leaves the pool; any other room's stays.
+      expect(credit(), "the room's unlanded off is not coming: its share revoked").toBeCloseTo(before - 3, 5);
+      const cut = (controller as unknown as { meterState: MeterState }).meterState.pendingCut;
+      expect(cut?.spendableAmps ?? 0).toBe(0);
+      // A second human ON of the same room revokes nothing more (no double revoke).
+      const after = credit();
+      await controller.onUserPowerOn(shedId!);
+      expect(credit()).toBeCloseTo(after, 5);
     } finally {
       vi.useRealTimers();
     }

@@ -158,6 +158,7 @@ All metric cards follow a consistent design language established in the Temperat
 - **Beep off is sticky**: turning the Beep toggle off records a persistent pref (`ac_beep_off` table) that the collector re-enforces whenever the beep comes back on (firmware resets it after AC power-loss restarts); turning it on releases the pref. Server-side enforcement details → [ac-automations.md](ac-automations.md).
 - The client posts the existing `{command,value}` shape, but the server capability registry is the command/value authority. In addition to the legacy controls it can expose AI Eco, Gentle Breeze/Soft Wind, Healthy/Ion, Fresh Air strength, Drying/Anti-mildew, Self Clean, light sensing, and 8°C heating only when that stable physical ID's verification policy and live cloud shape both support it. Shadow placeholder properties alone are not sufficient (Abdu's false Gentle Breeze/Fresh Air properties are explicitly denied).
 - **Last state restore**: on manual power-on, the backend restores saved properties from `/app/data/ac-last-state.json`. Across a source event, devices without an active system profile freeze and confirm that pre-event state instead of saving reboot defaults; devices with an active automation are initialized from the automation profile. Details → [tcl-ac.md](tcl-ac.md).
+- **A refused power command is shown, not swallowed (2026-09-27).** The capsule power toggle used to revert silently on an error; it now shows the server's reason as a small red `role="alert"` line under the power button for 10 s, reading the JSON `message` and falling back to `error` (e.g. the 409 "superseded" when a Smart AC Leveling overload shed wins the race with a dashboard ON; [tcl-ac.md](tcl-ac.md) → "Last-write-wins verifiers").
 - `model` remains a protocol-encoding label only. It must never decide which controls the expanded card renders; `capabilities` is the sole UI feature authority. Full shadow/property details → [tcl-ac.md](tcl-ac.md).
 
 ### Timer UI
@@ -182,6 +183,22 @@ Guest is grid-only and never leveling-managed, so the admin UI adapts per select
   act sooner"*. The ranges in this grid mirror the API's own validation (a value the input accepts
   must be one `PUT /api/ac/leveling` will take), and 4–20 mirrors `OVER_LIMIT_BUDGET_MIN`/`_MAX` in
   `server/src/leveling/config.ts`.
+- **Every field in the limits grid carries its API range since 2026-09-27.** Before that, Grid/Gen
+  limit, Margin, Raise buffer and Grid/Gen step passed no `min`/`max`/`integer` although a comment
+  claimed the grid mirrored the server, so one out-of-range value made the whole PUT fail with one
+  generic error. Now: limits 1-100, margin and raise buffer 0-10, steps `integer` 1-3.
+- **"Raise buffer A" edits the value v2 acts on** (2026-09-27): it shows `restingBufferAmps ??
+  raiseBufferAmps` and every change writes BOTH keys. The acting controller reads row 2's
+  `restingBufferAmps`, which wins over row 1's `raiseBufferAmps`, and each save round-trips the
+  stale row-2 value from GET, so editing `raiseBufferAmps` alone was silently a no-op.
+- **Derate is visible** (2026-09-27): the source pill still reads `measured / limitAmps A` (the
+  ENFORCED limit), and when `status.derateAmps > 0` an amber chip follows, `-1.0 A trip derate`
+  (`strain derate` when only generator brownouts stand). Its tooltip names the cause, the 0.5 A per
+  20 quiet minutes recovery, the configured limit (`configuredLimitAmps`) and the local
+  back-to-full time (`derateClearsAt`). The derated source's limit field adds one amber line via
+  `NumberField`'s `hint` prop: `enforcing 15.0 A now (trip derate, recovering)`. Why: the owner
+  set 16 A, saw 15 A with no explanation and re-saved three times in 49 s
+  ([ac-leveling.md](ac-leveling.md) → 2026-09-27).
 - **`NumericInput` holds raw text while editing** and only commits values that parse and pass the
   range. Two guards added with the integer field: an empty or whitespace-only box returns early
   (`Number("")` is 0, and committing that would zero a config field for someone merely clearing it to

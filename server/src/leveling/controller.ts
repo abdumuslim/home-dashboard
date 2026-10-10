@@ -9,11 +9,13 @@
 
 import pg from "pg";
 import { childLogger } from "../logger.js";
+import { isolatedPowerOffAfter, isPowerAcceptedError, type AcDevice } from "../tcl-cloud.js";
 import type { LevelerDeviceContext, LevelingDeps, LevelingStatusV2 } from "./api.js";
 import { DEFAULT_LEVELING_CONFIG_V2, isLevelingV2Key, LEVELING_V2_CONFIG_KEYS, mergeLevelingConfigV2, effectiveLimit, limitFor, type AcNeedOverride, type ControllerFlavor, type LevelingConfigV2 } from "./config.js";
 import {
   applyBucketCapacity,
   clearCollapse,
+  derateBreakdown,
   derateFor,
   ingestReading,
   initialMeterState,
@@ -24,6 +26,7 @@ import {
   PENDING_CUT_MS,
   refillBucket,
   resetCalm,
+  totalDerateFor,
 } from "./sensing.js";
 import {
   applyMeterEvent,
@@ -485,6 +488,15 @@ export class LevelingControllerV2 {
    */
   private shedOffObservedAt = new Map<string, number>();
   /**
+   * When our latest restore `power_on` for a SHED room was sent, recorded only
+   * when the shed's off had already been observed (`shedOffObservedAt`), so the
+   * unit is known to have been off BEFORE we asked it on. A lone powerSwitch
+   * OFF report after this instant is then a human declining the restore (the
+   * tick's `restore_declined` branch, 2026-09-27). Cleared with the shed record
+   * (recordShed/clearShed), so our own re-shed can never read as a decline.
+   */
+  private restoreSentAt = new Map<string, number>();
+  /**
    * Rooms commanded (or reported) ON whose shadow has not confirmed yet →
    * when the send happened. While any entry is live the compressor may be
    * drawing amps the model does not know about, so house sampling stands down.
@@ -733,6 +745,16 @@ export class LevelingControllerV2 {
    */
   private lastOffCreditAt = new Map<string, number>();
   /**
+   * Each room's own share of the pooled commanded-cut credit (`pendingCut` is
+   * one number): the priced off of its shed or of an observed off, when it was
+   * armed, and whether it was spendable. When a human turns that room back ON
+   * before its fall has landed, the share is revoked (`revokeRoomCutShare`) so
+   * the same room's off is never counted twice: 2026-09-26 14:26Z, Najat was
+   * switched on from the dashboard 3.9 s before the reducer re-shed her, the
+   * stale credit understated `requiredAmps`, and the re-shed stacked on it.
+   */
+  private cutShares = new Map<string, { amps: number; spendable: boolean; at: number }>();
+  /**
    * A dashboard off the route has told us about but the cloud has not accepted
    * yet, with the level it would free (2026-08-31). The tap must record intent
    * before the send, and `clearOnPowerOff` wipes the reconciler's level in the
@@ -814,6 +836,7 @@ export class LevelingControllerV2 {
     // In-memory only, and only meaningful for a live shed record: a resync
     // rebuilds the shed set from the DB, so any stamp from the old set is stale.
     this.shedOffObservedAt = new Map<string, number>();
+    this.restoreSentAt = new Map<string, number>();
     for (const row of shedRes?.rows ?? []) {
       this.shedIds.add(row.device_id);
       this.shedTimes.set(row.device_id, new Date(row.shed_at).getTime());
@@ -1009,6 +1032,7 @@ export class LevelingControllerV2 {
     // The off-observed stamp is only meaningful for a LIVE shed record — drop it
     // so it cannot survive into the next shed cycle (#9268/#9270).
     this.shedOffObservedAt.delete(deviceId);
+    this.restoreSentAt.delete(deviceId);
     await this.pool.query("DELETE FROM ac_leveling_shed WHERE device_id = $1", [deviceId]);
     log.info(`[leveler2] Cleared shed for AC ${this.deviceNames.get(deviceId) ?? deviceId} (${reason})`);
   }
@@ -1053,6 +1077,8 @@ export class LevelingControllerV2 {
     // A fresh shed has, by definition, not been observed OFF yet — clear any
     // stamp a prior cycle left so this shed's grace judgment starts clean.
     this.shedOffObservedAt.delete(deviceId);
+    // …and a restore sent before THIS shed is not one a later off can decline.
+    this.restoreSentAt.delete(deviceId);
     await this.pool.query(
       `INSERT INTO ac_leveling_shed (device_id, shed_at, reason) VALUES ($1, NOW(), $2)
        ON CONFLICT (device_id) DO UPDATE SET shed_at = NOW(), reason = $2`,
@@ -1114,6 +1140,7 @@ export class LevelingControllerV2 {
     // shield exists for — invariant 42/57).
     if (offObservedAt != null && (shedAt == null || offObservedAt >= shedAt)) {
       this.noteExternalOn(deviceId, now);
+      this.revokeRoomCutShare(deviceId, now, "shed room switched back on by hand");
       await this.clearShed(deviceId, "observed_on_after_off");
       return;
     }
@@ -1131,7 +1158,108 @@ export class LevelingControllerV2 {
     // OWN restore confirms through the tick OFF→ON "restore_confirmed" branch,
     // which deliberately does not shield — its test must stay green.)
     this.noteExternalOn(deviceId, now);
+    this.revokeRoomCutShare(deviceId, now, "shed room found on");
     await this.clearShed(deviceId, "observed_on");
+  }
+
+  /**
+   * Did a human decline our restore? The room is shed and reads OFF, our
+   * `power_on` went out at `sentAt` (within the same window `restoreInFlight`
+   * uses), and the unit's own `powerSwitch` report is a LONE one after that
+   * send: it applied the ON (a full-state dump) and someone switched it back
+   * off before a poll caught it ON. A stale report (Najat dropping the command)
+   * or an off inside a reconnect's full-state dump answers false, and
+   * confirm-or-resend carries on exactly as before (invariant 4).
+   */
+  private restoreDeclinedByHand(device: AcDevice, sentAt: number, now: number): boolean {
+    if (now - sentAt > GRADE_TURN_ON_MS) return false;
+    // Belt to the clears in `notePowerEvent` / `onDevicePowerCycle`: anything
+    // that restarts units since our ON makes the unit's reports ambiguous.
+    if (this.lastAcRestartAt >= sentAt || (this.devicePowerCycleAt.get(device.id) ?? 0) >= sentAt) return false;
+    return isolatedPowerOffAfter(device, sentAt);
+  }
+
+  /**
+   * A human switched off a room our restore had just turned on, and the
+   * collector has already judged it "manual" and recorded the persistent lock
+   * (`onRestoreDeclined`). Manual wins (42/65): stop re-sending, clear the shed
+   * and say so loudly. The restore did not FAIL, so no failure or bounce is
+   * booked, and its grade window can neither resolve it a success nor learn an
+   * on-cost from a room that never ran. Nothing is credited: the model never
+   * counted this room's draw (it was shed the whole time), so there is no fall
+   * to explain and nothing to spend. But the compressor may have drawn for a
+   * few seconds, unmodelled: its wind-down gets the same house-sampling
+   * cooldown an ordinary off's modeled drop arms (invariants 20/28).
+   */
+  private async declineRestore(device: AcDevice, sentAt: number, now: number): Promise<void> {
+    const id = device.id;
+    const name = this.deviceNames.get(id) ?? id;
+    const afterS = Math.round(((device.powerReportedAt ?? sentAt) - sentAt) / 1000);
+    // The ON is over: nothing is pending, starting or ramping for this room.
+    this.pendingOn.delete(id);
+    this.startBaseline.delete(id);
+    this.rampUntil.delete(id);
+    this.rampBaseline.delete(id);
+    this.rampAbsorbed.delete(id);
+    this.rampGrowth.delete(id);
+    this.powerEventRamp.delete(id);
+    this.recon = clearOnPowerOff(this.recon, id);
+    // The pending-ON stand-down ends here, but whatever the compressor drew in
+    // its seconds of running is still leaving the meter: never book it as house.
+    const source = meterView(this.meterState, now).source;
+    if (source !== "none") this.houseLoad = armDropCooldown(this.houseLoad, source, now);
+    // A swap whose RECEIVER this was is over: the amps its donor gave up are
+    // not coming back into use, and holding them would park raises and fan
+    // restores for the rest of the reservation.
+    if (this.swap?.receiverId === id) {
+      log.info(
+        `[leveler2] Proactive shed released: its receiver ${name} was switched off by hand, ` +
+          `${this.deviceNames.get(this.swap.donorId) ?? this.swap.donorId}'s reservation freed`,
+      );
+      this.swap = null;
+    }
+    // Neither a success nor a failure. Out of every open grade window, and no
+    // window whose single actuator was this room may learn from it.
+    this.pendingGrades = this.pendingGrades.map((g) => ({
+      ...g,
+      attempts: g.attempts.filter((a) => !(a.deviceId === id && a.kind === "restore")),
+      contaminated: g.contaminated || g.single?.deviceId === id,
+    }));
+    // No restore of ours is in flight any more: a later remote ON must read as
+    // external (the donor shield, trip-safe pricing), and a reducer cut of it
+    // must not be blamed on this restore. A human also ended the bounce episode,
+    // exactly as an external ON does (`noteExternalOn`).
+    const restoreEntry = this.pacing.perAc[id]?.restore;
+    if (restoreEntry != null) {
+      this.pacing = {
+        ...this.pacing,
+        perAc: { ...this.pacing.perAc, [id]: { ...this.pacing.perAc[id], restore: { ...restoreEntry, lastAttemptAt: 0 } } },
+      };
+    }
+    this.pacing = clearBounces(this.pacing, id);
+    // Our own shed's bar has nothing left to protect (same as `onUserPowerOn`).
+    this.shedBar.delete(id);
+    await this.releaseHold(id, "restore_declined");
+    await this.clearShed(id, "restore_declined");
+    const detail =
+      `the unit reported OFF on its own ${afterS}s after our restore power_on ` +
+      `(isolated report, ${device.powerReportCohort ?? "?"} field(s)): switched off by hand, not re-sending`;
+    log.warn(`[leveler2] ${name}: restore declined by hand; ${detail}`);
+    void this.store
+      .insertJournal({
+        at: now,
+        source: this.meterState.source,
+        mode: deriveMode(this.modeState, now),
+        severity: null,
+        reason: "restore_declined",
+        requiredAmps: null,
+        preAmps: meterView(this.meterState, now).smoothedAmps,
+        commands: [],
+        decisions: [{ at: now, deviceId: id, action: "restore declined by hand", detail }],
+        expectedDelta: null,
+        executed: this.acts(),
+      })
+      .catch(() => undefined);
   }
 
   hasFanHold(deviceId: string): boolean {
@@ -1238,6 +1366,8 @@ export class LevelingControllerV2 {
           // supply that no longer exists, and the entry mode re-admits every room
           // from scratch (invariant 58 follow-up).
           this.flickerRefusedSince.clear();
+          // Per-room cut shares describe the old line's pooled credit.
+          this.cutShares.clear();
           if (prevSource !== "none" && event.to !== "none") this.armRampOnSourceChange = true;
           log.info(`[leveler2] Power source changed → ${event.to}`);
           // The manual pins are released INSIDE `notePowerEvent`, for every
@@ -1282,16 +1412,20 @@ export class LevelingControllerV2 {
           break;
         }
         case "collapse": {
+          // The derate record carries ONE source, and a batch can hold a
+          // collapse on each line around a changeover: read it through the
+          // source-checked helper, as source_changed does (R6, 2026-09-27).
+          const collapseDerate = event.source !== "none" ? derateFor(this.meterState, event.source, now) : 0;
           const derated =
             event.source !== "none"
-              ? effectiveLimit(this.config, event.source, this.meterState.derate?.amps ?? 0)
+              ? effectiveLimit(this.config, event.source, collapseDerate)
               : null;
           log.warn(
             `[leveler2] Power collapse ${event.fromAmps.toFixed(1)}A → ${event.toAmps.toFixed(1)}A on ${event.source} — probable trip/blackout; commands frozen until recovery` +
               (derated != null ? `; ${event.source} limit derated to ${derated.toFixed(1)}A while it cools` : ""),
           );
           this.notePowerEvent(`power collapse on ${event.source}`, now);
-          if (derated != null && (this.meterState.derate?.amps ?? 0) > 0) {
+          if (derated != null && collapseDerate > 0) {
             void this.pushNotice(
               `${event.source === "gen" ? "Generator" : "Grid"} tripped at ${event.fromAmps.toFixed(1)}A — ` +
                 `holding the AC budget at ${derated.toFixed(1)}A while the breaker cools.`,
@@ -1328,9 +1462,12 @@ export class LevelingControllerV2 {
           // ceiling comes down and the ordinary ladder respects it. Journaled
           // because a limit that shrinks with no visible cause is the kind of
           // thing that costs a forensic session to work out afterwards.
+          // Both records through their own source-checked helpers: the collapse
+          // derate may belong to the other line, and the strain record may
+          // already stand higher than this event's amps (sensing keeps the max).
           const derated =
             event.source !== "none"
-              ? effectiveLimit(this.config, event.source, this.meterState.derate?.amps ?? 0) - event.amps
+              ? effectiveLimit(this.config, event.source, totalDerateFor(this.meterState, event.source, now))
               : null;
           log.warn(
             `[leveler2] Generator strain on ${event.source}: power gap ${Math.round(event.gapMs / 1000)}s ` +
@@ -1437,7 +1574,8 @@ export class LevelingControllerV2 {
       // against it before the meter shows the fall (2026-08-31). The one caller
       // that says otherwise is an observed off inside the restart window, where
       // the "hand" is a blackout and the room is coming back (2026-09-05).
-      this.meterState = noteCommandedCut(this.meterState, amps, now, { spendable: opts.spendable !== false });
+      this.stackCommandedCut(amps, now, { spendable: opts.spendable !== false });
+      this.cutShares.set(deviceId, { amps, spendable: opts.spendable !== false, at: now });
       // An OBSERVED off is also a peer removal for any bounce-extended bar (the
       // release valve, invariant 54): the house another room bounced in just
       // lost this room, priced by the same figure the meter credit used.
@@ -1482,6 +1620,81 @@ export class LevelingControllerV2 {
     // The room is ON: an off whose send we are still waiting on is moot, and
     // promoting it later would credit a fall that is not going to happen.
     this.pendingOffCredit.delete(deviceId);
+  }
+
+  /**
+   * A human turned this room back ON: whatever of its own off the meter has not
+   * shown yet is not coming (item 7, 2026-09-27). Take its part out of BOTH
+   * sides of the pooled credit: the pool's unabsorbed remainder apportioned
+   * across the live shares by their remaining amps (`rebaseCutShares` keeps
+   * those current as cuts stack), never more than this room's own share. The
+   * pool has one absorption ratchet, so a fall the meter showed since the last
+   * stack is spread proportionally rather than attributed. Invariant 74(d) is the device power-cycle twin (spend side only,
+   * because a restart's room is coming back by itself).
+   */
+  private revokeRoomCutShare(deviceId: string, now: number, why: string): void {
+    const share = this.cutShares.get(deviceId);
+    const cut = this.meterState.pendingCut;
+    if (share == null || cut == null || now >= cut.until || now - share.at >= PENDING_CUT_MS) {
+      this.cutShares.delete(deviceId);
+      return;
+    }
+    const unabsorbed = Math.max(0, cut.amps - cut.absorbedAmps);
+    // This room's part of what is still unabsorbed: the remainder apportioned
+    // across the live shares by their remaining amps, never more than its own.
+    let liveSum = 0;
+    for (const sh of this.cutShares.values()) if (now - sh.at < PENDING_CUT_MS) liveSum += sh.amps;
+    this.cutShares.delete(deviceId);
+    const remove = liveSum > 0 ? Math.min(share.amps, (unabsorbed * share.amps) / liveSum) : 0;
+    if (!(remove > 0)) return;
+    const amps = cut.amps - remove;
+    const left = Math.max(0, amps - cut.absorbedAmps);
+    const spendable = Math.min(left, Math.max(0, cut.spendableAmps - (share.spendable ? remove : 0)));
+    this.meterState = {
+      ...this.meterState,
+      pendingCut: left > 0 ? { ...cut, amps, spendableAmps: spendable } : null,
+    };
+    log.info(
+      `[leveler2] ${this.deviceNames.get(deviceId) ?? deviceId}: ${why}, revoked ${remove.toFixed(1)}A of its ` +
+        `own unlanded off from the cut credit (${left.toFixed(1)}A left)`,
+    );
+  }
+
+  /**
+   * Before a new cut stacks onto the pool, shrink every live share to its part
+   * of what the pool still holds unabsorbed (the absorption ratchet is ONE
+   * number, so the fall the meter already showed is spread across the shares by
+   * their remaining amps), and re-date them to the pool's new clock. Without it
+   * a room's ORIGINAL share outlived the absorption of its own cut: a 4 A off
+   * with 3 A absorbed, stacked with another 4 A, was revoked as 4 A of a 5 A
+   * pool although 1 A of it remained (Sol recheck 2026-09-27).
+   */
+  /**
+   * The ONLY way this controller stacks a cut onto the pooled credit: rebase the
+   * per-room shares first, then `noteCommandedCut`. A site that stacked without
+   * the rebase left a room's ORIGINAL share standing after its own cut was
+   * partly absorbed (the manual level-down path did, 2026-09-27).
+   */
+  private stackCommandedCut(amps: number, now: number, opts: { spendable: boolean }): void {
+    this.rebaseCutShares(now);
+    this.meterState = noteCommandedCut(this.meterState, amps, now, opts);
+  }
+
+  private rebaseCutShares(now: number): void {
+    const cut = this.meterState.pendingCut;
+    const unabsorbed = cut != null && now < cut.until ? Math.max(0, cut.amps - cut.absorbedAmps) : 0;
+    let sum = 0;
+    for (const [id, sh] of this.cutShares) {
+      if (now - sh.at >= PENDING_CUT_MS) this.cutShares.delete(id);
+      else sum += sh.amps;
+    }
+    if (sum <= 0) return;
+    const factor = Math.min(1, unabsorbed / sum);
+    for (const [id, sh] of this.cutShares) {
+      const amps = sh.amps * factor;
+      if (amps > 0) this.cutShares.set(id, { ...sh, amps, at: now });
+      else this.cutShares.delete(id);
+    }
   }
 
   // ---------- user hooks (manual always wins) ----------
@@ -1548,12 +1761,21 @@ export class LevelingControllerV2 {
     this.noteBudgetFreed(`${this.deviceNames.get(deviceId) ?? deviceId} switched off from the dashboard`);
   }
 
+  /**
+   * ⚠ Every in-memory effect runs SYNCHRONOUSLY, before the first await (the
+   * shed row DELETE inside `clearShed`, issued last). The control route calls
+   * this inside `sendControlVerified`'s `onSent` callback, in the same tick as
+   * the cloud's final "still current" check, so a newer leveler OFF cannot slip
+   * between the check and this claim and have its fresh shed cleared by an
+   * older ON (2026-09-27, Sol round 6). Keep it that way: no await before the
+   * last statement.
+   */
   async onUserPowerOn(deviceId: string): Promise<void> {
     if (!this.isManaged(deviceId)) return;
     // He put the room back himself. Our own shed's bar has nothing left to
     // protect (R9) — the room is on, and the next thing to judge is the meter.
     this.shedBar.delete(deviceId);
-    await this.clearShed(deviceId, "user_power_on");
+    this.revokeRoomCutShare(deviceId, Date.now(), "switched back on from the dashboard");
     this.rearmRamp([deviceId]);
     // Fires before the shadow flips — the meter here is still the pre-start
     // house load, the exact anchor the grid full start needs.
@@ -1569,6 +1791,9 @@ export class LevelingControllerV2 {
     // the shield window (invariant 42/57, 2026-08-06 #9224/#9228), and his ON
     // ends any restore bounce episode (2026-08-07).
     this.noteExternalOn(deviceId, now);
+    // LAST: its in-memory half (shedIds, shedTimes, the off-observed and
+    // restore stamps) runs synchronously; only the row DELETE is awaited.
+    await this.clearShed(deviceId, "user_power_on");
   }
 
   async onUserFanChange(deviceId: string): Promise<void> {
@@ -1637,7 +1862,7 @@ export class LevelingControllerV2 {
     if (!(amps > 0)) return;
     // SPENDABLE, exactly like an off: the user handed these amps back and the
     // limit never asked for them.
-    this.meterState = noteCommandedCut(this.meterState, amps, now, { spendable: true });
+    this.stackCommandedCut(amps, now, { spendable: true });
     // …and the peer-removal half, exactly as an off does it (invariant 54's
     // release valve): a room drawing less shrinks the house every bounce-extended
     // bar describes, priced by the same figure the meter credit used.
@@ -1811,6 +2036,9 @@ export class LevelingControllerV2 {
     // ("source none → X") and a bare telemetry gap restart nothing.
     if (powerEventRestartsAcs(kind)) {
       this.lastAcRestartAt = now;
+      // A restarting unit's reports say nothing about a hand: no restore sent
+      // before this may later be read as declined (2026-09-27).
+      this.restoreSentAt.clear();
       for (const deviceId of this.deviceNames.keys()) {
         released.push(...this.releaseManualIntent(deviceId, kind, now));
       }
@@ -1852,6 +2080,8 @@ export class LevelingControllerV2 {
       this.meterState = { ...this.meterState, pendingCut: { ...cut, spendableAmps: 0 } };
     }
     this.devicePowerCycleAt.set(deviceId, now);
+    // Same for this one unit's restart: its restore can no longer be declined.
+    this.restoreSentAt.delete(deviceId);
     log.info(
       `[leveler2] ${this.deviceNames.get(deviceId) ?? deviceId}: power cycle observed (${reason}), ` +
         "treated as a restart: intents released, baseline re-based, ramp re-armed",
@@ -2269,7 +2499,7 @@ export class LevelingControllerV2 {
       now,
     );
     this.entryCollapseLatched = true;
-    const derated = effectiveLimit(this.config, source, this.meterState.derate?.amps ?? 0);
+    const derated = effectiveLimit(this.config, source, derateFor(this.meterState, source, now));
     log.warn(
       `[leveler2] AC circuit appears DEAD on ${source}: ${running.length} room(s) modeled at ` +
         `${(view.smoothedAmps + gapAmps).toFixed(1)}A, meter ${view.smoothedAmps.toFixed(1)}A, every shadow dark for ` +
@@ -2525,7 +2755,28 @@ export class LevelingControllerV2 {
       // still in flight (keep the shed). Stamped every tick the shadow shows it
       // off; cleared with the shed record itself.
       if (managed && !device.power && this.shedIds.has(device.id)) {
-        this.shedOffObservedAt.set(device.id, now);
+        // …unless the unit itself reported that OFF, alone, after our restore:
+        // it applied the ON and a human switched it straight back off between
+        // two polls. Re-sending would reverse him (2026-09-27, Mom's remote).
+        const sentAt = this.restoreSentAt.get(device.id);
+        let declined = false;
+        if (sentAt != null && this.acts() && this.restoreDeclinedByHand(device, sentAt, now)) {
+          // The collector owns the verdict (the same beep fingerprints and
+          // power-event window as every observed off) and, on "manual", the
+          // PERSISTENT lock, so the choice survives idle rules and restarts.
+          declined = (await this.deps.onRestoreDeclined?.(device.id, sentAt, device).catch((err) => {
+            log.warn(`[leveler2] restore-declined check failed for ${device.id}: ${String(err)}`);
+            return false;
+          })) === true;
+          if (declined) {
+            await this.declineRestore(device, sentAt, now);
+          } else {
+            // Not a hand (near a power event, or ambiguous): ordinary
+            // confirm-or-resend, and do not ask again about this send.
+            this.restoreSentAt.delete(device.id);
+          }
+        }
+        if (!declined) this.shedOffObservedAt.set(device.id, now);
       }
       const prev = this.prevPowerStates.get(device.id);
       // FIRST sight of this device since boot. A shed record is persisted so it
@@ -3717,6 +3968,10 @@ export class LevelingControllerV2 {
        * Worse, `recordShed` has already put the room in `shedIds`, so the
        * observed-off path would not credit it either.
        */
+      // Captured BEFORE the send: a power ON publishes powerSwitch first and then
+      // waits ~3 s for the profile, so "after the call returned" is ~3 s late
+      // for judging which reports came after our ON (2026-09-27).
+      const sendStartedAt = Date.now();
       try {
         switch (cmd.kind) {
           case "set_level":
@@ -3737,9 +3992,18 @@ export class LevelingControllerV2 {
             break;
         }
       } catch (err) {
-        failedCommands.push(cmd);
-        log.warn(`[leveler2] command failed for ${name}: ${String(err)}`);
-        continue;
+        // A restore whose power ON was ACCEPTED but whose profile (level/fan)
+        // publish failed is a SENT restore: the unit is coming on. Booking it as
+        // refused left it untracked (no `restoreSentAt`, no pacing attempt, no
+        // server-ON stamp), so another restore could reverse a human's OFF
+        // (2026-09-27). The missing level is re-sent by the reconciler's own
+        // confirm-or-resend like any unconfirmed level send.
+        if (!(cmd.kind === "power_on" && isPowerAcceptedError(err))) {
+          failedCommands.push(cmd);
+          log.warn(`[leveler2] command failed for ${name}: ${String(err)}`);
+          continue;
+        }
+        log.warn(`[leveler2] ${name}: ${err.message}; the restore counts as sent, its level is re-sent on confirm`);
       }
       // Accepted by the cloud. From here the command COUNTS: for the credit, for
       // `sentCommands`, and for the abort above, whatever the bookkeeping below
@@ -3797,7 +4061,12 @@ export class LevelingControllerV2 {
             // after this very command; TCL shadows can lag minutes). While
             // shed, every observed-off recorder and auto-on path keeps
             // skipping the device, however long the shadow lags.
-            this.deps.setDevicePowerCache(cmd.deviceId, "on");
+            this.deps.setDevicePowerCache(cmd.deviceId, "on", sendStartedAt);
+            // The PUBLISH time (captured before the call, committed now that the
+            // cloud accepted), and only when the room is known to have been off
+            // before we asked it on.
+            if (this.shedOffObservedAt.has(cmd.deviceId)) this.restoreSentAt.set(cmd.deviceId, sendStartedAt);
+            else this.restoreSentAt.delete(cmd.deviceId);
             // The compressor starts now; the shadow confirms later. Until it
             // does, this room's draw is on the meter but not in the model, so
             // no house sample taken in that window is usable.
@@ -3940,7 +4209,17 @@ export class LevelingControllerV2 {
       // entry policy, and a restore's peer floor-downs or a swap's donor off are
       // paying for the turn-on in their own batch (invariant 69).
       const spendable = out.reason === "demote";
-      this.meterState = noteCommandedCut(this.meterState, commandedCutAmps, now, { spendable });
+      this.stackCommandedCut(commandedCutAmps, now, { spendable });
+      // Per-room shares of the SHEDS in it, so a human ON can take one back.
+      if (view.source !== "none") {
+        for (const cmd of sentCommands) {
+          if (cmd.kind !== "power_off") continue;
+          const ac = acs.find((a) => a.deviceId === cmd.deviceId);
+          if (ac == null) continue;
+          const amps = modelCutAmps(this.config, ac.deviceId, view.source, ac.currentLevel, null, ac.maxLevel);
+          if (amps > 0) this.cutShares.set(ac.deviceId, { amps, spendable, at: now });
+        }
+      }
       // …and the demote is the only one worth an urgent evaluation, for the same
       // reason (2026-08-31). The next evaluation (≥ 2.5 s away, never this one,
       // since `runLevelingCheck` drops a re-run queued inside
@@ -4504,11 +4783,27 @@ export class LevelingControllerV2 {
     // Report the ENFORCED limit, derate included — otherwise the card shows
     // headroom the controller will not spend after a trip.
     const limit = source === "none" ? null : effectiveLimit(this.config, source, view.derateAmps);
+    // ...and say WHY it is lower than the setting (2026-09-26: 16 A configured,
+    // 15 A shown, nothing on the card explained it). Display only.
+    const derate = source === "none" ? null : derateBreakdown(this.meterState, source, now);
+    const rawDerate = derate != null ? derate.collapseAmps + derate.strainAmps : 0;
+    const configuredLimit = source === "none" ? null : limitFor(this.config, source);
+    // The ACTUAL reduction: effectiveLimit floors at 1 A, so the raw derate can
+    // exceed what is enforced. The raw split stays in `derate` for the tooltip.
+    const derateAmps =
+      configuredLimit != null && limit != null ? Math.max(0, Number((configuredLimit - limit).toFixed(2))) : 0;
     return {
       enabled: this.config.enabled,
       source,
       measuredAmps: view.sampleCount > 0 ? Number(view.smoothedAmps.toFixed(2)) : null,
       limitAmps: limit,
+      configuredLimitAmps: configuredLimit,
+      derateAmps,
+      derate:
+        derate != null && rawDerate > 0
+          ? { collapseAmps: Number(derate.collapseAmps.toFixed(2)), strainAmps: Number(derate.strainAmps.toFixed(2)) }
+          : null,
+      derateClearsAt: rawDerate > 0 ? (derate?.clearsAt ?? null) : null,
       budgetAmps: limit != null ? Number((limit - this.config.marginAmps - view.smoothedAmps).toFixed(2)) : null,
       // The MEASURED non-AC split (house-load.ts) — v2's own rolling peak, not
       // v1's model-derived figure. Surfaced because an inflated house is what

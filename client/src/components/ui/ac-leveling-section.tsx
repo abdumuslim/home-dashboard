@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils";
 import { useAcLeveling } from "@/hooks/use-ac-leveling";
 import { AcCalibrationPanel } from "@/components/ui/ac-calibration-panel";
 import type { AcDevice } from "@/types/ac";
-import type { AcLevelingConfig, AcLevelingAcStatus, CalibrationFit, NeedTier } from "@/types/leveling";
+import type { AcLevelingConfig, AcLevelingAcStatus, AcLevelingStatus, CalibrationFit, NeedTier } from "@/types/leveling";
 
 const NEED_COLORS: Record<NeedTier, string> = {
   satisfied: "bg-emerald-400",
@@ -115,7 +115,7 @@ function NumericInput({ value, step, min, max, integer, onChange, className, tit
   );
 }
 
-function NumberField({ label, value, step, min, max, integer, title, onChange }: {
+function NumberField({ label, value, step, min, max, integer, title, hint, hintTitle, onChange }: {
   label: string;
   value: number;
   step?: number;
@@ -123,6 +123,9 @@ function NumberField({ label, value, step, min, max, integer, title, onChange }:
   max?: number;
   integer?: boolean;
   title?: string;
+  /** One short amber line under the input (e.g. the derated limit being enforced). */
+  hint?: string;
+  hintTitle?: string;
   onChange: (v: number) => void;
 }) {
   return (
@@ -138,7 +141,41 @@ function NumberField({ label, value, step, min, max, integer, title, onChange }:
         onChange={onChange}
         className="w-full px-2 py-1 rounded-lg bg-white/10 border border-white/10 text-xs text-text focus:outline-none focus:border-cyan/50"
       />
+      {hint && (
+        <span className="text-[0.6rem] leading-tight text-amber-400" title={hintTitle}>
+          {hint}
+        </span>
+      )}
     </label>
+  );
+}
+
+/**
+ * The limit on the card is the ENFORCED one: after a breaker trip (or a run of
+ * generator brownouts) the leveler holds a lower ceiling while the line cools.
+ * 2026-09-26 the owner set 16 A, saw 15 A with no explanation, and re-saved
+ * three times in 49 s; these strings are that explanation.
+ */
+function derateLabel(status: AcLevelingStatus): string {
+  return (status.derate?.collapseAmps ?? 0) > 0 ? "trip derate" : "strain derate";
+}
+
+function derateTitle(status: AcLevelingStatus): string {
+  const line = status.source === "gen" ? "generator" : "grid";
+  const collapse = status.derate?.collapseAmps ?? 0;
+  const strain = status.derate?.strainAmps ?? 0;
+  const causes = [
+    collapse > 0 && `the ${line} tripped recently (${collapse.toFixed(1)} A)`,
+    strain > 0 && `the generator browned out near the limit (${strain.toFixed(1)} A)`,
+  ].filter(Boolean).join(" and ");
+  const back = status.derateClearsAt != null
+    ? ` Back to full at about ${new Date(status.derateClearsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} if nothing trips again.`
+    : "";
+  const configured = status.configuredLimitAmps != null ? `configured limit ${status.configuredLimitAmps} A, ` : "";
+  return (
+    `Because ${causes}, the leveler holds a lower limit while the breaker cools. ` +
+    `It steps back 0.5 A every 20 quiet minutes. ` +
+    `(${configured}enforcing ${status.limitAmps ?? "?"} A now.)${back}`
   );
 }
 
@@ -299,6 +336,12 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
 
   const sourceActive = status?.source && status.source !== "none";
   const overLimit = status?.measuredAmps != null && status.limitAmps != null && status.measuredAmps > status.limitAmps;
+  const derated = status != null && (status.derateAmps ?? 0) > 0;
+  // "enforcing 15.0 A now" under the limit field of the derated source only.
+  const limitHint = (source: "grid" | "gen"): string | undefined =>
+    derated && status!.source === source && status!.limitAmps != null
+      ? `enforcing ${status!.limitAmps.toFixed(1)} A now (${derateLabel(status!)}, recovering)`
+      : undefined;
 
   return (
     <div className="px-5 pb-4 flex flex-col gap-3">
@@ -329,6 +372,14 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
             {status!.measuredAmps != null && status!.limitAmps != null && (
               <span className={cn("font-semibold", overLimit && "text-red-400")}>
                 {status!.measuredAmps.toFixed(1)} / {status!.limitAmps} A
+              </span>
+            )}
+            {derated && (
+              <span
+                className="px-1.5 py-0.5 rounded-full text-[0.6rem] font-medium bg-amber-400/15 text-amber-400"
+                title={derateTitle(status!)}
+              >
+                -{status!.derateAmps!.toFixed(1)} A {derateLabel(status!)}
               </span>
             )}
           </span>
@@ -386,17 +437,29 @@ export function AcLevelingSection({ active, acDevices }: { active: boolean; acDe
 
       {/* Limits */}
       <div className="grid grid-cols-3 gap-2">
-        <NumberField label="Grid limit A" value={draft.gridLimitAmps} onChange={(v) => update({ gridLimitAmps: v })} />
-        <NumberField label="Gen limit A" value={draft.genLimitAmps} onChange={(v) => update({ genLimitAmps: v })} />
-        <NumberField label="Margin A" step={0.5} value={draft.marginAmps} onChange={(v) => update({ marginAmps: v })} />
-        <NumberField label="Raise buffer A" step={0.5} value={draft.raiseBufferAmps} onChange={(v) => update({ raiseBufferAmps: v })} />
-        {/* Ranges mirror validateLevelingConfig() in routes.ts — a value the
-            input accepts must be one the API will take. The over-limit points
-            range mirrors OVER_LIMIT_BUDGET_MIN/MAX (leveling/config.ts, 4–20). */}
+        {/* Every range in this grid mirrors validateLevelingConfig() in
+            routes.ts (and validateLevelingV2Config for restingBufferAmps): a
+            value the input accepts must be one the API will take, since one
+            out-of-range field fails the whole save. The over-limit points
+            range mirrors OVER_LIMIT_BUDGET_MIN/MAX (leveling/config.ts, 4-20). */}
+        <NumberField label="Grid limit A" min={1} max={100} value={draft.gridLimitAmps} hint={limitHint("grid")} hintTitle={derated ? derateTitle(status!) : undefined} onChange={(v) => update({ gridLimitAmps: v })} />
+        <NumberField label="Gen limit A" min={1} max={100} value={draft.genLimitAmps} hint={limitHint("gen")} hintTitle={derated ? derateTitle(status!) : undefined} onChange={(v) => update({ genLimitAmps: v })} />
+        <NumberField label="Margin A" step={0.5} min={0} max={10} value={draft.marginAmps} onChange={(v) => update({ marginAmps: v })} />
+        {/* The acting v2 controller reads restingBufferAmps (config row 2),
+            which wins over row 1's raiseBufferAmps once present, so show that
+            value and write both keys: editing raiseBufferAmps alone did nothing. */}
+        <NumberField
+          label="Raise buffer A"
+          step={0.5}
+          min={0}
+          max={10}
+          value={draft.restingBufferAmps ?? draft.raiseBufferAmps}
+          onChange={(v) => update({ raiseBufferAmps: v, restingBufferAmps: v })}
+        />
         <NumberField label="Comfort °C" step={0.5} min={16} max={32} value={draft.comfortTargetC} onChange={(v) => update({ comfortTargetC: v })} />
         <NumberField label="Near target °C" step={0.1} min={0} max={5} value={draft.nearTargetBandC ?? 0.5} onChange={(v) => update({ nearTargetBandC: v })} />
-        <NumberField label="Grid step" value={draft.maxRaiseStepGrid ?? 1} onChange={(v) => update({ maxRaiseStepGrid: v })} />
-        <NumberField label="Gen step" value={draft.maxRaiseStepGen ?? 1} onChange={(v) => update({ maxRaiseStepGen: v })} />
+        <NumberField label="Grid step" step={1} min={1} max={3} integer value={draft.maxRaiseStepGrid ?? 1} onChange={(v) => update({ maxRaiseStepGrid: v })} />
+        <NumberField label="Gen step" step={1} min={1} max={3} integer value={draft.maxRaiseStepGen ?? 1} onChange={(v) => update({ maxRaiseStepGen: v })} />
         <NumberField
           label="Over-limit pts"
           min={4}

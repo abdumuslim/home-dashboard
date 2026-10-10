@@ -1,5 +1,19 @@
 import { describe, it, expect, vi } from "vitest";
-import { TclCloud, latestReportedAtMs, deviceOnline, SHADOW_STALE_MS, CONTROL_VERIFY_MAX_RESENDS, type AcDevice, type AcAction } from "./tcl-cloud.js";
+import {
+  TclCloud,
+  latestReportedAtMs,
+  deviceOnline,
+  isolatedPowerOffAfter,
+  powerReportInfo,
+  ISOLATED_POWER_REPORT_MAX_COHORT,
+  FULL_STATE_MIN_FIELDS,
+  SHADOW_STALE_MS,
+  CONTROL_VERIFY_MAX_RESENDS,
+  AcProfileNotAppliedError,
+  isPowerAcceptedError,
+  type AcDevice,
+  type AcAction,
+} from "./tcl-cloud.js";
 import { deriveAcCapabilities } from "./ac-capabilities.js";
 
 // Regression tests for the fan/turbo coupling on non-Najat models (TAC-12CHSD):
@@ -262,6 +276,459 @@ describe("shadow freshness → online flag (blackout detection)", () => {
   });
 });
 
+// Remote off must stick (2026-09-27). The raw shadow probe of all four units
+// showed that a power OFF stamps `powerSwitch` ALONE in `metadata.reported`,
+// while a power ON (and every reconnect / power-loss restart) dumps ~45-55
+// fields with one timestamp. AWS stamps on ARRIVAL, so only ORDER on the unit's
+// own connection is causal: our ON's dump first, then the lone OFF. Fixtures are
+// shaped like the probe captures.
+describe("shadow power-report metadata (causal: ON dump, then isolated OFF)", () => {
+  const SEND_SEC = 1_790_522_500; // our power-ON publish, epoch seconds
+  const sendMs = SEND_SEC * 1000 + 400; // mid-second, as a real send lands
+
+  /** A full-state dump like Najat 15:21:59-15:22:00: `n` fields over two seconds. */
+  function fullStateMeta(sec: number, n: number, prefix = "field"): Record<string, unknown> {
+    const meta: Record<string, unknown> = {};
+    for (let i = 0; i < n; i++) meta[`${prefix}${i}`] = { timestamp: i % 2 === 0 ? sec : sec + 1 };
+    return meta;
+  }
+
+  /** Our ON's dump at `dumpSec`, then powerSwitch re-stamped alone at `powerSec`. */
+  function dumpThenOff(dumpSec: number, powerSec: number): Record<string, unknown> {
+    return {
+      ...fullStateMeta(dumpSec, 50),
+      windSpeed7Gear: { timestamp: dumpSec + 30 },
+      capabilities: [{ timestamp: dumpSec }, { timestamp: dumpSec }],
+      errorCode: [],
+      powerSwitch: { timestamp: powerSec },
+    };
+  }
+
+  it("powerReportInfo: a lone powerSwitch after a dump: cohort 1, dump start recorded", () => {
+    expect(powerReportInfo(dumpThenOff(SEND_SEC + 2, SEND_SEC + 20))).toEqual({
+      powerReportedAt: (SEND_SEC + 20) * 1000,
+      powerReportCohort: 1,
+      fullStateReportAt: (SEND_SEC + 2) * 1000,
+    });
+  });
+
+  it("powerReportInfo: powerSwitch inside a full-state dump counts the whole cluster", () => {
+    const meta = { ...fullStateMeta(SEND_SEC + 5, 52), powerSwitch: { timestamp: SEND_SEC + 5 } };
+    expect(powerReportInfo(meta)).toEqual({
+      powerReportedAt: (SEND_SEC + 5) * 1000,
+      powerReportCohort: 53,
+      fullStateReportAt: (SEND_SEC + 5) * 1000,
+    });
+  });
+
+  it("powerReportInfo: the NEWEST dump wins, an incremental burst is not a dump", () => {
+    const meta = {
+      ...fullStateMeta(SEND_SEC - 300, 50, "old"),
+      ...fullStateMeta(SEND_SEC + 3, 30, "new"),
+      burstA: { timestamp: SEND_SEC + 40 },
+      burstB: { timestamp: SEND_SEC + 40 },
+      burstC: { timestamp: SEND_SEC + 41 },
+      powerSwitch: { timestamp: SEND_SEC + 60 },
+    };
+    expect(powerReportInfo(meta).fullStateReportAt).toBe((SEND_SEC + 3) * 1000);
+    expect(powerReportInfo(fullStateMeta(SEND_SEC, 10)).fullStateReportAt).toBeNull(); // no powerSwitch at all
+    const noDump = { ...fullStateMeta(SEND_SEC, FULL_STATE_MIN_FIELDS - 1), powerSwitch: { timestamp: SEND_SEC + 20 } };
+    expect(powerReportInfo(noDump).fullStateReportAt).toBeNull();
+  });
+
+  it("powerReportInfo: no metadata, or no powerSwitch stamp, is unknown", () => {
+    const unknown = { powerReportedAt: null, powerReportCohort: null, fullStateReportAt: null };
+    expect(powerReportInfo(undefined)).toEqual(unknown);
+    expect(powerReportInfo(fullStateMeta(SEND_SEC, 10))).toEqual(unknown);
+    expect(powerReportInfo({ powerSwitch: {} })).toEqual(unknown);
+  });
+
+  it("isolatedPowerOffAfter: our ON's dump, then a lone OFF: a human off", () => {
+    const info = powerReportInfo(dumpThenOff(SEND_SEC + 2, SEND_SEC + 20));
+    expect(isolatedPowerOffAfter({ power: false, ...info }, sendMs)).toBe(true);
+  });
+
+  it("isolatedPowerOffAfter: a lone OFF stamped after the send with NO post-send dump is ambiguous (late delivery)", () => {
+    // The dump is the shed-era one, 300 s old: nothing proves our ON landed
+    // before this off, so it may be an off delivered late to AWS.
+    const info = powerReportInfo(dumpThenOff(SEND_SEC - 300, SEND_SEC + 20));
+    expect(isolatedPowerOffAfter({ power: false, ...info }, sendMs)).toBe(false);
+  });
+
+  it("isolatedPowerOffAfter: a stale OFF from before the send is lag (the unit never applied our ON)", () => {
+    const info = powerReportInfo(dumpThenOff(SEND_SEC - 300, SEND_SEC - 200));
+    expect(isolatedPowerOffAfter({ power: false, ...info }, sendMs)).toBe(false);
+  });
+
+  it("isolatedPowerOffAfter: an OFF stamped inside a full-state dump after the send is a reconnect, not a hand", () => {
+    const meta = { ...fullStateMeta(SEND_SEC + 30, 45), powerSwitch: { timestamp: SEND_SEC + 30 } };
+    expect(isolatedPowerOffAfter({ power: false, ...powerReportInfo(meta) }, sendMs)).toBe(false);
+  });
+
+  it("isolatedPowerOffAfter: a dump AFTER the lone off (a reconnect since) is ambiguous", () => {
+    const meta = { ...fullStateMeta(SEND_SEC + 40, 45), powerSwitch: { timestamp: SEND_SEC + 20 } };
+    expect(isolatedPowerOffAfter({ power: false, ...powerReportInfo(meta) }, sendMs)).toBe(false);
+  });
+
+  it("isolatedPowerOffAfter: a dump in the send's own second counts, one second earlier does not", () => {
+    expect(isolatedPowerOffAfter({ power: false, ...powerReportInfo(dumpThenOff(SEND_SEC, SEND_SEC + 20)) }, sendMs)).toBe(true);
+    expect(isolatedPowerOffAfter({ power: false, ...powerReportInfo(dumpThenOff(SEND_SEC - 1, SEND_SEC + 20)) }, sendMs)).toBe(false);
+  });
+
+  it("isolatedPowerOffAfter: no metadata keeps today's shadow-lag reading", () => {
+    expect(isolatedPowerOffAfter({ power: false, powerReportedAt: null, powerReportCohort: null, fullStateReportAt: null }, sendMs)).toBe(false);
+    expect(isolatedPowerOffAfter({ power: false }, sendMs)).toBe(false);
+  });
+
+  it("isolatedPowerOffAfter: the cohort threshold is inclusive at ISOLATED_POWER_REPORT_MAX_COHORT", () => {
+    const base = { power: false, powerReportedAt: (SEND_SEC + 20) * 1000, fullStateReportAt: (SEND_SEC + 2) * 1000 };
+    expect(isolatedPowerOffAfter({ ...base, powerReportCohort: ISOLATED_POWER_REPORT_MAX_COHORT }, sendMs)).toBe(true);
+    expect(isolatedPowerOffAfter({ ...base, powerReportCohort: ISOLATED_POWER_REPORT_MAX_COHORT + 1 }, sendMs)).toBe(false);
+  });
+
+  it("isolatedPowerOffAfter: an ON is never an off, and no send time means no claim", () => {
+    const info = powerReportInfo(dumpThenOff(SEND_SEC + 2, SEND_SEC + 20));
+    expect(isolatedPowerOffAfter({ power: true, ...info }, sendMs)).toBe(false);
+    expect(isolatedPowerOffAfter({ power: false, ...info }, 0)).toBe(false);
+  });
+
+  it("getThingShadow + fetchDevices carry the power-report fields onto the AcDevice", async () => {
+    const tcl = new TclCloud("user", "pass");
+    const seam = tcl as unknown as {
+      tokenData: unknown;
+      authData: unknown;
+      awsCreds: unknown;
+      signAwsRequest: () => Record<string, string>;
+      fetchDevices: () => Promise<AcDevice[]>;
+    };
+    seam.tokenData = { saasToken: "t", cognitoToken: "c", cognitoId: "i", mqttEndpoint: "m" };
+    seam.authData = { token: "a", refreshToken: "r", username: "u", countryAbbr: "IQ" };
+    seam.awsCreds = { accessKeyId: "k", secretKey: "s", sessionToken: "x", expiration: Date.now() + 3_600_000, region: "eu-central-1" };
+    seam.signAwsRequest = () => ({});
+    const shadowDoc = {
+      state: { reported: { powerSwitch: 0, workMode: 1, autoGeneratorMode: 0, beepSwitch: 0 } },
+      metadata: { reported: dumpThenOff(SEND_SEC + 2, SEND_SEC + 20) },
+    };
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes("user_groups/get")) {
+        return new Response(JSON.stringify({ code: 0, data: [{ devices: [{ deviceId: "DHihohFAAAE", nickName: "Najat", isOnline: "1" }] }] }));
+      }
+      return new Response(JSON.stringify(shadowDoc));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const [dev] = await seam.fetchDevices();
+      expect(dev.power).toBe(false);
+      expect(dev.powerReportedAt).toBe((SEND_SEC + 20) * 1000);
+      expect(dev.powerReportCohort).toBe(1);
+      expect(dev.fullStateReportAt).toBe((SEND_SEC + 2) * 1000);
+      expect(isolatedPowerOffAfter(dev, sendMs)).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+// Cross-layer fight (2026-09-26 14:26Z double-shed forensics): the user's
+// dashboard ON started a set_power=1 verify loop; the leveler shed the room
+// ~2 s later through executeAcAction({power:0}); the ON verifier then read the
+// landed OFF as "not applied" and re-sent ON at 14:26:43.8. A leveler (or any
+// other raw) power command is newer intent and must supersede the verifier.
+describe("a raw power command supersedes a pending set_power verifier", () => {
+  it("leveler power_off while the user's ON verifier waits: the verifier never re-sends ON", async () => {
+    const tcl = tclWithDevice(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
+    let releaseDelay: () => void = () => undefined;
+    const seam = tcl as unknown as {
+      sendControl: unknown; publishWithRetry: unknown; getThingShadow: unknown; controlVerifyDelay: unknown;
+      ensureDeviceCachePopulated: unknown; lastControlVerify: Promise<void> | null;
+    };
+    const publishWithRetry = vi.fn(async () => undefined);
+    const shadows = [{ powerSwitch: 0 }, { powerSwitch: 0 }]; // pre, then the leveler's OFF landed
+    seam.sendControl = vi.fn(async () => undefined);
+    seam.publishWithRetry = publishWithRetry;
+    seam.getThingShadow = vi.fn(async () => ({ reported: shadows.length > 1 ? shadows.shift()! : shadows[0], reportedAt: null }));
+    seam.ensureDeviceCachePopulated = vi.fn(async () => undefined);
+    let held = false;
+    // Hold ONLY the first verify delay (the leveler's off lands inside it); later ones pass straight through.
+    seam.controlVerifyDelay = vi.fn(() => {
+      if (held) return Promise.resolve();
+      held = true;
+      return new Promise<void>((resolve) => { releaseDelay = resolve; });
+    });
+
+    await tcl.sendControlVerified("ac1", "set_power", 1); // the user's ON; verifier now waiting
+    await tcl.executeAcAction("ac1", { power: 0 });       // the leveler sheds the room
+    releaseDelay();
+    await seam.lastControlVerify;
+
+    expect(publishWithRetry.mock.calls.filter((c: unknown[]) => c[0] === "ac1").map((c: unknown[]) => c[1])).not.toContainEqual({ powerSwitch: 1 });
+  });
+
+  it("the newer OFF lands WHILE the verifier's shadow read is in flight: still no ON republish", async () => {
+    // The generation check used to run only BEFORE the read, so an OFF arriving
+    // during the read slipped past it (Sol recheck, 2026-09-27).
+    const tcl = tclWithDevice(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
+    const seam = tcl as unknown as {
+      sendControl: unknown; publishWithRetry: unknown; getThingShadow: unknown; controlVerifyDelay: unknown;
+      ensureDeviceCachePopulated: unknown; lastControlVerify: Promise<void> | null;
+    };
+    const publishWithRetry = vi.fn(async () => undefined);
+    let releaseRead: () => void = () => undefined;
+    let reads = 0;
+    seam.getThingShadow = vi.fn(() => {
+      reads++;
+      const shadow = { reported: { powerSwitch: 0 }, reportedAt: null };
+      if (reads !== 2) return Promise.resolve(shadow); // 1 = pre-capture, 3+ = later rounds
+      return new Promise((resolve) => { releaseRead = () => resolve(shadow); }); // the verifier's first read
+    });
+    seam.sendControl = vi.fn(async () => undefined);
+    seam.publishWithRetry = publishWithRetry;
+    seam.ensureDeviceCachePopulated = vi.fn(async () => undefined);
+    seam.controlVerifyDelay = vi.fn(async () => undefined);
+
+    await tcl.sendControlVerified("ac1", "set_power", 1); // the user's ON
+    await vi.waitFor(() => expect(reads).toBe(2));         // verifier is now inside its shadow read
+    await tcl.executeAcAction("ac1", { power: 0 });        // the leveler sheds the room
+    releaseRead();                                          // the read returns the landed OFF
+    await seam.lastControlVerify;
+
+    expect(publishWithRetry.mock.calls.filter((c: unknown[]) => c[0] === "ac1").map((c: unknown[]) => c[1])).not.toContainEqual({ powerSwitch: 1 });
+  });
+});
+
+// Round 4 (Sol, 2026-09-27): ONE generation check at the publish boundary. Node
+// is single-threaded, so a check with no await between it and the publish call
+// is the only place where "newer command already claimed this field" cannot
+// change before the send starts. Checks at earlier awaits kept missing the next
+// await (the pre-state read, then the token refresh).
+describe("the dashboard power command is checked AT the publish boundary", () => {
+  function realSendTcl() {
+    const tcl = tclWithDevice(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
+    const seam = tcl as unknown as {
+      ensureValidTokens: unknown; publishShadowUpdate: unknown; getThingShadow: unknown; controlVerifyDelay: unknown;
+      ensureDeviceCachePopulated: unknown; restoreLastState: unknown; publishWithRetry: unknown;
+      lastControlVerify: Promise<void> | null;
+    };
+    const published: Array<Record<string, unknown>> = [];
+    seam.publishShadowUpdate = vi.fn(async (_id: string, desired: Record<string, unknown>) => { published.push(desired); });
+    seam.publishWithRetry = vi.fn(async (_id: string, desired: Record<string, unknown>) => { published.push(desired); });
+    seam.getThingShadow = vi.fn(async () => ({ reported: { powerSwitch: 0 }, reportedAt: null }));
+    seam.ensureDeviceCachePopulated = vi.fn(async () => undefined);
+    seam.restoreLastState = vi.fn(async () => undefined);
+    seam.controlVerifyDelay = vi.fn(async () => undefined);
+    return { tcl, seam, published };
+  }
+
+  it("the leveler OFF publishes while the dashboard ON waits for its token refresh: the ON is never published and reports superseded", async () => {
+    const { tcl, seam, published } = realSendTcl();
+    let releaseTokens: () => void = () => undefined;
+    let tokenCalls = 0;
+    seam.ensureValidTokens = vi.fn(() => {
+      tokenCalls++;
+      if (tokenCalls !== 1) return Promise.resolve();
+      return new Promise<void>((resolve) => { releaseTokens = resolve; }); // the dashboard ON's token wait
+    });
+
+    const dashboardOn = tcl.sendControlVerified("ac1", "set_power", 1);
+    await vi.waitFor(() => expect(tokenCalls).toBe(1)); // the ON is inside sendControl, waiting for tokens
+    await tcl.executeAcAction("ac1", { power: 0 });      // the leveler's OFF publishes first
+    releaseTokens();
+    const outcome = await dashboardOn;
+    await seam.lastControlVerify;
+
+    expect(published).toEqual([{ powerSwitch: 0 }]); // only the OFF ever reached the cloud
+    expect(outcome).toBe("superseded");
+  });
+
+  it("an ordinary dashboard command reports sent", async () => {
+    const { tcl, seam } = realSendTcl();
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+    expect(await tcl.sendControlVerified("ac1", "set_power", 1)).toBe("sent");
+  });
+
+  it("manual wins: a leveler restore ON never supersedes the user's pending OFF verifier", async () => {
+    // Only a protective OFF supersedes a dashboard power command. A restore ON
+    // landing while the user's OFF is being verified must not silence that
+    // verifier: the user's off (already locked) has to stick.
+    const { tcl, seam, published } = realSendTcl();
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+    const shadows = [{ powerSwitch: 1 }, { powerSwitch: 1 }]; // pre (on), then the restore's ON landed
+    seam.getThingShadow = vi.fn(async () => ({ reported: shadows.length > 1 ? shadows.shift()! : shadows[0], reportedAt: null }));
+    let releaseDelay: () => void = () => undefined;
+    let held = false;
+    seam.controlVerifyDelay = vi.fn(() => {
+      if (held) return Promise.resolve();
+      held = true;
+      return new Promise<void>((resolve) => { releaseDelay = resolve; });
+    });
+
+    await tcl.sendControlVerified("ac1", "set_power", 0); // the user's OFF
+    await tcl.executeAcAction("ac1", { power: 1 });                            // a restore ON races it
+    releaseDelay();
+    await seam.lastControlVerify;
+
+    expect(published.filter((p) => p.powerSwitch === 0).length, "the user's OFF is re-sent over the restore").toBeGreaterThanOrEqual(2);
+  });
+});
+
+// Round 5 (Sol, 2026-09-27), the two rules that close item 8 for every await:
+// RULE A every publish a dashboard command can make (the initial one, the
+// saved-state restore after an ON, every verifier resend) goes through the
+// guarded same-tick publish; RULE B the outcome reflects the FINAL generation,
+// so a command superseded after its own publish still reports superseded.
+describe("dashboard power command: every publish guarded, outcome reflects the final generation", () => {
+  function realTcl() {
+    const tcl = tclWithDevice(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
+    const seam = tcl as unknown as {
+      ensureValidTokens: unknown; publishShadowUpdate: unknown; getThingShadow: unknown; controlVerifyDelay: unknown;
+      ensureDeviceCachePopulated: unknown; restoreLastState: unknown; lastState: Record<string, Record<string, unknown>>;
+      lastControlVerify: Promise<void> | null;
+    };
+    const published: Array<Record<string, unknown>> = [];
+    seam.publishShadowUpdate = vi.fn(async (_id: string, desired: Record<string, unknown>) => { published.push(desired); });
+    seam.getThingShadow = vi.fn(async () => ({ reported: { powerSwitch: 0 }, reportedAt: null }));
+    seam.ensureDeviceCachePopulated = vi.fn(async () => undefined);
+    seam.controlVerifyDelay = vi.fn(async () => undefined);
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+    return { tcl, seam, published };
+  }
+
+  it("RULE A: the leveler OFF lands while a verifier RESEND waits for its token refresh: the stale ON is never republished", async () => {
+    const { tcl, seam, published } = realTcl();
+    seam.restoreLastState = vi.fn(async () => undefined);
+    let releaseTokens: () => void = () => undefined;
+    let tokenCalls = 0;
+    seam.ensureValidTokens = vi.fn(() => {
+      tokenCalls++;
+      if (tokenCalls !== 2) return Promise.resolve();                         // 1 = initial send
+      return new Promise<void>((resolve) => { releaseTokens = resolve; });     // 2 = the resend's token wait
+    });
+
+    expect(await tcl.sendControlVerified("ac1", "set_power", 1)).toBe("sent");
+    await vi.waitFor(() => expect(tokenCalls).toBe(2)); // the verifier found OFF and is re-sending
+    await tcl.executeAcAction("ac1", { power: 0 });     // the leveler sheds the room
+    releaseTokens();
+    await seam.lastControlVerify;
+
+    expect(published).toEqual([{ powerSwitch: 1 }, { powerSwitch: 0 }]); // the initial ON, the shed; no stale resend
+  });
+
+  it("RULE B: the leveler OFF lands while the ON's saved-state restore waits: outcome superseded, no restore published", async () => {
+    vi.useFakeTimers();
+    try {
+      const { tcl, seam, published } = realTcl();
+      seam.lastState = { ac1: { targetTemperature: 23, workMode: 1 } }; // what restoreLastState would re-publish
+      const outcome = tcl.sendControlVerified("ac1", "set_power", 1);
+      await vi.waitFor(() => expect(published).toEqual([{ powerSwitch: 1 }])); // the ON went out; restore now waits 1 s
+      await tcl.executeAcAction("ac1", { power: 0 });                           // the leveler sheds the room
+      await vi.advanceTimersByTimeAsync(1_500);
+
+      expect(await outcome).toBe("superseded");
+      expect(published).toEqual([{ powerSwitch: 1 }, { powerSwitch: 0 }]); // no saved-state restore after the shed
+      await seam.lastControlVerify;
+      expect(published).toEqual([{ powerSwitch: 1 }, { powerSwitch: 0 }]); // and no verifier resend either
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a user's own newer tap supersedes too, reported as superseded_by_user (not blamed on the leveler)", async () => {
+    const { tcl, seam } = realTcl();
+    let releaseRead: () => void = () => undefined;
+    let reads = 0;
+    seam.restoreLastState = vi.fn(async () => undefined);
+    seam.getThingShadow = vi.fn(() => {
+      reads++;
+      const shadow = { reported: { powerSwitch: 0 }, reportedAt: null };
+      if (reads !== 1) return Promise.resolve(shadow);
+      return new Promise((resolve) => { releaseRead = () => resolve(shadow); });
+    });
+    const first = tcl.sendControlVerified("ac1", "set_power", 1);
+    await vi.waitFor(() => expect(reads).toBe(1));
+    const second = tcl.sendControlVerified("ac1", "set_power", 0); // the user taps again
+    releaseRead();
+    expect(await first).toBe("superseded_by_user");
+    expect(await second).toBe("sent");
+  });
+});
+
+describe("a raw power command during the dashboard command's INITIAL shadow read", () => {
+  it("the leveler OFF lands while the dashboard ON is still reading its pre-state: the ON is never published", async () => {
+    // Round 3 caught this at the read; round 4 moved the check to the publish
+    // boundary, which covers this await and every other one (real sendControl).
+    const tcl = tclWithDevice(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
+    const seam = tcl as unknown as {
+      ensureValidTokens: unknown; publishShadowUpdate: unknown; publishWithRetry: unknown; getThingShadow: unknown;
+      controlVerifyDelay: unknown; ensureDeviceCachePopulated: unknown; restoreLastState: unknown;
+      lastControlVerify: Promise<void> | null;
+    };
+    const published: Array<Record<string, unknown>> = [];
+    seam.publishShadowUpdate = vi.fn(async (_id: string, desired: Record<string, unknown>) => { published.push(desired); });
+    seam.publishWithRetry = vi.fn(async (_id: string, desired: Record<string, unknown>) => { published.push(desired); });
+    seam.ensureValidTokens = vi.fn(async () => undefined);
+    seam.restoreLastState = vi.fn(async () => undefined);
+    let releaseRead: () => void = () => undefined;
+    let reads = 0;
+    seam.getThingShadow = vi.fn(() => {
+      reads++;
+      const shadow = { reported: { powerSwitch: 1 }, reportedAt: null };
+      if (reads !== 1) return Promise.resolve(shadow);
+      return new Promise((resolve) => { releaseRead = () => resolve(shadow); }); // the INITIAL pre-state read
+    });
+    seam.ensureDeviceCachePopulated = vi.fn(async () => undefined);
+    seam.controlVerifyDelay = vi.fn(async () => undefined);
+
+    const dashboardOn = tcl.sendControlVerified("ac1", "set_power", 1);
+    await vi.waitFor(() => expect(reads).toBe(1));  // inside the initial read
+    await tcl.executeAcAction("ac1", { power: 0 });  // the leveler sheds the room
+    releaseRead();
+    expect(await dashboardOn).toBe("superseded");
+    await seam.lastControlVerify;
+
+    expect(published).toEqual([{ powerSwitch: 0 }]); // only the leveler's OFF went out
+  });
+});
+
+// Partial success (Sol recheck, 2026-09-27): a power ON publishes powerSwitch,
+// waits ~3 s, then publishes the profile. When only the profile throws, the ON
+// is already on its way to the unit, and callers must be able to tell that
+// apart from a refused send (they book the ON as sent).
+describe("executeAcAction: power accepted, profile failed", () => {
+  it("rejects with AcProfileNotAppliedError (powerAccepted) after the power publish went out", async () => {
+    vi.useFakeTimers();
+    try {
+      const tcl = tclWithDevice(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
+      const seam = tcl as unknown as { publishWithRetry: unknown; ensureDeviceCachePopulated: unknown; publishAcProfile: unknown };
+      const publishWithRetry = vi.fn(async () => undefined);
+      seam.publishWithRetry = publishWithRetry;
+      seam.ensureDeviceCachePopulated = vi.fn(async () => undefined);
+      seam.publishAcProfile = vi.fn(async () => { throw new Error("GetThingShadow HTTP 503"); });
+
+      const pending = tcl.executeAcAction("ac1", { power: 1, mode: 1, temperature: 23 });
+      const settled = pending.then(() => null, (err: unknown) => err);
+      await vi.advanceTimersByTimeAsync(3_000);
+      const err = await settled;
+
+      expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 1 });
+      expect(err).toBeInstanceOf(AcProfileNotAppliedError);
+      expect(isPowerAcceptedError(err)).toBe(true);
+      expect(isPowerAcceptedError(new Error("refused"))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a refused POWER publish is still an ordinary failure", async () => {
+    const tcl = tclWithDevice(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
+    const seam = tcl as unknown as { publishWithRetry: unknown; ensureDeviceCachePopulated: unknown };
+    seam.publishWithRetry = vi.fn(async () => { throw new Error("cloud refused"); });
+    seam.ensureDeviceCachePopulated = vi.fn(async () => undefined);
+    const err = await tcl.executeAcAction("ac1", { power: 1, mode: 1, temperature: 23 }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(isPowerAcceptedError(err)).toBe(false);
+  });
+});
+
 // UI command verify-resend (2026-06-11): Najat's firmware routinely accepts a
 // command without applying it — the shadow keeps the pre-command value. After
 // a UI send, the shadow is re-checked every 5s and the command re-published up
@@ -306,7 +773,7 @@ describe("sendControlVerified (5s × 3 confirm-or-resend)", () => {
     await tcl.sendControlVerified("ac1", "set_fan_speed", 5);
     await awaitVerify();
     expect(publishWithRetry).toHaveBeenCalledTimes(1);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { windSpeed7Gear: 5 });
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { windSpeed7Gear: 5 }, expect.any(Function));
   });
 
   it("gives up after the bounded re-sends when the firmware never applies", async () => {
@@ -337,7 +804,7 @@ describe("sendControlVerified (5s × 3 confirm-or-resend)", () => {
     await tcl.sendControlVerified("ac1", "set_fan_speed", 1);
     await awaitVerify();
     expect(publishWithRetry).toHaveBeenCalledTimes(1);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { windSpeed: 0, silenceSwitch: 1, turbo: 0 });
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { windSpeed: 0, silenceSwitch: 1, turbo: 0 }, expect.any(Function));
   });
 
   it("never schedules a verify for set_generator_mode (the leveler owns its retries)", async () => {
@@ -345,7 +812,8 @@ describe("sendControlVerified (5s × 3 confirm-or-resend)", () => {
       { generatorMode: 2 },
     ]);
     await tcl.sendControlVerified("ac1", "set_generator_mode", 4);
-    expect(sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 4, false, true);
+    // 6th argument: the publish-boundary guard (round 4, 2026-09-27).
+    expect(sendControl).toHaveBeenCalledWith("ac1", "set_generator_mode", 4, false, true, expect.any(Function));
     expect(getThingShadow).not.toHaveBeenCalled();
     expect(publishWithRetry).not.toHaveBeenCalled();
   });
@@ -429,8 +897,8 @@ describe("sendControlVerified last-write-wins (binary set_power)", () => {
     await drain();
 
     expect(publishWithRetry).toHaveBeenCalledTimes(1);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 1 });     // ON proceeds normally
-    expect(publishWithRetry).not.toHaveBeenCalledWith("ac1", { powerSwitch: 0 }); // OFF yields, never fights
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 1 }, expect.any(Function));     // ON proceeds normally
+    expect(publishWithRetry.mock.calls.filter((c: unknown[]) => c[0] === "ac1").map((c: unknown[]) => c[1])).not.toContainEqual({ powerSwitch: 0 }); // OFF yields, never fights
   });
 
   it("a lone set_power verify still re-sends up to 3 times when the shadow never applies", async () => {
@@ -442,7 +910,7 @@ describe("sendControlVerified last-write-wins (binary set_power)", () => {
     await (tcl as unknown as { lastControlVerify: Promise<void> }).lastControlVerify;
 
     expect(publishWithRetry).toHaveBeenCalledTimes(CONTROL_VERIFY_MAX_RESENDS);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 0 });
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 0 }, expect.any(Function));
   });
 
   it("supersession is per device — a set_power on ac2 does not cancel ac1's verify", async () => {
@@ -456,8 +924,8 @@ describe("sendControlVerified last-write-wins (binary set_power)", () => {
     await b;
     await drain();
 
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 0 }); // ac1 not superseded by ac2
-    expect(publishWithRetry).toHaveBeenCalledWith("ac2", { powerSwitch: 1 });
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 0 }, expect.any(Function)); // ac1 not superseded by ac2
+    expect(publishWithRetry).toHaveBeenCalledWith("ac2", { powerSwitch: 1 }, expect.any(Function));
   });
 
   it("supersession is per command — a set_temperature does not cancel a set_power verify", async () => {
@@ -471,8 +939,8 @@ describe("sendControlVerified last-write-wins (binary set_power)", () => {
     await t;
     await drain();
 
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 0 });        // set_power verify still ran
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { targetTemperature: 24 }); // set_temperature verify ran
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 0 }, expect.any(Function));        // set_power verify still ran
+    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { targetTemperature: 24 }, expect.any(Function)); // set_temperature verify ran
   });
 });
 

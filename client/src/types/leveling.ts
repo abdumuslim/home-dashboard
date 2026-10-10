@@ -16,6 +16,11 @@ export interface AcLevelingConfig {
   marginAmps: number;
   /** Extra headroom kept below the breaker when raising (asymmetric hysteresis). */
   raiseBufferAmps: number;
+  /**
+   * The v2 controller's copy of the raise buffer (config row 2), and the one it
+   * actually acts on once present. The form edits both in lockstep.
+   */
+  restingBufferAmps?: number;
   comfortTargetC: number;
   /** Near-target band °C: within this band of the target the AC is hard-capped at L1. */
   nearTargetBandC?: number;
@@ -90,7 +95,16 @@ export interface AcLevelingStatus {
   enabled: boolean;
   source: PowerSource;
   measuredAmps: number | null;
+  /** The ENFORCED limit: configured minus any live trip/strain derate. */
   limitAmps: number | null;
+  /** The configured limit for the active source (v2 only; null with no source). */
+  configuredLimitAmps?: number | null;
+  /** Reduction actually enforced: configured minus `limitAmps` (0 when none). */
+  derateAmps?: number;
+  /** The derate split by cause: breaker trips vs generator brownouts. */
+  derate?: { collapseAmps: number; strainAmps: number } | null;
+  /** Epoch ms the whole derate will have recovered if nothing new happens. */
+  derateClearsAt?: number | null;
   budgetAmps: number | null;
   nonAcLoadAmps: number | null;
   /** Over-limit leaky-bucket points remaining (acts at 0); `overLimitBudgetMax` is the capacity. */

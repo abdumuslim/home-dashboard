@@ -186,6 +186,16 @@ show the discontinuity). Clamp mapping on the mains: port A `current_a` = grid (
 `current_b` = gen (`current_2`). Full record: `docs/CT02_FLASH_PLAN.md` (ESP-SWITCH RECORD 2026-08-29);
 leveling-semantics note in `docs/agent/ac-leveling.md`.
 
+**Reading the CT02 against other instruments (2026-09-27).** The HLW8112 is true-RMS; a panel
+ammeter is usually average-responding and reads several percent low on the inverter ACs' distorted
+current, so "the CT02 shows ~1 A more than the panel" is expected, not a fault. Never "fix" it with a
+server-side offset: the only valid arbiter is a handheld true-RMS clamp read against `GET /api/diag`
+at a marked moment, and a confirmed gain error goes into the chip's persisted resistor-gain trim.
+**Clamp A polarity:** on 2026-09-27 `power_a` read negative under grid load in every sample (the
+2026-08-29 flip did not hold), pending a physical recheck. Amps are unaffected: the pipeline uses
+unsigned current and computes `power_1 = v × i1` itself. Detail: [ac-leveling.md](ac-leveling.md) →
+"2026-09-27: bug hunt", item 6.
+
 **Device & API contract (ESP era, and the shape the CT02 feed reuses):**
 - ESP sends `POST /api/power/ingest` with `{ v, i1, i2 }` every 5s.
 - I1 = Grid (indigo `#818cf8`), I2 = Generator (rose `#fb7185`).

@@ -613,3 +613,114 @@ describe("houseLoadAmps — the cross-source carry (2026-08-04)", () => {
     expect(houseLoadAmps(s, "gen", T, withoutAbdu)).toBeCloseTo(1.5, 5);
   });
 });
+
+describe("houseLoadAmps — the grid session memory (2026-09-27, Stream G)", () => {
+  // Nearly every grid entry follows ~2 h of generator. The 15-minute window
+  // has aged the grid record out by then, and the generator's house excludes
+  // every grid-only load (the unmanaged guest AC among it), so the grid entry
+  // used to be budgeted against a 4A house while the real one was 12A.
+  const H = 60 * 60_000;
+  const onGrid = (at: number, smoothedAmps: number, acs = live()) =>
+    (state = initialHouseLoad()) =>
+      sampleHouseLoad(state, { source: "grid", at, smoothedAmps, acs, config: cfg });
+  const onGen = (at: number, smoothedAmps: number) => (state = initialHouseLoad()) =>
+    sampleHouseLoad(state, { source: "gen", at, smoothedAmps, acs: live(), config: cfg });
+
+  // Grid session: 12A of house over the 11.4A model. Then 2 h of generator at 4A.
+  const afterGen = () => onGen(T + 2 * H, 15.4)(onGrid(T, 23.4)());
+
+  it("a grid entry after a long generator session is budgeted on the grid house it last measured", () => {
+    expect(houseLoadAmps(afterGen(), "grid", T + 2 * H, live())).toBeCloseTo(12.0, 5);
+  });
+
+  it("…the larger of the remembered grid house and the carried generator house", () => {
+    const bigGen = onGen(T + 2 * H, 25.4)(onGrid(T, 23.4)()); // 14A on the generator
+    expect(houseLoadAmps(bigGen, "grid", T + 2 * H, live())).toBeCloseTo(14.0, 5);
+  });
+
+  it("the memory is bounded: a day-old grid session is forgotten", () => {
+    const s = onGen(T + 25 * H, 15.4)(onGrid(T, 23.4)());
+    expect(houseLoadAmps(s, "grid", T + 25 * H, live())).toBeCloseTo(4.0, 5);
+  });
+
+  it("remembers the PEAK of the session's last window, the figure the grid itself reported", () => {
+    // 20A of house early in the session, 12A at its end: the early peak aged out
+    // of the grid ring while grid was still live, so it is not remembered.
+    const s = onGrid(T + 20 * 60_000, 23.4)(onGrid(T, 31.4)());
+    const after = onGen(T + 2 * H, 15.4)(s);
+    expect(houseLoadAmps(after, "grid", T + 2 * H, live())).toBeCloseTo(12.0, 5);
+  });
+
+  it("only remembers samples that were themselves valid (a ramping tick is never a sample)", () => {
+    const ramping = [ac("abdullah", { currentLevel: 2, minLevel: 2, ramping: true }), ac("najat"), ac("abdu")];
+    const s = onGrid(T + 60_000, 30.0, ramping)(onGrid(T, 23.4)());
+    const after = onGen(T + 2 * H, 15.4)(s);
+    expect(houseLoadAmps(after, "grid", T + 2 * H, live())).toBeCloseTo(12.0, 5);
+  });
+
+  it("survives the first tick back on grid, which prunes the ring before anything is usable", () => {
+    // Every compressor is ramping after the changeover: the tick is not a
+    // sample, but it does prune the stale ring. The memory must outlive that.
+    const ramping = live().map((a) => ({ ...a, ramping: true }));
+    const back = onGrid(T + 2 * H, 30.0, ramping)(afterGen());
+    expect(back.grid.samples).toHaveLength(0);
+    expect(houseLoadAmps(back, "grid", T + 2 * H, live())).toBeCloseTo(12.0, 5);
+  });
+
+  it("a sample voided as a phantom leaves the memory too", () => {
+    // The 12A reading turns out to have been Najat drawing before her shadow
+    // said so (she was not in the running set): voiding it must drop it here.
+    const withoutNajat = [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("abdu")];
+    const early = onGrid(T, 11.1, withoutNajat)(); // 2.0A of house over the 9.1A model
+    const phantom = onGrid(T + 60_000, 21.1, withoutNajat)(early); // "12A" of house
+    const voided = voidSamples(phantom, "grid", { excludeDeviceId: "najat", since: T + 30_000 });
+    const after = onGen(T + 2 * H, 15.4)(voided);
+    expect(houseLoadAmps(after, "grid", T + 2 * H, live())).toBeCloseTo(4.0, 5); // gen carry wins over 2.0
+  });
+
+  it("a POST-RETURN sample voided as a phantom falls back to the prior valid grid memory (Sol, 2026-09-27)", () => {
+    // Back on grid: the ramping first tick prunes the stale ring (the 12A memory
+    // survives beside it); a later usable sample replaces the memory; then the
+    // shell discovers Najat was already drawing and voids that sample. The ring
+    // is empty again, and the grid figure must fall back to the 12A the last
+    // VALID grid session measured, not to the 4A generator carry.
+    const withoutNajat = [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("abdu")];
+    const ramping = withoutNajat.map((a) => ({ ...a, ramping: true }));
+    const back = onGrid(T + 2 * H, 30.0, ramping)(afterGen());
+    expect(back.grid.samples).toHaveLength(0);
+    // Past the drop cooldown the entry tick armed: a genuinely usable sample.
+    const at = T + 2 * H + 3 * 60_000;
+    const sampled = onGrid(at, 16.1, withoutNajat)(back); // "7A", Najat's hidden draw included
+    expect(sampled.grid.samples).toHaveLength(1);
+    expect(houseLoadAmps(sampled, "grid", at, live())).toBeCloseTo(7.0, 5); // precondition: memory replaced
+    const voided = voidSamples(sampled, "grid", { excludeDeviceId: "najat", since: T + 2 * H });
+    expect(voided.grid.samples).toHaveLength(0);
+    expect(houseLoadAmps(voided, "grid", at, live())).toBeCloseTo(12.0, 5);
+  });
+
+  it("…but a prior memory that was ITSELF the voided evidence is dropped", () => {
+    // The 12A session peak was taken with Najat drawing unseen (not in its set):
+    // voiding her from before that sample must not keep it alive as memory.
+    const withoutNajat = [ac("abdullah", { currentLevel: 2, minLevel: 2 }), ac("abdu")];
+    const phantomSession = onGrid(T, 21.1, withoutNajat)(); // "12A" of house
+    const afterGenPhantom = onGen(T + 2 * H, 15.4)(phantomSession);
+    const ramping = withoutNajat.map((a) => ({ ...a, ramping: true }));
+    const back = onGrid(T + 2 * H, 30.0, ramping)(afterGenPhantom);
+    const at = T + 2 * H + 3 * 60_000;
+    const sampled = onGrid(at, 16.1, withoutNajat)(back);
+    const voided = voidSamples(sampled, "grid", { excludeDeviceId: "najat", since: T - 60_000 });
+    expect(houseLoadAmps(voided, "grid", at, live())).toBeCloseTo(4.0, 5); // the gen carry alone
+  });
+
+  it("fresh grid evidence still wins the moment it exists", () => {
+    const s = onGrid(T + 2 * H + 60_000, 17.4)(afterGen()); // 6A of house now
+    expect(houseLoadAmps(s, "grid", T + 2 * H + 60_000, live())).toBeCloseTo(6.0, 5);
+  });
+
+  it("the generator's figure is untouched by the grid memory", () => {
+    const s = onGrid(T, 23.4)();
+    // No gen samples: the gen query still carries only a fresh (in-window) grid peak.
+    expect(houseLoadAmps(s, "gen", T + 2 * H, live())).toBe(0);
+    expect(houseLoadAmps(afterGen(), "gen", T + 2 * H, live())).toBeCloseTo(4.0, 5);
+  });
+});

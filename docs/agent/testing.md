@@ -80,6 +80,49 @@ timestamp: 2026-08-01
     null rejected before EITHER write, a null `restingBufferAmps` and a non-boolean `fanTrimEnabled`
     likewise, a valid capacity forwarded with the response carrying what row 2 now holds, and a stale
     client omitting the key keeping the stored value).
+  - **The 2026-09-27 bug hunt** (SKILL 77 to 82; incident detail in [ac-leveling.md](ac-leveling.md)
+    → "2026-09-27: bug hunt"). **Double-shed hold (77):** `pipeline.test.ts` describe *"…and the
+    holds track the CUT's landing grace, not the 30s settle mode (2026-09-26)"* (mild held at 31 s
+    and 59 s, released at 61 s and at 45 s of mean-over; severe released in NORMAL but still held in
+    SETTLING; *"a stale shed plus a fresh FAN TRIM that reads arriving does not hold a SEVERE
+    shed"*; extreme and a runaway never held; levels and fans keep their pace; no room shed means no
+    extension; FLOORS/GRID_FULL unchanged) and `scenarios.test.ts` *"ACCEPTANCE: a shed still
+    landing past 30 s does not shed a second room (2026-09-26)"* (the live lagging-anchor geometry
+    with a 35 s off lag). **Grid start and roomy lane (78, 79):** `grid-start.test.ts` (including a
+    parity check against a verbatim copy of the pre-2026-09-27 GRID_FULL loop: when everything fits,
+    commands and journal are byte-identical), `grid-lane.test.ts` (both-tests spare, every other gate
+    stays, the settle-window lane flag, the candidate priced at its worst unconfirmed level),
+    `pipeline.test.ts` *"G2 grid roomy lane: the situational gate (pipeline)"* and *"G1 budget-aware
+    grid full start (pipeline wiring)"*. **Grid session memory (80):** `house-load.test.ts` describe
+    *"houseLoadAmps — the grid session memory (2026-09-27, Stream G)"*. **Whole-house acceptance:**
+    `scenarios.test.ts` describe *"ACCEPTANCE: grid entry and the grid roomy lane (2026-09-27)"*,
+    incl. *"the COMMON entry: after a long generator session the first grid batch still fits"*,
+    *"a remembered grid house that has since shrunk only delays the lift until fresh grid evidence
+    exists"* and the noise gate *"NOISE: ±0.5A and 60 s confirm lag near the 3A bar: no overload, no
+    cut/raise churn"* (no over-limit batch, no shed, the line under 30 A, every room's commanded
+    level monotonic, and the lane took part). **Remote off (81, 82):** `remote-off.test.ts`
+    (collector side: R2 the server-ON fast path yields to a causal report, R4 classify before the
+    fan intent is cleared, R5 and item 6 the honest fan-Auto log, items 1 to 4 the publish-time ON
+    reference, the persistent `restore_declined` lock, an isolated OFF without our ON's dump, and the
+    restart voids), `controller.test.ts` describes *"a restore declined by hand is not re-sent
+    (2026-09-27)"* and *"a human ON revokes the room's own unlanded cut credit"* (shell-only:
+    `scenario.ts` does not model the device poll), `tcl-cloud.test.ts` describes *"shadow
+    power-report metadata (causal: ON dump, then isolated OFF)"*, *"dashboard power command: every
+    publish guarded, outcome reflects the final generation"* (RULE A: initial send, 403 retry,
+    saved-state restore incl. both CHSD halves, verifier resends; RULE B: `"superseded"` vs
+    `"superseded_by_user"`), *"the dashboard power command is checked AT the publish boundary"*, *"a raw power command during the dashboard command's INITIAL
+    shadow read"*, *"a raw power command supersedes a pending set_power verifier"* and
+    *"executeAcAction: power accepted, profile failed"*, and the route-level
+    `control-superseded.test.ts` (409 for both superseded outcomes, no post-send hooks, the message
+    naming Smart AC Leveling only for an ON lost to a raw OFF, and *"the caller-side handoff (round
+    6)"*: a leveler OFF in the microtask gap after the send never has its shed cleared by the older
+    ON's bookkeeping, which runs through `onSent`), plus `controller.test.ts` *"onUserPowerOn claims
+    its state synchronously (round 6)"* (only the synchronous prefix is run, not awaited). Same day, other streams:
+    `leveling/status-derate.test.ts` and `leveling/resting-buffer-config.test.ts` (the derate made
+    visible), `leveling/meter-event-derate.test.ts` (meter-event handlers read the derate of the
+    event's OWN source; it scripts `ingestReading` to stage a mixed-source batch),
+    `automation-audit.test.ts` and `automation-rule-cache.test.ts` (automation audit and rule-cache
+    invalidation, [ac-automations.md](ac-automations.md)).
   - **The gated proactive shed (the swap)** (2026-08-06) — spread over four files by what each can see. `raise.test.ts`: `swapDonorFor` gate by gate, the ALONE emission, the loud journal line, the cross-tick reservation, and the donation cooldown in **both** tiers (live-trade donor reserves; a level-funding donor is barred without reserving). `pipeline.test.ts`: the donor's `power_off` may not share a batch with an invariant correction — the scene is built so the correction's own floor-down does *not* rescue the restore, or the swap never reaches its branch. `scenarios.test.ts`: the *"2026-08-06 heater episode"* whole-house replay, **plus the same replay under ±0.5 A noise** (see the churn gate below), plus the two negatives. `controller.test.ts`: the shell-only halves — the shed row, the push, a `power_off` stamping the funding cooldown, and the **source-change clear read off `controller.swap` directly**, because every outward effect of a stale trade is masked on the far side of a changeover (a decisions-level assertion passes with the clear deleted).
 - `power-stats-routes.test.ts` — HTTP shape for `GET /api/power/stats` (full payload, source "none" when latestPower null) and `GET /api/power/day-breakdown` (days+totals, all RANGE_MAP keys accepted, bogus range → 400), via the `push-routes.test.ts` fake-pool + live `createRouter` harness
 
@@ -149,6 +192,19 @@ timestamp: 2026-08-01
   `HOUSE_SAMPLE_COOLDOWN_MS` after their first tick (`firstTickAt` / `firstStepAt`), so no scenario
   can rely on house samples from its first 2 sim-minutes — settle scenes that need an honest house
   peak must `advance()` past the quiet before staging the incident.
+- **Grid scenes must let the harness MEASURE the grid house (2026-09-27).** The budget-aware grid
+  start (SKILL 78) and the grid session memory (80) read `houseLoadAmps`, which the harness samples
+  off the simulated meter. So a grid-entry scene first runs grid long enough for the sampler to see
+  the grid-only load (the acceptance uses 8 min at a 12 A house), then a generator interlude at a
+  smaller house, then back to grid with the guest load present. Handing the planner a house figure
+  directly would test a house the shell cannot see. The memory lives in `house-load.ts`, which the
+  harness imports, so it is exercised rather than mirrored; the harness has no restart, so the
+  memory's in-process loss on a server restart is not modeled.
+- **The roomy lane's SETTLING half rarely opens in the harness.** Right after a batch the harness's
+  calm clock is 0, so pressure is not `calm`; the calm-gate half carries the measured speed-up
+  (second step at +15 s instead of +40 s). Live readings arrive every 1 to 4 s, so both halves apply
+  in production. Its noise gate is a ±0.5 A, 60 s confirm-lag replay near the 3 A bar, the form the
+  churn gate above allows for a new spend path.
 
 **Verifying a fix is real (used for both 2026-07-28 fixes):** after the test passes, re-break the
 single line the fix hinges on and confirm the test fails with the *expected number*, then restore.

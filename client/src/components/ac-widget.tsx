@@ -233,6 +233,7 @@ export { useAcTimers, type AcTimerData };
 export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTimer, label }: AcWidgetProps) {
   const [showDetail, setShowDetail] = useState(false);
   const [powerBusy, setPowerBusy] = useState(false);
+  const [powerError, setPowerError] = useState("");
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
@@ -247,10 +248,32 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
   const colors = getModeColors(d.mode);
   const modeInfo = MODE_LABELS[d.mode] ?? MODE_LABELS[0];
 
+  // A refused power command used to fail silently (the optimistic state just
+  // reverted). Show the server's reason, e.g. a dashboard ON superseded by a
+  // Smart AC Leveling overload shed (409 "superseded", 2026-09-27).
+  useEffect(() => {
+    if (!powerError) return;
+    const id = setTimeout(() => setPowerError(""), 10_000);
+    return () => clearTimeout(id);
+  }, [powerError]);
+
   const handlePowerToggle = async () => {
     if (offline || powerBusy) return;
     setPowerBusy(true);
-    try { await onControl("set_power", isOn ? 0 : 1); } finally { setPowerBusy(false); }
+    setPowerError("");
+    try {
+      await onControl("set_power", isOn ? 0 : 1);
+    } catch (err) {
+      const raw = (err as Error).message ?? "";
+      let message = raw || "Command failed";
+      try {
+        const body = JSON.parse(raw) as { message?: string; error?: string };
+        message = body.message ?? body.error ?? message;
+      } catch { /* not JSON: show as is */ }
+      setPowerError(message);
+    } finally {
+      setPowerBusy(false);
+    }
   };
 
   return (
@@ -289,6 +312,10 @@ export function AcWidget({ device: d, onControl, timer, onSetTimer, onCancelTime
             <Settings className="w-4 h-4" />
           </button>
         </div>
+
+        {powerError && (
+          <p role="alert" className="mt-0.5 max-w-[8.5rem] text-center text-[0.55rem] leading-tight text-red-400">{powerError}</p>
+        )}
 
         <div className="h-[1px] w-3/4 bg-white/[0.08] my-1" />
 

@@ -55,6 +55,129 @@ export function latestReportedAtMs(
 }
 
 /**
+ * Fields whose metadata timestamp sits within this many SECONDS of the
+ * `powerSwitch` timestamp count as one device report (the "cohort"). The TCL
+ * firmware spreads a full-state dump over 1-2 s (probe 2026-09-27: Najat
+ * 15:21:59-15:22:00, guest 13:44:23-13:44:25).
+ */
+export const POWER_REPORT_COHORT_WINDOW_S = 2;
+
+/**
+ * A power report whose cohort is at most this many fields is an ISOLATED
+ * change: a button press, a remote, the TCL app. A power ON, and every
+ * reconnect or power-loss restart, makes the unit dump its whole state
+ * instead. Probe 2026-09-27 (raw shadows of all four units): an isolated
+ * power OFF stamped 1 field (Najat shed, 15:26:11Z); the largest incremental
+ * cluster seen anywhere was 3 fields; every full-state report stamped 45-55
+ * fields (Najat 54 and 53, Abdullah 46 after a changeover restart, guest 50).
+ * 10 sits far from both populations, so a remote off that also moves a few
+ * fan/compressor fields in the same second still reads isolated, while a
+ * reconnect dump can never pass.
+ */
+export const ISOLATED_POWER_REPORT_MAX_COHORT = 10;
+
+/**
+ * A cluster of at least this many fields stamped within
+ * +-POWER_REPORT_COHORT_WINDOW_S of each other is a FULL-STATE report: the dump
+ * a unit sends when it powers ON (or reconnects / restarts). Probe 2026-09-27:
+ * every full-state report stamped 45-55 fields (Najat 54 and 53, Abdullah 46,
+ * Abdu 46, guest 50) and no incremental cluster exceeded 3. 20 is under half
+ * the smallest dump, which leaves room for fields that re-stamp while the unit
+ * runs (temperatures, compressor figures: Najat's 15:21:59 dump still held all
+ * 55 of its fields six minutes later) and stays far above any incremental burst.
+ */
+export const FULL_STATE_MIN_FIELDS = 20;
+
+/** Newest epoch-seconds timestamp inside one field's metadata (arrays and
+ * nested objects carry per-element stamps), or null. */
+function metadataTimestampSec(meta: unknown, depth = 0): number | null {
+  if (meta == null || typeof meta !== "object" || depth > 4) return null;
+  const own = (meta as { timestamp?: unknown }).timestamp;
+  if (typeof own === "number" && Number.isFinite(own)) return own;
+  let newest: number | null = null;
+  for (const child of Array.isArray(meta) ? meta : Object.values(meta)) {
+    const t = metadataTimestampSec(child, depth + 1);
+    if (t != null && (newest == null || t > newest)) newest = t;
+  }
+  return newest;
+}
+
+export interface PowerReportInfo {
+  /** Epoch ms of the second `powerSwitch` was last reported in (null if unknown). */
+  powerReportedAt: number | null;
+  /** How many reported fields share that report (+-POWER_REPORT_COHORT_WINDOW_S), itself included. */
+  powerReportCohort: number | null;
+  /**
+   * Epoch ms of the EARLIEST second of the newest full-state report (a cluster
+   * of >= FULL_STATE_MIN_FIELDS fields other than `powerSwitch`), or null.
+   */
+  fullStateReportAt: number | null;
+}
+
+/** The newest full-state cluster among the non-power fields: its earliest second, or null. */
+function newestFullStateSec(stampsSec: readonly number[]): number | null {
+  const candidates = [...new Set(stampsSec)].sort((a, b) => b - a);
+  for (const t of candidates) {
+    const members = stampsSec.filter((s) => Math.abs(s - t) <= POWER_REPORT_COHORT_WINDOW_S);
+    if (members.length >= FULL_STATE_MIN_FIELDS) return Math.min(...members);
+  }
+  return null;
+}
+
+/** When `powerSwitch` was last reported, whether it came alone or inside a full-state dump, and when the newest dump was. */
+export function powerReportInfo(metadataReported: Record<string, unknown> | undefined): PowerReportInfo {
+  const unknown: PowerReportInfo = { powerReportedAt: null, powerReportCohort: null, fullStateReportAt: null };
+  const powerSec = metadataReported ? metadataTimestampSec(metadataReported.powerSwitch) : null;
+  if (powerSec == null || powerSec <= 0) return unknown;
+  let cohort = 0;
+  const otherStamps: number[] = [];
+  for (const [field, meta] of Object.entries(metadataReported ?? {})) {
+    const t = metadataTimestampSec(meta);
+    if (t == null) continue;
+    if (Math.abs(t - powerSec) <= POWER_REPORT_COHORT_WINDOW_S) cohort++;
+    if (field !== "powerSwitch") otherStamps.push(t);
+  }
+  const fullSec = newestFullStateSec(otherStamps);
+  return {
+    powerReportedAt: powerSec * 1000,
+    powerReportCohort: cohort,
+    fullStateReportAt: fullSec != null ? fullSec * 1000 : null,
+  };
+}
+
+/**
+ * Did the unit ITSELF go off AFTER our power ON landed? `sinceMs` is when our
+ * power ON was published. AWS stamps a field when the update REACHES AWS, so an
+ * isolated OFF stamp after our send alone does not prove order (a late-delivered
+ * off can carry a stamp after a send it physically preceded). What does prove
+ * it: a unit's own reports travel in order over its single MQTT connection, so
+ * the full-state dump its ON produced, followed by a LONE powerSwitch report, is
+ * "our ON landed, then someone switched it off". So all of:
+ *  - power is false;
+ *  - the newest full-state report (>= FULL_STATE_MIN_FIELDS fields) started in
+ *    the send's second or later: our ON's dump, not an older one;
+ *  - the powerSwitch report came after that dump started;
+ *  - and it came ALONE (cohort <= ISOLATED_POWER_REPORT_MAX_COHORT), so it is
+ *    not itself part of a dump (a reconnect).
+ * Anything else is ambiguous and answers false, which keeps today's lag
+ * reading: no metadata, no post-send dump (the unit never applied our ON:
+ * Najat drops commands), a dump after the off, or an off inside a dump.
+ */
+export function isolatedPowerOffAfter(
+  dev: Pick<AcDevice, "power" | "powerReportedAt" | "powerReportCohort" | "fullStateReportAt">,
+  sinceMs: number,
+): boolean {
+  if (dev.power || !(sinceMs > 0)) return false;
+  const reportedAt = dev.powerReportedAt ?? null;
+  const cohort = dev.powerReportCohort ?? null;
+  const dumpAt = dev.fullStateReportAt ?? null;
+  if (reportedAt == null || cohort == null || dumpAt == null) return false;
+  if (dumpAt < Math.floor(sinceMs / 1000) * 1000) return false;
+  if (reportedAt <= dumpAt) return false;
+  return cohort <= ISOLATED_POWER_REPORT_MAX_COHORT;
+}
+
+/**
  * Online decision: trust TCL's flag when it says online (it only ever gives
  * false negatives), otherwise require a FRESH shadow. A shadow with no
  * freshness metadata falls back to the legacy "has shadow = online" behavior.
@@ -87,6 +210,46 @@ export interface AcAction {
 }
 
 export type AcVerifiedProfileResult = "applied" | "superseded";
+
+/**
+ * `sendControlVerified`: "sent" when the cloud accepted the publish AND no newer
+ * command of the same field had claimed it by the time the call returns.
+ * Otherwise "superseded" (the newer command was a raw OFF: leveler, automation,
+ * timer) or "superseded_by_user" (a newer dashboard tap), whether the loss
+ * happened before this command's publish (nothing sent) or after it (sent, then
+ * overridden while its saved-state restore ran). Either way the caller must run
+ * none of its post-send bookkeeping: the newer command's state is the truth
+ * (2026-09-27, rounds 4 and 5).
+ */
+export type VerifiedControlOutcome = "sent" | "superseded" | "superseded_by_user";
+
+/** Thrown by the publish-boundary guard; `sendControlVerified` turns it into "superseded". */
+export class ControlSupersededError extends Error {
+  constructor(readonly deviceId: string) {
+    super(`control for ${deviceId} superseded by a newer command before it was published`);
+    this.name = "ControlSupersededError";
+  }
+}
+
+/**
+ * `executeAcAction` with power 1: the powerSwitch publish was ACCEPTED, then
+ * the profile publish failed. The unit is (or is about to be) ON, so a caller
+ * that books ONs must treat it as sent, not refused (2026-09-27: a leveler
+ * restore whose profile failed was booked as failed, never tracked, and the
+ * shed stayed eligible for another restore that could reverse a human's OFF).
+ * Callers that only care about success keep treating it as an error.
+ */
+export class AcProfileNotAppliedError extends Error {
+  readonly powerAccepted = true;
+  constructor(readonly deviceId: string, cause: unknown) {
+    super(`power ON accepted for ${deviceId} but the profile publish failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "AcProfileNotAppliedError";
+  }
+}
+
+export function isPowerAcceptedError(err: unknown): err is AcProfileNotAppliedError {
+  return err instanceof AcProfileNotAppliedError;
+}
 export type AcActionExecutionResult = "applied" | "suppressed";
 
 export interface AcActionExecutionOptions {
@@ -116,6 +279,17 @@ export interface AcDevice {
   isOnline: boolean;
   /** Epoch ms of the device's last shadow report (null if unknown) — drives "last seen" + the offline check. */
   lastSeenAt: number | null;
+  /**
+   * Epoch ms of the second the shadow's `powerSwitch` was last reported in, and
+   * how many reported fields share that report (see `powerReportInfo`). Lets an
+   * observed OFF after our ON be told apart: a lone report after the send is a
+   * human, a stale report or a full-state dump is not (`isolatedPowerOffAfter`).
+   * Optional: null/absent when the shadow carried no metadata.
+   */
+  powerReportedAt?: number | null;
+  powerReportCohort?: number | null;
+  /** Earliest second (ms) of the newest full-state report: the dump a power ON makes. */
+  fullStateReportAt?: number | null;
   power: boolean;
   mode: number;
   targetTemp: number;
@@ -433,6 +607,13 @@ export class TclCloud {
     value: unknown,
     skipRestore = false,
     preserveProfileIntent = false,
+    /**
+     * Publish-boundary guard (2026-09-27): evaluated immediately before each
+     * publish starts, with no await in between, so a newer command that claimed
+     * this field while this one waited (tokens, re-auth) is never overwritten by
+     * it. False → `ControlSupersededError`, nothing published.
+     */
+    stillCurrent?: () => boolean,
   ): Promise<void> {
     // Raw leveler/calibration controls do not pass through the verified UI
     // wrapper. If one lands while a manual preset verifier is pending, make it
@@ -448,7 +629,7 @@ export class TclCloud {
     if (command === "set_power" && value === 1) {
       const desired: Record<string, unknown> = { powerSwitch: 1 };
       try {
-        await this.publishShadowUpdate(deviceId, desired);
+        await this.publishControl(deviceId, desired, stillCurrent);
       } catch (err) {
         const msg = (err as Error).message ?? "";
         const name = (err as { name?: string }).name ?? "";
@@ -458,14 +639,14 @@ export class TclCloud {
           this.tokenExpiry = 0;
           this.tokenData = null;
           await this.ensureValidTokens();
-          await this.publishShadowUpdate(deviceId, desired);
+          await this.publishControl(deviceId, desired, stillCurrent);
         } else {
           throw err;
         }
       }
       log.info(`[tcl] Control ${command}=${value} → device ${deviceId}: OK`);
       if (!skipRestore) {
-        await this.restoreLastState(deviceId);
+        await this.restoreLastState(deviceId, stillCurrent);
       }
       return;
     }
@@ -486,7 +667,7 @@ export class TclCloud {
         throw new Error(`Invalid swing value: ${v}`);
       }
       try {
-        await this.publishShadowUpdate(deviceId, desired);
+        await this.publishControl(deviceId, desired, stillCurrent);
       } catch (err) {
         const msg = (err as Error).message ?? "";
         const name = (err as { name?: string }).name ?? "";
@@ -496,7 +677,7 @@ export class TclCloud {
           this.tokenExpiry = 0;
           this.tokenData = null;
           await this.ensureValidTokens();
-          await this.publishShadowUpdate(deviceId, desired);
+          await this.publishControl(deviceId, desired, stillCurrent);
         } else {
           throw err;
         }
@@ -519,7 +700,7 @@ export class TclCloud {
         desired = { windSpeed: v, silenceSwitch: 0, turbo: 0 };
       }
       try {
-        await this.publishShadowUpdate(deviceId, desired);
+        await this.publishControl(deviceId, desired, stillCurrent);
       } catch (err) {
         const msg = (err as Error).message ?? "";
         const name = (err as { name?: string }).name ?? "";
@@ -529,7 +710,7 @@ export class TclCloud {
           this.tokenExpiry = 0;
           this.tokenData = null;
           await this.ensureValidTokens();
-          await this.publishShadowUpdate(deviceId, desired);
+          await this.publishControl(deviceId, desired, stillCurrent);
         } else {
           throw err;
         }
@@ -562,7 +743,7 @@ export class TclCloud {
     }
     const desired: Record<string, unknown> = advancedPayload ?? { [prop]: value };
     try {
-      await this.publishShadowUpdate(deviceId, desired);
+      await this.publishControl(deviceId, desired, stillCurrent);
     } catch (err) {
       const msg = (err as Error).message ?? "";
       const name = (err as { name?: string }).name ?? "";
@@ -572,7 +753,7 @@ export class TclCloud {
         this.tokenExpiry = 0;
         this.tokenData = null;
         await this.ensureValidTokens();
-        await this.publishShadowUpdate(deviceId, desired);
+        await this.publishControl(deviceId, desired, stillCurrent);
       } else {
         throw err;
       }
@@ -862,11 +1043,17 @@ export class TclCloud {
         // Always attempt shadow fetch — TCL's isOnline flag is unreliable
         let shadow: Record<string, number> = {};
         let reportedAt: number | null = null;
+        let powerReport: PowerReportInfo = { powerReportedAt: null, powerReportCohort: null, fullStateReportAt: null };
         if (this.awsCreds) {
           try {
             const result = await this.getThingShadow(dev.deviceId);
             shadow = result.reported;
             reportedAt = result.reportedAt;
+            powerReport = {
+              powerReportedAt: result.powerReportedAt ?? null,
+              powerReportCohort: result.powerReportCohort ?? null,
+              fullStateReportAt: result.fullStateReportAt ?? null,
+            };
           } catch (err) {
             log.warn(`[tcl] Shadow read failed for ${dev.deviceId}:`, (err as Error).message);
           }
@@ -899,6 +1086,9 @@ export class TclCloud {
           capabilities,
           isOnline: online,
           lastSeenAt: reportedAt,
+          powerReportedAt: powerReport.powerReportedAt,
+          powerReportCohort: powerReport.powerReportCohort,
+          fullStateReportAt: powerReport.fullStateReportAt,
           power: shadow.powerSwitch != null ? shadow.powerSwitch === 1 : powerFromId?.value === 1,
           mode: shadow.workMode ?? 0,
           targetTemp: shadow.targetTemperature ?? 24,
@@ -953,7 +1143,9 @@ export class TclCloud {
     return devices.sort((a, b) => a.displayOrder - b.displayOrder);
   }
 
-  private async getThingShadow(deviceId: string): Promise<{ reported: Record<string, number>; reportedAt: number | null }> {
+  private async getThingShadow(
+    deviceId: string,
+  ): Promise<{ reported: Record<string, number>; reportedAt: number | null } & Partial<PowerReportInfo>> {
     if (!this.awsCreds) throw new Error("No AWS credentials");
 
     const region = this.awsCreds.region;
@@ -980,7 +1172,14 @@ export class TclCloud {
     return {
       reported: shadow.state?.reported ?? {},
       reportedAt: latestReportedAtMs(shadow.metadata?.reported),
+      ...powerReportInfo(shadow.metadata?.reported),
     };
+  }
+
+  /** Not async on purpose: the guard runs synchronously and the publish starts in the same tick. */
+  private publishControl(deviceId: string, desired: Record<string, unknown>, stillCurrent?: () => boolean): Promise<void> {
+    if (stillCurrent && !stillCurrent()) throw new ControlSupersededError(deviceId);
+    return this.publishShadowUpdate(deviceId, desired);
   }
 
   private async publishShadowUpdate(deviceId: string, desired: Record<string, unknown>): Promise<void> {
@@ -1203,6 +1402,17 @@ export class TclCloud {
     const safeAction = this.sanitizeAcAction(deviceId, action);
     if (!safeAction) throw new Error(`Unknown AC device: ${deviceId}`);
 
+    // A raw OFF sent here (leveler shed, automation off, timer, calibration) is
+    // newer, protective intent than a pending dashboard set_power command: claim
+    // the generation so that command's verify loop stops instead of reading this
+    // landed OFF as "my ON not applied" and re-sending it (2026-09-26 14:26Z: a
+    // user-ON verifier re-sent ON 2.8 s after the leveler's power_off), and so an
+    // initial dashboard ON still waiting to publish is never sent at all (the
+    // publish-boundary guard in sendControl). Only an OFF supersedes: a raw ON (a
+    // leveler restore, an automation) must never silence the user's own OFF
+    // (manual wins; that off is already locked and its verifier keeps re-sending).
+    if (safeAction.power === 0) this.supersedeControlVerify(deviceId, "set_power");
+
     if (safeAction.power === 0) {
       await this.sendControl(deviceId, "set_power", 0, false, true);
       return "applied";
@@ -1219,6 +1429,15 @@ export class TclCloud {
       await this.publishWithRetry(deviceId, { powerSwitch: 1 });
       log.info(`[tcl] Power ON sent to device ${deviceId}, waiting for boot`);
       await new Promise(r => setTimeout(r, 3000));
+      // The ON is on its way to the unit from here: a profile failure must not
+      // read as "nothing was sent" to a caller that books ONs (the leveler's
+      // restore, the collector's server-ON stamp). See AcProfileNotAppliedError.
+      try {
+        await this.publishAcProfile(deviceId, desired);
+      } catch (err) {
+        throw new AcProfileNotAppliedError(deviceId, err);
+      }
+      return "applied";
     }
 
     if (hasProfile) await this.publishAcProfile(deviceId, desired);
@@ -1409,7 +1628,20 @@ export class TclCloud {
    * restoreLastState, and they bypass the route hooks so no duplicate
    * manual-intent recording happens.
    */
-  async sendControlVerified(deviceId: string, command: string, value: unknown): Promise<void> {
+  async sendControlVerified(
+    deviceId: string,
+    command: string,
+    value: unknown,
+    /**
+     * The caller's post-send bookkeeping, SYNCHRONOUS, invoked in the same tick
+     * as the final "still current" check and only when it passes (2026-09-27,
+     * Sol round 6). The caller cannot do this after awaiting the result: a newer
+     * command can claim the field in the microtask gap between this function's
+     * return and the caller's continuation, and ON bookkeeping would then land
+     * on top of it. Never invoked for a superseded outcome.
+     */
+    onSent?: () => void,
+  ): Promise<VerifiedControlOutcome> {
     // A newer direct user command makes any pending frozen last-state snapshot
     // stale: cancel it (which also un-freezes state-save, since the user's new
     // state is now the one to remember) so the restore cannot revert this write
@@ -1429,6 +1661,10 @@ export class TclCloud {
     const genKey = `${deviceId}:${command}`;
     const generation = (this.controlGenerations.get(genKey) ?? 0) + 1;
     this.controlGenerations.set(genKey, generation);
+    this.controlClaimedBy.set(genKey, "user");
+    const stillCurrent = () => this.controlGenerations.get(genKey) === generation;
+    const lostTo = (): VerifiedControlOutcome =>
+      this.controlClaimedBy.get(genKey) === "user" ? "superseded_by_user" : "superseded";
 
     const payload = this.controlShadowPayload(deviceId, command, value);
     let pre: Record<string, number> | null = null;
@@ -1439,13 +1675,39 @@ export class TclCloud {
         // No pre-state — verification still runs, external-change detection degrades gracefully.
       }
     }
-    await this.sendControl(deviceId, command, value, false, true);
-    if (!payload) return;
+    // RULE A (2026-09-27, Sol rechecks 3-5): every publish this command can make
+    // is guarded at its publish boundary (`publishControl`: the check and the
+    // publish start in the same tick, after every token/re-auth await): the
+    // initial send, the saved-state restore that follows a power ON inside
+    // sendControl, and every verifier resend. A newer command of the same field
+    // (a protective OFF through executeAcAction, another dashboard tap) that
+    // claimed the generation during ANY wait wins; per-await checks kept missing
+    // the next await.
+    try {
+      await this.sendControl(deviceId, command, value, false, true, stillCurrent);
+    } catch (err) {
+      if (!(err instanceof ControlSupersededError)) throw err;
+      log.warn(`[tcl] ${command}=${String(value)} on ${deviceId} superseded by a newer command before it was sent; not sent`);
+      return lostTo();
+    }
+    // RULE B: the outcome reflects the FINAL generation. A newer command that
+    // arrived after our publish (e.g. a leveler OFF while the power ON's
+    // saved-state restore waited) owns the field now; reporting "sent" would let
+    // the caller run ON bookkeeping over it (the route's onUserPowerOn clearing
+    // the newer shed). No verify loop either: it would only stop at once.
+    if (!stillCurrent()) {
+      log.warn(`[tcl] ${command}=${String(value)} on ${deviceId} was sent, then superseded by a newer command; reporting superseded`);
+      return lostTo();
+    }
+    // Same tick as the check above: nothing can claim the field in between.
+    onSent?.();
+    if (!payload) return "sent";
     // Fire-and-forget — the route responds immediately; kept on a field so
     // tests can await the loop.
-    this.lastControlVerify = this.verifyControlApplied(deviceId, command, payload, pre, generation).catch((err) => {
+    this.lastControlVerify = this.verifyControlApplied(deviceId, command, payload, pre, generation, stillCurrent).catch((err) => {
       log.warn(`[tcl] Verify-resend loop failed for ${command} on ${deviceId}: ${(err as Error).message}`);
     });
+    return "sent";
   }
 
   private lastControlVerify: Promise<void> | null = null;
@@ -1464,12 +1726,25 @@ export class TclCloud {
    */
   private controlGenerations = new Map<string, number>();
 
+  /** Bump a verify generation without starting a loop: any pending verifier of that field stops. */
+  private supersedeControlVerify(deviceId: string, command: string): void {
+    const genKey = `${deviceId}:${command}`;
+    this.controlGenerations.set(genKey, (this.controlGenerations.get(genKey) ?? 0) + 1);
+    this.controlClaimedBy.set(genKey, "system");
+  }
+
+  /** Who made the latest generation claim per `(deviceId, command)`: a dashboard
+   * command ("user") or a raw OFF through executeAcAction ("system"). Only read
+   * to word a superseded outcome honestly. */
+  private controlClaimedBy = new Map<string, "user" | "system">();
+
   private async verifyControlApplied(
     deviceId: string,
     command: string,
     payload: Record<string, number>,
     pre: Record<string, number> | null,
     generation: number,
+    stillCurrent: () => boolean,
   ): Promise<void> {
     const genKey = `${deviceId}:${command}`;
     for (let attempt = 1; attempt <= CONTROL_VERIFY_MAX_RESENDS + 1; attempt++) {
@@ -1485,6 +1760,14 @@ export class TclCloud {
         return;
       }
       const reported = (await this.getThingShadow(deviceId)).reported;
+      // …and again after every await: a newer command can arrive while the
+      // shadow read is in flight, and this loop must not republish over it
+      // (2026-09-27: the check above alone let a leveler OFF that landed during
+      // the read be answered with the user's stale ON).
+      if (this.controlGenerations.get(genKey) !== generation) {
+        log.info(`[tcl] ${command} on ${deviceId} superseded by a newer command during the shadow read; verify stopped`);
+        return;
+      }
       const mismatched = Object.keys(payload).filter((k) => reported[k] !== payload[k]);
       if (mismatched.length === 0) {
         if (attempt > 1) log.info(`[tcl] ${command} on ${deviceId} confirmed after ${attempt - 1} re-send(s)`);
@@ -1502,14 +1785,28 @@ export class TclCloud {
         return;
       }
       log.info(`[tcl] ${command} on ${deviceId} not applied (shadow still ${mismatched.map((k) => `${k}=${reported[k]}`).join(", ")}) — re-sending (${attempt}/${CONTROL_VERIFY_MAX_RESENDS})`);
-      await this.publishWithRetry(deviceId, payload);
+      // RULE A: the resend is guarded at its publish boundary, after the token
+      // wait and any re-auth inside publishWithRetry (the checks above cannot
+      // see a newer command that arrives during those awaits).
+      try {
+        await this.publishWithRetry(deviceId, payload, stillCurrent);
+      } catch (err) {
+        if (!(err instanceof ControlSupersededError)) throw err;
+        log.info(`[tcl] ${command} on ${deviceId} superseded by a newer command before its resend; verify stopped`);
+        return;
+      }
     }
   }
 
-  private async publishWithRetry(deviceId: string, payload: Record<string, unknown>): Promise<void> {
+  private async publishWithRetry(
+    deviceId: string,
+    payload: Record<string, unknown>,
+    /** Publish-boundary guard, see sendControl. */
+    stillCurrent?: () => boolean,
+  ): Promise<void> {
     await this.ensureValidTokens();
     try {
-      await this.publishShadowUpdate(deviceId, payload);
+      await this.publishControl(deviceId, payload, stillCurrent);
     } catch (err) {
       const msg = (err as Error).message ?? "";
       const name = (err as { name?: string }).name ?? "";
@@ -1519,7 +1816,7 @@ export class TclCloud {
         this.tokenExpiry = 0;
         this.tokenData = null;
         await this.ensureValidTokens();
-        await this.publishShadowUpdate(deviceId, payload);
+        await this.publishControl(deviceId, payload, stillCurrent);
       } else {
         throw err;
       }
@@ -1617,15 +1914,21 @@ export class TclCloud {
     return desired;
   }
 
-  private async restoreLastState(deviceId: string): Promise<void> {
+  private async restoreLastState(deviceId: string, stillCurrent?: () => boolean): Promise<void> {
     const saved = this.lastState[deviceId];
     if (!saved || Object.keys(saved).length === 0) return;
     try {
       await new Promise(r => setTimeout(r, 1000));
       const payload = this.restorableState(deviceId, saved);
-      await this.publishRestorableState(deviceId, payload, this.isChsaModel(deviceId));
+      await this.publishRestorableState(deviceId, payload, this.isChsaModel(deviceId), stillCurrent);
       log.info(`[tcl] Restored last state for device ${deviceId}:`, JSON.stringify(payload));
     } catch (err) {
+      if (err instanceof ControlSupersededError) {
+        // The ON this restore belonged to was overridden while it waited: its
+        // saved profile must not land on top of the newer command (RULE A).
+        log.info(`[tcl] Last-state restore for ${deviceId} stopped: its power ON was superseded by a newer command`);
+        return;
+      }
       log.warn(`[tcl] Failed to restore last state for ${deviceId}:`, (err as Error).message);
     }
   }
@@ -1642,15 +1945,16 @@ export class TclCloud {
     deviceId: string,
     payload: Record<string, unknown>,
     isChsa: boolean,
+    stillCurrent?: () => boolean,
   ): Promise<void> {
     // The CHSD fan block must travel alone. Use the explicit current-shadow
     // family during power-cycle recovery because the cached device can still
     // describe the pre-event report.
     const split = isChsa ? { main: payload, fan: null } : this.splitFanPayload(deviceId, payload);
-    await this.publishShadowUpdate(deviceId, split.main);
+    await this.publishControl(deviceId, split.main, stillCurrent);
     if (split.fan) {
       await this.profileSplitDelay();
-      await this.publishShadowUpdate(deviceId, split.fan);
+      await this.publishControl(deviceId, split.fan, stillCurrent);
     }
   }
 

@@ -286,6 +286,218 @@ describe("escalation settle (2026-08-02 trim → double shed in 7 seconds)", () 
     });
   });
 
+  // -------------------------------------------------------------------------
+  // The fourth face (2026-09-23..26, invariant 77): both holds keyed on
+  // `mode === "SETTLING"`, and SETTLING is SETTLE_MS (30s) after the batch,
+  // while the protection they give is defined by the CUT: `settling` per
+  // `cutTrendOf` lasts CREDIT_LANDING_GRACE_MS (60s). Two constants for one
+  // window (hard rule 5c class). For a cut aged 30 to 60s the mode had already
+  // flipped to NORMAL, both holds were false, and a second room went off while
+  // the first shed was still landing. Five live pairs, every second shed at
+  // mode NORMAL: 08:53:51→08:54:23 (31.45s), 15:35:56→15:36:27 (30.25s, the
+  // meter had not moved: pre 16.074 at both ticks), 03:58:55→03:59:26 (30.60s),
+  // 04:47:51→04:48:31 (39.87s, the priority-#1 room), 14:26:07→14:26:41.
+  // -------------------------------------------------------------------------
+  describe("…and the holds track the CUT's landing grace, not the 30s settle mode (2026-09-26)", () => {
+    // Same geometry as the 2026-08-06 block: the outrun void has zeroed the
+    // credit, the meter sits above the anchor, nothing has fallen, so the cut
+    // reads `settling` for as long as it is younger than the grace.
+    const inFlight = (readings: number[], smoothed: number, over: Partial<MeterView> = {}): MeterView => ({
+      ...overMeter(readings, smoothed),
+      commandedCutCreditAmps: 0,
+      commandedCutTotalAmps: 4.0,
+      commandedCutAnchorAmps: smoothed - 1.0,
+      commandedCutAgeMs: 31_000,
+      ...over,
+    });
+    // The extension exists for an OFF in flight, so these houses carry the
+    // room the first shed switched off.
+    const withShed = (): AcView[] => [...pinned(), ac("c", { on: false, shed: true, currentLevel: 1, needDelta: 0.2 })];
+    const offs = (commands: Command[]) => commands.filter((c) => c.kind === "power_off");
+    const held = (out: ReturnType<typeof run>) => out.decisions.some((d) => d.blockedBy === "escalation settle");
+
+    // Every live second shed was MILD, a mean a few tenths over (#9180 geometry).
+    it("holds a MILD shed at cut age 31s with the mode already NORMAL", () => {
+      const out = run(withShed(), inFlight([15.4], 15.4));
+      expect(out.severity).toBe("mild");
+      expect(offs(out.commands)).toHaveLength(0);
+      expect(held(out)).toBe(true);
+    });
+
+    it("still holds it at 59s, one second inside the landing grace", () => {
+      const out = run(withShed(), inFlight([15.4], 15.4, { commandedCutAgeMs: 59_000 }));
+      expect(out.severity).toBe("mild");
+      expect(offs(out.commands)).toHaveLength(0);
+      expect(held(out)).toBe(true);
+    });
+
+    it("releases at 61s: the cut is `stalled`, and a stalled cut is not protection", () => {
+      const out = run(withShed(), inFlight([15.4], 15.4, { commandedCutAgeMs: 61_000 }));
+      expect(out.severity).toBe("mild");
+      expect(offs(out.commands)).toHaveLength(1);
+      expect(held(out)).toBe(false);
+    });
+
+    it("releases once the mean has been over 45s: TIME promotes it past the mild hold", () => {
+      // SUSTAINED_OVER_SEVERE_MS makes it severe, and a severe cut that is only
+      // `settling` (not visibly falling) is not held past SETTLE_MS.
+      const out = run(withShed(), inFlight([15.4], 15.4, { smoothedOverMs: 46_000 }));
+      expect(out.severity).toBe("severe");
+      expect(offs(out.commands)).toHaveLength(1);
+      expect(held(out)).toBe(false);
+    });
+
+    it("a SEVERE mean that has not moved in 31s is not held (inside SETTLING it still is)", () => {
+      // The deliberate asymmetry: past SETTLE_MS a severe meter that is not
+      // falling is off-lag or a real overload, and the breaker gets the doubt.
+      const normal = run(withShed(), inFlight([16.5], 16.0));
+      expect(normal.severity).toBe("severe");
+      expect(offs(normal.commands)).toHaveLength(1);
+      expect(held(normal)).toBe(false);
+      // …while the invariant-64 hold inside SETTLING is untouched.
+      const settling = run(withShed(), inFlight([16.5], 16.0), { mode: "SETTLING" });
+      expect(offs(settling.commands)).toHaveLength(0);
+      expect(held(settling)).toBe(true);
+    });
+
+    it("a stale shed plus a fresh FAN TRIM that reads arriving does not hold a SEVERE shed (Sol, 2026-09-27)", () => {
+      // Room c was shed long before this cut; the pooled cut is a 0.5A fan
+      // trim (it re-based anchor and age), 31s old and `arriving` (0.2A of
+      // 0.5A gone). The mean is 1.2A over (severe, not extreme) and the two
+      // running rooms have no level or fan left. `arriving` there says nothing
+      // about an OFF in flight, and the 45s promotion cannot release a
+      // severe-arriving hold, so only a shed may answer it.
+      const m: MeterView = {
+        ...overMeter([16.2, 16.2], 16.2),
+        commandedCutCreditAmps: 0.3,
+        commandedCutAnchorAmps: 16.4,
+        commandedCutTotalAmps: 0.5,
+        commandedCutAgeMs: 31_000,
+      };
+      const out = run(withShed(), m);
+      expect(out.severity).toBe("severe");
+      expect(offs(out.commands)).toHaveLength(1);
+      expect(held(out)).toBe(false);
+    });
+
+    it("an ARRIVING cut holds severe inside SETTLING only; at 31s and 59s in NORMAL it sheds", () => {
+      // The 12:56 geometry (2.3 of 2.9 A already gone), aged past SETTLE_MS.
+      // Changed after independent review (2026-09-27): the grace window cannot
+      // tie the pooled cut to an off in flight, and a severe-arriving hold is
+      // not released by the 45s promotion, so severe keeps its pre-fix NORMAL
+      // behaviour (not held). Invariant 64's SETTLING hold is unchanged.
+      const arriving = (ageMs: number): MeterView => ({
+        ...overMeter([16.0, 15.9], 14.24),
+        derateAmps: 1.0,
+        flickerAmps: 0.4,
+        commandedCutCreditAmps: 0.575,
+        commandedCutAnchorAmps: 16.565,
+        commandedCutTotalAmps: 2.9,
+        commandedCutAgeMs: ageMs,
+      });
+      for (const age of [31_000, 59_000]) {
+        const normal = run(withShed(), arriving(age));
+        expect(normal.severity).toBe("severe");
+        expect(offs(normal.commands), `${age}ms`).toHaveLength(1);
+        expect(held(normal), `${age}ms`).toBe(false);
+      }
+      const settling = run(withShed(), arriving(13_000), { mode: "SETTLING" });
+      expect(offs(settling.commands)).toHaveLength(0);
+      expect(held(settling)).toBe(true);
+    });
+
+    it("never holds the EXTREME rung inside the extended window", () => {
+      const out = run(withShed(), inFlight([16.5], 16.0, { smoothedOverMs: 200_000 }));
+      expect(out.severity).toBe("extreme");
+      expect(offs(out.commands)).toHaveLength(1);
+      expect(held(out)).toBe(false);
+    });
+
+    it("a runaway past the extreme bar is never held either (required-sizing escape)", () => {
+      // Credit voided by the outrun, so `required` is the raw figure and a 3A+
+      // deficit classifies extreme on magnitude alone, 31s after the first shed.
+      // (With only two rooms the shed batch is uncapped, invariant 50, so the
+      // count is not the point here: that the rung ACTS is.)
+      const out = run(withShed(), inFlight([19.5, 19.4], 19.4));
+      expect(out.severity).toBe("extreme");
+      expect(offs(out.commands).length).toBeGreaterThanOrEqual(1);
+      expect(held(out)).toBe(false);
+    });
+
+    it("only the SHED rung is extended: past SETTLE_MS levels and fans keep their own pace", () => {
+      // A fan trim arms the same pooled cut, so extending the full settle hold
+      // to the 60s grace froze the fan rung for a minute per gear. The settle
+      // hold keeps the mode window; the next level/fan batch re-arms it.
+      const m: MeterView = {
+        ...overMeter([15.9], 15.2),
+        commandedCutCreditAmps: 0,
+        commandedCutTotalAmps: 4.0,
+        commandedCutAnchorAmps: 15.2,
+        commandedCutAgeMs: 31_000,
+      };
+      const cuttable = [ac("a", { currentLevel: 3, fanSpeed: 5, needDelta: 2 })];
+      const normal = run(cuttable, m);
+      expect(normal.severity).toBe("mild");
+      expect(normal.commands.filter((c) => c.kind === "set_level")).toHaveLength(1);
+      // …inside SETTLING the same covered deficit is still a duplicate (invariant 35).
+      const settling = run(cuttable, m, { mode: "SETTLING" });
+      expect(settling.commands.filter((c) => c.kind === "set_level" || c.kind === "set_fan")).toHaveLength(0);
+      // …and with only a shed left, NORMAL holds it.
+      const floored = run(withShed(), m);
+      expect(offs(floored.commands)).toHaveLength(0);
+      expect(held(floored)).toBe(true);
+    });
+
+    it("a deficit LARGER than the in-flight cut still cuts levels and fans; only the shed rung waits", () => {
+      // The case-E shape (required grew 0.63 → 2.44A, satisfied=false): what is
+      // in flight cannot cover the new deficit, so the level/fan rungs act on
+      // the credited remainder (they would inside SETTLING too). The shed rung
+      // stays held while a MILD deficit's cut is still settling; the escapes
+      // are severity promotion (the mean past +1A, a severe raw streak, or 45s
+      // over) and extreme.
+      const small: Partial<MeterView> = {
+        commandedCutCreditAmps: 0.1,
+        commandedCutTotalAmps: 0.2, // under the 0.3A raw deficit (15.2 - 15 + 0.1 margin)
+        commandedCutAnchorAmps: 15.2,
+        commandedCutAgeMs: 31_000,
+      };
+      const cuttable = [ac("a", { currentLevel: 3, fanSpeed: 5, needDelta: 2 })];
+      const acted = run(cuttable, { ...overMeter([15.9], 15.2), ...small });
+      expect(acted.severity).toBe("mild");
+      expect(acted.commands.filter((c) => c.kind === "set_level")).toHaveLength(1);
+      // …and with no level or fan left, the shed rung is what waits.
+      const floored = run(withShed(), { ...overMeter([15.9], 15.2), ...small });
+      expect(floored.severity).toBe("mild");
+      expect(offs(floored.commands)).toHaveLength(0);
+      expect(held(floored)).toBe(true);
+    });
+
+    it("no room shed: a pooled cut re-based by a fan trim does not extend anything", () => {
+      // The 2026-08-31 stalled-credit shape: a hand-off the house outran, then a
+      // fan trim re-based the pooled clock. Without an off in flight the shed
+      // rung keeps its pre-fix pace.
+      const out = run(pinned(), inFlight([15.4], 15.4));
+      expect(out.severity).toBe("mild");
+      expect(offs(out.commands)).toHaveLength(1);
+      expect(held(out)).toBe(false);
+    });
+
+    it("no cut in flight at all: NORMAL sheds exactly as before (a hold never invents itself)", () => {
+      const out = run(withShed(), overMeter([16.5], 16.0));
+      expect(out.severity).toBe("severe");
+      expect(offs(out.commands)).toHaveLength(1);
+      expect(held(out)).toBe(false);
+    });
+
+    it("FLOORS and GRID_FULL are not widened: the entry windows keep their own policy", () => {
+      for (const mode of ["FLOORS", "GRID_FULL"] as const) {
+        const out = run(withShed(), inFlight([16.5], 16.0), { mode });
+        expect(offs(out.commands), mode).toHaveLength(1);
+        expect(held(out), mode).toBe(false);
+      }
+    });
+  });
+
   it("a fan trim is credited what the planner claimed, not zero", () => {
     // The credit is what shrinks the next evaluation's demand; at zero the
     // reducer re-demanded amps that were already leaving.
@@ -993,5 +1205,88 @@ describe("funded spend (2026-08-31)", () => {
     const out = run(acs, credited(), { fanHolds: holds, pacing });
     expect(out.commands.some((c) => c.kind === "set_fan")).toBe(false);
     expect(out.decisions.some((d) => d.blockedBy === "restore reservation")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// STREAM G (2026-09-27). Owner decisions that day: "Grid fast lane: YES" and
+// "Budget-aware full start: YES" (the latter supersedes the 2026-07-23/24 blind
+// "on grid start all to full, then drop"). The planner-level arithmetic is
+// pinned in grid-start.test.ts and grid-lane.test.ts; these pin the pipeline's
+// half: which ticks may use the lane at all, and the GRID_FULL wiring.
+// ---------------------------------------------------------------------------
+describe("G2 grid roomy lane: the situational gate (pipeline)", () => {
+  // Grid, 12A on a 30A line, calm for 5 s only (raise calm is 30 s).
+  const gridMeter = (over: Partial<MeterView> = {}): MeterView =>
+    meter({ source: "grid", smoothedAmps: 12, latestAmps: 12, calmMs: 5_000, ...over });
+  const room = () => [ac("a", { currentLevel: 1, needDelta: 2 })];
+  const raised = (out: ReturnType<typeof run>) => levelsFor(out.commands, "a").map((c) => c.level);
+
+  it("a quiet grid tick raises inside the calm window, journaled", () => {
+    const out = run(room(), gridMeter(), { nonAcAmps: 6 });
+    expect(raised(out)).toEqual([2]);
+    expect(out.decisions.some((d) => (d.detail ?? "").includes("grid roomy lane:"))).toBe(true);
+  });
+
+  it("…and inside a settle window (SETTLING) too", () => {
+    const out = run(room(), gridMeter(), { nonAcAmps: 6, mode: "SETTLING" });
+    expect(raised(out)).toEqual([2]);
+    expect(out.reason).toBe("raise");
+  });
+
+  it("closed after a recent over-limit batch (the swap's quiet rule)", () => {
+    const out = run(room(), gridMeter(), { nonAcAmps: 6, overLimitActedRecently: true });
+    expect(raised(out)).toEqual([]);
+    const settling = run(room(), gridMeter(), { nonAcAmps: 6, overLimitActedRecently: true, mode: "SETTLING" });
+    expect(settling.reason).toBe("settling");
+  });
+
+  it("closed under a derate, a collapse or a frozen meter", () => {
+    expect(raised(run(room(), gridMeter({ derateAmps: 1 }), { nonAcAmps: 6 }))).toEqual([]);
+    expect(raised(run(room(), gridMeter({ frozen: true }), { nonAcAmps: 6 }))).toEqual([]);
+    expect(raised(run(room(), gridMeter({ collapsed: true }), { nonAcAmps: 6 }))).toEqual([]);
+  });
+
+  it("closed when a correction ships this tick", () => {
+    const acs = [ac("z", { currentLevel: 0 }), ac("a", { currentLevel: 1, needDelta: 2 })];
+    const out = run(acs, gridMeter(), { nonAcAmps: 6 });
+    expect(levelsFor(out.commands, "z")).toHaveLength(1); // the never-level-0 re-cap
+    expect(levelsFor(out.commands, "a")).toHaveLength(0);
+  });
+
+  it("closed when the measured grid house leaves the model short", () => {
+    // house 24 + a L2 (4) = 28 against 29.7: 1.7A spare < 3A.
+    expect(raised(run(room(), gridMeter(), { nonAcAmps: 24 }))).toEqual([]);
+  });
+
+  it("never on gen: the same quiet tick waits for calm, and SETTLING is the settle plan", () => {
+    const gen = (over: Partial<MeterView> = {}) => meter({ source: "gen", smoothedAmps: 8, latestAmps: 8, calmMs: 5_000, ...over });
+    expect(raised(run(room(), gen(), { nonAcAmps: 1 }))).toEqual([]);
+    expect(run(room(), gen(), { nonAcAmps: 1, mode: "SETTLING" }).reason).toBe("settling");
+  });
+});
+
+describe("G1 budget-aware grid full start (pipeline wiring)", () => {
+  const trio = () => [
+    ac("a", { currentLevel: 1, needDelta: 3 }),
+    ac("b", { currentLevel: 1, needDelta: 2 }),
+  ];
+  const gridMeter = meter({ source: "grid", smoothedAmps: 10, latestAmps: 10 });
+
+  it("with room for everything the batch is the blind start's", () => {
+    const out = run(trio(), gridMeter, { mode: "GRID_FULL", nonAcAmps: 5 });
+    expect(out.reason).toBe("grid_full");
+    expect(out.commands).toEqual([
+      { deviceId: "a", kind: "set_level", level: 3 },
+      { deviceId: "b", kind: "set_level", level: 3 },
+    ]);
+    expect(out.decisions).toHaveLength(1);
+  });
+
+  it("with the grid house measured, it lifts only what fits and journals the arithmetic", () => {
+    // house 20 + a 2 + b 2 = 24; a→L3 (+4) = 28; b→L2 = 30 > 29.7 → b holds L1.
+    const out = run(trio(), gridMeter, { mode: "GRID_FULL", nonAcAmps: 20 });
+    expect(out.commands).toEqual([{ deviceId: "a", kind: "set_level", level: 3 }]);
+    expect(out.decisions.some((d) => d.action === "grid-entry budget" && (d.detail ?? "").includes("b holds L1"))).toBe(true);
   });
 });

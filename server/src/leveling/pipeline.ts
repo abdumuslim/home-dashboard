@@ -14,13 +14,13 @@ import { effectiveLimit } from "./config.js";
 import type { CostBook } from "./costs.js";
 import { commandedCutAmpsOf, modelFor, steadyDraw } from "./costs.js";
 import { assessPressure } from "./pressure.js";
-import { cutTrendOf } from "./sensing.js";
+import { CREDIT_LANDING_GRACE_MS, cutTrendOf } from "./sensing.js";
 import { planReduction, SHED_NEED_GAP_C } from "./reduce.js";
-import { invariantCorrections, planRaise, rampDebitAmps, type SwapDecision } from "./raise.js";
+import { invariantCorrections, planGridFullStart, planRaise, rampDebitAmps, type SwapDecision } from "./raise.js";
 import { noteEscalation, planFanRestore, recordFanCut, recordGentleRestoreHold, type FanHolds } from "./fan-trim.js";
-import { ceilOf, floorOf } from "./needs.js";
+import { floorOf } from "./needs.js";
 import { planIdleDemotes } from "./demote.js";
-import { attemptedWithin, canAttempt, RESTORE_CONFIRM_WAIT_MS, type PacingState } from "./pacing.js";
+import type { PacingState } from "./pacing.js";
 
 /** Outcome-grading delays: when the batch's meter effect is judged. */
 export const GRADE_LEVEL_MS = 45_000;
@@ -279,11 +279,63 @@ export function plan(input: PlanInput): PlanOutput {
     // required-sizing are the emergency escape (invariant 48's "fires on
     // stalled" contract stays intact).
     const cutLanding = meter.commandedCutCreditAmps > 0 || cutTrend === "settling";
+    // …and the WINDOW both holds live in is the cut's, not the mode's (2026-09-26,
+    // invariant 77). They keyed on `mode === "SETTLING"`, which is SETTLE_MS (30s)
+    // after the batch, while `settling` above is CREDIT_LANDING_GRACE_MS (60s):
+    // two constants for one window. For a cut aged 30 to 60s the mode had already
+    // flipped to NORMAL and a second room went off while the first shed was still
+    // landing, five times in four days (30.25 to 39.87s apart, the meter flat
+    // between them). So in NORMAL the SHED hold also stays open while the newest
+    // cut is younger than its own landing grace. SETTLING itself is NOT
+    // lengthened: it also parks raises and restores and has the invariant-70
+    // early exit, and that exit fires only once nothing is owed, where the holds
+    // are vacuous anyway. FLOORS and GRID_FULL keep their entry policies
+    // untouched (the holds never applied there).
+    //
+    // ⚠ Only the SHED rung. The settle hold below (which also parks levels and
+    // fans) keeps the mode window: a fan trim arms the same pooled cut, and a
+    // 60s freeze after every trim turned the fan rung's 10s pace
+    // (FAN_SETTLE_MS) into a minute per gear (the 2026-08-31 funded-spend
+    // acceptance caught it). Levels and fans past SETTLE_MS re-plan exactly as
+    // they always have, and every batch they ship re-arms SETTLING.
+    //
+    // ⚠ The extension carries MILD only; SEVERE and EXTREME keep exactly their
+    // pre-2026-09-26 behaviour in NORMAL (not held). Past SETTLE_MS the median
+    // has had its ~12 to 20s to catch up, so a severe mean that has still not
+    // moved is off-lag or a real overload and the meter cannot say which; at
+    // severe magnitude the breaker gets the benefit of the doubt. Staged in the
+    // harness, a severe-settling extension held the ONLY rung left (every level
+    // and fan already spent, the level cut overpriced as in invariant 38) and
+    // pushed the first shed from 40s to 80s at 1.4A over on a 14.9A gen; the
+    // 12:39:57 breaker went after 91s at 0.6 to 1.1A. Severe `arriving` is not
+    // extended either (independent review, 2026-09-27): `roomShed` does not tie
+    // the pooled cut to an off in flight, so a stale shed plus a fresh fan trim
+    // that reads `arriving` would hold a severe shed to 60s, and the 45s
+    // promotion cannot release a severe hold. The live double sheds were all
+    // MILD. Mild is released by two different clocks, neither unconditional: a
+    // flat mean that stays over the limit promotes to severe after 45s (that
+    // clock resets on a reading where the cut is visibly landing), and a single
+    // pooled cut's added grace ends at 60s (a new cut re-bases it). Severe is
+    // never held here. A hold only ever turns a shed into a wait.
+    //
+    // ⚠ And only while a ROOM IS OFF on our record. The pooled cut's clock is
+    // re-based by every cut, a fan trim included, so a trim on top of an old
+    // hand-off (whose amps a heater had quietly replaced) read `settling` again
+    // and held the causer's shed for 40s at 0.4A over (the 2026-08-31 stalled-
+    // credit acceptance caught it). The physics the 60s grace stands for is an
+    // OFF in flight (TCL send-to-confirm, 6s to minutes); a fan trim lands in
+    // seconds and has FAN_SETTLE_MS. With no room shed there is no off in
+    // flight to wait for, and the ladder keeps its pre-2026-09-26 pace.
+    const cutWithinGrace =
+      meter.commandedCutTotalAmps > 0 && meter.commandedCutAgeMs < CREDIT_LANDING_GRACE_MS;
+    const roomShed = acs.some((a) => a.managed && a.shed);
+    const graceWindow = mode === "NORMAL" && cutWithinGrace && roomShed;
     const escalationHold =
-      mode === "SETTLING" &&
       cutLanding &&
-      (pressure.severity === "mild" ||
-        (pressure.severity === "severe" && (cutTrend === "arriving" || cutTrend === "settling")));
+      ((mode === "SETTLING" &&
+        (pressure.severity === "mild" ||
+          (pressure.severity === "severe" && (cutTrend === "arriving" || cutTrend === "settling")))) ||
+        (graceWindow && pressure.severity === "mild"));
     // …and when what we have ALREADY commanded off covers the whole raw
     // deficit, the next batch is not an escalation, it is a duplicate. Live
     // 2026-08-03 00:41Z: three batches in 13 seconds took 12.9A off the house
@@ -293,9 +345,12 @@ export function plan(input: PlanInput): PlanOutput {
     //
     // Compared against `rawRequiredAmps`, not `requiredAmps`: the credit is
     // spent as the meter absorbs it, so the credited figure reads 0 exactly
-    // when the cut is landing. Bounded three ways — SETTLE_MS ends the mode,
+    // when the cut is landing. Bounded three ways — SETTLE_MS ends the mode
+    // (deliberately NOT the cut's landing grace, see the shed-hold note above),
     // PENDING_CUT_MS expires the total, and 45s of mean-over-limit promotes
-    // this to severe, which is never held.
+    // this to severe, which is never held. A deficit that has GROWN past what is
+    // in flight fails the comparison and the level and fan rungs act on it at
+    // once; only the shed rung waits (escalationHold).
     const settleHold =
       pressure.severity === "mild" &&
       mode === "SETTLING" &&
@@ -585,39 +640,31 @@ export function plan(input: PlanInput): PlanOutput {
     };
   }
 
-  // ---- GRID_FULL (no over-pressure): grid entry — drive every ON managed AC
-  // to its ceiling in one batch and restore sheds at theirs ("on grid, start
-  // all to full, then drop when needed" — user 2026-07-23). The over-limit
-  // branch above still wins whenever the meter objects, and a bucket_empty
-  // ends the window entirely (modes.ts) so entry policy never fights the
-  // reducer. Deliberately NOT envelope-guarded: grid is the roomy source and
-  // full-start is an explicit user directive; the reducer is the safety.
+  // ---- GRID_FULL (no over-pressure): grid entry, start high and fast in one
+  // batch. Until 2026-09-27 this drove every ON managed AC to its ceiling blind
+  // ("on grid, start all to full, then drop when needed", user 2026-07-23) and
+  // left the reducer as the safety. Owner decision 2026-09-27, "Budget-aware
+  // full start: YES": the grid house the CT02 measures (the unmanaged guest AC
+  // and every other grid-only load, since 2026-08-29) made that blind start
+  // overshoot 30A (34.4A on 2026-09-26 13:13Z, three severe cut batches in 21 s).
+  // Lifts and restores are now admitted only while the modeled end-state fits,
+  // pins first, then hottest; when everything fits the batch is exactly the old
+  // one. The over-limit branch above still wins whenever the meter objects, and
+  // a bucket_empty still ends the window (modes.ts).
   if (mode === "GRID_FULL") {
-    const commands: Command[] = [];
-    const attempts: Array<{ deviceId: string; kind: "raise" | "restore" }> = [];
-    let isTurnOn = false;
-    for (const ac of acs) {
-      if (!ac.managed) continue;
-      const ceil = ceilOf(ac, config.nearTargetBandC);
-      if (ac.shed && !ac.on) {
-        // Restores ride the pacing backoff so a dead cloud can't be hammered.
-        if (!canAttempt(pacing, ac.deviceId, "restore", now)) continue;
-        // In flight, shadow not confirmed yet — don't re-send every batch.
-        if (attemptedWithin(pacing, ac.deviceId, "restore", RESTORE_CONFIRM_WAIT_MS, now)) continue;
-        commands.push({ deviceId: ac.deviceId, kind: "power_on", level: ceil, reason: "restore" });
-        attempts.push({ deviceId: ac.deviceId, kind: "restore" });
-        isTurnOn = true;
-      } else if (ac.on && !ac.shed && (ac.currentLevel === 0 || ac.currentLevel < ceil)) {
-        commands.push({ deviceId: ac.deviceId, kind: "set_level", level: ceil });
-      }
-    }
+    const start = planGridFullStart({
+      acs,
+      config,
+      limitAmps: limit,
+      houseAmps: input.nonAcAmps ?? 0,
+      pacing,
+      now,
+    });
     return {
-      ...emptyPlan(input, "grid_full", [
-        { at: now, action: "grid-entry full start", detail: "all managed ACs → ceiling; reduce on evidence" },
-      ]),
-      commands,
-      attempts,
-      compareAfter: commands.length > 0 ? now + (isTurnOn ? GRADE_TURN_ON_MS : GRADE_LEVEL_MS) : 0,
+      ...emptyPlan(input, "grid_full", start.decisions),
+      commands: start.commands,
+      attempts: start.attempts,
+      compareAfter: start.commands.length > 0 ? now + (start.isTurnOn ? GRADE_TURN_ON_MS : GRADE_LEVEL_MS) : 0,
     };
   }
 
@@ -651,13 +698,41 @@ export function plan(input: PlanInput): PlanOutput {
    */
   const settlingFundedLane =
     mode === "SETTLING" && spendableCredit > 0 && pressure.kind === "calm" && corrections.commands.length === 0;
-  if (mode === "SETTLING" && !settlingFundedLane) return settlingPlan();
+  /**
+   * GRID ROOMY LANE (owner decision 2026-09-27, "Grid fast lane: YES"): the
+   * SITUATIONAL half of the gate. The per-candidate half (spare ≥
+   * max(GRID_ROOMY_SPARE_AMPS, cost) on the meter AND the model) lives in
+   * planRaise. Seven days of grid: 64% of blocked grid raises/restores were
+   * pacing gates with a median 13A of 30A unused; gen's median was 1.8A, and gen
+   * never reaches this lane.
+   *
+   * The lane exists only while the house is quiet in every way the swap's
+   * quiet rule already asks (and for the same reasons): grid, calm pressure
+   * (never the deliberate `hold` ride), nothing else shipping this tick, no
+   * over-limit batch inside SWAP_QUIET_AFTER_OVER_MS (`overLimitActedRecently`,
+   * the swap's own input), and no derate, collapse or frozen meter. It waives
+   * the calm gate and the settle window and nothing else.
+   */
+  const roomyLaneOpen =
+    source === "grid" &&
+    (mode === "NORMAL" || mode === "SETTLING") &&
+    pressure.kind === "calm" &&
+    corrections.commands.length === 0 &&
+    input.overLimitActedRecently !== true &&
+    meter.derateAmps <= 0 &&
+    !meter.collapsed &&
+    !meter.frozen;
+  const settlingRoomyLane = mode === "SETTLING" && roomyLaneOpen;
+  if (mode === "SETTLING" && !settlingFundedLane && !settlingRoomyLane) return settlingPlan();
 
   // ---- NORMAL + calm: spend headroom (restore ≫ warm ≫ raise ≫ fan restore).
   // Reached in SETTLING too, but only through the funded lane above, and then
   // ONLY a funded candidate may ship (`fundedOnly`).
   if (pressure.kind === "calm") {
-    const fundedOnly = settlingFundedLane;
+    // The settle-window lane: only a spender the in-flight cut pays for, or (on
+    // grid) a roomy one, may ship; everything else is blocked as the settle
+    // window blocks it.
+    const fundedOnly = settlingFundedLane || settlingRoomyLane;
     // Committed-but-unmetered draw of ramping compressors. GEN only, the same
     // split the physics envelope uses: grid starts every AC FULL by explicit
     // user directive and leans on the reducer as its safety, so charging a
@@ -693,6 +768,9 @@ export function plan(input: PlanInput): PlanOutput {
       // buy back the lag, never the trough the cut itself digs (invariant 41).
       spendableCreditAmps: spendableCredit,
       fundedOnly,
+      // The grid house rides HERE, not in `nonAcAmps` above: the lane's model
+      // test is the one grid consumer of the measured house outside GRID_FULL.
+      roomyLane: roomyLaneOpen ? { houseAmps: input.nonAcAmps ?? 0 } : undefined,
       limitAmps: limit,
       calmMs: meter.calmMs,
       config,

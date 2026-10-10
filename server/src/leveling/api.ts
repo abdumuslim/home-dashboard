@@ -11,7 +11,8 @@ export type NeedTier = "satisfied" | "mild" | "full";
 export interface LevelingDeps {
   getTclCloud: () => TclCloud | null;
   broadcast: (payload: Record<string, unknown>) => Promise<void>;
-  setDevicePowerCache: (deviceId: string, power: "on" | "off") => void;
+  /** `at`: when the power command was PUBLISHED (v2 passes it for a restore ON; see the collector). */
+  setDevicePowerCache: (deviceId: string, power: "on" | "off", at?: number) => void;
   isManualOffLocked: (deviceId: string) => Promise<boolean>;
   onLevelerFanCommand: (deviceId: string, fan: number) => void;
   onUrgentLevelingNeeded?: () => void;
@@ -21,6 +22,14 @@ export interface LevelingDeps {
    * observed level jump there), so they stamp ONE number or they drift.
    */
   onPowerEvent?: (kind: string, now: number) => void;
+  /**
+   * A shed room's restore landed and the unit then went off on its own
+   * (2026-09-27). The collector judges it exactly like an observed off and, on
+   * "manual", records the persistent manual-off lock; `true` means the decline
+   * stands, `false` keeps the shed and the ordinary confirm-or-resend. Absent =
+   * never decline.
+   */
+  onRestoreDeclined?: (deviceId: string, sentAt: number, device: AcDevice) => Promise<boolean>;
 }
 
 export interface LevelerDeviceContext {
@@ -117,7 +126,24 @@ export interface LevelingStatusV2 {
   enabled: boolean;
   source: PowerSource;
   measuredAmps: number | null;
+  /** The ENFORCED limit on the active source: configured minus any live derate. */
   limitAmps: number | null;
+  /**
+   * The limit the user configured for the active source (null with no source).
+   * Differs from `limitAmps` only while a trip or strain derate stands; shown so
+   * a derated card does not read as a setting that failed to save (2026-09-26:
+   * the owner set 16 A, saw 15 A, and re-saved three times in 49 s).
+   */
+  configuredLimitAmps?: number | null;
+  /**
+   * The reduction actually enforced: configured minus `limitAmps` (0 when none).
+   * Can be smaller than the raw `derate` sum, because the limit floors at 1 A.
+   */
+  derateAmps?: number;
+  /** The raw live derate split by cause, or null when nothing is derated. */
+  derate?: { collapseAmps: number; strainAmps: number } | null;
+  /** Epoch ms the whole derate will have recovered if no new event arrives; null when none. */
+  derateClearsAt?: number | null;
   budgetAmps: number | null;
   /** Measured worst-case non-AC house load on this source (house-load.ts peak). */
   nonAcLoadAmps: number | null;

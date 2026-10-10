@@ -15,7 +15,7 @@ import type { CostBook } from "./costs.js";
 import { levelCutSavings, modelCutAmps, modelFor, raiseJumpAmps, restoreCostAmps, steadyDraw } from "./costs.js";
 import type { LevelingConfigV2 } from "./config.js";
 import { rampCommittedAmps } from "./dead-window.js";
-import { ceilCapOf, ceilOf, floorOf, isNonCooling } from "./needs.js";
+import { ceilCapOf, ceilOf, floorOf, isNonCooling, worstCaseLevel } from "./needs.js";
 import { SHED_NEED_GAP_C } from "./reduce.js";
 import { PENDING_CUT_MS } from "./sensing.js";
 import {
@@ -332,6 +332,20 @@ export const SWAP_NEED_GAP_C = SHED_NEED_GAP_C;
 export const SWAP_QUIET_AFTER_OVER_MS = PENDING_CUT_MS;
 
 /**
+ * GRID ROOMY LANE (owner decision 2026-09-27, "Grid fast lane: YES"): the spare
+ * a grid raise or restore must leave, on BOTH the meter and the model, before it
+ * may skip the calm gate or the settle window. The candidate's own cost is the
+ * other half of the bar (`max(GRID_ROOMY_SPARE_AMPS, cost)`), so a big step
+ * needs a correspondingly big cushion.
+ *
+ * Evidence (7 days of grid, 2026-09-20..26): 64% of the 290 blocked grid
+ * raise/restore decisions were pacing gates (settle window 128, calm 43), with a
+ * MEDIAN 13A of the 30A line unused at those moments. Gen is untouched: its
+ * median spare at the same gates was 1.8A, below this bar by construction.
+ */
+export const GRID_ROOMY_SPARE_AMPS = 3;
+
+/**
  * How long after a human turns a room ON that room is shielded from being picked
  * as a proactive-shed DONOR (`AcView.recentlyExternalOn`). "Manual wins"
  * (invariant 42) must cover the power button for the COMFORT tool: the swap is
@@ -551,6 +565,22 @@ export interface RaiseInput {
    * Defaults to false, i.e. the ordinary calm-tick admission.
    */
   fundedOnly?: boolean;
+  /**
+   * The GRID ROOMY LANE (2026-09-27), present only when the caller's situational
+   * gate holds (pipeline.ts: grid, calm pressure, no corrections this tick, no
+   * over-limit batch inside `SWAP_QUIET_AFTER_OVER_MS`, no derate, collapse or
+   * frozen meter). Absent means the lane does not exist, which is every gen tick
+   * and every busy grid tick: byte-identical to the admission it extends.
+   *
+   * It waives ONLY the calm gate (restore and raise) and, through `fundedOnly`,
+   * the settle window, and only for a candidate that leaves
+   * `max(GRID_ROOMY_SPARE_AMPS, its own cost)` spare on BOTH the meter test the
+   * admission already uses AND a model test: `houseAmps` (the measured grid
+   * house) plus every managed room's modeled steady draw at its `envelopeLevel`
+   * (unconfirmed sends counted), this batch's admitted commands and the
+   * candidate at its target, against the same ceiling as that kind's meter test.
+   */
+  roomyLane?: { houseAmps: number };
   limitAmps: number;
   calmMs: number;
   config: LevelingConfigV2;
@@ -889,6 +919,60 @@ export function planRaise(input: RaiseInput): RaisePlan {
    */
   const spendableCreditAmps = Math.max(0, input.spendableCreditAmps ?? 0);
   const fundedOnly = input.fundedOnly === true;
+  /**
+   * GRID ROOMY LANE (2026-09-27): see `RaiseInput.roomyLane`. Grid only, belt and
+   * braces on top of the caller's gate, so a gen tick can never reach it.
+   */
+  const roomyLane = source === "grid" ? input.roomyLane ?? null : null;
+  /**
+   * The model half of the roomy test: grid house + every managed room at the
+   * level it is CHARGED for (this batch's own commands first, then
+   * `envelopeLevel`, which already counts unconfirmed sends), plus `extra`. So a
+   * second spend inside one batch, or inside one settle window, sees the first.
+   */
+  const roomyModelAmps = (extra: { deviceId: string; level: number; maxLevel: number }): number => {
+    const sent = new Map<string, number>();
+    const restored: Array<{ deviceId: string; level: number; maxLevel: number }> = [];
+    for (const c of commands) {
+      if (c.kind === "set_level") sent.set(c.deviceId, c.level);
+      if (c.kind === "power_on") {
+        const room = acs.find((a) => a.deviceId === c.deviceId);
+        if (room != null) restored.push({ deviceId: c.deviceId, level: c.level, maxLevel: room.maxLevel });
+      }
+    }
+    // Every running room, the candidate included, at the WORST level the firmware
+    // may still apply: its observed level, its `envelopeLevel` (unconfirmed sends)
+    // and anything this batch or this candidate commands it, with level 0 priced
+    // as unrestricted (`worstCaseLevel`). A new, lower command does not cancel an
+    // unconfirmed higher one on the firmware's side until it confirms
+    // (independent review, 2026-09-27: an L3 in flight priced at a new L2 read
+    // 4.7A of spare where the worst case left 2.7A).
+    const running = onManaged.map((a) => {
+      const levels = [a.currentLevel, a.envelopeLevel];
+      const batch = sent.get(a.deviceId);
+      if (batch != null) levels.push(batch);
+      if (a.deviceId === extra.deviceId) levels.push(extra.level);
+      return { deviceId: a.deviceId, level: worstCaseLevel(levels), maxLevel: a.maxLevel };
+    });
+    // A candidate that is not running (a restore) enters at its own level.
+    const entering = onManaged.some((a) => a.deviceId === extra.deviceId) ? [] : [extra];
+    return (roomyLane?.houseAmps ?? 0) + envelopeTotalAmps([...running, ...restored, ...entering], config, source);
+  };
+  /** Spare left on both tests, or null when the lane is closed or either is short. */
+  const roomySpare = (
+    costAmps: number,
+    meterSpareAmps: number,
+    ceilingAmps: number,
+    extra: { deviceId: string; level: number; maxLevel: number },
+  ): { meter: number; model: number } | null => {
+    if (roomyLane == null) return null;
+    const need = Math.max(GRID_ROOMY_SPARE_AMPS, costAmps);
+    const modelSpareAmps = ceilingAmps - roomyModelAmps(extra);
+    return meterSpareAmps >= need && modelSpareAmps >= need ? { meter: meterSpareAmps, model: modelSpareAmps } : null;
+  };
+  const roomyNote = (spare: { meter: number; model: number }): string =>
+    `grid roomy lane: ${Math.min(spare.meter, spare.model).toFixed(1)}A spare after ` +
+    `(meter ${spare.meter.toFixed(1)}A, model ${spare.model.toFixed(1)}A)`;
   // The meter plus the load already on its way to it, less the load already on
   // its way OFF it: the honest picture of what this house is committed to right
   // now, and never below where a cut in flight is taking it.
@@ -1559,7 +1643,12 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // seconds ago and are leaving it now, so the settled figure is already known.
     // Waiting the window out on top of the median's own lag is what made a
     // dashboard off take ~30–45 s to reach a waiting room.
-    if (!restoreCalmOk && !funded) {
+    // …or unless the grid is ROOMY (2026-09-27): plain fit, and the spare left on
+    // both the meter and the model clears `max(GRID_ROOMY_SPARE_AMPS, cost)`.
+    const roomy = fitsPlain
+      ? roomySpare(cost.amps, ceilingFor - (candidateCommitted + cost.amps), ceilingFor, candidateEntry)
+      : null;
+    if (!restoreCalmOk && !funded && roomy == null) {
       reservedAmps = Math.max(reservedAmps, cost.amps);
       decisions.push({
         at: now,
@@ -1576,7 +1665,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // one opened, which is what this lane exists NOT to do; it ships normally one
     // tick later. `break`, not `continue`: the ordering rule is unchanged, a
     // milder room may not jump a needier one just because it is cheaper.
-    if (fundedOnly && !(funded && fitsPlain)) {
+    if (fundedOnly && !((funded || roomy != null) && fitsPlain)) {
       decisions.push({
         at: now,
         deviceId: candidate.deviceId,
@@ -1614,7 +1703,12 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // (or a settle window) on a prediction, and a prediction that turns out wrong
     // re-sheds into invariant 67's bounce ladder. Say so in the journal.
     const fundedDetail = funded ? fundedNote(spendableCreditAmps) : undefined;
-    const admitDetail = [probeDetail, patienceDetail, fundedDetail].filter(Boolean).join(" · ") || undefined;
+    // …and LOUD when the roomy lane is what let it through (a calm or settle
+    // window it would otherwise have waited out). Silent when neither gate held.
+    const roomyDetail =
+      roomy != null && !funded && (!restoreCalmOk || fundedOnly) ? roomyNote(roomy) : undefined;
+    const admitDetail =
+      [probeDetail, patienceDetail, fundedDetail, roomyDetail].filter(Boolean).join(" · ") || undefined;
     if (fitsPlain) {
       commands.push(restoreCmd());
       attempts.push({ deviceId: candidate.deviceId, kind: "restore", meterAmps: candidateCommitted });
@@ -1830,6 +1924,8 @@ export function planRaise(input: RaiseInput): RaisePlan {
      * baseline, a recently-proven level), neither of which the credit describes.
      */
     let fundedRaise = false;
+    /** Set with `fundedRaise`, on the same ordinary path: the roomy-lane spare, or null. */
+    let roomyRaise: { meter: number; model: number } | null = null;
     // Grid turn-on full start (user directive "on grid start all to full"):
     // an AC that just came on restores its last gen level (usually L1 from the
     // previous gen episode) — lift it to the affordable ceiling in ONE command
@@ -1874,7 +1970,15 @@ export function planRaise(input: RaiseInput): RaisePlan {
       // outright, so nothing more expensive than this can be admitted here.
       const step = raiseJumpAmps(book, config, ac.deviceId, source, ac.currentLevel, ac.currentLevel + 1, ac.maxLevel, now);
       fundedRaise = fundedByCredit(step.amps, spendableCreditAmps);
-      if (!raiseCalmOk && !fundedRaise) {
+      // GRID ROOMY LANE (2026-09-27): the same one-step target, tested on the
+      // meter budget this phase already uses (`available`, to the resting
+      // ceiling) and on the model against that same ceiling.
+      roomyRaise = roomySpare(step.amps, available - step.amps, restingCeiling, {
+        deviceId: ac.deviceId,
+        level: ac.currentLevel + 1,
+        maxLevel: ac.maxLevel,
+      });
+      if (!raiseCalmOk && !fundedRaise && roomyRaise == null) {
         decisions.push({ at: now, deviceId: ac.deviceId, action: "raise", blockedBy: "calm" });
         continue;
       }
@@ -2021,7 +2125,7 @@ export function planRaise(input: RaiseInput): RaisePlan {
     // step that may ship is one the in-flight cut pays for AND the budget already
     // holds. No funding demotes and no entry policies here: a cut is already
     // travelling, and this lane exists to spend that one, not to plan another.
-    if (fundedOnly && !(fundedRaise && jump.amps <= available)) {
+    if (fundedOnly && !((fundedRaise || roomyRaise != null) && jump.amps <= available)) {
       decisions.push({
         at: now,
         deviceId: ac.deviceId,
@@ -2134,7 +2238,8 @@ export function planRaise(input: RaiseInput): RaisePlan {
         // one is the next forensic mystery.
         detail:
           `${jump.amps.toFixed(1)}A ${jump.confidence}` +
-          (fundedRaise ? ` · ${fundedNote(spendableCreditAmps)}` : ""),
+          (fundedRaise ? ` · ${fundedNote(spendableCreditAmps)}` : "") +
+          (roomyRaise != null && !fundedRaise && (!raiseCalmOk || fundedOnly) ? ` · ${roomyNote(roomyRaise)}` : ""),
       });
       available -= jump.amps;
     }
@@ -2143,4 +2248,170 @@ export function planRaise(input: RaiseInput): RaisePlan {
   }
 
   return { commands, decisions, attempts, isTurnOn: false, reservedAmps, probeRestoreIds: [], cutAmps, fundingDonors, swap: null, flickerRefused };
+}
+
+/** Inputs of the budget-aware grid full start (`planGridFullStart`). */
+export interface GridStartInput {
+  /** ALL managed AC views (on and off/shed), pre-sorted by priority. */
+  acs: AcView[];
+  config: LevelingConfigV2;
+  /** The effective grid limit (derate already applied). */
+  limitAmps: number;
+  /**
+   * Measured worst-case non-AC house load on grid (house-load.ts): the
+   * unmanaged guest AC and every other grid-only load the CT02 sees.
+   */
+  houseAmps: number;
+  pacing: PacingState;
+  now: number;
+}
+
+export interface GridStartPlan {
+  commands: Command[];
+  attempts: Array<{ deviceId: string; kind: "raise" | "restore" }>;
+  decisions: Decision[];
+  isTurnOn: boolean;
+  /** True when the budget held any room below its ceiling or left one shed. */
+  limited: boolean;
+}
+
+/**
+ * BUDGET-AWARE GRID FULL START (G1, owner decision 2026-09-27: "Budget-aware
+ * full start: YES", superseding the 2026-07-23/24 blind "on grid start all to
+ * full, then drop when needed"). Still start high and fast, in one batch, but
+ * only into an end-state the models say fits:
+ *
+ *   house + Σ modeled steady draw of every room at its admitted level
+ *     ≤ limit − margin − restingBuffer
+ *
+ * Live 2026-09-26 13:13Z: the blind start put all three managed rooms at L3
+ * (models 8.0 + 7.3 + 6.3 = 21.6A) on top of the grid-only house the CT02 has
+ * measured since 2026-08-29, the meter reached 34.4A on a 30A line, and three
+ * severe cut batches followed within 21 s.
+ *
+ * Every running room is charged first at the level it is CHARGED for now
+ * (`max(currentLevel, envelopeLevel)`, level 0 priced as the top level:
+ * invariant 7's worst case), and a restore already in flight at its ceiling.
+ * Then, mirroring the gen recovery admission: manual pins first (a pin is the
+ * clearest statement that a room is wanted), then hottest by `rankNeedDelta`,
+ * configured priority (`acs` order) as the tie-break. A running room gets the
+ * highest level up to its ceiling that fits, never below what it is charged at
+ * (this phase never cuts); a shed room restores at the highest level at or above
+ * its floor that fits, or stays shed for the ordinary restore path. When
+ * everything fits, the batch and the journal are exactly the blind start's.
+ */
+export function planGridFullStart(input: GridStartInput): GridStartPlan {
+  const { acs, config, now, pacing } = input;
+  const ceiling = input.limitAmps - config.marginAmps - config.restingBufferAmps;
+  const drawAt = (a: AcView, level: number): number =>
+    steadyDraw(level, a.maxLevel, modelFor(config, a.deviceId, "grid"));
+  const chargedOf = (a: AcView): number =>
+    a.currentLevel === 0 || a.envelopeLevel === 0 ? 0 : Math.max(a.currentLevel, a.envelopeLevel);
+
+  const managed = acs.filter((a) => a.managed);
+  const running = managed.filter((a) => a.on);
+  // A shed room the restore pacing will not send this tick is not coming on.
+  const restorable = managed.filter(
+    (a) => a.shed && !a.on && canAttempt(pacing, a.deviceId, "restore", now),
+  );
+  const inFlight = restorable.filter((a) =>
+    attemptedWithin(pacing, a.deviceId, "restore", RESTORE_CONFIRM_WAIT_MS, now),
+  );
+
+  let total =
+    input.houseAmps +
+    running.reduce((sum, a) => sum + drawAt(a, chargedOf(a)), 0) +
+    inFlight.reduce((sum, a) => sum + drawAt(a, ceilOf(a, config.nearTargetBandC)), 0);
+
+  const isPinned = (a: AcView): boolean => a.manualTarget != null || a.manualCap != null;
+  const order = [...running.filter((a) => !a.shed), ...restorable.filter((a) => !inFlight.includes(a))].sort(
+    (x, y) =>
+      Number(isPinned(y)) - Number(isPinned(x)) ||
+      y.rankNeedDelta - x.rankNeedDelta ||
+      acs.indexOf(x) - acs.indexOf(y),
+  );
+
+  const targets = new Map<string, number>();
+  const notes: string[] = [];
+  let limited = false;
+  // For the journal: what the blind start would have committed.
+  let atCeilings = 0;
+  for (const a of order) {
+    const ceil = ceilOf(a, config.nearTargetBandC);
+    atCeilings += drawAt(a, ceil);
+    if (a.shed) {
+      let level: number | null = null;
+      for (let l = ceil; l >= floorOf(a); l--) {
+        if (total + drawAt(a, l) <= ceiling) {
+          level = l;
+          break;
+        }
+      }
+      if (level == null) {
+        limited = true;
+        notes.push(`${a.deviceId} waits`);
+        continue;
+      }
+      if (level < ceil) limited = true;
+      total += drawAt(a, level);
+      targets.set(a.deviceId, level);
+      continue;
+    }
+    const charged = chargedOf(a);
+    // Charged at its worst already (level 0, or an unconfirmed level at or
+    // above the ceiling): the ceiling costs nothing more, exactly as before.
+    if (charged === 0 || charged >= ceil) {
+      targets.set(a.deviceId, ceil);
+      continue;
+    }
+    let level = charged;
+    for (let l = ceil; l > charged; l--) {
+      if (total - drawAt(a, charged) + drawAt(a, l) <= ceiling) {
+        level = l;
+        break;
+      }
+    }
+    total += drawAt(a, level) - drawAt(a, charged);
+    targets.set(a.deviceId, level);
+    if (level < ceil) {
+      limited = true;
+      notes.push(`${a.deviceId} holds L${level}`);
+    }
+  }
+
+  // Emission in `acs` order, exactly the blind start's command shapes.
+  const commands: Command[] = [];
+  const attempts: Array<{ deviceId: string; kind: "raise" | "restore" }> = [];
+  const lifted: string[] = [];
+  let isTurnOn = false;
+  for (const a of managed) {
+    const target = targets.get(a.deviceId);
+    if (target == null) continue;
+    if (a.shed && !a.on) {
+      commands.push({ deviceId: a.deviceId, kind: "power_on", level: target, reason: "restore" });
+      attempts.push({ deviceId: a.deviceId, kind: "restore" });
+      lifted.push(`${a.deviceId}→L${target} (restore)`);
+      isTurnOn = true;
+    } else if (a.currentLevel === 0 || a.currentLevel < target) {
+      commands.push({ deviceId: a.deviceId, kind: "set_level", level: target });
+      lifted.push(`${a.deviceId}→L${target}`);
+    }
+  }
+
+  const decisions: Decision[] = [
+    { at: now, action: "grid-entry full start", detail: "all managed ACs → ceiling; reduce on evidence" },
+  ];
+  if (limited) {
+    const committed = running.filter((a) => a.shed).reduce((sum, a) => sum + drawAt(a, chargedOf(a)), 0) +
+      inFlight.reduce((sum, a) => sum + drawAt(a, ceilOf(a, config.nearTargetBandC)), 0);
+    decisions.push({
+      at: now,
+      action: "grid-entry budget",
+      detail:
+        `${lifted.length > 0 ? `lifted ${lifted.join(", ")}` : "nothing lifted"}; ${notes.join(", ")}: ` +
+        `house ${input.houseAmps.toFixed(1)}A + ${(atCeilings + committed).toFixed(1)}A at ceilings ` +
+        `> ${ceiling.toFixed(1)}A`,
+    });
+  }
+  return { commands, attempts, decisions, isTurnOn, limited };
 }
