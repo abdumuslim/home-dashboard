@@ -99,6 +99,18 @@ interface QpSensorFields {
 
 const QP_MSG_SETTINGS_ACK = "28";
 const QP_MSG_INTERVAL_CONFIG = "17";
+/** Uplink "12": ONE real-time reading, sent the moment it is taken. Uplink "17" (same code as the
+ *  downlink config) is a rolling HISTORY window, 50 samples newest first, re-sent every report
+ *  (captured live 2026-11-23). Only "12" may drive the live reading: a history window is by
+ *  definition late, and ordering it by the device clock is a trap (a clock jump after a deep
+ *  reboot would freeze or rewind the live value). */
+const QP_MSG_REALTIME = "12";
+/** The CGS2 is configured to report every 15 s. A gap longer than this between two MQTT
+ *  readings means it is not following that setting: it rebooted (a flat battery, 2026-11-23)
+ *  or lost the setting and fell back to its factory 15-minute default. */
+export const QP_SLOW_REPORT_GAP_MS = 60_000;
+/** At most one interval re-send per this window, so a unit that ignores it is not spammed. */
+export const QP_INTERVAL_RESEND_MIN_MS = 5 * 60_000;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AWData = Record<string, any>;
@@ -304,6 +316,11 @@ export class Collector {
   private sentDateKey = "";
   private mqttClient: mqtt.MqttClient | null = null;
   private lastMqttMessage = 0;
+  private lastQpIntervalConfigAt = 0;
+  /** Arrival of the last sensor message of ANY type: the report cadence the re-send check reads. */
+  private lastQpReportAt = 0;
+  /** Count of real-time (type 12) readings: a clock-free way for a cloud poll to see one landed. */
+  private qpRealtimeSeq = 0;
   // Alert system
   private alertRules: AlertRule[] = [];
   private alertRulesLastFetch = 0;
@@ -3879,12 +3896,35 @@ export class Collector {
     }
 
     const row = this.toAirRow(new Date(), sensors);
-    const live = row as unknown as Record<string, unknown>;
-    // battery.status: 1 = charging (USB plugged), 0 = discharging
-    live.batteryCharging = sensors.battery?.status === 1;
-    this.latestAirRow = live;
-    this.latestAirTs = row.ts;
-    this.lastMqttMessage = Date.now();
+    const realtime = msg.type === QP_MSG_REALTIME || msg.type === undefined;
+    if (realtime) {
+      // Real-time by protocol, so it always wins: no device-clock ordering on this side.
+      const live = row as unknown as Record<string, unknown>;
+      // battery.status: 1 = charging (USB plugged), 0 = discharging
+      live.batteryCharging = sensors.battery?.status === 1;
+      this.latestAirRow = live;
+      // latestAirTs never decreases, written so (a server clock stepping back must not rewind it,
+      // or the cloud's cached sample could later out-date this real-time reading).
+      this.latestAirTs = this.latestAirTs && this.latestAirTs.getTime() > row.ts.getTime() ? this.latestAirTs : row.ts;
+      // MQTT counts as live (pausing the cloud fallback) only while real-time readings arrive.
+      this.lastMqttMessage = Date.now();
+      this.qpRealtimeSeq++;
+    }
+    // The interval setting is otherwise sent only when OUR client connects, so a monitor that
+    // rebooted (flat battery) and came back on its 15-minute default stayed slow until the next
+    // container restart (2026-11-23: ~15-min-old air data for 3 h). Its first late report says so.
+    const prevReportAt = this.lastQpReportAt;
+    this.lastQpReportAt = Date.now();
+    if (
+      prevReportAt > 0 &&
+      this.lastQpReportAt - prevReportAt > QP_SLOW_REPORT_GAP_MS &&
+      this.lastQpReportAt - this.lastQpIntervalConfigAt >= QP_INTERVAL_RESEND_MIN_MS
+    ) {
+      log.info(
+        `[collector] MQTT: air monitor silent ${Math.round((this.lastQpReportAt - prevReportAt) / 1000)}s before this report; re-sending its 15s interval setting`,
+      );
+      this.sendIntervalConfig();
+    }
     this.airBuffer.push(row);
 
     // Persist median of buffered readings to DB every 60 seconds
@@ -3901,6 +3941,7 @@ export class Collector {
     const mac = this.config.mqttQingpingMac;
     const topic = `qingping/${mac}/down`;
 
+    this.lastQpIntervalConfigAt = Date.now();
     const cfg = {
       id: Date.now(),
       need_ack: 1,
@@ -3955,6 +3996,7 @@ export class Collector {
   }
 
   private async collectQingping(): Promise<void> {
+    const realtimeSeqAtStart = this.qpRealtimeSeq; // before ANY await, token refresh included
     await this.ensureQpToken();
     const tsNow = Math.floor(Date.now() / 1000);
     const resp = await fetch(
@@ -3981,8 +4023,31 @@ export class Collector {
       return;
     }
     const data = body.devices[0].data;
-    const row = this.toAirRow(new Date(data.timestamp.value * 1000), data);
+    const sampleSec: unknown = data.timestamp?.value;
+    const sampleAt = typeof sampleSec === "number" && sampleSec > 0 ? new Date(sampleSec * 1000) : null;
+    if (!sampleAt || !Number.isFinite(sampleAt.getTime())) { // also beyond the Date range (1e20)
+      log.warn("[collector] Qingping cloud sample without a valid timestamp, ignored");
+      return;
+    }
+    const row = this.toAirRow(sampleAt, data);
     await this.storeAir(row);
+    // The cloud copy can be OLDER than the last MQTT reading (2026-11-23: a 04:15 cloud sample
+    // replaced a 04:21 MQTT one). One rule, on the server clock: the live reading's time only moves
+    // forward. Live MQTT is type 12 only, real-time, so its arrival stamp IS its sample time and
+    // compares directly with the cloud's sample time. A sample dated after the server clock (a
+    // fast or wrong device clock) is not live until it is in the past, so every later MQTT
+    // arrival is later than it and latestAirTs never decreases; a type-12 reading that landed
+    // while this poll was in flight wins; and the cached sample the cloud keeps returning can
+    // never re-win (its time is not newer than itself). The stored row is a real sample either way.
+    const sampleMs = row.ts.getTime();
+    const keep =
+      sampleMs > Date.now() ||
+      this.qpRealtimeSeq !== realtimeSeqAtStart ||
+      (this.latestAirTs !== null && sampleMs <= this.latestAirTs.getTime());
+    if (keep) {
+      log.info(`[collector] Stored air reading at ${row.ts.toISOString()} (not adopted as live)`);
+      return;
+    }
     const live = row as unknown as Record<string, unknown>;
     live.batteryCharging = data.battery?.status === 1;
     this.latestAirRow = live;
