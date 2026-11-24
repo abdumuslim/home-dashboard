@@ -595,7 +595,9 @@ export class Collector {
       lastAcs: this.watchAcs,
       purifiers: this.xiaomiCloud?.getDevices() ?? [],
       hasPowerReading: this.latestPowerTs != null,
-      meter: this.watchMeter?.controller === controller ? this.watchMeter : null,
+      // A silent meter blanks the tuple at read time too, not only at the next tick.
+      meter: this.watchMeter?.controller === controller && this.latestPowerTs != null
+        && Date.now() - this.latestPowerTs.getTime() <= STALE_POWER_MS ? this.watchMeter : null,
       leveling: controller.getStatus(),
     };
   }

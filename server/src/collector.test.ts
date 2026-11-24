@@ -1065,10 +1065,14 @@ describe("Smart AC leveling", () => {
         source: "grid", amps: next.measuredAmps, limit: next.limitAmps, ts: at + 9000,
       });
       expect(next.limitAmps).toBe(30);
-      // A silent meter: later ticks do not refresh the tuple's time.
-      vi.setSystemTime(at + 8000 + 16_000);
-      await checkAcLeveling(collector);
+      // A silent meter blanks the tuple at read time, before any later tick,
+      // and a tick on the silent meter does not bring it back.
+      vi.setSystemTime(at + 8000 + 15_000);
       expect(collector.getWatchDeviceState().meter).toMatchObject({ ts: at + 9000 });
+      vi.setSystemTime(at + 8000 + 15_001);
+      expect(collector.getWatchDeviceState().meter).toBeNull();
+      await checkAcLeveling(collector);
+      expect(collector.getWatchDeviceState().meter).toBeNull();
       vi.spyOn(collector.acLeveler2, "controllerFlavor").mockReturnValue("v2");
       expect(collector.getWatchDeviceState().meter).toBeNull();
     } finally { vi.useRealTimers(); }
