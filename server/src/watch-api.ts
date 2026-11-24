@@ -68,8 +68,11 @@ export function watchSky(row: Reading, history: Reading[], ts: number) {
     return (humidity != null && humidity >= 85) || (temp != null && dew != null && temp - dew < 2.5)
       ? "cloudy_night" : "clear_night";
   }
+  // Sun up but too low to judge clouds (about 40 minutes after sunrise and before sunset): the watch shows the sun
+  // on the horizon (owner, 24 Nov) where the dashboard shows nothing.
+  if (ghi < 1) return "twilight";
   const radiation = number(row.solar_radiation);
-  if (radiation == null || ghi < 1) return null;
+  if (radiation == null) return null;
   const values = [radiation / ghi];
   for (const sample of history) {
     const at = epoch(sample.ts), rad = number(sample.solar_radiation);

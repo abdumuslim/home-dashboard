@@ -639,14 +639,18 @@ describe("watch readings", () => {
     const row = { solar_radiation: 300, rain_hourly_mm: 0, temp_c: 20, dew_point_c: 10, humidity: 65 };
     for (const [instant, day, label] of [
       ["2026-06-20T20:59Z", false, "clear_night"], ["2026-06-20T21:01Z", false, "clear_night"],
-      ["2026-06-21T01:55Z", false, "clear_night"], ["2026-06-21T02:00Z", true, null],
-      ["2026-06-21T02:25Z", true, null], ["2026-06-21T02:30Z", true, "sunny"],
+      ["2026-06-21T01:55Z", false, "clear_night"], ["2026-06-21T02:00Z", true, "twilight"],
+      ["2026-06-21T02:25Z", true, "twilight"], ["2026-06-21T02:30Z", true, "sunny"],
     ] as const) {
       const ts = Date.parse(instant);
       expect(watchSun(ts).isDay).toBe(day);
       expect(watchSky(row, [], ts)).toBe(label);
     }
     expect(watchSun(Date.parse("2026-06-21T02:30Z")).ghi).toBeCloseTo(2.2558391555313135, 10);
+    // Twilight is time-based: no radiation reading is needed for it, while a missing reading in full day stays null.
+    expect(watchSky({ ...row, solar_radiation: null }, [], Date.parse("2026-06-21T02:25Z"))).toBe("twilight");
+    expect(watchSky({ ...row, solar_radiation: null }, [], Date.parse("2026-06-21T09:00Z"))).toBeNull();
+    expect(watchSky({ ...row, rain_hourly_mm: 1 }, [], Date.parse("2026-06-21T02:25Z"))).toBe("light_rain");
     // Both sides of local New Year's midnight are dark. Elevation, unlike
     // the night label alone, detects an accidental UTC year/day-of-year.
     for (const [instant, elevation] of [
