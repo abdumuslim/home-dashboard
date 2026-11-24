@@ -573,23 +573,7 @@ describe("D1: an OFF report is pinned to, and classified by, only a record publi
 });
 
 describe("P2: a pinned record stays while newer records are pinned, so our older OFF presented again late is still ours", () => {
-  /**
-   * From now on every shadow read answers with the unit's report as of its
-   * request and is held until released (`held[i]()`, in request order), as a
-   * read that answers late does; `holding = false` lets later reads through.
-   */
-  function holdShadowReads(): { held: Array<() => void>; holding: boolean } {
-    const answer = globalThis.fetch; // setup()'s stub: the unit's report at the call
-    const reads = { held: [] as Array<() => void>, holding: true };
-    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
-      const response = await answer(url, init);
-      if (!reads.holding || String(url).includes("user_groups/get")) return response;
-      return new Promise<Response>((resolve) => reads.held.push(() => resolve(response)));
-    }));
-    return reads;
-  }
-
-  it("one arm, two accepted OFF sends, then reads held out of order present our first OFF's report R1, our second's R2, and R1 again: no lock and no lock push for any presentation", async () => {
+  it("one arm and two accepted OFF sends: presenting R1, R2 and then R1 again never creates a lock or lock push", async () => {
     const s = await setup();
     const pushes: string[] = [];
     (s.collector as never as { broadcastPush: (p: { title?: string }) => Promise<void> }).broadcastPush = async (p) => {
@@ -604,35 +588,21 @@ describe("P2: a pinned record stays while newer records are pinned, so our older
 
     s.at(7_000);
     await s.step(); // P1: our OFF at 7 s, accepted
-    const reads = holdShadowReads();
-    s.at(7_500);
-    const poll = s.tcl.fetchDevicesLive(); // a dashboard poll: its read answers ON (reported 5 s), late
-    await until(() => reads.held.length === 1);
-    s.report(0, 8); // R1: P1's OFF lands at 8 s
-    s.at(12_500);
-    const firstCheck = s.cseam.checkMetricAutomation(first); // its read answers R1, late
-    await until(() => reads.held.length === 2);
-    s.at(13_500);
-    const lastCheck = s.cseam.checkMetricAutomation(last); // its read answers R1 too, and answers last
-    await until(() => reads.held.length === 3);
-
     s.at(21_000);
-    reads.held[0]();
-    await poll; // the late ON read lands: the cache says ON
+    await s.tcl.fetchDevicesLive(); // the cloud still reports the old ON
     s.at(22_000);
     await s.step(); // P2: the same arm resends at 22 s, accepted
     expect(s.events.filter((event) => event === "publish 0")).toHaveLength(2);
     expect(s.tcl.isOffWhenOnlineArmed(GUEST)).toBe(true);
 
     s.at(23_000);
-    reads.held[1]();
-    await firstCheck; // R1 ends the arm and a rule observes it: pinned to P1 (P2 came later)
+    s.report(0, 8);
+    await s.cseam.checkMetricAutomation(first); // R1 ends the arm: pinned to P1 (P2 came later)
     expect(s.tcl.isOffWhenOnlineArmed(GUEST)).toBe(false);
     expect(s.inserts).toEqual([]);
     expect(pushes).toEqual([]);
     expect(logLines.filter(ownOffLine)).toHaveLength(1);
 
-    reads.holding = false;
     s.report(0, 24); // R2: P2's OFF report at 24 s
     s.at(30_000);
     await s.cseam.checkMetricAutomation(second); // a rule observes R2: pinned to P2
@@ -641,8 +611,8 @@ describe("P2: a pinned record stays while newer records are pinned, so our older
     expect(logLines.filter(ownOffLine)).toHaveLength(2);
 
     s.at(200_000); // past the rule ONs' 120 s shadow-lag grace, 23 min after the last power event
-    reads.held[2]();
-    await lastCheck; // the oldest read answers last: a rule observes R1 again
+    s.report(0, 8); // a later poll presents R1 again
+    await s.cseam.checkMetricAutomation(last);
     expect(s.inserts).toEqual([]);
     expect(pushes).toEqual([]);
     expect(logLines.filter(ownOffLine)).toHaveLength(3);

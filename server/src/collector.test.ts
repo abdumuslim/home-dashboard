@@ -1025,6 +1025,45 @@ describe("Smart AC leveling", () => {
     acTimers.clear();
   });
 
+  it("pairs watch power with the acting tick's selected sample across a held publish and controller flip", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { collector, tclCloud, setLevelingConfig } = createCollector();
+      setLevelingConfig(LEVELING_CONFIG);
+      await collector.acLeveler.ensureLoaded();
+      const devices = [{ id: "ac1", name: "Mom", power: true, generatorMode: 3, maxGeneratorLevel: 3, currentTemp: 28, mode: 1 }];
+      tclCloud.getDevices.mockReturnValue(devices);
+      tclCloud.fetchDevicesLive.mockResolvedValue(devices as never);
+      const at = Date.now();
+      genReadings(collector, 8, 1);
+      // The tick awaits a load before it takes its meter view.
+      const loaded = collector.acLeveler.ensureLoaded.bind(collector.acLeveler);
+      vi.spyOn(collector.acLeveler, "ensureLoaded").mockImplementationOnce(loaded).mockImplementationOnce(async () => {
+        await loaded();
+        vi.setSystemTime(at + 4000);
+        genReadings(collector, 12, 1);
+      });
+      tclCloud.sendControl.mockImplementationOnce(async () => {
+        // A new raw source while the already-selected generator floor is publishing.
+        await Promise.resolve();
+        vi.setSystemTime(at + 8000);
+        gridReadings(collector, 4, 1);
+      });
+      await checkAcLeveling(collector);
+      expect(tclCloud.sendControl).toHaveBeenCalled();
+      const status = collector.acLeveler.getStatus();
+      expect(status.source).toBe("gen");
+      expect(status.measuredAmps).not.toBeNull();
+      expect(collector.getWatchDeviceState().meter).toMatchObject({
+        source: "gen", amps: status.measuredAmps, limit: 15, ts: at + 4000,
+      });
+      await checkAcLeveling(collector);
+      expect(collector.getWatchDeviceState().meter).toMatchObject({ source: "grid", limit: 30, ts: at + 8000 });
+      vi.spyOn(collector.acLeveler2, "controllerFlavor").mockReturnValue("v2");
+      expect(collector.getWatchDeviceState().meter).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
   it("keeps Guest out of the leveling context and ESP load attribution", async () => {
     const { collector, tclCloud, setLevelingConfig } = createCollector();
     setLevelingConfig(LEVELING_CONFIG);

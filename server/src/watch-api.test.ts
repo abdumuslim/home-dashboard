@@ -8,8 +8,8 @@ import { createRouter } from "./routes.js";
 import { Collector } from "./collector.js";
 import { signToken } from "./auth.js";
 import type { Config } from "./config.js";
-import type { AcDevice } from "./tcl-cloud.js";
-import type { PurifierDevice } from "./xiaomi-cloud.js";
+import { TclCloud, type AcDevice } from "./tcl-cloud.js";
+import { XiaomiCloud, type PurifierDevice } from "./xiaomi-cloud.js";
 import { listenOnFetchSafePort } from "./test-http.js";
 
 const logs = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }));
@@ -33,7 +33,7 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
-async function harness(cfg = config) {
+async function harness(cfg = config, genLevel?: () => Promise<unknown>) {
   const weather: Record<string, unknown>[] = [], air: Record<string, unknown>[] = [];
   const presets = new Map<number, Record<string, unknown>>();
   const query = vi.fn(async (sql: string, args: unknown[] = []) => {
@@ -51,6 +51,7 @@ async function harness(cfg = config) {
     isReady: () => true, getDevices: () => devices,
     getDevicesNoOlderThan: vi.fn(async () => devices), fetchDevicesLive: vi.fn(async () => devices),
     ensureDeviceCachePopulated: vi.fn(), cancelOffWhenOnline: vi.fn(),
+    claimPresetIntent: () => () => true,
     validateControlLive: vi.fn(async () => ({ ok: true })), sendControlVerified: vi.fn(async () => "sent"),
     sanitizeAcAction: vi.fn((_id: string, action: object) => ({ ...action })),
     executeAcActionVerified: vi.fn(async () => "applied"),
@@ -70,7 +71,7 @@ async function harness(cfg = config) {
   const push = vi.spyOn(collector as unknown as { broadcastPush(payload: object): Promise<void> }, "broadcastPush").mockResolvedValue(undefined);
   const changed = vi.fn();
   const api = createRouter(pool, cfg, () => xiaomi as never, () => tcl as never, undefined,
-    () => ({ cached: true }) as never, undefined, changed, locks);
+    () => ({ cached: true }) as never, undefined, changed, locks, genLevel ? { onUserGenLevel: genLevel } as never : undefined);
   const app = express(), downstream = vi.fn();
   app.use(createWatchGate(cfg, pool, collector, api.controls));
   app.use((_req, _res, next) => { downstream(); next(); });
@@ -83,18 +84,183 @@ async function harness(cfg = config) {
     fetch(base + path, { method, headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) });
   const audits = () => query.mock.calls.filter(([sql]) => sql.includes("INSERT INTO ac_control_audit")).map(([, args]) => args);
   const writes = () => query.mock.calls.filter(([sql]) => sql.includes("UPDATE automations"));
-  return { request, audits, writes, query, collector, weather, air, devices, purifiers, presets,
+  return { request, base, audits, writes, query, collector, weather, air, devices, purifiers, presets,
     tcl, xiaomi, locks, push, changed, downstream };
 }
 
 function device(id: string, ts: number) {
-  return { id, lastSeenAt: ts, powerReportedAt: ts, isOnline: true, power: true, mode: 1,
+  return { id, lastSeenAt: ts, powerReportedAt: ts, isOnline: true, power: true, powerKnown: true, mode: 1,
     currentTemp: 26.5, targetTemp: 25, targetTempKnown: true, currentTempKnown: true, fanSpeed: 3, capabilities: { modes: [{ value: 1 }], fanSpeeds: [{ value: 3 }] } } as AcDevice;
 }
 function purifier(id: string): PurifierDevice {
   return { id, name: "purifier", model: id === miot ? "zhimi.airpurifier.vb2" : "zhimi.airpurifier.v7",
-    isOnline: true, readingsStale: false, power: "on", mode: "auto", fan_level: 2, favorite_level: 7, aqi: 9 };
+    isOnline: true, readingsAt: Date.now(), readingsStale: false, power: "on", mode: "auto", fan_level: 2, favorite_level: 7, aqi: 9 };
 }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+describe("watch repair regressions", () => {
+  it("shows the acting v2 tick's sample, then clears all power fields on rollback or expiry", async () => {
+    const h = await harness();
+    h.devices.push(device(guest, Date.now()));
+    const query = h.query.getMockImplementation()!;
+    h.query.mockImplementation(async (sql, args) => {
+      if (sql.includes("FROM ac_leveling_config")) return { rows: [
+        { id: 1, config: { enabled: true, gridLimitAmps: 30 } }, { id: 2, config: { controller: "v2" } },
+      ], rowCount: 2 };
+      return query(sql, args);
+    });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    await h.collector.acLeveler2.ensureLoaded();
+    const at = Date.now(), sample = (amps: number) => h.collector.setLatestPower({
+      ts: new Date().toISOString(), voltage: 220, current_1: amps, current_2: 0, power_1: amps * 220, power_2: 0,
+    });
+    sample(10);
+    vi.setSystemTime(at + 4000);
+    sample(14);
+    await (h.collector as unknown as { runLevelingCheck(): Promise<void> }).runLevelingCheck();
+    expect(h.collector.leveling()).toBe(h.collector.acLeveler2);
+    const power = async () => (await (await h.request("/api/watch")).json()).power;
+    const empty = { source: null, amps: null, limit: null, ts: null };
+    expect(await power()).toEqual({ source: "grid", amps: 12, limit: 30, ts: at + 4000 });
+    const flavor = vi.spyOn(h.collector.acLeveler2, "controllerFlavor").mockReturnValue("v1");
+    expect(await power()).toEqual(empty);
+    flavor.mockRestore();
+    vi.setSystemTime(at + 19_001);
+    expect(await power()).toEqual(empty);
+  });
+
+  it.each(["cache", "delivery", "generator bookkeeping"])("supersedes the older preset during %s", async stage => {
+    const started = deferred<void>(), release = deferred<void>();
+    const wait = async () => { started.resolve(); await release.promise; };
+    const h = await harness(config, stage === "generator bookkeeping" ? wait : undefined);
+    h.presets.set(1, { targetTemp: 23, generatorMode: 2 });
+    if (stage === "cache") h.tcl.ensureDeviceCachePopulated.mockImplementationOnce(wait);
+    if (stage === "delivery") h.tcl.executeAcActionVerified.mockImplementationOnce(async () => { await wait(); return "applied"; });
+    const old = h.request(`/api/watch/ac/${mom}/preset`, "POST", watch, { slot: 1 });
+    await started.promise;
+    try {
+      const newer = await h.request("/api/ac/preset-apply", "POST", hermes, { deviceId: mom, slot: 2, presetData: { targetTemp: 28 } });
+      expect(newer.status).toBe(200);
+    } finally { release.resolve(); }
+    expect((await old).status).toBe(409);
+    expect(h.tcl.executeAcActionVerified).toHaveBeenCalledTimes(stage === "cache" ? 1 : 2);
+    expect(h.writes().map(([, args]) => JSON.parse(String(args?.[0]))._preset_slot)).toEqual([2]);
+  });
+
+  it.each(["/api/ac/devices/" + mom + "/control", "/api/devices/" + miot + "/control", "/api/ac/preset-apply"])(
+    "preserves the legacy Express response to unparsed bodies on %s", async path => {
+      const h = await harness();
+      for (const body of [undefined, "unparsed text"]) {
+        const r = await fetch(h.base + path, { method: "POST", headers: hermes, body });
+        expect(r.status).toBe(500);
+        expect(r.headers.get("content-type")).toContain("text/html");
+      }
+      expect(h.writes()).toHaveLength(0);
+      expect(h.audits()).toHaveLength(0);
+    });
+
+  it("uses the dashboard clock across sunrise while preserving the weather sample time", async () => {
+    const h = await harness(), ts = Date.parse("2026-06-21T01:55Z");
+    h.weather.push({ ts: new Date(ts), solar_radiation: 0, humidity: 60 });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(ts);
+    const weather = async () => (await (await h.request("/api/watch")).json()).weather;
+    expect(await weather()).toMatchObject({ sky: "clear_night", isDay: false, ts });
+    clock.mockReturnValue(Date.parse("2026-06-21T02:30Z"));
+    expect(await weather()).toMatchObject({ sky: "cloudy", isDay: true, ts });
+  });
+
+  it("joins a held TCL guest restore across watch and collector and decodes known OFF without metadata", async () => {
+    const h = await harness();
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const tcl = new TclCloud("user", "pass");
+    const restore = deferred<void>(), started = deferred<void>();
+    const publish = vi.fn(async () => { started.resolve(); await restore.promise; });
+    const rooms = [guest, mom, "CA5IMhFAAAE", "Cy3aihFAAAE"];
+    const shadow = vi.fn(async (id: string) => ({
+      reported: id === guest ? { powerSwitch: 1, autoGeneratorMode: 0 } : id === mom ? { powerSwitch: 0 } : {},
+      reportedAt: Date.now() + 1000,
+    }));
+    Object.assign(tcl, { tokenData: {}, authData: {}, awsCreds: {}, ensureValidTokens: async () => {},
+      lastState: { [guest]: { targetTemperature: 22 } }, getThingShadow: shadow, publishShadowUpdate: publish });
+    h.collector.tclCloud = tcl;
+    const list = vi.fn(async () => Response.json({ data: [{ devices: rooms.map(id => ({
+      deviceId: id, nickName: id, identifiers: id === "CA5IMhFAAAE" ? [{ identifier: "powerSwitch", value: 0 }] : [],
+    })) }] }));
+    // Only provider HTTP is stubbed while the real restore is suspended.
+    expect(tcl.preparePowerCycleRestore(guest)).toBe(true);
+    vi.stubGlobal("fetch", list);
+    let first: AcDevice[];
+    try {
+      const collectorFetch = tcl.fetchDevicesLive();
+      await started.promise;
+      h.collector.noteWatchRequest();
+      await vi.advanceTimersByTimeAsync(15_000);
+      restore.resolve();
+      first = await collectorFetch;
+      await vi.advanceTimersByTimeAsync(0);
+    } finally { restore.resolve(); vi.unstubAllGlobals(); }
+    expect.soft(list).toHaveBeenCalledTimes(1);
+    expect.soft(shadow).toHaveBeenCalledTimes(4);
+    expect.soft(publish).toHaveBeenCalledTimes(1);
+    expect.soft(tcl.getDevices()).toBe(first);
+    const snap = await (await h.request("/api/watch")).json();
+    expect(snap.acs.map((a: { on: boolean | null }) => a.on)).toEqual([false, false, null, true]);
+  });
+
+  it("joins a collector list and live readers, stamping each purifier only when its properties land", async () => {
+    const h = await harness();
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const cloud = new XiaomiCloud("user", "pass", "sg");
+    const list = deferred<PurifierDevice[]>(), slow = deferred<Partial<PurifierDevice>>();
+    const identities = [miio, miot].map(id => {
+      const { id: did, name, model, isOnline } = purifier(id);
+      return { id: did, name, model, isOnline };
+    });
+    const fetchList = vi.fn(() => list.promise);
+    const props = vi.fn((id: string) => id === miio ? Promise.resolve({ aqi: 8 }) : slow.promise);
+    Object.assign(cloud, { authStatus: "authenticated", fetchPurifiersForRegion: fetchList, getDeviceProps: props });
+    h.collector.xiaomiCloud = cloud;
+    const collectorList = cloud.refreshDevices();
+    h.collector.noteWatchRequest();
+    await vi.advanceTimersByTimeAsync(15_000);
+    const browser = cloud.fetchDevicesLive();
+    await vi.advanceTimersByTimeAsync(1000);
+    list.resolve(identities);
+    await vi.advanceTimersByTimeAsync(0);
+    const firstAt = Date.now();
+    const snapshot = async () => (await (await h.request("/api/watch")).json()).purifiers;
+    const partial = await snapshot();
+    await vi.advanceTimersByTimeAsync(4000);
+    const secondAt = Date.now();
+    slow.resolve({ aqi: 14 });
+    const [, devices] = await Promise.all([collectorList, browser]);
+    expect.soft(fetchList).toHaveBeenCalledTimes(1);
+    expect.soft(props).toHaveBeenCalledTimes(2);
+    expect.soft(cloud.getDevices()).toBe(devices);
+    expect.soft(partial[0]).toMatchObject({ pm25: 8, ts: firstAt });
+    expect.soft(partial[1]).toMatchObject({ pm25: null, ts: null });
+    expect.soft((await snapshot())[1]).toMatchObject({ pm25: 14, ts: secondAt });
+    props.mockRejectedValue(new Error("unavailable"));
+    await vi.advanceTimersByTimeAsync(1000);
+    await cloud.fetchDevicesLive();
+    const failed = await snapshot();
+    expect(failed[0]).toMatchObject({ pm25: 8, ts: firstAt });
+    expect(failed[1]).toMatchObject({ pm25: 14, ts: secondAt });
+  });
+
+  it("prefers today's list-only OFF to an older cached ON shadow", async () => {
+    const h = await harness(), previous = device(mom, Date.now() - 30_000);
+    h.devices.push(previous);
+    expect((await (await h.request("/api/watch")).json()).acs[0].on).toBe(true);
+    h.devices[0] = { ...previous, power: false, powerKnown: true, lastSeenAt: null, powerReportedAt: null };
+    expect((await (await h.request("/api/watch")).json()).acs[0].on).toBe(false);
+  });
+});
 
 describe("app-wide watch bearer", () => {
   it("refuses all other surfaces even beside full-access cookies, before parsing bodies or dispatching", async () => {
@@ -213,13 +379,13 @@ describe("watch device controls through the dashboard handlers", () => {
     expect(h.writes()).toHaveLength(0);
     expect(h.changed).not.toHaveBeenCalled();
     expect((await h.request(path, "POST", watch, { slot: 4 })).status).toBe(200);
-    expect(h.tcl.executeAcActionVerified).toHaveBeenLastCalledWith(mom, { mode: 1, temperature: 23 });
+    expect(h.tcl.executeAcActionVerified).toHaveBeenLastCalledWith(mom, { mode: 1, temperature: 23 }, expect.any(Function));
     expect(h.audits().every(a => a?.[3] === "watch")).toBe(true);
     expect(h.writes()).toHaveLength(1);
     expect(JSON.parse(String(h.writes()[0][1]?.[0]))).toEqual({ mode: 1, temperature: 23, power: 1, _preset_slot: 4 });
     for (const headers of [hermes, cookie()]) {
       expect((await h.request("/api/ac/preset-apply", "POST", headers, { deviceId: guest, slot: 8, presetData: { targetTemp: 27, generatorMode: 0 } })).status).toBe(200);
-      expect(h.tcl.executeAcActionVerified).toHaveBeenLastCalledWith(guest, { temperature: 27, generator_mode: 0 });
+      expect(h.tcl.executeAcActionVerified).toHaveBeenLastCalledWith(guest, { temperature: 27, generator_mode: 0 }, expect.any(Function));
     }
   });
 
@@ -277,9 +443,9 @@ describe("watch device controls through the dashboard handlers", () => {
 describe("watch readings", () => {
   it("shows a browser's successful purifier sample on the first watch poll, with its original time", async () => {
     const h = await harness();
-    h.purifiers.push(purifier(miot));
     const sampled = Date.now() - 60_000;
     vi.spyOn(Date, "now").mockReturnValue(sampled);
+    h.purifiers.push(purifier(miot));
     expect((await h.request("/api/devices", "GET", cookie())).status).toBe(200);
     vi.spyOn(Date, "now").mockReturnValue(sampled + 60_000);
     const snap = await (await h.request("/api/watch")).json();
@@ -313,14 +479,14 @@ describe("watch readings", () => {
     expect(data.weather).toMatchObject({ ts: weatherTs, windKmh: 7, rainMmH: 0, windDir: 0 });
     expect(data.air).toMatchObject({ ts: airTs + 1000, co2: null, tvocLevel: "good" });
     expect(airLevel("tvoc", 3)).toBe("good"); // excellent and good both read good
-    expect(data.power).toEqual({ source: null, amps: null, limit: null, ts: shadowTs });
+    expect(data.power).toEqual({ source: null, amps: null, limit: null, ts: null });
     expect(data.acs.map((d: AcDevice) => d.name)).toEqual(["ماما", "عبدو", "عبدالله", "الضيوف"]);
     expect(data.acs[0]).toMatchObject({ ts: shadowTs, mode: "cool", on: true, setC: 25, roomC: 26.5, fan: 3, gridOnly: false });
     expect(data.acs[3]).toMatchObject({ level: null, gridOnly: true, turnedDown: false });
     expect(data.purifiers.map((d: PurifierDevice) => d.name)).toEqual(["ماما", "عبدو"]);
     expect(data.purifiers[0]).toMatchObject({ fanLevel: null, favoriteMax: 16 });
     expect(data.purifiers[1]).toMatchObject({ fanLevel: 2, favoriteMax: 14, pm25Level: "good" });
-    Object.assign(h.devices[0], { capabilities: { modes: [], fanSpeeds: [] }, power: false, powerReportedAt: null,
+    Object.assign(h.devices[0], { capabilities: { modes: [], fanSpeeds: [] }, power: false, powerKnown: false, powerReportedAt: null,
       mode: 0, targetTemp: 24, currentTemp: 0, targetTempKnown: false, currentTempKnown: false, fanSpeed: 0 });
     Object.assign(h.devices[1], { targetTemp: 24, targetTempKnown: true });
     h.weather.splice(0, h.weather.length, { ts: new Date(now - 660_000), wind_speed_kmh: 20, wind_dir_avg10m: 180 });
@@ -351,14 +517,18 @@ describe("watch readings", () => {
   it("keeps the smoothed amps paired with the controller's sample even after a newer raw meter reading", async () => {
     const h = await harness(), now = Date.now(), ts = now - 5000;
     const state = h.collector.getWatchDeviceState();
-    vi.spyOn(h.collector, "getWatchDeviceState").mockReturnValue({
-      ...state, leveling: { ...state.leveling, enabled: true },
-      meter: { source: "gen", amps: 12.36, limit: 15, ts },
+    const observations = vi.spyOn(h.collector, "getWatchDeviceState").mockReturnValue({
+      ...state, hasPowerReading: true, leveling: { ...state.leveling, enabled: true },
+      meter: { controller: h.collector.acLeveler, source: "gen", amps: 12.36, limit: 15, ts },
     });
     const raw = vi.spyOn(h.collector, "getLatestPower").mockReturnValue({ ts: new Date(now), current_1: 0, current_2: 14 });
     expect((await (await h.request("/api/watch")).json()).power).toEqual({ source: "generator", amps: 12.4, limit: 15, ts });
     raw.mockReturnValue({ ts: new Date(now), current_1: 0, current_2: 0 });
+    expect((await (await h.request("/api/watch")).json()).power).toEqual({ source: "generator", amps: 12.4, limit: 15, ts });
+    observations.mockReturnValue({ ...state, hasPowerReading: true, meter: { controller: h.collector.acLeveler, source: "none", amps: null, limit: null, ts: now } });
     expect((await (await h.request("/api/watch")).json()).power).toEqual({ source: "none", amps: null, limit: null, ts: now });
+    vi.spyOn(Date, "now").mockReturnValue(now + 15_001);
+    expect((await (await h.request("/api/watch")).json()).power).toEqual({ source: null, amps: null, limit: null, ts: null });
   });
 
   it("refreshes both providers on watch-only demand, ages failed readings, and sleeps at two minutes", async () => {
@@ -372,7 +542,10 @@ describe("watch readings", () => {
     const demandAt = Date.now();
     expect((await h.request("/api/watch")).status).toBe(503);
     const air = purifier(miot), ac = device(mom, ts);
-    h.xiaomi.fetchDevicesLive.mockImplementation(async () => { h.purifiers.splice(0, 2, air); return h.purifiers; });
+    h.xiaomi.fetchDevicesLive.mockImplementation(async () => {
+      if (!air.readingsStale) h.purifiers.splice(0, 2, { ...air, readingsAt: Date.now() });
+      return h.purifiers;
+    });
     h.tcl.getDevicesNoOlderThan.mockImplementation(async () => { h.devices.splice(0, 4, ac); return h.devices; });
     await vi.advanceTimersByTimeAsync(14_999);
     expect(h.xiaomi.fetchDevicesLive).not.toHaveBeenCalled();

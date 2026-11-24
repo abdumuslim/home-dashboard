@@ -27,6 +27,8 @@ export interface PurifierDevice {
   // only ever set one way is the ambiguity that made an empty list mean two
   // different things in the first place.
   readingsStale?: boolean;
+  /** Receipt time of this device's last successful properties RPC. */
+  readingsAt?: number;
 }
 
 export interface PurifierAction {
@@ -108,6 +110,8 @@ export class XiaomiCloud {
   private password: string;
   private region: string;
   private cachedDevices: PurifierDevice[] = [];
+  private listFetch?: Promise<PurifierDevice[]>;
+  private liveFetch?: Promise<PurifierDevice[]>;
   private deviceCacheTime = 0;
   // Armed after a failed list call. A failure leaves deviceCacheTime untouched
   // (the cache did not refresh), and the collector loop ticks every ~5s, so
@@ -413,9 +417,7 @@ export class XiaomiCloud {
       // identity only, so replacing here stripped every reading out of the
       // cache twelve times an hour and left the failure path serving tiles with
       // no power, mode, aqi or temperature. It refreshes identity, not readings.
-      this.cachedDevices = mergeDeviceCache(this.cachedDevices, await this.fetchPurifiersForRegion(this.region));
-      this.deviceCacheTime = Date.now();
-      this.deviceListRetryAt = 0;
+      await this.refreshDeviceList();
     } catch (err) {
       // Keep the last-known-good list on ANY failure, not just an auth one: an
       // empty list is a claim about the account, and a blip cannot make it.
@@ -428,17 +430,29 @@ export class XiaomiCloud {
     return this.cachedDevices;
   }
 
-  /** Fetch fresh device list + live props (bypasses cache, for API use) */
-  async fetchDevicesLive(): Promise<PurifierDevice[]> {
+  private refreshDeviceList(): Promise<PurifierDevice[]> {
+    // List-only polling and live property readers share the same cache commit.
+    return this.listFetch ??= this.fetchPurifiersForRegion(this.region).then(list => {
+      this.cachedDevices = mergeDeviceCache(this.cachedDevices, list);
+      this.deviceCacheTime = Date.now();
+      this.deviceListRetryAt = 0;
+      return this.cachedDevices;
+    }).finally(() => { this.listFetch = undefined; });
+  }
+
+  /** All live readers share the list and the whole batch of properties RPCs. */
+  fetchDevicesLive(): Promise<PurifierDevice[]> {
+    return this.liveFetch ??= this.refreshLiveProperties().finally(() => { this.liveFetch = undefined; });
+  }
+
+  private async refreshLiveProperties(): Promise<PurifierDevice[]> {
     if (this.authStatus !== "authenticated") return this.cachedDevices;
     // Deliberately unguarded: ANY failing list call throws past this assignment,
     // so cachedDevices keeps its last-known-good contents and the route reports
     // the failure instead of serving an empty list as if it were the truth. For
     // a blip that is honest ("we could not confirm these are live") and it
     // surfaces as the client's stale marker for a poll or two.
-    const devices = mergeDeviceCache(this.cachedDevices, await this.fetchPurifiersForRegion(this.region));
-    this.cachedDevices = devices;
-    this.deviceCacheTime = Date.now();
+    const devices = await this.refreshDeviceList();
 
     // Query live props for each online device
     await Promise.all(
@@ -447,7 +461,7 @@ export class XiaomiCloud {
           // A successful RPC is the whole truth for this device: an undefined
           // prop means it answered without one, so it must clear the merged
           // value rather than leave yesterday's reading standing.
-          Object.assign(d, await this.getDeviceProps(d.id), { readingsStale: false });
+          Object.assign(d, await this.getDeviceProps(d.id), { readingsStale: false, readingsAt: Date.now() });
         } catch (err) {
           // Was a silent `catch {}`. With the merge above the device now keeps
           // its previous readings instead of losing them, which is the right
@@ -481,8 +495,7 @@ export class XiaomiCloud {
   private async ensureDeviceCachePopulated(): Promise<void> {
     if (this.cachedDevices.length > 0) return;
     if (this.authStatus !== "authenticated") return;
-    this.cachedDevices = await this.fetchPurifiersForRegion(this.region);
-    this.deviceCacheTime = Date.now();
+    await this.refreshDeviceList();
   }
 
   private getModel(deviceId: string): string {

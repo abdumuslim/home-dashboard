@@ -84,6 +84,7 @@ function createTclMock(validation: { ok: true } | { ok: false; status: 400 | 409
     cloud: {
       isReady: () => true,
       getDevices: () => [{ id: "DHihohFAAAE", name: "Najat" }],
+      claimPresetIntent: () => () => true,
       ensureDeviceCachePopulated: async () => undefined,
       sanitizeAcAction: (deviceId: string, action: Record<string, unknown>) => knownIds.has(deviceId) ? action : null,
       executeAcAction: async (deviceId: string, action: Record<string, unknown>) => {

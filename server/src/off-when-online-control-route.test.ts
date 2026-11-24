@@ -461,13 +461,15 @@ describe("routes with a real Collector and TclCloud", () => {
   it("L7: an older preset suspended in its device-cache fill while a newer arm is accepted: the arm survives the preset", async () => {
     const h = await realCollector();
     h.seam.controlVerifyDelay = async () => undefined; // let the preset's verify read run at once
-    h.seam.cachedDevices = []; // a cold cache: the preset route's first await is a live device fetch
-    const url = await start(h.tcl, h.locks);
+    // Refresh the previously seen Guest. The arm route can use that cached
+    // identity while the preset waits for the single in-flight list.
     const gate = h.holdNextDeviceList();
-
+    vi.spyOn(h.tcl, "ensureDeviceCachePopulated").mockImplementationOnce(async () => {
+      await h.tcl.fetchDevicesLive();
+    });
+    const url = await start(h.tcl, h.locks);
     const responding = presetApply(url, { mode: 1 });
     await until(() => gate.held);
-    await h.tcl.fetchDevicesLive(); // another poll fills the cache meanwhile
     const armed = await armRoute(url, true);
     expect(armed.status).toBe(200);
     gate.release();

@@ -709,7 +709,7 @@ describe("executeAcAction: power accepted, profile failed", () => {
       await vi.advanceTimersByTimeAsync(3_000);
       const err = await settled;
 
-      expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 1 });
+      expect(publishWithRetry).toHaveBeenCalledWith("ac1", { powerSwitch: 1 }, undefined);
       expect(err).toBeInstanceOf(AcProfileNotAppliedError);
       expect(isPowerAcceptedError(err)).toBe(true);
       expect(isPowerAcceptedError(new Error("refused"))).toBe(false);
@@ -958,55 +958,85 @@ describe("sendControlVerified last-write-wins (binary set_power)", () => {
 // (fan + swings, NO workMode) and the blower never went to turbo. 13 minutes
 // later the identical fan block sent ALONE applied on the first try.
 describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
-  function publishingTcl(dev: AcDevice): { tcl: TclCloud; publishWithRetry: ReturnType<typeof vi.fn> } {
+  function publishingTcl(dev: AcDevice): { tcl: TclCloud; publish: ReturnType<typeof vi.fn> } {
     const tcl = tclWithDevice(dev);
-    const seam = tcl as unknown as { publishWithRetry: unknown; profileSplitDelay: unknown };
-    const publishWithRetry = vi.fn(async () => undefined);
-    seam.publishWithRetry = publishWithRetry;
+    const seam = tcl as unknown as { publishShadowUpdate: unknown; ensureValidTokens: unknown; profileSplitDelay: unknown };
+    const publish = vi.fn(async () => undefined);
+    seam.ensureValidTokens = async () => {};
+    seam.publishShadowUpdate = publish;
     seam.profileSplitDelay = vi.fn(async () => undefined); // no real 500ms waits in tests
-    return { tcl, publishWithRetry };
+    return { tcl, publish };
   }
 
   const FAN_7 = { windSpeed: 0, silenceSwitch: 0, turbo: 1 };
 
+  it.each([1, 3])("supersedes a preset while its confirmation read is returning mode %i", async mode => {
+    const { tcl, publish } = publishingTcl(acDevice({ mode: 3 }));
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const read = vi.fn().mockResolvedValueOnce({ reported: { workMode: 3 } })
+      .mockImplementationOnce(async () => { await hold; return { reported: { workMode: mode } }; })
+      .mockResolvedValue({ reported: { workMode: 1 } });
+    Object.assign(tcl, { getThingShadow: read, controlVerifyDelay: async () => {} });
+    const old = tcl.executeAcActionVerified("ac1", { mode: 1 });
+    await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+    await tcl.executeAcAction("ac1", { mode: 4 });
+    release();
+    expect(await old).toBe("superseded");
+    expect(publish).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops the older preset's fan publish if a new command lands during the CHSD split", async () => {
+    const { tcl, publish } = publishingTcl(acDevice({}));
+    let release!: () => void;
+    const delay = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    Object.assign(tcl, { getThingShadow: async () => ({ reported: {} }), profileSplitDelay: delay });
+    const preset = tcl.executeAcActionVerified("ac1", { mode: 1, fan_speed: 7 });
+    await vi.waitFor(() => expect(delay).toHaveBeenCalledOnce());
+    await tcl.executeAcAction("ac1", { mode: 4 });
+    release();
+    expect(await preset).toBe("superseded");
+    expect(publish.mock.calls).toEqual([["ac1", { workMode: 1 }], ["ac1", { workMode: 4 }]]);
+  });
+
   it("splits the fan out of a swing payload (2026-07-27 post-changeover regression)", async () => {
-    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    const { tcl, publish } = publishingTcl(acDevice({}));
     await tcl.executeAcAction("ac1", { fan_speed: 7, vertical_swing: 10, horizontal_swing: 11 });
-    expect(publishWithRetry).toHaveBeenCalledTimes(2);
-    expect(publishWithRetry).toHaveBeenNthCalledWith(1, "ac1", {
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(publish).toHaveBeenNthCalledWith(1, "ac1", {
       verticalSwitch: 0, verticalDirection: 10, horizontalSwitch: 0, horizontalDirection: 11,
     });
-    expect(publishWithRetry).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
+    expect(publish).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
   });
 
   it("still splits the fan out of a workMode payload (the 2026-05-10 case)", async () => {
-    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    const { tcl, publish } = publishingTcl(acDevice({}));
     await tcl.executeAcAction("ac1", { mode: 1, temperature: 25, fan_speed: 7 });
-    expect(publishWithRetry).toHaveBeenCalledTimes(2);
-    expect(publishWithRetry).toHaveBeenNthCalledWith(1, "ac1", { workMode: 1, targetTemperature: 25 });
-    expect(publishWithRetry).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(publish).toHaveBeenNthCalledWith(1, "ac1", { workMode: 1, targetTemperature: 25 });
+    expect(publish).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
   });
 
   it("splits the fan out of a generator-level payload too", async () => {
-    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    const { tcl, publish } = publishingTcl(acDevice({}));
     await tcl.executeAcAction("ac1", { fan_speed: 7, generator_mode: 3 });
-    expect(publishWithRetry).toHaveBeenCalledTimes(2);
-    expect(publishWithRetry).toHaveBeenNthCalledWith(1, "ac1", { generatorMode: 3 });
-    expect(publishWithRetry).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(publish).toHaveBeenNthCalledWith(1, "ac1", { generatorMode: 3 });
+    expect(publish).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
   });
 
   it("publishes once when the payload is fan-only (nothing to conflict with)", async () => {
-    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    const { tcl, publish } = publishingTcl(acDevice({}));
     await tcl.executeAcAction("ac1", { fan_speed: 7 });
-    expect(publishWithRetry).toHaveBeenCalledTimes(1);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", FAN_7);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledWith("ac1", FAN_7);
   });
 
   it("publishes once when the payload carries no fan at all", async () => {
-    const { tcl, publishWithRetry } = publishingTcl(acDevice({}));
+    const { tcl, publish } = publishingTcl(acDevice({}));
     await tcl.executeAcAction("ac1", { mode: 1, temperature: 25 });
-    expect(publishWithRetry).toHaveBeenCalledTimes(1);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { workMode: 1, targetTemperature: 25 });
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledWith("ac1", { workMode: 1, targetTemperature: 25 });
   });
 
   it("applies Fan→Cool plus Eco as one mode-aware profile", async () => {
@@ -1019,12 +1049,12 @@ describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
         ECO: 0,
       }),
     });
-    const { tcl, publishWithRetry } = publishingTcl(device);
+    const { tcl, publish } = publishingTcl(device);
 
     await tcl.executeAcAction("ac1", { mode: 1, eco: 1 });
 
-    expect(publishWithRetry).toHaveBeenCalledTimes(1);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { workMode: 1, ECO: 1 });
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledWith("ac1", { workMode: 1, ECO: 1 });
   });
 
   it("re-sends an ignored verified profile with the same main/fan split", async () => {
@@ -1040,7 +1070,7 @@ describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
         ECO: 0,
       }),
     });
-    const { tcl, publishWithRetry } = publishingTcl(device);
+    const { tcl, publish } = publishingTcl(device);
     const seam = tcl as unknown as {
       getThingShadow: unknown;
       controlVerifyDelay: unknown;
@@ -1053,15 +1083,15 @@ describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
 
     await tcl.executeAcActionVerified("ac1", { mode: 1, eco: 1, fan_speed: 7 });
 
-    expect(publishWithRetry).toHaveBeenCalledTimes(4);
-    expect(publishWithRetry).toHaveBeenNthCalledWith(1, "ac1", { workMode: 1, ECO: 1 });
-    expect(publishWithRetry).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
-    expect(publishWithRetry).toHaveBeenNthCalledWith(3, "ac1", { workMode: 1, ECO: 1 });
-    expect(publishWithRetry).toHaveBeenNthCalledWith(4, "ac1", FAN_7);
+    expect(publish).toHaveBeenCalledTimes(4);
+    expect(publish).toHaveBeenNthCalledWith(1, "ac1", { workMode: 1, ECO: 1 });
+    expect(publish).toHaveBeenNthCalledWith(2, "ac1", FAN_7);
+    expect(publish).toHaveBeenNthCalledWith(3, "ac1", { workMode: 1, ECO: 1 });
+    expect(publish).toHaveBeenNthCalledWith(4, "ac1", FAN_7);
   });
 
   it("lets a newer direct command supersede an in-flight preset verifier", async () => {
-    const { tcl, publishWithRetry } = publishingTcl(acDevice({ mode: 3 }));
+    const { tcl, publish } = publishingTcl(acDevice({ mode: 3 }));
     const delayResolvers: Array<() => void> = [];
     const seam = tcl as unknown as {
       getThingShadow: unknown;
@@ -1078,12 +1108,12 @@ describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
     delayResolvers[0]();
 
     await expect(preset).resolves.toBe("superseded");
-    expect(publishWithRetry).toHaveBeenCalledTimes(1);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { workMode: 1 });
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledWith("ac1", { workMode: 1 });
   });
 
   it("keeps stale automation enforcement behind an in-flight manual preset", async () => {
-    const { tcl, publishWithRetry } = publishingTcl(acDevice({ mode: 3 }));
+    const { tcl, publish } = publishingTcl(acDevice({ mode: 3 }));
     const delayResolvers: Array<() => void> = [];
     const seam = tcl as unknown as {
       getThingShadow: unknown;
@@ -1106,16 +1136,16 @@ describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
       { suppressWhileManualPresetPending: true },
     );
     expect(staleAutomation).toBe("suppressed");
-    expect(publishWithRetry).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledTimes(1);
 
     delayResolvers[0]();
     await expect(preset).resolves.toBe("applied");
-    expect(publishWithRetry).toHaveBeenCalledTimes(1);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { workMode: 1 });
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledWith("ac1", { workMode: 1 });
   });
 
   it("lets an authoritative background action supersede a pending manual preset", async () => {
-    const { tcl, publishWithRetry } = publishingTcl(acDevice({ mode: 3 }));
+    const { tcl, publish } = publishingTcl(acDevice({ mode: 3 }));
     const delayResolvers: Array<() => void> = [];
     const seam = tcl as unknown as {
       getThingShadow: unknown;
@@ -1129,7 +1159,7 @@ describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
 
     const safetyAction = await tcl.executeAcAction("ac1", { mode: 4 });
     expect(safetyAction).toBe("applied");
-    expect(publishWithRetry).toHaveBeenLastCalledWith("ac1", { workMode: 4 });
+    expect(publish).toHaveBeenLastCalledWith("ac1", { workMode: 4 });
 
     delayResolvers[0]();
     await expect(preset).resolves.toBe("superseded");
@@ -1173,10 +1203,10 @@ describe("executeAcAction fan isolation (TAC-12CHSD)", () => {
   });
 
   it("leaves Najat bundled — her fan key is unaffected by this quirk", async () => {
-    const { tcl, publishWithRetry } = publishingTcl(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
+    const { tcl, publish } = publishingTcl(acDevice({ name: "Najat", model: "TAC-24CHSA" }));
     await tcl.executeAcAction("ac1", { fan_speed: 5, vertical_swing: 9 });
-    expect(publishWithRetry).toHaveBeenCalledTimes(1);
-    expect(publishWithRetry).toHaveBeenCalledWith("ac1", { windSpeed7Gear: 5, verticalWind: 0, verticalDirection: 9 });
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledWith("ac1", { windSpeed7Gear: 5, verticalWind: 0, verticalDirection: 9 });
   });
 });
 

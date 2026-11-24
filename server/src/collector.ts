@@ -16,7 +16,7 @@ import {
   type AcDevice,
   type OffWhenOnlineArm,
 } from "./tcl-cloud.js";
-import { acTimers, fetchPurifierReadings, getPurifierSamples } from "./routes.js";
+import { acTimers } from "./routes.js";
 import { AcLeveler } from "./ac-leveler.js";
 import { LevelingControllerV2 } from "./leveling/controller.js";
 // The v2 context is a SUPERSET of v1's (it carries `slotKey` too) and v1 accepts
@@ -343,10 +343,14 @@ export class Collector {
   tclCloud: TclCloud | null = null;
   private watchActiveUntil = 0;
   private watchTimer?: NodeJS.Timeout;
-  private watchXiaomiBusy = false;
-  private watchTclBusy = false;
   private watchAcs = new Map<string, AcDevice>();
-  private watchMeter: { source: "grid" | "gen" | "none"; amps: number | null; limit: number | null; ts: number } | null = null;
+  private watchMeter: {
+    controller: AcLeveler | LevelingControllerV2;
+    source: "grid" | "gen" | "none";
+    amps: number | null;
+    limit: number | null;
+    ts: number;
+  } | null = null;
   acLeveler: AcLeveler;
   acLeveler2: LevelingControllerV2;
 
@@ -565,16 +569,12 @@ export class Collector {
       this.watchTimer = undefined;
       return;
     }
-    if (!this.watchXiaomiBusy && this.xiaomiCloud?.isReady()) {
-      this.watchXiaomiBusy = true;
-      void fetchPurifierReadings(this.xiaomiCloud).catch(() => log.warn("[collector] Watch purifier refresh failed"))
-        .finally(() => { this.watchXiaomiBusy = false; });
+    if (this.xiaomiCloud?.isReady()) {
+      void this.xiaomiCloud.fetchDevicesLive().catch(() => log.warn("[collector] Watch purifier refresh failed"));
     }
-    if (!this.watchTclBusy && this.tclCloud?.isReady()) {
-      this.watchTclBusy = true;
+    if (this.tclCloud?.isReady()) {
       void this.tclCloud.getDevicesNoOlderThan(WATCH_REFRESH_MS - 1).then(devices => this.rememberWatchAcs(devices))
-        .catch(() => log.warn("[collector] Watch AC refresh failed"))
-        .finally(() => { this.watchTclBusy = false; });
+        .catch(() => log.warn("[collector] Watch AC refresh failed"));
     }
   }
 
@@ -589,13 +589,14 @@ export class Collector {
   getWatchDeviceState() {
     const acs = this.tclCloud?.getDevices() ?? [];
     this.rememberWatchAcs(acs);
+    const controller = this.leveling();
     return {
       acs,
       lastAcs: this.watchAcs,
       purifiers: this.xiaomiCloud?.getDevices() ?? [],
-      purifierReadings: getPurifierSamples(this.xiaomiCloud),
-      meter: this.watchMeter,
-      leveling: this.leveling().getStatus(),
+      hasPowerReading: this.latestPowerTs != null,
+      meter: this.watchMeter?.controller === controller ? this.watchMeter : null,
+      leveling: controller.getStatus(),
     };
   }
 
@@ -3612,8 +3613,8 @@ export class Collector {
     const status = controller.getStatus();
     // A tick can await several publishes while newer meter samples arrive.
     // Only associate its smoothed result with a sample we can identify.
-    if (meterTs && meterTs === this.latestPowerTs && status !== previousStatus && status.measuredAmps != null) {
-      this.watchMeter = { source: status.source, amps: status.measuredAmps, limit: status.limitAmps, ts: meterTs.getTime() };
+    if (meterTs && meterTs === this.latestPowerTs && status !== previousStatus) {
+      this.watchMeter = { controller, source: status.source, amps: status.measuredAmps, limit: status.limitAmps, ts: meterTs.getTime() };
     }
     // Shadow phase: v2 also evaluates (journal-only, no commands) so its
     // decisions can be compared against v1's before cutover.

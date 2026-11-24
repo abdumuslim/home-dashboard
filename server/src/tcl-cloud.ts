@@ -304,6 +304,8 @@ export interface AcDevice {
   /** Earliest second (ms) of the newest full-state report: the dump a power ON makes. */
   fullStateReportAt?: number | null;
   power: boolean;
+  /** Whether the shadow or the list identifier actually supplied powerSwitch. */
+  powerKnown?: boolean;
   mode: number;
   targetTemp: number;
   currentTemp: number;
@@ -477,6 +479,7 @@ export class TclCloud {
   private tokenExpiry = 0;
   private baseApiUrl = DEFAULT_BASE_API;
   private cachedDevices: AcDevice[] = [];
+  private liveFetch?: Promise<AcDevice[]>;
   private deviceCacheTime = 0;
   private lastState: Record<string, Record<string, unknown>> = {};
   private pendingPowerCycleRestores = new Map<string, PendingPowerCycleRestore>();
@@ -554,9 +557,7 @@ export class TclCloud {
     log.info("[tcl] Cloud initialized successfully");
 
     try {
-      const devices = await this.fetchDevices();
-      this.cachedDevices = devices;
-      this.deviceCacheTime = Date.now();
+      const devices = await this.fetchDevicesLive();
 
       log.info(`[tcl] Found ${devices.length} AC device(s)`);
       for (const d of devices) {
@@ -575,12 +576,16 @@ export class TclCloud {
     return this.cachedDevices;
   }
 
-  async fetchDevicesLive(): Promise<AcDevice[]> {
+  fetchDevicesLive(): Promise<AcDevice[]> {
+    return this.liveFetch ??= this.refreshDeviceCache().finally(() => { this.liveFetch = undefined; });
+  }
+
+  private async refreshDeviceCache(): Promise<AcDevice[]> {
     await this.ensureValidTokens();
     const devices = await this.fetchDevices();
     this.cachedDevices = devices;
     this.deviceCacheTime = Date.now();
-    return devices.sort((a, b) => a.displayOrder - b.displayOrder);
+    return devices;
   }
 
   async ensureDeviceCachePopulated(): Promise<void> {
@@ -591,6 +596,7 @@ export class TclCloud {
 
   /** The cached device snapshot while it is at most `maxAgeMs` old, else a live fetch. */
   async getDevicesNoOlderThan(maxAgeMs: number): Promise<AcDevice[]> {
+    if (this.liveFetch) return this.liveFetch;
     if (this.cachedDevices.length > 0 && Date.now() - this.deviceCacheTime <= maxAgeMs) {
       return this.cachedDevices;
     }
@@ -1241,6 +1247,7 @@ export class TclCloud {
           powerReportCohort: powerReport.powerReportCohort,
           fullStateReportAt: powerReport.fullStateReportAt,
           power,
+          powerKnown: shadow.powerSwitch != null || powerFromId?.value != null,
           mode: shadow.workMode ?? 0,
           targetTemp: shadow.targetTemperature ?? 24,
           currentTemp: shadow.currentTemperature ?? 0,
@@ -2016,24 +2023,24 @@ export class TclCloud {
 
     if (safeAction.power === 1) {
       if (!hasProfile) {
-        await this.sendControl(deviceId, "set_power", 1, false, true);
+        await this.sendControl(deviceId, "set_power", 1, false, true, stillCurrent);
         return "applied";
       }
-      await this.publishWithRetry(deviceId, { powerSwitch: 1 });
+      await this.publishWithRetry(deviceId, { powerSwitch: 1 }, stillCurrent);
       log.info(`[tcl] Power ON sent to device ${deviceId}, waiting for boot`);
       await new Promise(r => setTimeout(r, 3000));
       // The ON is on its way to the unit from here: a profile failure must not
       // read as "nothing was sent" to a caller that books ONs (the leveler's
       // restore, the collector's server-ON stamp). See AcProfileNotAppliedError.
       try {
-        await this.publishAcProfile(deviceId, desired);
+        await this.publishAcProfile(deviceId, desired, stillCurrent);
       } catch (err) {
         throw new AcProfileNotAppliedError(deviceId, err);
       }
       return "applied";
     }
 
-    if (hasProfile) await this.publishAcProfile(deviceId, desired);
+    if (hasProfile) await this.publishAcProfile(deviceId, desired, stillCurrent);
     return "applied";
   }
 
@@ -2045,11 +2052,13 @@ export class TclCloud {
    * re-sent as the exact same split profile and a final failure is surfaced to
    * the caller instead of silently reporting success.
    */
-  async executeAcActionVerified(deviceId: string, action: AcAction): Promise<AcVerifiedProfileResult> {
+  async executeAcActionVerified(deviceId: string, action: AcAction,
+    stillCurrent = this.claimPresetIntent(deviceId)): Promise<AcVerifiedProfileResult> {
     // An armed "off when back online" is cancelled by the preset route at its
     // entry, not here: an arm accepted while this request waited is newer than
     // the preset and must survive it (2026-10-10).
     await this.ensureDeviceCachePopulated();
+    if (!stillCurrent()) return "superseded";
     // A verified preset is newer user intent than any frozen last-state
     // snapshot: cancel a pending restore (un-freezing state-save) before the
     // first publish so it cannot revert the preset. LOUD by design.
@@ -2060,12 +2069,12 @@ export class TclCloud {
     const safeAction = this.sanitizeAcAction(deviceId, action);
     if (!safeAction) throw new Error(`Unknown AC device: ${deviceId}`);
     const desired = this.buildProfileShadowPayload(deviceId, safeAction);
-    const generation = this.bumpProfileGeneration(deviceId);
-    this.pendingManualProfiles.set(deviceId, generation);
+    const options = { preserveProfileIntent: true, stillCurrent };
+    this.pendingManualProfiles.set(deviceId, stillCurrent);
     try {
       if (Object.keys(desired).length === 0) {
-        await this.executeAcAction(deviceId, safeAction, { preserveProfileIntent: true });
-        return "applied";
+        await this.executeAcAction(deviceId, safeAction, options);
+        return stillCurrent() ? "applied" : "superseded";
       }
 
       let pre: Record<string, number> | null = null;
@@ -2075,15 +2084,17 @@ export class TclCloud {
         // Retry confirmation still works; only third-value detection degrades.
       }
 
-      if (this.profileGenerations.get(deviceId) !== generation) return "superseded";
-      await this.executeAcAction(deviceId, safeAction, { preserveProfileIntent: true });
+      if (!stillCurrent()) return "superseded";
+      await this.executeAcAction(deviceId, safeAction, options);
+      if (!stillCurrent()) return "superseded";
       for (let attempt = 1; attempt <= CONTROL_VERIFY_MAX_RESENDS + 1; attempt++) {
         await this.controlVerifyDelay();
-        if (this.profileGenerations.get(deviceId) !== generation) {
+        if (!stillCurrent()) {
           log.info(`[tcl] Preset profile on ${deviceId} superseded by a newer profile — verify stopped`);
           return "superseded";
         }
         const reported = (await this.getThingShadow(deviceId)).reported;
+        if (!stillCurrent()) return "superseded";
         const mismatched = Object.keys(desired).filter((key) => reported[key] !== desired[key]);
         if (mismatched.length === 0) {
           if (attempt > 1) log.info(`[tcl] Preset profile on ${deviceId} confirmed after ${attempt - 1} re-send(s)`);
@@ -2099,18 +2110,27 @@ export class TclCloud {
           throw new Error(`Preset was not applied after ${CONTROL_VERIFY_MAX_RESENDS} re-sends`);
         }
         log.info(`[tcl] Preset profile on ${deviceId} not applied — re-sending (${attempt}/${CONTROL_VERIFY_MAX_RESENDS})`);
-        await this.publishAcProfile(deviceId, desired);
+        await this.publishAcProfile(deviceId, desired, stillCurrent);
       }
       throw new Error("Preset verification ended unexpectedly");
+    } catch (err) {
+      if (!stillCurrent()) return "superseded";
+      throw err;
     } finally {
-      if (this.pendingManualProfiles.get(deviceId) === generation) {
+      if (this.pendingManualProfiles.get(deviceId) === stillCurrent) {
         this.pendingManualProfiles.delete(deviceId);
       }
     }
   }
 
   private profileGenerations = new Map<string, number>();
-  private pendingManualProfiles = new Map<string, number>();
+  private pendingManualProfiles = new Map<string, () => boolean>();
+
+  /** Claim before the first await, including a watch preset's saved-slot lookup. */
+  claimPresetIntent(deviceId: string): () => boolean {
+    const generation = this.bumpProfileGeneration(deviceId);
+    return () => this.profileGenerations.get(deviceId) === generation;
+  }
 
   private bumpProfileGeneration(deviceId: string): number {
     const generation = (this.profileGenerations.get(deviceId) ?? 0) + 1;
@@ -2118,16 +2138,16 @@ export class TclCloud {
     return generation;
   }
 
-  private async publishAcProfile(deviceId: string, desired: Record<string, unknown>): Promise<void> {
+  private async publishAcProfile(deviceId: string, desired: Record<string, unknown>, stillCurrent?: () => boolean): Promise<void> {
     const { main, fan } = this.splitFanPayload(deviceId, desired);
     if (fan) {
-      await this.publishWithRetry(deviceId, main);
+      await this.publishWithRetry(deviceId, main, stillCurrent);
       log.info(`[tcl] Profile (main) applied to ${deviceId}: ${JSON.stringify(main)}`);
       await this.profileSplitDelay();
-      await this.publishWithRetry(deviceId, fan);
+      await this.publishWithRetry(deviceId, fan, stillCurrent);
       log.info(`[tcl] Profile (fan) applied to ${deviceId}: ${JSON.stringify(fan)}`);
     } else {
-      await this.publishWithRetry(deviceId, main);
+      await this.publishWithRetry(deviceId, main, stillCurrent);
       log.info(`[tcl] Profile applied to device ${deviceId}: ${JSON.stringify(main)}`);
     }
   }

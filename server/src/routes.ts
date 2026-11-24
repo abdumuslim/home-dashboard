@@ -5,7 +5,7 @@ import { getBaghdadPrayerTimes } from "./prayer.js";
 import type { TimeName } from "./prayer-engine/index.js";
 import type { Config } from "./config.js";
 import { ALERT_METRICS, VALID_PRAYER_NAMES, PRAYER_LABELS } from "./alert-metrics.js";
-import type { PurifierDevice, XiaomiCloud } from "./xiaomi-cloud.js";
+import type { XiaomiCloud } from "./xiaomi-cloud.js";
 import type { TclCloud, AcAction } from "./tcl-cloud.js";
 import { MAX_GENERATOR_LEVEL } from "./tcl-cloud.js";
 import { isAcLevelingEligible, maxGeneratorLevelForDevices, validateLevelingDeviceReferences } from "./ac-capabilities.js";
@@ -28,31 +28,6 @@ import {
 } from "./automation-slots.js";
 
 const log = childLogger("routes");
-
-// All live property readers (dashboard, Hermes and watch collector) share
-// these receipts. Xiaomi's identity-only list refresh has no sampling time
-// for the cached properties it carries forward.
-type PurifierSample = { device: PurifierDevice; ts: number };
-const purifierSamples = new WeakMap<XiaomiCloud, Map<string, PurifierSample>>();
-
-export function getPurifierSamples(cloud: XiaomiCloud | null): ReadonlyMap<string, PurifierSample> {
-  return (cloud && purifierSamples.get(cloud)) ?? new Map();
-}
-
-export async function fetchPurifierReadings(cloud: XiaomiCloud): Promise<PurifierDevice[]> {
-  const ready = cloud.isReady(), ts = Date.now();
-  const devices = await cloud.fetchDevicesLive();
-  if (ready) {
-    const samples = purifierSamples.get(cloud) ?? new Map<string, PurifierSample>();
-    for (const device of devices) {
-      if (device.isOnline && device.readingsStale === false && ts >= (samples.get(device.id)?.ts ?? 0)) {
-        samples.set(device.id, { device: { ...device }, ts });
-      }
-    }
-    purifierSamples.set(cloud, samples);
-  }
-  return devices;
-}
 
 export interface AcTimer {
   deviceId: string;
@@ -209,8 +184,8 @@ type PresetData = Record<string, unknown>;
 type SavedPresetLoader = () => Promise<PresetData | null>;
 
 export interface DeviceControls {
-  ac(req: Request, res: Response, id: string, command: string, value: unknown): Promise<void>;
-  purifier(req: Request, res: Response, id: string, command: string, params: unknown[]): Promise<void>;
+  ac(req: Request, res: Response, id: string, body: { command: string; value: unknown }): Promise<void>;
+  purifier(req: Request, res: Response, id: string, body: { command: string; params?: unknown[] }): Promise<void>;
   preset(req: Request, res: Response, deviceId: string, slot: number, preset: PresetData | SavedPresetLoader,
     preserveGeneratorCap?: () => boolean): Promise<void>;
 }
@@ -219,9 +194,7 @@ export type ApiRouter = Router & { ingestPower: PowerIngestFn; controls: DeviceC
 
 export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: () => XiaomiCloud | null, getTclCloud?: () => TclCloud | null, getLatestAir?: () => Record<string, unknown> | null, getForecast?: () => ForecastResponse | null, onPowerIngest?: (data: { ts: string; voltage: number; current_1: number; current_2: number; power_1: number; power_2: number }) => void, onAutomationRulesChanged?: () => void, acManualOffLocks?: AcManualOffLockHandlers, acLeveling?: AcLevelingHandlers, acCalibration?: AcCalibrationHandlers, getLoopAgeMs?: () => number, onXiaomiRelogin?: () => void): ApiRouter {
   const router = Router();
-  // Only the watch has a DB lookup before verified delivery takes ownership.
-  // A later room command must also supersede a tap still waiting for its slot.
-  const loadingPresets = new Map<string, SavedPresetLoader>();
+  const pendingPresets = new Map<string, { loadingSlot: boolean }>();
 
   // Health check — before auth middleware, no auth required
   router.get("/api/health", async (_req: Request, res: Response) => {
@@ -399,7 +372,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       }
       try {
         return {
-          devices: await fetchPurifierReadings(xiaomi),
+          devices: await xiaomi.fetchDevicesLive(),
           // Re-read after the fetch: a 401 raised by the props loop is swallowed
           // inside fetchDevicesLive, so the status is the only witness to it.
           available: xiaomi.isReady(),
@@ -990,7 +963,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       return;
     }
     try {
-      const devices = await fetchPurifierReadings(cloud);
+      const devices = await cloud.fetchDevicesLive();
       res.json({ devices, available: cloud.isReady(), authStatus: cloud.getAuthStatus().status, region: cloud.getRegion() });
     } catch (err) {
       // A dead token now rejects here instead of resolving with []. Serve the
@@ -1011,11 +984,13 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   const ALLOWED_COMMANDS = ["set_power", "set_mode", "set_level_favorite", "set_fan_level", "set_led", "set_buzzer", "set_child_lock"];
 
   router.post("/api/devices/:id/control", requireAuth, (req, res) =>
-    controlPurifier(req, res, String(req.params.id), req.body?.command, req.body?.params ?? []));
+    controlPurifier(req, res, String(req.params.id), req.body));
 
-  async function controlPurifier(req: Request, res: Response, id: string, command: string, params: unknown[]) {
+  async function controlPurifier(req: Request, res: Response, id: string, body: { command: string; params?: unknown[] }) {
     const cloud = getXiaomiCloud?.();
     if (!cloud) { res.status(503).json({ error: "Xiaomi Cloud not available" }); return; }
+    const { command, params: args } = body;
+    const params = args ?? [];
     if (!command || !ALLOWED_COMMANDS.includes(command)) {
       res.status(400).json({ error: `Invalid command. Allowed: ${ALLOWED_COMMANDS.join(", ")}` });
       return;
@@ -1650,7 +1625,9 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       res.status(409).json({ error: "Turn off when back online is not available for Smart AC Leveling ACs" });
       return;
     }
-    loadingPresets.delete(id);
+    // A deferred arm is future intent. It supersedes a still-loading saved
+    // slot, but an already dispatched preset must leave the newer arm intact.
+    if (pendingPresets.get(id)?.loadingSlot) pendingPresets.delete(id);
     auditAcControl(req, id, "off_when_online", enabled ? 1 : 0);
     // Answer once the arm file holds the change (a durable acknowledgement; a
     // disarm, once the file excludes the arm, whichever path removed it from
@@ -1697,14 +1674,15 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
   }
 
   router.post("/api/ac/devices/:id/control", requireAuth, (req, res) =>
-    controlAc(req, res, String(req.params.id), req.body?.command, req.body?.value));
+    controlAc(req, res, String(req.params.id), req.body));
 
-  async function controlAc(req: Request, res: Response, id: string, command: string, value: unknown) {
+  async function controlAc(req: Request, res: Response, id: string, body: { command: string; value: unknown }) {
     const cloud = getTclCloud?.();
     if (!cloud || !cloud.isReady()) {
       res.status(503).json({ error: "TCL Cloud not available" });
       return;
     }
+    const { command, value } = body;
     if (!command || typeof command !== "string") {
       res.status(400).json({ error: "command is required" });
       return;
@@ -1722,7 +1700,7 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       // (`offWhenOnlineCancelSaved`). Optional call: older test doubles of the
       // cloud predate the method.
       const cancelsOffWhenOnline = command === "set_power";
-      loadingPresets.delete(id);
+      pendingPresets.delete(id);
       if (cancelsOffWhenOnline) cloud.cancelOffWhenOnline?.(id, "cancelled by direct user power command");
       const validation = await cloud.validateControlLive(id, command, value);
       if (!validation.ok) {
@@ -2195,8 +2173,10 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
 
   // ---------- Preset Apply (update active automations) ----------
 
-  router.post("/api/ac/preset-apply", requireAuth, (req, res) =>
-    applyPreset(req, res, req.body?.deviceId, req.body?.slot, req.body?.presetData));
+  router.post("/api/ac/preset-apply", requireAuth, (req, res) => {
+    const { deviceId, slot, presetData } = req.body;
+    return applyPreset(req, res, deviceId, slot, presetData);
+  });
 
   async function applyPreset(req: Request, res: Response, deviceId: string, slot: number, preset: PresetData | SavedPresetLoader,
     preserveGeneratorCap?: () => boolean) {
@@ -2205,35 +2185,21 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       res.status(400).json({ error: "deviceId, slot 1–10, and presetData required" });
       return;
     }
-    let presetData: PresetData;
-    if (typeof preset === "function") {
-      loadingPresets.set(deviceId, preset);
-      try {
-        const saved = await preset();
-        if (loadingPresets.get(deviceId) !== preset) {
-          res.status(409).json({ error: "Preset was superseded by a newer AC control" });
-          return;
-        }
-        if (!saved) { res.status(404).json({ error: "Preset slot is empty" }); return; }
-        presetData = saved;
-      } finally {
-        if (loadingPresets.get(deviceId) === preset) loadingPresets.delete(deviceId);
-      }
-    } else {
-      loadingPresets.delete(deviceId);
-      presetData = preset;
-    }
     const cloud = getTclCloud?.();
-    if (!cloud || !cloud.isReady()) { res.status(503).json({ error: "TCL Cloud not available" }); return; }
-    // A verified preset is newer user intent than an armed "turn off once back
-    // online": cancel it here, at the request's entry before its first await,
-    // so an arm accepted while this request waits is newer and survives it
-    // (executeAcActionVerified does not disarm). LOUD. The success answer waits
-    // until the arm file durably excludes the arm (`offWhenOnlineCancelSaved`).
-    // Optional call: older test doubles of the cloud predate the method.
-    cloud.cancelOffWhenOnline?.(deviceId, "cancelled by verified preset");
+    const request = { loadingSlot: typeof preset === "function" };
+    pendingPresets.set(deviceId, request);
+    const ownsProfile = cloud?.claimPresetIntent(deviceId);
+    const current = () => pendingPresets.get(deviceId) === request && (ownsProfile?.() ?? true);
+    const superseded = () => { res.status(409).json({ error: "Preset was superseded by a newer AC control" }); };
     try {
+      const presetData = typeof preset === "function" ? await preset() : preset;
+      if (!current()) return superseded();
+      request.loadingSlot = false;
+      if (!presetData) { res.status(404).json({ error: "Preset slot is empty" }); return; }
+      if (!cloud || !cloud.isReady()) { res.status(503).json({ error: "TCL Cloud not available" }); return; }
+      cloud.cancelOffWhenOnline?.(deviceId, "cancelled by verified preset");
       await cloud.ensureDeviceCachePopulated();
+      if (!current()) return superseded();
       const action = cloud.sanitizeAcAction(deviceId, presetDataToAcAction(presetData));
       if (!action) { res.status(404).json({ error: `Unknown AC device: ${deviceId}` }); return; }
 
@@ -2245,15 +2211,13 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
       // Fan→Cool followed immediately by Eco while the shadow still says Fan.
       acCalibration?.requestAbort("user_control");
       auditAcControl(req, deviceId, "apply_preset", { slot, action });
-      const delivery = await cloud.executeAcActionVerified(deviceId, action);
-      if (delivery === "superseded") {
-        res.status(409).json({ error: "Preset was superseded by a newer AC control" });
-        return;
-      }
+      const delivery = await cloud.executeAcActionVerified(deviceId, action, current);
+      if (delivery === "superseded" || !current()) return superseded();
       if (action.generator_mode != null) {
         const eligible = isAcLevelingEligible(deviceId);
         if (!eligible) acLeveling?.noteUserGenLevel?.(deviceId, action.generator_mode);
         else await acLeveling?.onUserGenLevel(deviceId, action.generator_mode);
+        if (!current()) return superseded();
       }
       if (action.fan_speed === 0) acManualOffLocks?.onUserFanAuto?.(deviceId);
       else if (action.fan_speed != null || action.turbo != null) acManualOffLocks?.onUserFanChange?.(deviceId);
@@ -2266,9 +2230,15 @@ export function createRouter(pool: pg.Pool, config?: Config, getXiaomiCloud?: ()
         [actionOn, deviceId],
       );
       onAutomationRulesChanged?.();
-      res.json({ ok: true, updated: result.rowCount, action, ...(await offWhenOnlineCancelSaved(cloud, deviceId)) });
+      if (!current()) return superseded();
+      const cancel = await offWhenOnlineCancelSaved(cloud, deviceId);
+      if (!current()) return superseded();
+      res.json({ ok: true, updated: result.rowCount, action, ...cancel });
     } catch (err) {
+      if (!current()) return superseded();
       res.status(500).json({ error: (err as Error).message });
+    } finally {
+      if (pendingPresets.get(deviceId) === request) pendingPresets.delete(deviceId);
     }
   }
 

@@ -3,7 +3,7 @@ import type pg from "pg";
 import type { Collector } from "./collector.js";
 import type { Config } from "./config.js";
 import { matchesWatchBearer } from "./auth.js";
-import { determineSource, STALE_POWER_MS } from "./ac-leveling.js";
+import { STALE_POWER_MS } from "./ac-leveling.js";
 import { isAcLevelingEligible } from "./ac-capabilities.js";
 import { childLogger } from "./logger.js";
 import { median, type DeviceControls } from "./routes.js";
@@ -21,7 +21,7 @@ const acModes = ["auto", "cool", "dry", "fan", "heat"];
 const purifierModes = ["auto", "silent", "favorite", "fan"];
 const minute = 60_000;
 type Reading = Record<string, unknown>;
-type WatchCollector = Pick<Collector, "noteWatchRequest" | "getWatchDeviceState" | "getLatestPower" |
+type WatchCollector = Pick<Collector, "noteWatchRequest" | "getWatchDeviceState" |
   "getLatestAir" | "getAcManualOffLockedIds" | "isAcTurnedDown" | "preserveWatchGeneratorCap">;
 
 function number(value: unknown): number | null {
@@ -101,25 +101,19 @@ function weatherGroup(rows: Reading[], now: number) {
     if (speed != null && at != null && at <= now && now - at <= 10 * minute) speeds.push(speed);
   }
   return {
-    sky: ts == null ? null : watchSky(row, rows, ts),
-    isDay: ts == null ? null : watchSun(ts).isDay,
+    sky: ts == null ? null : watchSky(row, rows, now),
+    isDay: ts == null ? null : watchSun(now).isDay,
     tempC: number(row.temp_c), windKmh: speeds.length ? median(speeds) : null,
     windDir: ts != null && now - ts <= 10 * minute ? number(row.wind_dir_avg10m) : null,
     rainMmH: number(row.rain_hourly_mm), ts,
   };
 }
 
-function powerGroup(raw: Reading | null, state: ReturnType<WatchCollector["getWatchDeviceState"]>, now: number) {
-  const ts = epoch(raw?.ts), grid = number(raw?.current_1), gen = number(raw?.current_2);
-  if (ts == null || grid == null || gen == null || now - ts > STALE_POWER_MS) {
-    return { source: null, amps: null, limit: null, ts };
+function powerGroup(reading: ReturnType<WatchCollector["getWatchDeviceState"]>["meter"], now: number) {
+  if (!reading || now - reading.ts > STALE_POWER_MS) {
+    return { source: null, amps: null, limit: null, ts: null };
   }
-  const source = determineSource({ current_1: grid, current_2: gen }, 0);
-  const reading = state.meter;
-  if (source === "none" || !reading || reading.source !== source || !state.leveling.enabled || now - reading.ts > STALE_POWER_MS) {
-    return { source: source === "gen" ? "generator" : source, amps: null, limit: null, ts };
-  }
-  return { source: source === "gen" ? "generator" : source,
+  return { source: reading.source === "gen" ? "generator" : reading.source,
     amps: reading.amps == null ? null : Math.round(reading.amps * 10) / 10, limit: reading.limit, ts: reading.ts };
 }
 
@@ -134,20 +128,21 @@ async function buildSnapshot(pool: pg.Pool, collector: WatchCollector) {
     collector.getAcManualOffLockedIds(),
   ]);
   const air = liveAir ?? storedAir?.rows[0], co2 = number(air?.co2), pm25 = number(air?.pm25), tvoc = number(air?.tvoc);
-  const state = collector.getWatchDeviceState(), raw = collector.getLatestPower();
+  const state = collector.getWatchDeviceState();
   const now = Date.now();
-  if (!air && !weather.rows.length && !raw && !state.acs.length && !state.lastAcs.size &&
-      !state.purifiers.length && !state.purifierReadings.size) return null;
+  if (!air && !weather.rows.length && !state.hasPowerReading && !state.acs.length && !state.lastAcs.size &&
+      !state.purifiers.length) return null;
 
   const acs = Array.from(rooms, ([id, name]) => {
     const current = state.acs.find(d => d.id === id), saved = state.lastAcs.get(id);
     const d = saved && (saved.lastSeenAt ?? 0) > (current?.lastSeenAt ?? 0) ? saved : current;
+    const power = current?.powerKnown ? current : d;
     const controller = state.leveling.acs.find(a => a.deviceId === id);
     const fanKnown = d?.capabilities.fanSpeeds.some(option => option.value >= 2 && option.value <= 6) || (d?.fanSpeed ?? 0) > 0;
     const gridOnly = !isAcLevelingEligible(id);
     return {
       id, name, online: current?.isOnline ?? d?.isOnline ?? null,
-      on: d && (d.power || d.powerReportedAt != null) ? d.power : null,
+      on: power?.powerKnown ? power.power : null,
       mode: d?.capabilities.modes.length ? acMode(d.mode) : null,
       // The TCL cache substitutes 24 / 0 for a missing target / room reading;
       // its presence flags say whether the shadow really carried the value.
@@ -162,19 +157,17 @@ async function buildSnapshot(pool: pg.Pool, collector: WatchCollector) {
   });
   const purifiers = Array.from(purifierModels, ([id, model]) => {
     const current = state.purifiers.find(d => d.id === id && d.model === model.model);
-    const sample = state.purifierReadings.get(id);
-    const saved = sample?.device.model === model.model ? sample : undefined;
-    const d = saved?.device ?? current;
+    const d = current?.readingsAt != null ? current : undefined;
     const pm25 = number(d?.aqi);
     return {
-      id, name: model.name, online: current?.isOnline ?? d?.isOnline ?? null,
+      id, name: model.name, online: current?.isOnline ?? null,
       on: d?.power === "on" ? true : d?.power === "off" ? false : null,
       mode: d?.mode && purifierModes.includes(d.mode) && (d.mode !== "fan" || model.fan) ? d.mode : null,
       fanLevel: model.fan ? number(d?.fan_level) : null, favoriteLevel: number(d?.favorite_level),
-      favoriteMax: model.max, pm25, pm25Level: airLevel("pm25", pm25), ts: saved?.ts ?? null,
+      favoriteMax: model.max, pm25, pm25Level: airLevel("pm25", pm25), ts: d?.readingsAt ?? null,
     };
   });
-  return { v: 1, ts: now, power: powerGroup(raw, state, now), weather: weatherGroup(weather.rows, now),
+  return { v: 1, ts: now, power: powerGroup(state.meter, now), weather: weatherGroup(weather.rows, now),
     air: { co2, co2Level: airLevel("co2", co2), pm25, pm25Level: airLevel("pm25", pm25),
       tvoc, tvocLevel: airLevel("tvoc", tvoc), ts: epoch(air?.ts) }, acs, purifiers };
 }
@@ -211,7 +204,7 @@ export function createWatchGate(config: Config, pool: pg.Pool, collector: WatchC
     const on = req.body?.on;
     if (typeof on !== "boolean") { res.status(400).json({ error: "on must be boolean" }); return; }
     collector.noteWatchRequest();
-    return controls.ac(req, res, String(req.params.id), "set_power", on ? 1 : 0);
+    return controls.ac(req, res, String(req.params.id), { command: "set_power", value: on ? 1 : 0 });
   });
   router.get("/api/watch/ac/:id/presets", async (req, res) => {
     collector.noteWatchRequest();
@@ -238,7 +231,7 @@ export function createWatchGate(config: Config, pool: pg.Pool, collector: WatchC
     const control = purifierCommand(req.body?.command, req.body?.value, model);
     if (!control) { res.status(400).json({ error: "Invalid control for this purifier" }); return; }
     collector.noteWatchRequest();
-    return controls.purifier(req, res, id, control.command, [control.value]);
+    return controls.purifier(req, res, id, { command: control.command, params: [control.value] });
   });
   router.use(deny);
   const handleError: ErrorRequestHandler = (err, req, res, next) => {
