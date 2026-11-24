@@ -13,6 +13,9 @@ const rooms = new Map([
   ["DHihohFAAAE", "ماما"], ["CA5IMhFAAAE", "عبدو"],
   ["Cy3aihFAAAE", "عبدالله"], ["DlXqDBFAAAE", "الضيوف"],
 ]);
+// Rooms with their own thermometer (the dashboard's indoor cards): the weather station's indoor console sits
+// in ماما's room and its channel 8 in عبدو's. The other rooms only have the AC's own sensor.
+const roomSensors = new Map([["DHihohFAAAE", "temp_indoor_c"], ["CA5IMhFAAAE", "temp_ch8_c"]]);
 const purifierModels = new Map([
   ["357465941", { name: "ماما", model: "zhimi.airpurifier.v7", fan: false, max: 16 }],
   ["317499063", { name: "عبدو", model: "zhimi.airpurifier.vb2", fan: true, max: 14 }],
@@ -139,7 +142,7 @@ async function buildSnapshot(pool: pg.Pool, collector: WatchCollector) {
   const asOf = new Date(), liveAir = collector.getLatestAir();
   const [weather, yesterday, storedAir, locked] = await Promise.all([
     pool.query(`SELECT ts, temp_c, humidity, feels_like_c, dew_point_c, rain_hourly_mm, solar_radiation,
-      uv_index, wind_speed_kmh, wind_dir_avg10m FROM weather_readings
+      uv_index, wind_speed_kmh, wind_dir_avg10m, temp_indoor_c, temp_ch8_c FROM weather_readings
       WHERE ts <= $1 AND ts >= (SELECT MAX(ts) FROM weather_readings WHERE ts <= $1) - INTERVAL '10 minutes'
       ORDER BY ts DESC`, [asOf]),
     pool.query("SELECT ts, temp_c FROM weather_readings WHERE ts >= $1 AND ts <= $2",
@@ -150,6 +153,8 @@ async function buildSnapshot(pool: pg.Pool, collector: WatchCollector) {
   const air = liveAir ?? storedAir?.rows[0], co2 = number(air?.co2), pm25 = number(air?.pm25), tvoc = number(air?.tvoc);
   const state = collector.getWatchDeviceState();
   const now = Date.now();
+  const station = weather.rows[0] as Reading | undefined, stationTs = epoch(station?.ts);
+  const stationFresh = stationTs != null && stationTs <= now && now - stationTs <= 10 * minute;
   if (!air && !weather.rows.length && !state.hasPowerReading && !state.acs.length && !state.lastAcs.size &&
       !state.purifiers.length) return null;
 
@@ -167,7 +172,9 @@ async function buildSnapshot(pool: pg.Pool, collector: WatchCollector) {
       // The TCL cache substitutes 24 / 0 for a missing target / room reading;
       // its presence flags say whether the shadow really carried the value.
       setC: d?.targetTempKnown ? number(d.targetTemp) : null,
-      roomC: d?.currentTempKnown ? number(d.currentTemp) : null,
+      // A fresh room-sensor reading wins (the number the dashboard shows); else the AC's own sensor.
+      roomC: (stationFresh ? number(station?.[roomSensors.get(id) ?? ""]) : null) ??
+        (d?.currentTempKnown ? number(d.currentTemp) : null),
       fan: d && fanKnown ? d.fanSpeed === 0 ? "A" : d.fanSpeed : null,
       level: !gridOnly && state.leveling.enabled && controller?.managed ? number(controller.level) : null,
       manualOffLock: locked.has(id),

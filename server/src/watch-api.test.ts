@@ -532,6 +532,20 @@ describe("watch readings", () => {
     expect(reconcile).not.toHaveBeenCalled();
   });
 
+  it("shows a fresh room-sensor reading for the rooms that have one, else the AC's own sensor", async () => {
+    const h = await harness(), now = Date.now();
+    h.devices.push(...[mom, "CA5IMhFAAAE", "Cy3aihFAAAE", guest].map(id => device(id, now - 60_000)));
+    const rooms = async () => ((await (await h.request("/api/watch")).json()).acs as { roomC: number | null }[])
+      .map(a => a.roomC);
+    h.weather.push({ ts: new Date(now - 60_000), temp_c: 20, temp_indoor_c: 27.3, temp_ch8_c: 29.8 });
+    expect(await rooms()).toEqual([27.3, 29.8, 26.5, 26.5]); // ماما console, عبدو channel 8, the rest the AC
+    h.weather[0].temp_ch8_c = null; // channel 8 missing: never a zero, the AC reading instead
+    expect(await rooms()).toEqual([27.3, 26.5, 26.5, 26.5]);
+    h.weather[0].ts = new Date(now - 11 * 60_000); // a station silent for over 10 minutes is not shown as live
+    expect(await rooms()).toEqual([26.5, 26.5, 26.5, 26.5]);
+    const sql = h.query.mock.calls.map(([q]) => q as string).find(q => q.includes("FROM weather_readings") && q.includes("ORDER BY"));
+    expect(sql).toMatch(/temp_indoor_c, temp_ch8_c/);
+  });
   it("reads current shed, fan hold and lock state independently of the previous controller status", async () => {
     const h = await harness();
     h.devices.push(device(mom, Date.now()), device("CA5IMhFAAAE", Date.now()));
