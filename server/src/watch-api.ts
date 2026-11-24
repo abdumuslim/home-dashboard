@@ -95,7 +95,8 @@ export function airLevel(metric: keyof typeof airBands, value: number | null) {
 
 // Same comparison as the dashboard's temperature card: the mean of the last 5
 // minutes against the mean of the 5 minutes starting 24 hours earlier; null
-// unless both windows hold a reading.
+// unless both windows hold a reading. Both windows hang off asOf, the cutoff
+// the SQL used, so the fetched rows always cover them.
 function meanTemp(rows: Reading[], from: number, to: number) {
   let sum = 0, count = 0;
   for (const sample of rows) {
@@ -112,7 +113,7 @@ function weatherGroup(rows: Reading[], yesterdayRows: Reading[], now: number, as
     const speed = number(sample.wind_speed_kmh), at = epoch(sample.ts);
     if (speed != null && at != null && at <= now && now - at <= 10 * minute) speeds.push(speed);
   }
-  const today = meanTemp(rows, now - yesterdayWindow, now);
+  const today = meanTemp(rows, asOf - yesterdayWindow, asOf);
   const before = meanTemp(yesterdayRows, asOf - day, asOf - day + yesterdayWindow);
   return {
     sky: ts == null ? null : watchSky(row, rows, now),

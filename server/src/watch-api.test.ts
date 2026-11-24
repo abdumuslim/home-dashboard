@@ -442,25 +442,34 @@ describe("watch device controls through the dashboard handlers", () => {
 
 describe("watch readings", () => {
   it("carries humidity, feels-like and the 5-minute mean against the same 5 minutes yesterday", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const at = Date.parse("2026-11-24T06:00:00.000Z"), day = 86_400_000;
+    vi.setSystemTime(at);
     const h = await harness();
-    const now = Date.now(), day = 86_400_000;
-    h.weather.push({ ts: new Date(now - 30_000), temp_c: 19, humidity: 54, feels_like_c: 17.1 },
-      { ts: new Date(now - 200_000), temp_c: 18, humidity: 50, feels_like_c: 16 },
-      { ts: new Date(now - 400_000), temp_c: 30 }, // outside today's 5 minutes
-      { ts: new Date(now - day + 60_000), temp_c: 16.2 },
-      { ts: new Date(now - day + 120_000), temp_c: null },
-      { ts: new Date(now - day - 60_000), temp_c: 5 }); // before yesterday's window
-    const fresh = (await (await h.request("/api/watch")).json()).weather;
-    expect(fresh).toMatchObject({ tempC: 19, humidity: 54, feelsLikeC: 17.1, vsYesterdayC: 2.3 });
+    const base = h.query.getMockImplementation()!;
+    h.query.mockImplementation(async (sql: string, args: unknown[] = []) => {
+      const result = await base(sql, args);
+      vi.setSystemTime(at + 2_000); // the reads take 2 s: the response clock moves past the SQL cutoff
+      return result;
+    });
+    const watchWeather = async () => { vi.setSystemTime(at); return (await (await h.request("/api/watch")).json()).weather; };
+    h.weather.push({ ts: new Date(at), temp_c: 19, humidity: 54, feels_like_c: 17.1 }, // at the SQL cutoff
+      { ts: new Date(at - 300_000), temp_c: 18, humidity: 50, feels_like_c: 16 }, // window start, inclusive
+      { ts: new Date(at - 300_001), temp_c: 30 }, // 1 ms outside today's 5 minutes
+      { ts: new Date(at - day + 60_000), temp_c: 16.2 },
+      { ts: new Date(at - day + 300_000), temp_c: 16.4 }, // yesterday's window end, inclusive
+      { ts: new Date(at - day + 300_001), temp_c: 99 }, // 1 ms past it
+      { ts: new Date(at - day + 120_000), temp_c: null },
+      { ts: new Date(at - day - 1), temp_c: 5 }); // 1 ms before it
+    const fresh = await watchWeather();
+    expect(fresh).toMatchObject({ tempC: 19, humidity: 54, feelsLikeC: 17.1, vsYesterdayC: 2.2 }); // 18.5 - 16.3
     const yesterdaySql = h.query.mock.calls.find(([sql]) => sql.includes("WHERE ts >= $1 AND ts <= $2"));
-    const [from, to] = (yesterdaySql?.[1] ?? []) as Date[];
-    expect(to.getTime() - from.getTime()).toBe(300_000);
-    expect(Math.abs(from.getTime() - (now - day))).toBeLessThan(5_000);
-    h.weather.splice(3, 1); // no reading yesterday: no comparison, never a zero
-    expect((await (await h.request("/api/watch")).json()).weather).toMatchObject({ vsYesterdayC: null, humidity: 54 });
+    expect((yesterdaySql?.[1] as Date[]).map(d => d.getTime())).toEqual([at - day, at - day + 300_000]);
+    h.weather.splice(3, 2); // no reading in yesterday's window: no comparison, never a zero
+    expect(await watchWeather()).toMatchObject({ vsYesterdayC: null, humidity: 54 });
     h.weather.splice(0, 2); // nothing in today's 5 minutes
-    h.weather.push({ ts: new Date(now - day + 90_000), temp_c: 15 });
-    expect((await (await h.request("/api/watch")).json()).weather).toMatchObject({ vsYesterdayC: null });
+    h.weather.push({ ts: new Date(at - day + 90_000), temp_c: 15 });
+    expect(await watchWeather()).toMatchObject({ vsYesterdayC: null });
   });
   it("shows a browser's successful purifier sample on the first watch poll, with its original time", async () => {
     const h = await harness();
