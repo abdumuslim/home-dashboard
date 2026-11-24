@@ -119,6 +119,7 @@ function weatherGroup(rows: Reading[], yesterdayRows: Reading[], now: number, as
     sky: ts == null ? null : watchSky(row, rows, now),
     isDay: ts == null ? null : watchSun(now).isDay,
     tempC: number(row.temp_c), feelsLikeC: number(row.feels_like_c), humidity: number(row.humidity),
+    uv: number(row.uv_index),
     vsYesterdayC: today == null || before == null ? null : Math.round((today - before) * 10) / 10,
     windKmh: speeds.length ? median(speeds) : null,
     windDir: ts != null && now - ts <= 10 * minute ? number(row.wind_dir_avg10m) : null,
@@ -138,7 +139,7 @@ async function buildSnapshot(pool: pg.Pool, collector: WatchCollector) {
   const asOf = new Date(), liveAir = collector.getLatestAir();
   const [weather, yesterday, storedAir, locked] = await Promise.all([
     pool.query(`SELECT ts, temp_c, humidity, feels_like_c, dew_point_c, rain_hourly_mm, solar_radiation,
-      wind_speed_kmh, wind_dir_avg10m FROM weather_readings
+      uv_index, wind_speed_kmh, wind_dir_avg10m FROM weather_readings
       WHERE ts <= $1 AND ts >= (SELECT MAX(ts) FROM weather_readings WHERE ts <= $1) - INTERVAL '10 minutes'
       ORDER BY ts DESC`, [asOf]),
     pool.query("SELECT ts, temp_c FROM weather_readings WHERE ts >= $1 AND ts <= $2",

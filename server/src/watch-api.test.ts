@@ -453,7 +453,7 @@ describe("watch readings", () => {
       return result;
     });
     const watchWeather = async () => { vi.setSystemTime(at); return (await (await h.request("/api/watch")).json()).weather; };
-    h.weather.push({ ts: new Date(at), temp_c: 19, humidity: 54, feels_like_c: 17.1 }, // at the SQL cutoff
+    h.weather.push({ ts: new Date(at), temp_c: 19, humidity: 54, feels_like_c: 17.1, uv_index: 3 }, // at the SQL cutoff
       { ts: new Date(at - 300_000), temp_c: 18, humidity: 50, feels_like_c: 16 }, // window start, inclusive
       { ts: new Date(at - 300_001), temp_c: 30 }, // 1 ms outside today's 5 minutes
       { ts: new Date(at - day + 60_000), temp_c: 16.2 },
@@ -462,7 +462,7 @@ describe("watch readings", () => {
       { ts: new Date(at - day + 120_000), temp_c: null },
       { ts: new Date(at - day - 1), temp_c: 5 }); // 1 ms before it
     const fresh = await watchWeather();
-    expect(fresh).toMatchObject({ tempC: 19, humidity: 54, feelsLikeC: 17.1, vsYesterdayC: 2.2 }); // 18.5 - 16.3
+    expect(fresh).toMatchObject({ tempC: 19, humidity: 54, feelsLikeC: 17.1, uv: 3, vsYesterdayC: 2.2 }); // 18.5 - 16.3
     const yesterdaySql = h.query.mock.calls.find(([sql]) => sql.includes("WHERE ts >= $1 AND ts <= $2"));
     expect((yesterdaySql?.[1] as Date[]).map(d => d.getTime())).toEqual([at - day, at - day + 300_000]);
     h.weather.splice(3, 2); // no reading in yesterday's window: no comparison, never a zero
@@ -490,7 +490,7 @@ describe("watch readings", () => {
     expect((await h.request("/api/watch")).status).toBe(503);
     h.air.push({ ts: new Date(airTs), co2: 1020 });
     const partial = await (await h.request("/api/watch")).json();
-    expect(partial.weather).toEqual({ sky: null, isDay: null, tempC: null, feelsLikeC: null, humidity: null,
+    expect(partial.weather).toEqual({ sky: null, isDay: null, tempC: null, feelsLikeC: null, humidity: null, uv: null,
       vsYesterdayC: null, windKmh: null, windDir: null, rainMmH: null, ts: null });
     expect(partial.air).toMatchObject({ ts: airTs, co2: 1020, co2Level: "moderate", pm25Level: null });
     expect(partial.power).toEqual({ source: null, amps: null, limit: null, ts: null });
