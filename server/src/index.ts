@@ -3,6 +3,7 @@ import { createPool, initDb } from "./database.js";
 import { Collector } from "./collector.js";
 import { ForecastService } from "./forecast.js";
 import { createRouter } from "./routes.js";
+import { createWatchGate } from "./watch-api.js";
 import { Ct02Feed } from "./ct02-feed.js";
 import { registerDiagnosticsRoutes } from "./diagnostics.js";
 import { childLogger } from "./logger.js";
@@ -42,18 +43,6 @@ async function main(): Promise<void> {
 
   // Create Express app
   const app = express();
-
-  // No-cache middleware for API and static asset responses
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    const p = req.path;
-    if (p.startsWith("/api/") || p.endsWith(".js") || p.endsWith(".css") || p.endsWith(".html")) {
-      res.set("Cache-Control", "no-cache, no-store, must-revalidate");
-    }
-    next();
-  });
-
-  // Parse JSON bodies for push subscription endpoints
-  app.use(express.json());
 
   // Mount API routes
   const apiRouter = createRouter(
@@ -106,6 +95,20 @@ async function main(): Promise<void> {
     () => collector.getLoopAgeMs(),
     () => collector.requestXiaomiRelogin(),
   );
+  app.use(createWatchGate(config, pool, collector, apiRouter.controls));
+
+  // No-cache middleware for API and static asset responses
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const p = req.path;
+    if (p.startsWith("/api/") || p.endsWith(".js") || p.endsWith(".css") || p.endsWith(".html")) {
+      res.set("Cache-Control", "no-cache, no-store, must-revalidate");
+    }
+    next();
+  });
+
+  // Parse JSON bodies for push subscription endpoints
+  app.use(express.json());
+
   app.use(apiRouter);
 
   // CT02 open-firmware meter feed: its own MQTT connection, decoded in memory.

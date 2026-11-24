@@ -1,6 +1,7 @@
 import express from "express";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Server } from "node:http";
+import { listenOnFetchSafePort } from "./test-http.js";
 import { acTimers, createRouter, type AcManualOffLockHandlers } from "./routes.js";
 import type { Config } from "./config.js";
 import { signToken, verifyToken } from "./auth.js";
@@ -121,9 +122,7 @@ async function startServer(options: {
     options.locks,
     options.leveling,
   ));
-  const server = await new Promise<Server>((resolve) => {
-    const s = app.listen(0, () => resolve(s));
-  });
+  const server = await listenOnFetchSafePort(app);
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("No test server port");
   return { server, url: `http://127.0.0.1:${address.port}` };
@@ -160,6 +159,15 @@ function control(url: string, headers: Record<string, string>, command: string, 
 }
 
 describe("AC control attribution (2026-07-24 'Najat keeps turning back on')", () => {
+  it("refuses a colliding watch key at the agent session handler even in isolation", async () => {
+    const { server, url } = await startServer({ config: { ...TEST_CONFIG, watchApiToken: TEST_CONFIG.hermesApiToken } });
+    servers.push(server);
+    const result = await fetch(url + "/api/agent/session", {
+      method: "POST", headers: { Authorization: "Bearer " + TEST_CONFIG.hermesApiToken, Cookie: loginCookie() },
+    });
+    expect(result.status).toBe(401);
+    expect(result.headers.has("set-cookie")).toBe(false);
+  });
   it("/api/agent/session mints a session carrying the agent claim", async () => {
     const { server, url } = await startServer();
     servers.push(server);

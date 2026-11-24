@@ -2,8 +2,13 @@ import { createHmac, timingSafeEqual } from "crypto";
 import type { Request, Response, NextFunction } from "express";
 import type { Config } from "./config.js";
 
-/** Who is behind an authenticated request: a human dashboard session or the Hermes agent. */
-export type AuthKind = "user" | "agent";
+export type AuthKind = "user" | "agent" | "watch";
+
+export const actorName: Record<AuthKind, string> = {
+  user: "the dashboard",
+  agent: "the Hermes agent",
+  watch: "the watch",
+};
 
 declare module "express" {
   interface Request {
@@ -32,8 +37,7 @@ export function verifyToken(token: string, secret: string): Record<string, unkno
   if (parts.length !== 3) return null;
   const [header, body, sig] = parts;
   const expected = base64url(createHmac("sha256", secret).update(`${header}.${body}`).digest());
-  if (sig.length !== expected.length) return null;
-  if (!timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  if (!safeCompare(sig, expected)) return null;
   try {
     const payload = JSON.parse(Buffer.from(body, "base64url").toString());
     if (payload.exp && Date.now() > payload.exp) return null;
@@ -44,7 +48,10 @@ export function verifyToken(token: string, secret: string): Record<string, unkno
 }
 
 function safeCompare(a: string, b: string): boolean {
-  return a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -66,10 +73,18 @@ function parseBearerToken(header: string | string[] | undefined): string | null 
   return match?.[1]?.trim() || null;
 }
 
-export function isHermesBearerRequest(req: Request, config: Config): boolean {
-  if (!config.hermesApiToken) return false;
+function matchesBearer(req: Request, secret: string | undefined): boolean {
+  if (!secret) return false;
   const token = parseBearerToken(req.headers.authorization);
-  return !!token && safeCompare(token, config.hermesApiToken);
+  return !!token && safeCompare(token, secret);
+}
+
+export function matchesWatchBearer(req: Request, config: Config): boolean {
+  return matchesBearer(req, config.watchApiToken);
+}
+
+export function isHermesBearerRequest(req: Request, config: Config): boolean {
+  return config.hermesApiToken !== config.watchApiToken && matchesBearer(req, config.hermesApiToken);
 }
 
 // Cloudflare's published edge ranges (https://www.cloudflare.com/ips/, retrieved

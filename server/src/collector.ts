@@ -16,7 +16,7 @@ import {
   type AcDevice,
   type OffWhenOnlineArm,
 } from "./tcl-cloud.js";
-import { acTimers } from "./routes.js";
+import { acTimers, fetchPurifierReadings, getPurifierSamples } from "./routes.js";
 import { AcLeveler } from "./ac-leveler.js";
 import { LevelingControllerV2 } from "./leveling/controller.js";
 // The v2 context is a SUPERSET of v1's (it carries `slotKey` too) and v1 accepts
@@ -28,7 +28,7 @@ import { computeNeedTier, type NeedTier } from "./ac-leveling.js";
 import { computeAutoFanLevel } from "./ac-auto-fan.js";
 import { childLogger } from "./logger.js";
 import { RateGate } from "./rate-gate.js";
-import type { AuthKind } from "./auth.js";
+import { actorName, type AuthKind } from "./auth.js";
 import { isAcLevelingEligible, isPowerCycleRestoreEligible } from "./ac-capabilities.js";
 import {
   findActiveRangeSlot,
@@ -38,6 +38,7 @@ import {
 } from "./automation-slots.js";
 
 const log = childLogger("collector");
+const WATCH_REFRESH_MS = 15_000;
 
 interface WeatherRow {
   ts: Date;
@@ -340,6 +341,12 @@ export class Collector {
   // Automation system
   xiaomiCloud: XiaomiCloud | null = null;
   tclCloud: TclCloud | null = null;
+  private watchActiveUntil = 0;
+  private watchTimer?: NodeJS.Timeout;
+  private watchXiaomiBusy = false;
+  private watchTclBusy = false;
+  private watchAcs = new Map<string, AcDevice>();
+  private watchMeter: { source: "grid" | "gen" | "none"; amps: number | null; limit: number | null; ts: number } | null = null;
   acLeveler: AcLeveler;
   acLeveler2: LevelingControllerV2;
 
@@ -545,6 +552,64 @@ export class Collector {
     return this.latestAirRow;
   }
 
+  /** The request only renews demand. Cloud calls run on a separate collector
+   * timer, so a slow provider cannot hold up the response or the leveling loop. */
+  noteWatchRequest(): void {
+    this.watchActiveUntil = Date.now() + 120_000;
+    this.watchTimer ??= setInterval(() => this.refreshWatchDevices(), WATCH_REFRESH_MS).unref();
+  }
+
+  private refreshWatchDevices(): void {
+    if (Date.now() >= this.watchActiveUntil) {
+      clearInterval(this.watchTimer);
+      this.watchTimer = undefined;
+      return;
+    }
+    if (!this.watchXiaomiBusy && this.xiaomiCloud?.isReady()) {
+      this.watchXiaomiBusy = true;
+      void fetchPurifierReadings(this.xiaomiCloud).catch(() => log.warn("[collector] Watch purifier refresh failed"))
+        .finally(() => { this.watchXiaomiBusy = false; });
+    }
+    if (!this.watchTclBusy && this.tclCloud?.isReady()) {
+      this.watchTclBusy = true;
+      void this.tclCloud.getDevicesNoOlderThan(WATCH_REFRESH_MS - 1).then(devices => this.rememberWatchAcs(devices))
+        .catch(() => log.warn("[collector] Watch AC refresh failed"))
+        .finally(() => { this.watchTclBusy = false; });
+    }
+  }
+
+  private rememberWatchAcs(acs: AcDevice[]): void {
+    // A subsequent list fetch can succeed while one unit's shadow read
+    // fails. Retain that unit's most recent actual report across the failure.
+    for (const d of acs) {
+      if (d.lastSeenAt != null && d.lastSeenAt >= (this.watchAcs.get(d.id)?.lastSeenAt ?? 0)) this.watchAcs.set(d.id, d);
+    }
+  }
+
+  getWatchDeviceState() {
+    const acs = this.tclCloud?.getDevices() ?? [];
+    this.rememberWatchAcs(acs);
+    return {
+      acs,
+      lastAcs: this.watchAcs,
+      purifiers: this.xiaomiCloud?.getDevices() ?? [],
+      purifierReadings: getPurifierSamples(this.xiaomiCloud),
+      meter: this.watchMeter,
+      leveling: this.leveling().getStatus(),
+    };
+  }
+
+  isAcTurnedDown(deviceId: string): boolean {
+    return this.isLevelerShed(deviceId) || this.hasLevelerFanHold(deviceId);
+  }
+
+  preserveWatchGeneratorCap(deviceId: string): boolean {
+    if (!isAcLevelingEligible(deviceId)) return false;
+    // Before the controller has evaluated this room, keep its existing cap.
+    // Once known, use the same live management decision as automation sends.
+    return this.isAcLevelingManaged(deviceId) || !this.leveling().getStatus().acs.some(ac => ac.deviceId === deviceId);
+  }
+
   /** Read-only view of the newest ESP reading, for observability (diagnostics.ts). */
   getLatestPower(): Record<string, unknown> | null {
     return this.latestPowerRow;
@@ -649,7 +714,7 @@ export class Collector {
    */
   notifyAcLockCleared(deviceId: string, authKind: AuthKind, ip: string): void {
     const name = this.tclCloud?.getDevices().find((d) => d.id === deviceId)?.name ?? deviceId;
-    const source = authKind === "agent" ? "the Hermes agent" : "the dashboard";
+    const source = actorName[authKind];
     log.info(`[collector] AC ${deviceId}: manual-off lock released by a power-ON from ${source} (ip=${ip})`);
     void this.broadcastPush({
       title: "AC manual-off released",
@@ -1204,6 +1269,7 @@ export class Collector {
 
   stop(): void {
     this.stopped = true;
+    clearInterval(this.watchTimer);
     if (this.loopWatchdog) {
       clearInterval(this.loopWatchdog);
       this.loopWatchdog = null;
@@ -3539,7 +3605,16 @@ export class Collector {
         slotKey: need.slotKey,
       };
     });
-    await this.leveling().tick(ctx, outdoorTempC);
+    const controller = this.leveling();
+    const meterTs = this.latestPowerTs;
+    const previousStatus = controller.getStatus();
+    await controller.tick(ctx, outdoorTempC);
+    const status = controller.getStatus();
+    // A tick can await several publishes while newer meter samples arrive.
+    // Only associate its smoothed result with a sample we can identify.
+    if (meterTs && meterTs === this.latestPowerTs && status !== previousStatus && status.measuredAmps != null) {
+      this.watchMeter = { source: status.source, amps: status.measuredAmps, limit: status.limitAmps, ts: meterTs.getTime() };
+    }
     // Shadow phase: v2 also evaluates (journal-only, no commands) so its
     // decisions can be compared against v1's before cutover.
     if (this.acLeveler2.controllerFlavor() === "shadow") {

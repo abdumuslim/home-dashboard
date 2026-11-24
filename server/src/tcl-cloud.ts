@@ -307,6 +307,9 @@ export interface AcDevice {
   mode: number;
   targetTemp: number;
   currentTemp: number;
+  /** False when the shadow carried no targetTemperature / currentTemperature and the value above is a default. */
+  targetTempKnown?: boolean;
+  currentTempKnown?: boolean;
   fanSpeed: number;
   eco: boolean;
   sleep: number;
@@ -1241,6 +1244,8 @@ export class TclCloud {
           mode: shadow.workMode ?? 0,
           targetTemp: shadow.targetTemperature ?? 24,
           currentTemp: shadow.currentTemperature ?? 0,
+          targetTempKnown: shadow.targetTemperature != null,
+          currentTempKnown: shadow.currentTemperature != null,
           fanSpeed: isChsaModel
             ? (shadow.windSpeed7Gear ?? 0)
             : (shadow.silenceSwitch === 1 ? 1 : shadow.turbo === 1 ? 7 : (shadow.windSpeed ?? 0)),
