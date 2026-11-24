@@ -19,7 +19,7 @@ const purifierModels = new Map([
 ]);
 const acModes = ["auto", "cool", "dry", "fan", "heat"];
 const purifierModes = ["auto", "silent", "favorite", "fan"];
-const minute = 60_000;
+const minute = 60_000, day = 24 * 60 * minute, yesterdayWindow = 5 * minute;
 type Reading = Record<string, unknown>;
 type WatchCollector = Pick<Collector, "noteWatchRequest" | "getWatchDeviceState" |
   "getLatestAir" | "getAcManualOffLockedIds" | "isAcTurnedDown" | "preserveWatchGeneratorCap">;
@@ -93,17 +93,33 @@ export function airLevel(metric: keyof typeof airBands, value: number | null) {
   return value == null ? null : value <= first ? "good" : value <= second ? "moderate" : "bad";
 }
 
-function weatherGroup(rows: Reading[], now: number) {
+// Same comparison as the dashboard's temperature card: the mean of the last 5
+// minutes against the mean of the 5 minutes starting 24 hours earlier; null
+// unless both windows hold a reading.
+function meanTemp(rows: Reading[], from: number, to: number) {
+  let sum = 0, count = 0;
+  for (const sample of rows) {
+    const temp = number(sample.temp_c), at = epoch(sample.ts);
+    if (temp != null && at != null && at >= from && at <= to) { sum += temp; count++; }
+  }
+  return count ? sum / count : null;
+}
+
+function weatherGroup(rows: Reading[], yesterdayRows: Reading[], now: number, asOf: number) {
   const row = rows[0] ?? {}, ts = epoch(row.ts);
   const speeds: number[] = [];
   for (const sample of rows) {
     const speed = number(sample.wind_speed_kmh), at = epoch(sample.ts);
     if (speed != null && at != null && at <= now && now - at <= 10 * minute) speeds.push(speed);
   }
+  const today = meanTemp(rows, now - yesterdayWindow, now);
+  const before = meanTemp(yesterdayRows, asOf - day, asOf - day + yesterdayWindow);
   return {
     sky: ts == null ? null : watchSky(row, rows, now),
     isDay: ts == null ? null : watchSun(now).isDay,
-    tempC: number(row.temp_c), windKmh: speeds.length ? median(speeds) : null,
+    tempC: number(row.temp_c), feelsLikeC: number(row.feels_like_c), humidity: number(row.humidity),
+    vsYesterdayC: today == null || before == null ? null : Math.round((today - before) * 10) / 10,
+    windKmh: speeds.length ? median(speeds) : null,
     windDir: ts != null && now - ts <= 10 * minute ? number(row.wind_dir_avg10m) : null,
     rainMmH: number(row.rain_hourly_mm), ts,
   };
@@ -119,11 +135,13 @@ function powerGroup(reading: ReturnType<WatchCollector["getWatchDeviceState"]>["
 
 async function buildSnapshot(pool: pg.Pool, collector: WatchCollector) {
   const asOf = new Date(), liveAir = collector.getLatestAir();
-  const [weather, storedAir, locked] = await Promise.all([
-    pool.query(`SELECT ts, temp_c, humidity, dew_point_c, rain_hourly_mm, solar_radiation,
+  const [weather, yesterday, storedAir, locked] = await Promise.all([
+    pool.query(`SELECT ts, temp_c, humidity, feels_like_c, dew_point_c, rain_hourly_mm, solar_radiation,
       wind_speed_kmh, wind_dir_avg10m FROM weather_readings
       WHERE ts <= $1 AND ts >= (SELECT MAX(ts) FROM weather_readings WHERE ts <= $1) - INTERVAL '10 minutes'
       ORDER BY ts DESC`, [asOf]),
+    pool.query("SELECT ts, temp_c FROM weather_readings WHERE ts >= $1 AND ts <= $2",
+      [new Date(asOf.getTime() - day), new Date(asOf.getTime() - day + yesterdayWindow)]),
     liveAir ? null : pool.query("SELECT ts, co2, pm25, tvoc FROM air_readings WHERE ts <= $1 ORDER BY ts DESC LIMIT 1", [asOf]),
     collector.getAcManualOffLockedIds(),
   ]);
@@ -167,7 +185,7 @@ async function buildSnapshot(pool: pg.Pool, collector: WatchCollector) {
       favoriteMax: model.max, pm25, pm25Level: airLevel("pm25", pm25), ts: d?.readingsAt ?? null,
     };
   });
-  return { v: 1, ts: now, power: powerGroup(state.meter, now), weather: weatherGroup(weather.rows, now),
+  return { v: 1, ts: now, power: powerGroup(state.meter, now), weather: weatherGroup(weather.rows, yesterday.rows, now, asOf.getTime()),
     air: { co2, co2Level: airLevel("co2", co2), pm25, pm25Level: airLevel("pm25", pm25),
       tvoc, tvocLevel: airLevel("tvoc", tvoc), ts: epoch(air?.ts) }, acs, purifiers };
 }

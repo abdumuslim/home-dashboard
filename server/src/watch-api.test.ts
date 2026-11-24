@@ -441,6 +441,27 @@ describe("watch device controls through the dashboard handlers", () => {
 });
 
 describe("watch readings", () => {
+  it("carries humidity, feels-like and the 5-minute mean against the same 5 minutes yesterday", async () => {
+    const h = await harness();
+    const now = Date.now(), day = 86_400_000;
+    h.weather.push({ ts: new Date(now - 30_000), temp_c: 19, humidity: 54, feels_like_c: 17.1 },
+      { ts: new Date(now - 200_000), temp_c: 18, humidity: 50, feels_like_c: 16 },
+      { ts: new Date(now - 400_000), temp_c: 30 }, // outside today's 5 minutes
+      { ts: new Date(now - day + 60_000), temp_c: 16.2 },
+      { ts: new Date(now - day + 120_000), temp_c: null },
+      { ts: new Date(now - day - 60_000), temp_c: 5 }); // before yesterday's window
+    const fresh = (await (await h.request("/api/watch")).json()).weather;
+    expect(fresh).toMatchObject({ tempC: 19, humidity: 54, feelsLikeC: 17.1, vsYesterdayC: 2.3 });
+    const yesterdaySql = h.query.mock.calls.find(([sql]) => sql.includes("WHERE ts >= $1 AND ts <= $2"));
+    const [from, to] = (yesterdaySql?.[1] ?? []) as Date[];
+    expect(to.getTime() - from.getTime()).toBe(300_000);
+    expect(Math.abs(from.getTime() - (now - day))).toBeLessThan(5_000);
+    h.weather.splice(3, 1); // no reading yesterday: no comparison, never a zero
+    expect((await (await h.request("/api/watch")).json()).weather).toMatchObject({ vsYesterdayC: null, humidity: 54 });
+    h.weather.splice(0, 2); // nothing in today's 5 minutes
+    h.weather.push({ ts: new Date(now - day + 90_000), temp_c: 15 });
+    expect((await (await h.request("/api/watch")).json()).weather).toMatchObject({ vsYesterdayC: null });
+  });
   it("shows a browser's successful purifier sample on the first watch poll, with its original time", async () => {
     const h = await harness();
     const sampled = Date.now() - 60_000;
@@ -460,7 +481,8 @@ describe("watch readings", () => {
     expect((await h.request("/api/watch")).status).toBe(503);
     h.air.push({ ts: new Date(airTs), co2: 1020 });
     const partial = await (await h.request("/api/watch")).json();
-    expect(partial.weather).toEqual({ sky: null, isDay: null, tempC: null, windKmh: null, windDir: null, rainMmH: null, ts: null });
+    expect(partial.weather).toEqual({ sky: null, isDay: null, tempC: null, feelsLikeC: null, humidity: null,
+      vsYesterdayC: null, windKmh: null, windDir: null, rainMmH: null, ts: null });
     expect(partial.air).toMatchObject({ ts: airTs, co2: 1020, co2Level: "moderate", pm25Level: null });
     expect(partial.power).toEqual({ source: null, amps: null, limit: null, ts: null });
     h.weather.push({ ts: new Date(weatherTs), wind_speed_kmh: 10, wind_dir_avg10m: 0, rain_hourly_mm: 0 },
