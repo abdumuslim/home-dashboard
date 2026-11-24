@@ -24,7 +24,7 @@ import { LevelingControllerV2 } from "./leveling/controller.js";
 import type { LevelerDeviceContext } from "./leveling/api.js";
 import { powerEventRestartsAcs } from "./leveling/power-events.js";
 import { AcCalibrator } from "./ac-calibration.js";
-import { computeNeedTier, type NeedTier } from "./ac-leveling.js";
+import { computeNeedTier, STALE_POWER_MS, type NeedTier } from "./ac-leveling.js";
 import { computeAutoFanLevel } from "./ac-auto-fan.js";
 import { childLogger } from "./logger.js";
 import { RateGate } from "./rate-gate.js";
@@ -3607,14 +3607,18 @@ export class Collector {
       };
     });
     const controller = this.leveling();
-    const meterTs = this.latestPowerTs;
     const previousStatus = controller.getStatus();
     await controller.tick(ctx, outdoorTempC);
     const status = controller.getStatus();
-    // A tick can await several publishes while newer meter samples arrive.
-    // Only associate its smoothed result with a sample we can identify.
-    if (meterTs && meterTs === this.latestPowerTs && status !== previousStatus) {
-      this.watchMeter = { controller, source: status.source, amps: status.measuredAmps, limit: status.limitAmps, ts: meterTs.getTime() };
+    // The watch's power tuple is one observation of the acting controller:
+    // its source, smoothed amps and limit as this tick left them, stamped
+    // with the tick's end time (the amps are smoothed over a window, so no
+    // single meter sample stands behind them). Recorded only while the
+    // meter itself is live, so a silent ESP never looks fresh.
+    const tickedAt = Date.now();
+    const sampleAt = this.latestPowerTs?.getTime();
+    if (status !== previousStatus && sampleAt != null && tickedAt - sampleAt <= STALE_POWER_MS) {
+      this.watchMeter = { controller, source: status.source, amps: status.measuredAmps, limit: status.limitAmps, ts: tickedAt };
     }
     // Shadow phase: v2 also evaluates (journal-only, no commands) so its
     // decisions can be compared against v1's before cutover.

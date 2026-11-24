@@ -1025,7 +1025,7 @@ describe("Smart AC leveling", () => {
     acTimers.clear();
   });
 
-  it("pairs watch power with the acting tick's selected sample across a held publish and controller flip", async () => {
+  it("stamps watch power with the acting tick's end time as one observation across a held publish and controller flip", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       const { collector, tclCloud, setLevelingConfig } = createCollector();
@@ -1055,10 +1055,20 @@ describe("Smart AC leveling", () => {
       expect(status.source).toBe("gen");
       expect(status.measuredAmps).not.toBeNull();
       expect(collector.getWatchDeviceState().meter).toMatchObject({
-        source: "gen", amps: status.measuredAmps, limit: 15, ts: at + 4000,
+        source: "gen", amps: status.measuredAmps, limit: status.limitAmps, ts: at + 8000,
       });
+      expect(status.limitAmps).toBe(15);
+      vi.setSystemTime(at + 9000);
       await checkAcLeveling(collector);
-      expect(collector.getWatchDeviceState().meter).toMatchObject({ source: "grid", limit: 30, ts: at + 8000 });
+      const next = collector.acLeveler.getStatus();
+      expect(collector.getWatchDeviceState().meter).toMatchObject({
+        source: "grid", amps: next.measuredAmps, limit: next.limitAmps, ts: at + 9000,
+      });
+      expect(next.limitAmps).toBe(30);
+      // A silent meter: later ticks do not refresh the tuple's time.
+      vi.setSystemTime(at + 8000 + 16_000);
+      await checkAcLeveling(collector);
+      expect(collector.getWatchDeviceState().meter).toMatchObject({ ts: at + 9000 });
       vi.spyOn(collector.acLeveler2, "controllerFlavor").mockReturnValue("v2");
       expect(collector.getWatchDeviceState().meter).toBeNull();
     } finally { vi.useRealTimers(); }
